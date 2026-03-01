@@ -11,7 +11,7 @@
 #include <tt-metalium/bfloat16.hpp>
 
 using namespace tt;
-using namespace tt::tt_metal;
+#include <fmt/core.h>
 
 bool verify_fft(std::vector<bfloat16>& lhs_r, std::vector<bfloat16>& lhs_i,
                 std::vector<bfloat16>& rhs_r, std::vector<bfloat16>& rhs_i,
@@ -48,11 +48,11 @@ bool verify_fft(std::vector<bfloat16>& lhs_r, std::vector<bfloat16>& lhs_i,
         if (!check_tol(expected_lhs_r, out_lr) || !check_tol(expected_lhs_i, out_li) ||
             !check_tol(expected_rhs_r, out_rr) || !check_tol(expected_rhs_i, out_ri)) {
             pass = false;
-            tt::log_error(tt::LogTest, "Mismatch at index {}:", i);
-            tt::log_error(tt::LogTest, "  LHS R: expected {}, got {}", expected_lhs_r, out_lr);
-            tt::log_error(tt::LogTest, "  LHS I: expected {}, got {}", expected_lhs_i, out_li);
-            tt::log_error(tt::LogTest, "  RHS R: expected {}, got {}", expected_rhs_r, out_rr);
-            tt::log_error(tt::LogTest, "  RHS I: expected {}, got {}", expected_rhs_i, out_ri);
+            fmt::print("Mismatch at index {}:\n", i);
+            fmt::print("  LHS R: expected {}, got {}\n", expected_lhs_r, out_lr);
+            fmt::print("  LHS I: expected {}, got {}\n", expected_lhs_i, out_li);
+            fmt::print("  RHS R: expected {}, got {}\n", expected_rhs_r, out_rr);
+            fmt::print("  RHS I: expected {}, got {}\n", expected_rhs_i, out_ri);
             break;
         }
     }
@@ -64,9 +64,11 @@ int main() {
 
     try {
         int device_id = 0;
-        IDevice *device = CreateDevice(device_id);
+        std::shared_ptr<tt::tt_metal::distributed::MeshDevice> device = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
 
-        CommandQueue& cq = device->command_queue();
+        tt::tt_metal::distributed::MeshCommandQueue& cq = device->mesh_command_queue();
+        tt::tt_metal::distributed::MeshWorkload workload;
+        tt::tt_metal::distributed::MeshCoordinateRange device_range = tt::tt_metal::distributed::MeshCoordinateRange(device->shape());
         Program program = CreateProgram();
 
         CoreCoord core = {0, 0};
@@ -77,24 +79,26 @@ int main() {
         uint32_t single_tile_size = tile_elems * sizeof(bfloat16); // 2048 bytes
         uint32_t buffer_size = single_tile_size * num_tiles;
 
-        tt::tt_metal::InterleavedBufferConfig dram_config{
-            .device=device,
-            .size=buffer_size,
-            .page_size=single_tile_size,
-            .buffer_type=tt::tt_metal::BufferType::DRAM
+        tt::tt_metal::distributed::DeviceLocalBufferConfig dram_config{
+            .page_size = single_tile_size,
+            .buffer_type = tt::tt_metal::BufferType::DRAM
+        };
+
+        tt::tt_metal::distributed::ReplicatedBufferConfig buffer_config{
+            .size = buffer_size
         };
 
         // Create DRAM buffers
-        auto src0_r_buffer = CreateBuffer(dram_config);
-        auto src0_i_buffer = CreateBuffer(dram_config);
-        auto src1_r_buffer = CreateBuffer(dram_config);
-        auto src1_i_buffer = CreateBuffer(dram_config);
-        auto tw_r_buffer = CreateBuffer(dram_config);
-        auto tw_i_buffer = CreateBuffer(dram_config);
-        auto dst0_r_buffer = CreateBuffer(dram_config);
-        auto dst0_i_buffer = CreateBuffer(dram_config);
-        auto dst1_r_buffer = CreateBuffer(dram_config);
-        auto dst1_i_buffer = CreateBuffer(dram_config);
+        auto src0_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto src0_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto src1_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto src1_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto tw_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto tw_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto dst0_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto dst0_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto dst1_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto dst1_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
 
         // Circular Buffers (L1) Setup
         uint32_t src0_r_cb_index = tt::CBIndex::c_0;
@@ -128,7 +132,7 @@ int main() {
         for (auto cb_idx : all_cbs) {
             tt_metal::CircularBufferConfig cb_config = tt_metal::CircularBufferConfig(single_tile_size * tiles_in_cb, {{cb_idx, tt::DataFormat::Float16_b}})
                 .set_page_size(cb_idx, single_tile_size);
-            auto cb = tt_metal::CreateCircularBuffer(program, core, cb_config);
+            tt_metal::CreateCircularBuffer(program, core, cb_config);
         }
 
         // Kernels
@@ -171,12 +175,12 @@ int main() {
         std::vector<bfloat16> tw_i_vec = create_random_vector_of_bfloat16(
             num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
 
-        EnqueueWriteBuffer(cq, src0_r_buffer, src0_r_vec, false);
-        EnqueueWriteBuffer(cq, src0_i_buffer, src0_i_vec, false);
-        EnqueueWriteBuffer(cq, src1_r_buffer, src1_r_vec, false);
-        EnqueueWriteBuffer(cq, src1_i_buffer, src1_i_vec, false);
-        EnqueueWriteBuffer(cq, tw_r_buffer, tw_r_vec, false);
-        EnqueueWriteBuffer(cq, tw_i_buffer, tw_i_vec, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, src0_r_buffer, src0_r_vec, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, src0_i_buffer, src0_i_vec, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, src1_r_buffer, src1_r_vec, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, src1_i_buffer, src1_i_vec, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, tw_r_buffer, tw_r_vec, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, tw_i_buffer, tw_i_vec, false);
 
         // Set kernel args
         SetRuntimeArgs(
@@ -206,28 +210,28 @@ int main() {
         );
 
         // Run
-        EnqueueProgram(cq, program, false);
-        Finish(cq);
+        workload.add_program(device_range, std::move(program));
+        tt::tt_metal::distributed::EnqueueMeshWorkload(cq, workload, false);
 
         // Read results
-        std::vector<bfloat16> out0_r_vec; EnqueueReadBuffer(cq, dst0_r_buffer, out0_r_vec, true);
-        std::vector<bfloat16> out0_i_vec; EnqueueReadBuffer(cq, dst0_i_buffer, out0_i_vec, true);
-        std::vector<bfloat16> out1_r_vec; EnqueueReadBuffer(cq, dst1_r_buffer, out1_r_vec, true);
-        std::vector<bfloat16> out1_i_vec; EnqueueReadBuffer(cq, dst1_i_buffer, out1_i_vec, true);
+        std::vector<bfloat16> out0_r_vec(num_elems, 0); tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_r_vec, dst0_r_buffer, true);
+        std::vector<bfloat16> out0_i_vec(num_elems, 0); tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_i_vec, dst0_i_buffer, true);
+        std::vector<bfloat16> out1_r_vec(num_elems, 0); tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_r_vec, dst1_r_buffer, true);
+        std::vector<bfloat16> out1_i_vec(num_elems, 0); tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_i_vec, dst1_i_buffer, true);
 
         pass &= verify_fft(src0_r_vec, src0_i_vec, src1_r_vec, src1_i_vec, tw_r_vec, tw_i_vec,
                            out0_r_vec, out0_i_vec, out1_r_vec, out1_i_vec);
 
-        pass &= CloseDevice(device);
+        pass &= device->close();
 
     } catch (const std::exception &e) {
-        tt::log_error(tt::LogTest, "Test failed with exception!");
-        tt::log_error(tt::LogTest, "{}", e.what());
+        fmt::print(stderr, "Test failed with exception!\n");
+        fmt::print(stderr, "{}\n", e.what());
         throw;
     }
 
     if (pass) {
-        tt::log_info(tt::LogTest, "Test Passed");
+        fmt::print("Test Passed\n");
     } else {
         TT_THROW("Test Failed");
     }
