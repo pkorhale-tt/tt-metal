@@ -9,6 +9,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/bfloat16.hpp>
+#include <tt-metalium/distributed.hpp>
 
 using namespace tt;
 #include <fmt/core.h>
