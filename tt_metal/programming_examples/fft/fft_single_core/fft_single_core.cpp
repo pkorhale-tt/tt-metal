@@ -10,7 +10,6 @@
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/distributed.hpp>
-#include <tt-metalium/test_utils.hpp>
 
 using namespace tt;
 #include <fmt/core.h>
@@ -160,18 +159,18 @@ int main() {
         );
 
         // Host data
-        std::vector<bfloat16> src0_r_vec = tt::test_utils::create_random_vector_of_bfloat16(
-            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> src0_i_vec = tt::test_utils::create_random_vector_of_bfloat16(
-            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> src1_r_vec = tt::test_utils::create_random_vector_of_bfloat16(
-            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> src1_i_vec = tt::test_utils::create_random_vector_of_bfloat16(
-            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> tw_r_vec = tt::test_utils::create_random_vector_of_bfloat16(
-            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> tw_i_vec = tt::test_utils::create_random_vector_of_bfloat16(
-            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
+        std::vector<bfloat16> src0_r_vec = tt::create_random_vector_of_bfloat16_native(
+            buffer_size, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
+        std::vector<bfloat16> src0_i_vec = tt::create_random_vector_of_bfloat16_native(
+            buffer_size, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
+        std::vector<bfloat16> src1_r_vec = tt::create_random_vector_of_bfloat16_native(
+            buffer_size, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
+        std::vector<bfloat16> src1_i_vec = tt::create_random_vector_of_bfloat16_native(
+            buffer_size, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
+        std::vector<bfloat16> tw_r_vec = tt::create_random_vector_of_bfloat16_native(
+            buffer_size, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
+        std::vector<bfloat16> tw_i_vec = tt::create_random_vector_of_bfloat16_native(
+            buffer_size, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
 
         tt::tt_metal::EnqueueWriteBuffer(cq, src0_r_buffer, src0_r_vec, false);
         tt::tt_metal::EnqueueWriteBuffer(cq, src0_i_buffer, src0_i_vec, false);
