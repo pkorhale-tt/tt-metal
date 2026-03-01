@@ -74,7 +74,6 @@ int main() {
 
         uint32_t num_tiles = 1;
         uint32_t tile_elems = 32 * 32;                // 1024 elements per bfloat16 tile
-        uint32_t num_elems = tile_elems * num_tiles;
         uint32_t single_tile_size = tile_elems * sizeof(bfloat16); // 2048 bytes
         uint32_t buffer_size = single_tile_size * num_tiles;
 
