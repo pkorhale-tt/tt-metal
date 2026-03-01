@@ -20,25 +20,25 @@ bool verify_fft(std::vector<bfloat16>& lhs_r, std::vector<bfloat16>& lhs_i,
                 std::vector<bfloat16>& out_rhs_r, std::vector<bfloat16>& out_rhs_i) {
     bool pass = true;
     for (size_t i = 0; i < lhs_r.size(); i++) {
-        float r1 = rhs_r[i].to_float();
-        float i1 = rhs_i[i].to_float();
-        float wr = tw_r[i].to_float();
-        float wi = tw_i[i].to_float();
+        float r1 = static_cast<float>(rhs_r[i]);
+        float i1 = static_cast<float>(rhs_i[i]);
+        float wr = static_cast<float>(tw_r[i]);
+        float wi = static_cast<float>(tw_i[i]);
         
         // Butterfly math
         float f0 = r1 * wr - i1 * wi;
         float f1 = r1 * wi + i1 * wr;
 
-        float expected_lhs_r = lhs_r[i].to_float() + f0;
-        float expected_lhs_i = lhs_i[i].to_float() + f1;
+        float expected_lhs_r = static_cast<float>(lhs_r[i]) + f0;
+        float expected_lhs_i = static_cast<float>(lhs_i[i]) + f1;
 
-        float expected_rhs_r = lhs_r[i].to_float() - f0;
-        float expected_rhs_i = lhs_i[i].to_float() - f1;
+        float expected_rhs_r = static_cast<float>(lhs_r[i]) - f0;
+        float expected_rhs_i = static_cast<float>(lhs_i[i]) - f1;
 
-        float out_lr = out_lhs_r[i].to_float();
-        float out_li = out_lhs_i[i].to_float();
-        float out_rr = out_rhs_r[i].to_float();
-        float out_ri = out_rhs_i[i].to_float();
+        float out_lr = static_cast<float>(out_lhs_r[i]);
+        float out_li = static_cast<float>(out_lhs_i[i]);
+        float out_rr = static_cast<float>(out_rhs_r[i]);
+        float out_ri = static_cast<float>(out_rhs_i[i]);
 
         // Tolerance check
         auto check_tol = [](float expected, float actual, float tol=0.1f) {
@@ -48,11 +48,11 @@ bool verify_fft(std::vector<bfloat16>& lhs_r, std::vector<bfloat16>& lhs_i,
         if (!check_tol(expected_lhs_r, out_lr) || !check_tol(expected_lhs_i, out_li) ||
             !check_tol(expected_rhs_r, out_rr) || !check_tol(expected_rhs_i, out_ri)) {
             pass = false;
-            tt::log_error("Mismatch at index {}:", i);
-            tt::log_error("  LHS R: expected {}, got {}", expected_lhs_r, out_lr);
-            tt::log_error("  LHS I: expected {}, got {}", expected_lhs_i, out_li);
-            tt::log_error("  RHS R: expected {}, got {}", expected_rhs_r, out_rr);
-            tt::log_error("  RHS I: expected {}, got {}", expected_rhs_i, out_ri);
+            tt::log_error(tt::LogTest, "Mismatch at index {}:", i);
+            tt::log_error(tt::LogTest, "  LHS R: expected {}, got {}", expected_lhs_r, out_lr);
+            tt::log_error(tt::LogTest, "  LHS I: expected {}, got {}", expected_lhs_i, out_li);
+            tt::log_error(tt::LogTest, "  RHS R: expected {}, got {}", expected_rhs_r, out_rr);
+            tt::log_error(tt::LogTest, "  RHS I: expected {}, got {}", expected_rhs_i, out_ri);
             break;
         }
     }
