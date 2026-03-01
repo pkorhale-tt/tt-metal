@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <functional>
 #include <random>
+#include <cmath>
 
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/device.hpp>
@@ -20,6 +21,9 @@ bool verify_fft(std::vector<bfloat16>& lhs_r, std::vector<bfloat16>& lhs_i,
                 std::vector<bfloat16>& out_lhs_r, std::vector<bfloat16>& out_lhs_i,
                 std::vector<bfloat16>& out_rhs_r, std::vector<bfloat16>& out_rhs_i) {
     bool pass = true;
+    float max_rtol = 0.0f;
+    float max_diff = 0.0f;
+
     for (size_t i = 0; i < lhs_r.size(); i++) {
         float r1 = static_cast<float>(rhs_r[i]);
         float i1 = static_cast<float>(rhs_i[i]);
@@ -41,22 +45,33 @@ bool verify_fft(std::vector<bfloat16>& lhs_r, std::vector<bfloat16>& lhs_i,
         float out_rr = static_cast<float>(out_rhs_r[i]);
         float out_ri = static_cast<float>(out_rhs_i[i]);
 
-        // Tolerance check - bfloat16 has 7 bits of mantissa, precision drops rapidly as magnitude increases
-        auto check_tol = [](float expected, float actual, float rtol=0.05f, float atol=1.0f) {
-            return std::abs(expected - actual) <= (atol + rtol * std::abs(expected));
+        // Tolerance check - bfloat16 has 7 bits of mantissa
+        auto check_tol = [&](float expected, float actual) {
+            float diff = std::abs(expected - actual);
+            float rtol = (expected != 0.0f) ? (diff / std::abs(expected)) : 0.0f;
+            
+            if (diff > max_diff) max_diff = diff;
+            if (rtol > max_rtol) max_rtol = rtol;
+            
+            return diff <= (1.0f + 0.05f * std::abs(expected));
         };
 
         if (!check_tol(expected_lhs_r, out_lr) || !check_tol(expected_lhs_i, out_li) ||
             !check_tol(expected_rhs_r, out_rr) || !check_tol(expected_rhs_i, out_ri)) {
+            if (pass) { // Print only the first failure
+                fmt::print("Mismatch at index {}:\n", i);
+                fmt::print("  LHS R: expected {}, got {}\n", expected_lhs_r, out_lr);
+                fmt::print("  LHS I: expected {}, got {}\n", expected_lhs_i, out_li);
+                fmt::print("  RHS R: expected {}, got {}\n", expected_rhs_r, out_rr);
+                fmt::print("  RHS I: expected {}, got {}\n", expected_rhs_i, out_ri);
+            }
             pass = false;
-            fmt::print("Mismatch at index {}:\n", i);
-            fmt::print("  LHS R: expected {}, got {}\n", expected_lhs_r, out_lr);
-            fmt::print("  LHS I: expected {}, got {}\n", expected_lhs_i, out_li);
-            fmt::print("  RHS R: expected {}, got {}\n", expected_rhs_r, out_rr);
-            fmt::print("  RHS I: expected {}, got {}\n", expected_rhs_i, out_ri);
-            break;
         }
     }
+    
+    fmt::print("Verification summary:  Max Diff = {}, Max RTol = {:.2f}%\n", max_diff, max_rtol * 100.0f);
+    
+    return pass;
     return pass;
 }
 
