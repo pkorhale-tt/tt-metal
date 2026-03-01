@@ -59,12 +59,12 @@ bool verify_fft(std::vector<bfloat16>& lhs_r, std::vector<bfloat16>& lhs_i,
     return pass;
 }
 
-int main(int argc, char **argv) {
+int main() {
     bool pass = true;
 
     try {
         int device_id = 0;
-        Device *device = CreateDevice(device_id);
+        IDevice *device = CreateDevice(device_id);
 
         CommandQueue& cq = device->command_queue();
         Program program = CreateProgram();
@@ -159,17 +159,17 @@ int main(int argc, char **argv) {
 
         // Host data
         std::vector<bfloat16> src0_r_vec = create_random_vector_of_bfloat16(
-            num_elems, 100, std::chrono::system_clock::now().time_since_epoch().count());
+            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
         std::vector<bfloat16> src0_i_vec = create_random_vector_of_bfloat16(
-            num_elems, 100, std::chrono::system_clock::now().time_since_epoch().count());
+            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
         std::vector<bfloat16> src1_r_vec = create_random_vector_of_bfloat16(
-            num_elems, 100, std::chrono::system_clock::now().time_since_epoch().count());
+            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
         std::vector<bfloat16> src1_i_vec = create_random_vector_of_bfloat16(
-            num_elems, 100, std::chrono::system_clock::now().time_since_epoch().count());
+            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
         std::vector<bfloat16> tw_r_vec = create_random_vector_of_bfloat16(
-            num_elems, 100, std::chrono::system_clock::now().time_since_epoch().count());
+            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
         std::vector<bfloat16> tw_i_vec = create_random_vector_of_bfloat16(
-            num_elems, 100, std::chrono::system_clock::now().time_since_epoch().count());
+            num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
 
         EnqueueWriteBuffer(cq, src0_r_buffer, src0_r_vec, false);
         EnqueueWriteBuffer(cq, src0_i_buffer, src0_i_vec, false);
