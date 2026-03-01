@@ -154,7 +154,7 @@ int main() {
             core,
             tt::tt_metal::ComputeConfig{
                 .math_fidelity = MathFidelity::HiFi4, 
-                .fp32_dest_acc_en = false, 
+                .fp32_dest_acc_en = true, 
                 .math_approx_mode = false
             }
         );
