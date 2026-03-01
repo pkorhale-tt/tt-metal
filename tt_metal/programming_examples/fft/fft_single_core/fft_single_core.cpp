@@ -154,7 +154,7 @@ int main() {
             "tt_metal/programming_examples/fft/fft_single_core/kernels/compute/fft_compute.cpp",
             core,
             tt::tt_metal::ComputeConfig{
-                .math_fidelity = tt::tt_metal::MathFidelity::HiFi4, 
+                .math_fidelity = MathFidelity::HiFi4, 
                 .fp32_dest_acc_en = false, 
                 .math_approx_mode = false
             }
