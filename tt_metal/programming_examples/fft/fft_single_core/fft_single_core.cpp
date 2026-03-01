@@ -10,6 +10,7 @@
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/distributed.hpp>
+#include <tt-metalium/test_utils.hpp>
 
 using namespace tt;
 #include <fmt/core.h>
@@ -65,11 +66,9 @@ int main() {
 
     try {
         int device_id = 0;
-        std::shared_ptr<tt::tt_metal::distributed::MeshDevice> device = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
+        tt::tt_metal::IDevice* device = tt::tt_metal::CreateDevice(device_id);
 
-        tt::tt_metal::distributed::MeshCommandQueue& cq = device->mesh_command_queue();
-        tt::tt_metal::distributed::MeshWorkload workload;
-        tt::tt_metal::distributed::MeshCoordinateRange device_range = tt::tt_metal::distributed::MeshCoordinateRange(device->shape());
+        CommandQueue& cq = device->command_queue();
         Program program = CreateProgram();
 
         CoreCoord core = {0, 0};
@@ -80,26 +79,24 @@ int main() {
         uint32_t single_tile_size = tile_elems * sizeof(bfloat16); // 2048 bytes
         uint32_t buffer_size = single_tile_size * num_tiles;
 
-        tt::tt_metal::distributed::DeviceLocalBufferConfig dram_config{
+        tt::tt_metal::InterleavedBufferConfig dram_config{
+            .device = device,
+            .size = buffer_size,
             .page_size = single_tile_size,
             .buffer_type = tt::tt_metal::BufferType::DRAM
         };
 
-        tt::tt_metal::distributed::ReplicatedBufferConfig buffer_config{
-            .size = buffer_size
-        };
-
         // Create DRAM buffers
-        auto src0_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto src0_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto src1_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto src1_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto tw_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto tw_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto dst0_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto dst0_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto dst1_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
-        auto dst1_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
+        auto src0_r_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto src0_i_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto src1_r_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto src1_i_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto tw_r_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto tw_i_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto dst0_r_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto dst0_i_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto dst1_r_buffer = tt::tt_metal::CreateBuffer(dram_config);
+        auto dst1_i_buffer = tt::tt_metal::CreateBuffer(dram_config);
 
         // Circular Buffers (L1) Setup
         uint32_t src0_r_cb_index = tt::CBIndex::c_0;
@@ -163,25 +160,25 @@ int main() {
         );
 
         // Host data
-        std::vector<bfloat16> src0_r_vec = create_random_vector_of_bfloat16(
+        std::vector<bfloat16> src0_r_vec = tt::test_utils::create_random_vector_of_bfloat16(
             num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> src0_i_vec = create_random_vector_of_bfloat16(
+        std::vector<bfloat16> src0_i_vec = tt::test_utils::create_random_vector_of_bfloat16(
             num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> src1_r_vec = create_random_vector_of_bfloat16(
+        std::vector<bfloat16> src1_r_vec = tt::test_utils::create_random_vector_of_bfloat16(
             num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> src1_i_vec = create_random_vector_of_bfloat16(
+        std::vector<bfloat16> src1_i_vec = tt::test_utils::create_random_vector_of_bfloat16(
             num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> tw_r_vec = create_random_vector_of_bfloat16(
+        std::vector<bfloat16> tw_r_vec = tt::test_utils::create_random_vector_of_bfloat16(
             num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
-        std::vector<bfloat16> tw_i_vec = create_random_vector_of_bfloat16(
+        std::vector<bfloat16> tw_i_vec = tt::test_utils::create_random_vector_of_bfloat16(
             num_elems, 100.0f, std::chrono::system_clock::now().time_since_epoch().count());
 
-        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, src0_r_buffer, src0_r_vec, false);
-        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, src0_i_buffer, src0_i_vec, false);
-        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, src1_r_buffer, src1_r_vec, false);
-        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, src1_i_buffer, src1_i_vec, false);
-        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, tw_r_buffer, tw_r_vec, false);
-        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, tw_i_buffer, tw_i_vec, false);
+        tt::tt_metal::EnqueueWriteBuffer(cq, src0_r_buffer, src0_r_vec, false);
+        tt::tt_metal::EnqueueWriteBuffer(cq, src0_i_buffer, src0_i_vec, false);
+        tt::tt_metal::EnqueueWriteBuffer(cq, src1_r_buffer, src1_r_vec, false);
+        tt::tt_metal::EnqueueWriteBuffer(cq, src1_i_buffer, src1_i_vec, false);
+        tt::tt_metal::EnqueueWriteBuffer(cq, tw_r_buffer, tw_r_vec, false);
+        tt::tt_metal::EnqueueWriteBuffer(cq, tw_i_buffer, tw_i_vec, false);
 
         // Set kernel args
         SetRuntimeArgs(
@@ -211,19 +208,19 @@ int main() {
         );
 
         // Run
-        workload.add_program(device_range, std::move(program));
-        tt::tt_metal::distributed::EnqueueMeshWorkload(cq, workload, false);
+        tt::tt_metal::EnqueueProgram(cq, program, false);
+        tt::tt_metal::Finish(cq);
 
         // Read results
-        std::vector<bfloat16> out0_r_vec(num_elems, 0); tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_r_vec, dst0_r_buffer, true);
-        std::vector<bfloat16> out0_i_vec(num_elems, 0); tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_i_vec, dst0_i_buffer, true);
-        std::vector<bfloat16> out1_r_vec(num_elems, 0); tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_r_vec, dst1_r_buffer, true);
-        std::vector<bfloat16> out1_i_vec(num_elems, 0); tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_i_vec, dst1_i_buffer, true);
+        std::vector<bfloat16> out0_r_vec; tt::tt_metal::EnqueueReadBuffer(cq, dst0_r_buffer, out0_r_vec, true);
+        std::vector<bfloat16> out0_i_vec; tt::tt_metal::EnqueueReadBuffer(cq, dst0_i_buffer, out0_i_vec, true);
+        std::vector<bfloat16> out1_r_vec; tt::tt_metal::EnqueueReadBuffer(cq, dst1_r_buffer, out1_r_vec, true);
+        std::vector<bfloat16> out1_i_vec; tt::tt_metal::EnqueueReadBuffer(cq, dst1_i_buffer, out1_i_vec, true);
 
         pass &= verify_fft(src0_r_vec, src0_i_vec, src1_r_vec, src1_i_vec, tw_r_vec, tw_i_vec,
                            out0_r_vec, out0_i_vec, out1_r_vec, out1_i_vec);
 
-        pass &= device->close();
+        pass &= tt::tt_metal::CloseDevice(device);
 
     } catch (const std::exception &e) {
         fmt::print(stderr, "Test failed with exception!\n");
