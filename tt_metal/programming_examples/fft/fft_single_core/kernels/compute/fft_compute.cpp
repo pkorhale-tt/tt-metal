@@ -41,7 +41,7 @@ inline void sfpu_op(uint32_t in0_cb, uint32_t in1_cb, uint32_t out_cb)
     tile_regs_acquire();
     
     // Copy in0 to dst[0]
-    copy_tile_init();
+    copy_tile_init(in0_cb);
     copy_tile(in0_cb, 0, 0); // copy tile 0 from in0_cb to DST index 0
     
     // Copy in1 to dst[1]
