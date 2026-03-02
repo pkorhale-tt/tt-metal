@@ -141,7 +141,7 @@ int main() {
             tmp2_f0_cb_index, tmp3_f1_cb_index
         };
 
-        uint32_t t_iles_in_cb = 2; // double buffering capacity
+        uint32_t tiles_in_cb = 2; // double buffering capacity
         for (auto cb_idx : all_cbs) {
             tt_metal::CircularBufferConfig cb_config = tt_metal::CircularBufferConfig(single_tile_size * tiles_in_cb, {{cb_idx, tt::DataFormat::Float16_b}})
                 .set_page_size(cb_idx, single_tile_size);
