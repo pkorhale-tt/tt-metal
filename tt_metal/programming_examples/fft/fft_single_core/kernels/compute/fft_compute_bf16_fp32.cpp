@@ -10,9 +10,10 @@
 // 3. Convert fp32 outputs → bf16
 
 #include <stdint.h>
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/common.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // OPERATION DEFINITIONS
@@ -187,6 +188,9 @@ namespace NAMESPACE {
 void MAIN {
     uint32_t num_tiles = get_arg_val<uint32_t>(0);
     
+    // Initialize copy_tile
+    copy_tile_to_dst_init_short(cb_data0_r_bf16);
+    
     for (uint32_t tile = 0; tile < num_tiles; tile++) {
         
         // ═══════════════════════════════════════════════════════════════════
@@ -202,12 +206,6 @@ void MAIN {
         // ═══════════════════════════════════════════════════════════════════
         // PHASE 2: FFT BUTTERFLY COMPUTATION (all in fp32)
         // ═══════════════════════════════════════════════════════════════════
-        
-        // ─────────────────────────────────────────────────────────────────
-        // Complex multiplication: f = twiddle × data1
-        // f0 = data1_r * twiddle_r - data1_i * twiddle_i (Real part)
-        // f1 = data1_r * twiddle_i + data1_i * twiddle_r (Imag part)
-        // ─────────────────────────────────────────────────────────────────
         
         // --- f0 = data1_r * twiddle_r - data1_i * twiddle_i ---
         math_op_keep<MUL>(cb_data1_r_fp32, cb_twiddle_r_fp32, cb_tmp0);
@@ -225,12 +223,7 @@ void MAIN {
         cb_pop_front(cb_twiddle_r_fp32, 1);
         cb_pop_front(cb_twiddle_i_fp32, 1);
         
-        // ─────────────────────────────────────────────────────────────────
-        // Butterfly: 
-        // out0 = data0 + f (LHS output)
-        // out1 = data0 - f (RHS output)
-        // ─────────────────────────────────────────────────────────────────
-        
+                // --- Butterfly: out0 = data0 + f, out1 = data0 - f ---
         cb_wait_front(cb_f0, 1);
         cb_wait_front(cb_f1, 1);
         
@@ -241,7 +234,7 @@ void MAIN {
         math_op<SUB>(cb_data0_r_fp32, cb_f0, cb_out1_r_fp32);
         // data0_r and f0 are now popped
         
-               // --- out0_i = data0_i + f1 ---
+        // --- out0_i = data0_i + f1 ---
         math_op_keep<ADD>(cb_data0_i_fp32, cb_f1, cb_out0_i_fp32);
         
         // --- out1_i = data0_i - f1 ---
@@ -258,3 +251,4 @@ void MAIN {
     }
 }
 }
+        
