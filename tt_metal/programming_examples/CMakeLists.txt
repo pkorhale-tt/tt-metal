@@ -24,6 +24,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/loopback)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/matmul)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/basic_fft)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float32)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/pad_multi_core)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/shard_data_rm)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/vecadd_sharding)
@@ -38,6 +39,7 @@ add_custom_target(
     DEPENDS
         profiler_examples
         metal_example_fft_single_core
+        metal_example_fft_float32_single_core
         ${PROGRAMMING_EXAMPLES_TEST_TARGETS}
 )
 
