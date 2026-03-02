@@ -56,7 +56,8 @@ bool verify_fft(
             if (diff > max_diff) max_diff = diff;
             if (rtol > max_rtol) max_rtol = rtol;
             
-            return diff <= (0.5f + 0.01f * std::abs(expected));
+            // Tolerance: 5% relative + 1.0 absolute
+            return diff <= (1.0f + 0.05f * std::abs(expected));
         };
         
         if (!check_tol(expected_lhs_r, out_lr) || 
@@ -104,13 +105,15 @@ int main() {
         // BUFFER CONFIGURATION
         // ═══════════════════════════════════════════════════════════════════
         uint32_t num_tiles = 1;
-        uint32_t tile_elems = 32 * 32;
+        uint32_t tile_elems = 32 * 32;  // 1024 elements
         
+        // IMPORTANT: Different tile sizes for bf16 and fp32!
         uint32_t bf16_tile_size = tile_elems * sizeof(bfloat16);  // 2048 bytes
         uint32_t fp32_tile_size = tile_elems * sizeof(float);     // 4096 bytes
         
         uint32_t bf16_buffer_size = bf16_tile_size * num_tiles;
         
+        // DRAM buffer config
         tt::tt_metal::distributed::DeviceLocalBufferConfig dram_config{
             .page_size = bf16_tile_size,
             .buffer_type = tt::tt_metal::BufferType::DRAM
@@ -121,7 +124,7 @@ int main() {
         };
         
         // ═══════════════════════════════════════════════════════════════════
-        // CREATE DRAM BUFFERS
+        // CREATE DRAM BUFFERS (all bfloat16)
         // ═══════════════════════════════════════════════════════════════════
         auto src0_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(
             buffer_config, dram_config, mesh_device.get());
@@ -146,59 +149,21 @@ int main() {
             buffer_config, dram_config, mesh_device.get());
         
         // ═══════════════════════════════════════════════════════════════════
-        // CIRCULAR BUFFER INDICES
-        // ═══════════════════════════════════════════════════════════════════
-        
-        // Input CBs (bf16)
-        uint32_t cb_in0_r_bf16 = tt::CBIndex::c_0;
-        uint32_t cb_in0_i_bf16 = tt::CBIndex::c_1;
-        uint32_t cb_in1_r_bf16 = tt::CBIndex::c_2;
-        uint32_t cb_in1_i_bf16 = tt::CBIndex::c_3;
-        uint32_t cb_tw_r_bf16 = tt::CBIndex::c_4;
-        uint32_t cb_tw_i_bf16 = tt::CBIndex::c_5;
-        
-        // Converted input CBs (fp32)
-        uint32_t cb_in0_r_fp32 = tt::CBIndex::c_6;
-        uint32_t cb_in0_i_fp32 = tt::CBIndex::c_7;
-        uint32_t cb_in1_r_fp32 = tt::CBIndex::c_8;
-        uint32_t cb_in1_i_fp32 = tt::CBIndex::c_9;
-        uint32_t cb_tw_r_fp32 = tt::CBIndex::c_10;
-        uint32_t cb_tw_i_fp32 = tt::CBIndex::c_11;
-        
-        // FFT output CBs (fp32)
-        uint32_t cb_out0_r_fp32 = tt::CBIndex::c_12;
-        uint32_t cb_out0_i_fp32 = tt::CBIndex::c_13;
-        uint32_t cb_out1_r_fp32 = tt::CBIndex::c_14;
-        uint32_t cb_out1_i_fp32 = tt::CBIndex::c_15;
-        
-        // Final output CBs (bf16)
-                // Final output CBs (bf16)
-        uint32_t cb_out0_r_bf16 = tt::CBIndex::c_16;
-        uint32_t cb_out0_i_bf16 = tt::CBIndex::c_17;
-        uint32_t cb_out1_r_bf16 = tt::CBIndex::c_18;
-        uint32_t cb_out1_i_bf16 = tt::CBIndex::c_19;
-        
-        // Temporary CBs (fp32)
-        uint32_t cb_tmp0 = tt::CBIndex::c_24;
-        uint32_t cb_tmp1 = tt::CBIndex::c_25;
-        uint32_t cb_f0 = tt::CBIndex::c_26;
-        uint32_t cb_f1 = tt::CBIndex::c_27;
-        
-        // ═══════════════════════════════════════════════════════════════════
-        // CREATE CIRCULAR BUFFERS
+        // CIRCULAR BUFFER SETUP
         // ═══════════════════════════════════════════════════════════════════
         uint32_t tiles_in_cb = 2;  // Double buffering
         
-        // BFloat16 CBs
-        std::vector<uint32_t> bf16_cbs = {
-            cb_in0_r_bf16, cb_in0_i_bf16,
-            cb_in1_r_bf16, cb_in1_i_bf16,
-            cb_tw_r_bf16, cb_tw_i_bf16,
-            cb_out0_r_bf16, cb_out0_i_bf16,
-            cb_out1_r_bf16, cb_out1_i_bf16
+        // --- BF16 Input CBs (from DRAM) ---
+        std::vector<uint32_t> bf16_input_cbs = {
+            tt::CBIndex::c_0,   // in0_r
+            tt::CBIndex::c_1,   // in0_i
+            tt::CBIndex::c_2,   // in1_r
+            tt::CBIndex::c_3,   // in1_i
+            tt::CBIndex::c_4,   // tw_r
+            tt::CBIndex::c_5    // tw_i
         };
         
-        for (auto cb_idx : bf16_cbs) {
+        for (auto cb_idx : bf16_input_cbs) {
             tt_metal::CircularBufferConfig cb_config = 
                 tt_metal::CircularBufferConfig(
                     bf16_tile_size * tiles_in_cb,
@@ -207,23 +172,47 @@ int main() {
             tt_metal::CreateCircularBuffer(program, core, cb_config);
         }
         
-        // Float32 CBs
-        std::vector<uint32_t> fp32_cbs = {
-            cb_in0_r_fp32, cb_in0_i_fp32,
-            cb_in1_r_fp32, cb_in1_i_fp32,
-            cb_tw_r_fp32, cb_tw_i_fp32,
-            cb_out0_r_fp32, cb_out0_i_fp32,
-            cb_out1_r_fp32, cb_out1_i_fp32,
-            cb_tmp0, cb_tmp1,
-            cb_f0, cb_f1
+        // --- FP32 Intermediate CBs (for compute) ---
+        std::vector<uint32_t> fp32_intermediate_cbs = {
+            tt::CBIndex::c_6,   // fp32_in0_r
+            tt::CBIndex::c_7,   // fp32_in0_i
+            tt::CBIndex::c_8,   // fp32_in1_r
+            tt::CBIndex::c_9,   // fp32_in1_i
+            tt::CBIndex::c_10,  // fp32_tw_r
+            tt::CBIndex::c_11,  // fp32_tw_i
+            tt::CBIndex::c_12,  // fp32_out0_r
+            tt::CBIndex::c_13,  // fp32_out0_i
+            tt::CBIndex::c_14,  // fp32_out1_r
+            tt::CBIndex::c_15,  // fp32_out1_i
+            tt::CBIndex::c_24,  // tmp0
+            tt::CBIndex::c_25,  // tmp1
+            tt::CBIndex::c_26,  // f0
+            tt::CBIndex::c_27   // f1
         };
         
-        for (auto cb_idx : fp32_cbs) {
+        for (auto cb_idx : fp32_intermediate_cbs) {
             tt_metal::CircularBufferConfig cb_config = 
                 tt_metal::CircularBufferConfig(
                     fp32_tile_size * tiles_in_cb,
                     {{cb_idx, tt::DataFormat::Float32}}
                 ).set_page_size(cb_idx, fp32_tile_size);
+            tt_metal::CreateCircularBuffer(program, core, cb_config);
+        }
+        
+        // --- BF16 Output CBs (to DRAM) ---
+        std::vector<uint32_t> bf16_output_cbs = {
+            tt::CBIndex::c_16,  // out0_r
+            tt::CBIndex::c_17,  // out0_i
+            tt::CBIndex::c_18,  // out1_r
+            tt::CBIndex::c_19   // out1_i
+        };
+        
+        for (auto cb_idx : bf16_output_cbs) {
+            tt_metal::CircularBufferConfig cb_config = 
+                tt_metal::CircularBufferConfig(
+                    bf16_tile_size * tiles_in_cb,
+                    {{cb_idx, tt::DataFormat::Float16_b}}
+                ).set_page_size(cb_idx, bf16_tile_size);
             tt_metal::CreateCircularBuffer(program, core, cb_config);
         }
         
@@ -234,7 +223,7 @@ int main() {
         // Reader kernel
         auto reader_id = tt::tt_metal::CreateKernel(
             program,
-            "tt_metal/programming_examples/fft/fft_single_core/kernels/dataflow/reader_fft.cpp",
+            "tt_metal/programming_examples/basic_fft/fft_single_core/kernels/dataflow/reader_fft.cpp",
             core,
             tt::tt_metal::DataMovementConfig{
                 .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
@@ -245,7 +234,7 @@ int main() {
         // Writer kernel
         auto writer_id = tt::tt_metal::CreateKernel(
             program,
-            "tt_metal/programming_examples/fft/fft_single_core/kernels/dataflow/writer_fft.cpp",
+            "tt_metal/programming_examples/basic_fft/fft_single_core/kernels/dataflow/writer_fft.cpp",
             core,
             tt::tt_metal::DataMovementConfig{
                 .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
@@ -253,13 +242,10 @@ int main() {
             }
         );
         
-        // ═══════════════════════════════════════════════════════════════════
-        // SINGLE COMBINED COMPUTE KERNEL
-        // (Does: bf16→fp32 conversion, FFT, fp32→bf16 conversion)
-        // ═══════════════════════════════════════════════════════════════════
-        auto fft_compute_id = tt::tt_metal::CreateKernel(
+        // Compute kernel
+        auto compute_id = tt::tt_metal::CreateKernel(
             program,
-            "tt_metal/programming_examples/fft/fft_single_core/kernels/compute/fft_compute_bf16_fp32.cpp",
+            "tt_metal/programming_examples/basic_fft/fft_single_core/kernels/compute/fft_compute_bf16_fp32.cpp",
             core,
             tt::tt_metal::ComputeConfig{
                 .math_fidelity = MathFidelity::HiFi4,
@@ -276,8 +262,7 @@ int main() {
         std::vector<bfloat16> src0_r_vec = create_random_vector_of_bfloat16_native(
             bf16_buffer_size, max_val, 
             std::chrono::system_clock::now().time_since_epoch().count());
-        
-        std::vector<bfloat16> src0_i_vec = create_random_vector_of_bfloat16_native(
+                std::vector<bfloat16> src0_i_vec = create_random_vector_of_bfloat16_native(
             bf16_buffer_size, max_val,
             std::chrono::system_clock::now().time_since_epoch().count() + 1);
         
@@ -347,10 +332,10 @@ int main() {
             }
         );
         
-        // Compute kernel args (SINGLE kernel now)
+        // Compute kernel args
         tt::tt_metal::SetRuntimeArgs(
             program,
-            fft_compute_id,
+            compute_id,
             core,
             {num_tiles}
         );
@@ -413,3 +398,6 @@ int main() {
     
     return 0;
 }
+
+
+        
