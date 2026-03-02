@@ -234,7 +234,7 @@ int main() {
         // Writer kernel
         auto writer_id = tt::tt_metal::CreateKernel(
             program,
-            "tt_metal/programming_examples/basic_fft/fft_single_core/kernels/dataflow/writer_fft.cpp",
+            "tt_metal/programming_examples/fft/fft_single_core/kernels/dataflow/writer_fft.cpp",
             core,
             tt::tt_metal::DataMovementConfig{
                 .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
@@ -245,7 +245,7 @@ int main() {
         // Compute kernel
         auto compute_id = tt::tt_metal::CreateKernel(
             program,
-            "tt_metal/programming_examples/basic_fft/fft_single_core/kernels/compute/fft_compute_bf16_fp32.cpp",
+            "tt_metal/programming_examples/fft/fft_single_core/kernels/compute/fft_compute_bf16_fp32.cpp",
             core,
             tt::tt_metal::ComputeConfig{
                 .math_fidelity = MathFidelity::HiFi4,
