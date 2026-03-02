@@ -67,6 +67,15 @@ bool verify_fft_f32(
         float hw_rhs_r = out_rhs_r[i];
         float hw_rhs_i = out_rhs_i[i];
         
+        // --- PRINT FIRST 5 ELEMENTS ALWAYS ---
+        if (i < 5) {
+            fmt::print("\n=== INDEX {} ===\n", i);
+            fmt::print("LHS R - Expected: {}, Actual: {}\n", expected_lhs_r, hw_lhs_r);
+            fmt::print("LHS I - Expected: {}, Actual: {}\n", expected_lhs_i, hw_lhs_i);
+            fmt::print("RHS R - Expected: {}, Actual: {}\n", expected_rhs_r, hw_rhs_r);
+            fmt::print("RHS I - Expected: {}, Actual: {}\n", expected_rhs_i, hw_rhs_i);
+        }
+        
         // Check tolerance (float32 should be very close!)
         auto check_tol = [&](float expected, float actual, const char* name) {
             float diff = std::abs(expected - actual);
