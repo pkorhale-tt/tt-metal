@@ -223,7 +223,7 @@ int main() {
         // Reader kernel
         auto reader_id = tt::tt_metal::CreateKernel(
             program,
-            "tt_metal/programming_examples/basic_fft/fft_single_core/kernels/dataflow/reader_fft.cpp",
+            "tt_metal/programming_examples/fft/fft_single_core/kernels/dataflow/reader_fft.cpp",
             core,
             tt::tt_metal::DataMovementConfig{
                 .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
