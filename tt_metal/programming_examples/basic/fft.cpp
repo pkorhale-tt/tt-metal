@@ -60,19 +60,19 @@ tt::tt_metal::Program create_fft_program(
 
     KernelHandle reader_kernel_id = CreateKernel(
         program,
-        "kernels/dataflow/reader.cpp",
+        "tt_metal/programming_examples/basic/kernels/dataflow/reader.cpp",
         core,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default});
 
     KernelHandle writer_kernel_id = CreateKernel(
         program,
-        "kernels/dataflow/writer.cpp",
+        "tt_metal/programming_examples/basic/kernels/dataflow/writer.cpp",
         core,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
 
     KernelHandle compute_kernel_id = CreateKernel(
         program,
-        "kernels/compute/compute.cpp",
+        "tt_metal/programming_examples/basic/kernels/compute/compute.cpp",
         core,
         ComputeConfig{
             .math_fidelity = MathFidelity::HiFi4,
