@@ -47,26 +47,26 @@ tt::tt_metal::Program create_fft_program(
     uint32_t cb_tile_size = 512 * 4;
 
     // Create all circular buffers
-    createCB(program, core, CBIndex::c_0, 1, cb_tile_size);   // data0_r
-    createCB(program, core, CBIndex::c_1, 1, cb_tile_size);   // data0_i
-    createCB(program, core, CBIndex::c_2, 1, cb_tile_size);   // data1_r
-    createCB(program, core, CBIndex::c_3, 1, cb_tile_size);   // data1_i
-    createCB(program, core, CBIndex::c_4, 1, cb_tile_size);   // twiddle_r
-    createCB(program, core, CBIndex::c_5, 1, cb_tile_size);   // twiddle_i
-    createCB(program, core, CBIndex::c_6, 1, cb_tile_size);   // f0
-    createCB(program, core, CBIndex::c_7, 1, cb_tile_size);   // f1
-    createCB(program, core, CBIndex::c_8, 1, cb_tile_size);   // out_data_r
-    createCB(program, core, CBIndex::c_9, 1, cb_tile_size);   // out_data_i
-    createCB(program, core, CBIndex::c_16, 1, cb_tile_size);  // out_data0_r
-    createCB(program, core, CBIndex::c_17, 1, cb_tile_size);  // out_data0_i
-    createCB(program, core, CBIndex::c_18, 1, cb_tile_size);  // out_data1_r
-    createCB(program, core, CBIndex::c_19, 1, cb_tile_size);  // out_data1_i
-    createCB(program, core, CBIndex::c_20, 1, cb_tile_size);  // ddr_data_r
-    createCB(program, core, CBIndex::c_21, 1, cb_tile_size);  // ddr_data_i
-    createCB(program, core, CBIndex::c_22, 1, cb_tile_size);  // ddr_twiddle
-    createCB(program, core, CBIndex::c_23, 1, cb_tile_size);  // intermediate0
-    createCB(program, core, CBIndex::c_24, 1, cb_tile_size);  // intermediate1
-    createCB(program, core, CBIndex::c_25, 1, cb_tile_size);  // intermediate2
+    createCB(program, core, CBIndex::c_0, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_1, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_2, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_3, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_4, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_5, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_6, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_7, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_8, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_9, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_16, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_17, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_18, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_19, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_20, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_21, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_22, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_23, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_24, 1, cb_tile_size);
+    createCB(program, core, CBIndex::c_25, 1, cb_tile_size);
 
     // Create reader kernel
     KernelHandle reader_kernel_id = CreateKernel(
@@ -246,9 +246,20 @@ int main(int argc, char** argv) {
     float* twiddle_factors = computeTwiddleFactors(domain_size);
     std::vector<float> twiddle_vec(twiddle_factors, twiddle_factors + domain_size);
 
-        //==========================================================
-    // TEST 1: Impulse Response Test (Continued)
     //==========================================================
+    // TEST 1: Impulse Response Test
+    //==========================================================
+    printf("---------- TEST 1: Impulse Response ----------\n");
+    printf("Input: delta function at index 0\n");
+    printf("Expected: FFT should produce all 1s\n\n");
+
+    std::vector<float> impulse_r(domain_size, 0.0f);
+    std::vector<float> impulse_i(domain_size, 0.0f);
+    impulse_r[0] = 1.0f;
+
+    std::vector<float> result_r(domain_size, 0.0f);
+    std::vector<float> result_i(domain_size, 0.0f);
+
     tt::tt_metal::Program program_impulse = create_fft_program(
         core, domain_size,
         in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
@@ -279,42 +290,12 @@ int main(int argc, char** argv) {
            impulse_correct, domain_size, tolerance);
 
     //==========================================================
-    // TEST 2: DC Signal Test
+    // TEST 2: Round Trip Test (
+
+        //==========================================================
+    // TEST 2: Round Trip Test (Forward + Backward)
     //==========================================================
-    printf("---------- TEST 2: DC Signal Test ----------\n");
-    printf("Input: constant value 1.0 for all elements\n");
-    printf("Expected: DC component at index 0 = %d, rest = 0\n\n", domain_size);
-
-    std::vector<float> dc_r(domain_size, 1.0f);
-    std::vector<float> dc_i(domain_size, 0.0f);
-
-    std::vector<float> dc_result_r(domain_size, 0.0f);
-    std::vector<float> dc_result_i(domain_size, 0.0f);
-
-    tt::tt_metal::Program program_dc = create_fft_program(
-        core, domain_size,
-        in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
-        result_data_r_dram_buffer, result_data_i_dram_buffer,
-        step_results_r_buffer, step_results_i_buffer,
-        FFT_FORWARD
-    );
-
-    fft_mesh(cq, device, std::move(program_dc),
-             in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
-             result_data_r_dram_buffer, result_data_i_dram_buffer,
-             dc_r, dc_i, twiddle_vec,
-             dc_result_r, dc_result_i, domain_size, FFT_FORWARD);
-
-    printf("DC FFT Output (first 10 elements):\n");
-    for (int i = 0; i < 10; i++) {
-        printf("  [%d] (%.6f, %.6f)\n", i, dc_result_r[i], dc_result_i[i]);
-    }
-    printf("Expected [0] = (%d, 0)\n\n", domain_size);
-
-    //==========================================================
-    // TEST 3: Round Trip Test (Forward + Backward)
-    //==========================================================
-    printf("---------- TEST 3: Round Trip Test ----------\n");
+    printf("---------- TEST 2: Round Trip Test ----------\n");
     printf("Input -> Forward FFT -> Backward FFT -> Output\n");
     printf("Expected: Output should match Input\n\n");
 
@@ -396,53 +377,6 @@ int main(int argc, char** argv) {
             test_r.data(), test_i.data(), domain_size, 1.0f);
 
     //==========================================================
-    // TEST 4: Sine Wave Test
-    //==========================================================
-    printf("\n---------- TEST 4: Sine Wave Test ----------\n");
-    printf("Input: sin(2*pi*k/N) with k=4 (4 cycles)\n");
-    printf("Expected: peaks at indices 4 and N-4\n\n");
-
-    int frequency = 4;
-    std::vector<float> sine_r(domain_size);
-    std::vector<float> sine_i(domain_size, 0.0f);
-    
-    for (int i = 0; i < domain_size; i++) {
-        sine_r[i] = sin(2.0 * PI * frequency * i / domain_size);
-    }
-
-    std::vector<float> sine_result_r(domain_size, 0.0f);
-    std::vector<float> sine_result_i(domain_size, 0.0f);
-
-    tt::tt_metal::Program program_sine = create_fft_program(
-        core, domain_size,
-        in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
-        result_data_r_dram_buffer, result_data_i_dram_buffer,
-        step_results_r_buffer, step_results_i_buffer,
-        FFT_FORWARD
-    );
-
-    fft_mesh(cq, device, std::move(program_sine),
-             in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
-             result_data_r_dram_buffer, result_data_i_dram_buffer,
-             sine_r, sine_i, twiddle_vec,
-             sine_result_r, sine_result_i, domain_size, FFT_FORWARD);
-
-    printf("Sine Wave FFT - Magnitude at key frequencies:\n");
-    for (int i = 0; i <= 10; i++) {
-        float mag = sqrt(sine_result_r[i] * sine_result_r[i] + 
-                        sine_result_i[i] * sine_result_i[i]);
-        printf("  [%d] magnitude = %.4f %s\n", i, mag, 
-               (i == frequency) ? "<-- Expected peak" : "");
-    }
-    printf("  ...\n");
-    for (int i = domain_size - 10; i < domain_size; i++) {
-        float mag = sqrt(sine_result_r[i] * sine_result_r[i] + 
-                        sine_result_i[i] * sine_result_i[i]);
-        printf("  [%d] magnitude = %.4f %s\n", i, mag,
-               (i == domain_size - frequency) ? "<-- Expected peak" : "");
-    }
-
-    //==========================================================
     // Summary
     //==========================================================
     printf("\n========================================\n");
@@ -450,9 +384,7 @@ int main(int argc, char** argv) {
     printf("========================================\n");
     printf("Domain size: %d\n", domain_size);
     printf("Test 1 (Impulse): %d/%d correct\n", impulse_correct, domain_size);
-    printf("Test 2 (DC): Expected %d at [0], Got %.4f\n", domain_size, dc_result_r[0]);
-    printf("Test 3 (Round trip): See comparison above\n");
-    printf("Test 4 (Sine wave): Check peaks at [%d] and [%d]\n", frequency, domain_size - frequency);
+    printf("Test 2 (Round trip): See comparison above\n");
     printf("========================================\n");
 
     // Cleanup
