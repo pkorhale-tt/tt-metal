@@ -231,9 +231,9 @@ int main(int argc, char** argv) {
         result_data_r_dram_buffer, result_data_i_dram_buffer, read_in_buffer, twiddle_buffer, FFT_BACKWARD
     );
 
-    // Feed forward results as backward input
-    data_r_vec = result_r_vec;
-    data_i_vec = result_i_vec;
+    // Reload original golden input so backward FFT tests independence against golden outputs
+    std::copy(golden_r, golden_r + domain_size, data_r_vec.begin());
+    std::copy(golden_i, golden_i + domain_size, data_i_vec.begin());
 
     fft_mesh(cq, device, std::move(program_bck), in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
              result_data_r_dram_buffer, result_data_i_dram_buffer, data_r_vec, data_i_vec, twiddle_vec, 
