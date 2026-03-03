@@ -232,9 +232,11 @@ int main(int argc, char** argv) {
         result_data_r_dram_buffer, result_data_i_dram_buffer, step_results_r_buffer, step_results_i_buffer, FFT_BACKWARD
     );
 
-    // Feed forward results as backward input
-    data_r_vec = result_r_vec;
-    data_i_vec = result_i_vec;
+    // For backwards pass, input is golden values
+    for (int i = 0; i < domain_size; i++) {
+        data_r_vec[i] = golden_r[i];
+        data_i_vec[i] = golden_i[i];
+    }
 
     fft_mesh(cq, device, std::move(program_bck), in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
              result_data_r_dram_buffer, result_data_i_dram_buffer, data_r_vec, data_i_vec, twiddle_vec, 
