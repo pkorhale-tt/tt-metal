@@ -6,7 +6,6 @@
 #include "api/compute/eltwise_unary/sfpu_split_includes.h"
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/compute/eltwise_unary/negative.h"
-#include "debug/dprint.h"
 
 #define USE_SFPU 1
 
