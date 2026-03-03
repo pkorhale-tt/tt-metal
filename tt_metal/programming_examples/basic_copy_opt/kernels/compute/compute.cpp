@@ -1,5 +1,5 @@
 #include <cstdint>
-#include "compute_kernel_api/cb_api.h"
+#include "api/compute/cb_api.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/eltwise_binary_sfpu.h"
