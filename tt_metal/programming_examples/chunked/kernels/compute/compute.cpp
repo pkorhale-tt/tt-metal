@@ -1,13 +1,15 @@
 #include <cstdint>
-#include "api/compute/eltwise_binary.h"
-#include "api/compute/tile_move_copy.h"
-#include "api/compute/eltwise_binary_sfpu.h"
-#include "api/compute/eltwise_unary/sfpu_split_includes.h"
-#include "api/compute/eltwise_unary/eltwise_unary.h"
-#include "api/compute/eltwise_unary/negative.h"
+#include "compute_kernel_api/eltwise_binary.h"
+#include "compute_kernel_api/tile_move_copy.h"
+#include "compute_kernel_api/eltwise_binary_sfpu.h"
+#include "compute_kernel_api/eltwise_binary_sfpu.h"
+#include "compute_kernel_api/eltwise_unary/sfpu_split_includes.h"
+#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+#include "compute_kernel_api/eltwise_unary/negative.h"
 #include "debug/dprint.h"
+#include "../constants.h"
 
-#define USE_SFPU 1
+//#define USE_SFPU 1
 
 namespace NAMESPACE {
 
@@ -106,118 +108,125 @@ void MAIN {
     uint32_t direction = get_arg_val<uint32_t>(0);
     uint32_t domain_size = get_arg_val<uint32_t>(1);
 
+    uint32_t number_chunks = (domain_size/2) / CHUNK_SIZE;
+    if (number_chunks * CHUNK_SIZE < (domain_size/2)) number_chunks++;
+
     constexpr auto cb_data0_r = tt::CBIndex::c_0;
     constexpr auto cb_data0_i = tt::CBIndex::c_1;
     constexpr auto cb_data1_r = tt::CBIndex::c_2;
     constexpr auto cb_data1_i = tt::CBIndex::c_3;
     constexpr auto cb_twiddle_r = tt::CBIndex::c_4;
     constexpr auto cb_twiddle_i = tt::CBIndex::c_5;
-    constexpr auto cb_out_data0_r = tt::CBIndex::c_16;
-    constexpr auto cb_out_data0_i = tt::CBIndex::c_17;
-    constexpr auto cb_out_data1_r = tt::CBIndex::c_18;
-    constexpr auto cb_out_data1_i = tt::CBIndex::c_19;
+    constexpr auto cb_out_data0_r = tt::CBIndex::c_6;
+    constexpr auto cb_out_data0_i = tt::CBIndex::c_7;
+    constexpr auto cb_out_data1_r = tt::CBIndex::c_8;
+    constexpr auto cb_out_data1_i = tt::CBIndex::c_9;
 
-    constexpr auto cb_intermediate0 = tt::CBIndex::c_23;
-    constexpr auto cb_intermediate1 = tt::CBIndex::c_24;
-    constexpr auto cb_intermediate2 = tt::CBIndex::c_25;
-    constexpr auto cb_f0 = tt::CBIndex::c_6;
-    constexpr auto cb_f1 = tt::CBIndex::c_7;
+    constexpr auto cb_intermediate0 = tt::CBIndex::c_12;
+    constexpr auto cb_intermediate1 = tt::CBIndex::c_13;
+    constexpr auto cb_intermediate2 = tt::CBIndex::c_14;
+    constexpr auto cb_f0 = tt::CBIndex::c_15;
+    constexpr auto cb_f1 = tt::CBIndex::c_16;
 
     unary_op_init_common(cb_data1_r, cb_out_data1_r);    
     binary_op_init_common(cb_data1_r, cb_data1_i, cb_intermediate0);
 
     copy_tile_to_dst_init_short(cb_data1_r);
 
-    int num_steps=getLog(domain_size);
-    for (int step=0; step <= num_steps; step++) {
-        cb_wait_front(cb_data1_r, 1);
-        cb_wait_front(cb_data1_i, 1);
-
-        cb_wait_front(cb_twiddle_r, 1);
-        cb_wait_front(cb_twiddle_i, 1);
-
+    uint32_t num_steps=(uint32_t) getLog(domain_size);
+    for (uint32_t step=0; step <= num_steps; step++) {
         // If this is a backwards FFT then we need to invert imaginary data on the 
         // first step and use this as input
         bool requires_imaginary_neg=(direction == 1 && step == 0);
 
-        if (requires_imaginary_neg) {
-            unary_sfpu_op<NEG>(cb_data1_i, cb_intermediate2);
-            cb_wait_front(cb_intermediate2, 1);
-        }
+        for (uint32_t i=0;i<number_chunks;i++) {
 
-        // Calculate f0
+            cb_wait_front(cb_data1_r, 1);
+            cb_wait_front(cb_data1_i, 1);
+
+            cb_wait_front(cb_twiddle_r, 1);
+            cb_wait_front(cb_twiddle_i, 1);
+
+
+            if (requires_imaginary_neg) {
+                unary_sfpu_op<NEG>(cb_data1_i, cb_intermediate2);
+                cb_wait_front(cb_intermediate2, 1);
+            }
+
+            // Calculate f0
 #ifdef USE_SFPU
-        maths_sfpu_op<MUL>(cb_data1_r, cb_twiddle_r, cb_intermediate0);
-        maths_sfpu_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_i, cb_intermediate1);
-        maths_sfpu_op<SUB,true,true>(cb_intermediate0, cb_intermediate1, cb_f0);
+            maths_sfpu_op<MUL>(cb_data1_r, cb_twiddle_r, cb_intermediate0);
+            maths_sfpu_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_i, cb_intermediate1);
+            maths_sfpu_op<SUB,true,true>(cb_intermediate0, cb_intermediate1, cb_f0);
 #else
-        maths_mm_op<MUL>(cb_data1_r, cb_twiddle_r, cb_intermediate0);
-        maths_mm_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_i, cb_intermediate1);
-        maths_mm_op<SUB,true,true>(cb_intermediate0, cb_intermediate1, cb_f0);
+            maths_mm_op<MUL>(cb_data1_r, cb_twiddle_r, cb_intermediate0);
+            maths_mm_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_i, cb_intermediate1);
+            maths_mm_op<SUB,true,true>(cb_intermediate0, cb_intermediate1, cb_f0);
 #endif
 
-        // Calculate f1      
+            // Calculate f1      
 #ifdef USE_SFPU
-        maths_sfpu_op<MUL>(cb_data1_r, cb_twiddle_i, cb_intermediate0);
-        maths_sfpu_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_r, cb_intermediate1);
-        maths_sfpu_op<ADD,true,true>(cb_intermediate0, cb_intermediate1, cb_f1);
+            maths_sfpu_op<MUL>(cb_data1_r, cb_twiddle_i, cb_intermediate0);
+            maths_sfpu_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_r, cb_intermediate1);
+            maths_sfpu_op<ADD,true,true>(cb_intermediate0, cb_intermediate1, cb_f1);
 #else
-        maths_mm_op<MUL>(cb_data1_r, cb_twiddle_i, cb_intermediate0);
-        maths_mm_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_r, cb_intermediate1);
-        maths_mm_op<ADD,true,true>(cb_intermediate0, cb_intermediate1, cb_f1);
+            maths_mm_op<MUL>(cb_data1_r, cb_twiddle_i, cb_intermediate0);
+            maths_mm_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_r, cb_intermediate1);
+            maths_mm_op<ADD,true,true>(cb_intermediate0, cb_intermediate1, cb_f1);
 #endif
 
-        cb_pop_front(cb_twiddle_r, 1);
-        cb_pop_front(cb_twiddle_i, 1);
+            cb_pop_front(cb_twiddle_r, 1);
+            cb_pop_front(cb_twiddle_i, 1);
 
-        // Wait on data for data 0 CBs to be available as we are about to use these
-        cb_wait_front(cb_data0_r, 1);
-        cb_wait_front(cb_data0_i, 1);
+            // Wait on data for data 0 CBs to be available as we are about to use these
+            cb_wait_front(cb_data0_r, 1);
+            cb_wait_front(cb_data0_i, 1);
 
-        if (requires_imaginary_neg) {
-            // Now invert the data 0 imaginary numbers if this is required
-            cb_pop_front(cb_intermediate2, 1);            
-            unary_sfpu_op<NEG>(cb_data0_i, cb_intermediate2);
-            cb_wait_front(cb_intermediate2, 1);
-        }
+            if (requires_imaginary_neg) {
+                // Now invert the data 0 imaginary numbers if this is required
+                cb_pop_front(cb_intermediate2, 1);            
+                unary_sfpu_op<NEG>(cb_data0_i, cb_intermediate2);
+                cb_wait_front(cb_intermediate2, 1);
+            }
 
-        cb_wait_front(cb_f0, 1);
-        cb_wait_front(cb_f1, 1);
+            cb_wait_front(cb_f0, 1);
+            cb_wait_front(cb_f1, 1);
 
-        // Calculate data_1 real
+            // Calculate data_1 real
 #ifdef USE_SFPU
-        maths_sfpu_op<SUB>(cb_data0_r, cb_f0, cb_out_data1_r);
+            maths_sfpu_op<SUB>(cb_data0_r, cb_f0, cb_out_data1_r);
 #else
-        maths_mm_op<SUB>(cb_data0_r, cb_f0, cb_out_data1_r);
+            maths_mm_op<SUB>(cb_data0_r, cb_f0, cb_out_data1_r);
 #endif
-        // Calculate data_1 imaginary
+            // Calculate data_1 imaginary
 #ifdef USE_SFPU
-        maths_sfpu_op<SUB>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data1_i);
+            maths_sfpu_op<SUB>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data1_i);
 #else
-        maths_mm_op<SUB>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data1_i);
+            maths_mm_op<SUB>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data1_i);
 #endif
-        // Calculate data_0 real
+            // Calculate data_0 real
 #ifdef USE_SFPU
-        maths_sfpu_op<ADD>(cb_data0_r, cb_f0, cb_out_data0_r);
+            maths_sfpu_op<ADD>(cb_data0_r, cb_f0, cb_out_data0_r);
 #else
-        maths_mm_op<ADD>(cb_data0_r, cb_f0, cb_out_data0_r);
+            maths_mm_op<ADD>(cb_data0_r, cb_f0, cb_out_data0_r);
 #endif
-        // Calculate data_0 imaginary
+            // Calculate data_0 imaginary
 #ifdef USE_SFPU
-        maths_sfpu_op<ADD>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data0_i);
+            maths_sfpu_op<ADD>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data0_i);
 #else
-        maths_mm_op<ADD>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data0_i);
+            maths_mm_op<ADD>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data0_i);
 #endif        
 
-        if (requires_imaginary_neg) cb_pop_front(cb_intermediate2, 1);
+            if (requires_imaginary_neg) cb_pop_front(cb_intermediate2, 1);
 
-        cb_pop_front(cb_f0, 1);
-        cb_pop_front(cb_f1, 1);
+            cb_pop_front(cb_f0, 1);
+            cb_pop_front(cb_f1, 1);
    
-        cb_pop_front(cb_data0_r, 1);
-        cb_pop_front(cb_data0_i, 1);
-        cb_pop_front(cb_data1_r, 1);
-        cb_pop_front(cb_data1_i, 1);
+            cb_pop_front(cb_data0_r, 1);
+            cb_pop_front(cb_data0_i, 1);
+            cb_pop_front(cb_data1_r, 1);
+            cb_pop_front(cb_data1_i, 1);
+        }
     }
 }
 
