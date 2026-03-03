@@ -1,4 +1,8 @@
-#include "api/dataflow/dataflow_api.h"
+// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+#include <stdint.h>
+#include "dataflow_api.h"
 
 void kernel_main() {
     uint32_t data_r_addr = get_arg_val<uint32_t>(0);
@@ -26,4 +30,3 @@ void kernel_main() {
     cb_pop_front(cb_out_data_r, 1);
     cb_pop_front(cb_out_data_i, 1);
 }
-

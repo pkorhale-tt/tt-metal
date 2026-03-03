@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/distributed.hpp>
@@ -6,6 +9,8 @@
 #include <vector>
 #include <cmath>
 #include <memory>
+#include <cstdlib>
+#include <cstdio>
 
 #define PI 3.14159265358979323846264338327950288
 
@@ -17,13 +22,13 @@ enum FFTDirection {
     FFT_BACKWARD = 1
 };
 
-void compare(float*, float*, float*, float*, int);
-void moveorigin(float*, float*, int);
+// Function declarations
+void compare(float*, float*, float*, float*, int, float);
 void descale(float*, float*, int);
 int checkIfPowerOfTwo(int);
 CBHandle createCB(Program&, CoreCoord&, uint32_t, uint32_t, uint32_t);
 float* computeTwiddleFactors(int);
-[[maybe_unused]] static double getElapsedTime(struct timeval);
+static double getElapsedTime(struct timeval);
 
 tt::tt_metal::Program create_fft_program(
     CoreCoord core,
@@ -35,79 +40,102 @@ tt::tt_metal::Program create_fft_program(
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> result_i_dram,
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> step_results_r_buffer,
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> step_results_i_buffer,
-    FFTDirection direction) {
-
+    FFTDirection direction) 
+{
     Program program = CreateProgram();
 
     uint32_t cb_tile_size = 512 * 4;
-    createCB(program, core, CBIndex::c_0, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_1, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_2, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_3, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_4, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_5, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_16, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_17, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_18, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_19, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_8, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_9, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_20, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_21, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_22, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_23, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_24, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_25, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_6, 1, cb_tile_size);
-    createCB(program, core, CBIndex::c_7, 1, cb_tile_size);
 
+    // Create all circular buffers
+    createCB(program, core, CBIndex::c_0, 1, cb_tile_size);   // data0_r
+    createCB(program, core, CBIndex::c_1, 1, cb_tile_size);   // data0_i
+    createCB(program, core, CBIndex::c_2, 1, cb_tile_size);   // data1_r
+    createCB(program, core, CBIndex::c_3, 1, cb_tile_size);   // data1_i
+    createCB(program, core, CBIndex::c_4, 1, cb_tile_size);   // twiddle_r
+    createCB(program, core, CBIndex::c_5, 1, cb_tile_size);   // twiddle_i
+    createCB(program, core, CBIndex::c_6, 1, cb_tile_size);   // f0
+    createCB(program, core, CBIndex::c_7, 1, cb_tile_size);   // f1
+    createCB(program, core, CBIndex::c_8, 1, cb_tile_size);   // out_data_r
+    createCB(program, core, CBIndex::c_9, 1, cb_tile_size);   // out_data_i
+    createCB(program, core, CBIndex::c_16, 1, cb_tile_size);  // out_data0_r
+    createCB(program, core, CBIndex::c_17, 1, cb_tile_size);  // out_data0_i
+    createCB(program, core, CBIndex::c_18, 1, cb_tile_size);  // out_data1_r
+    createCB(program, core, CBIndex::c_19, 1, cb_tile_size);  // out_data1_i
+    createCB(program, core, CBIndex::c_20, 1, cb_tile_size);  // ddr_data_r
+    createCB(program, core, CBIndex::c_21, 1, cb_tile_size);  // ddr_data_i
+    createCB(program, core, CBIndex::c_22, 1, cb_tile_size);  // ddr_twiddle
+    createCB(program, core, CBIndex::c_23, 1, cb_tile_size);  // intermediate0
+    createCB(program, core, CBIndex::c_24, 1, cb_tile_size);  // intermediate1
+    createCB(program, core, CBIndex::c_25, 1, cb_tile_size);  // intermediate2
+
+    // Create reader kernel
     KernelHandle reader_kernel_id = CreateKernel(
         program,
         "tt_metal/programming_examples/basic_copy_opt/kernels/dataflow/reader.cpp",
         core,
-        DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default});
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1, 
+            .noc = NOC::RISCV_1_default
+        });
 
+    // Create writer kernel
     KernelHandle writer_kernel_id = CreateKernel(
         program,
         "tt_metal/programming_examples/basic_copy_opt/kernels/dataflow/writer.cpp",
         core,
-        DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0, 
+            .noc = NOC::RISCV_0_default
+        });
 
+    // Create compute kernel
     KernelHandle compute_kernel_id = CreateKernel(
         program,
         "tt_metal/programming_examples/basic_copy_opt/kernels/compute/compute.cpp",
         core,
         ComputeConfig{
             .math_fidelity = MathFidelity::HiFi4,
-            .fp32_dest_acc_en = false,
+            .fp32_dest_acc_en = true,
             .math_approx_mode = false,
             .compile_args = {},
         });
 
+    // Set runtime arguments for reader
     SetRuntimeArgs(
         program,
         reader_kernel_id,
         core,
-        {   in_data_r_dram->address(),
+        {
+            in_data_r_dram->address(),
             in_data_i_dram->address(),
             twiddle_dram->address(),
             0, 0, 0,
-            domain_size});
+            domain_size
+        });
 
+    // Set runtime arguments for compute
     SetRuntimeArgs(
         program,
         compute_kernel_id,
         core,
-        {(uint32_t)direction, domain_size, step_results_r_buffer->address(), step_results_i_buffer->address()});
+        {
+            (uint32_t)direction, 
+            domain_size, 
+            step_results_r_buffer->address(), 
+            step_results_i_buffer->address()
+        });
 
+    // Set runtime arguments for writer
     SetRuntimeArgs(
         program,
         writer_kernel_id,
         core,
-        {   result_r_dram->address(),
+        {
+            result_r_dram->address(),
             result_i_dram->address(),
             0, 0,
-            domain_size});
+            domain_size
+        });
 
     return program;
 }
@@ -127,10 +155,11 @@ void fft_mesh(
     std::vector<float>& result_r,
     std::vector<float>& result_i,
     uint32_t domain_size,
-    FFTDirection direction) {
-
+    FFTDirection direction) 
+{
     struct timeval start_time;
 
+    // Transfer input data to device
     gettimeofday(&start_time, NULL);
     tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, in_data_r_dram, input_r, false);
     tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, in_data_i_dram, input_i, false);
@@ -138,6 +167,7 @@ void fft_mesh(
     tt::tt_metal::distributed::Finish(cq);
     double xfer_on_time = getElapsedTime(start_time);
 
+    // Execute program
     gettimeofday(&start_time, NULL);
     tt::tt_metal::distributed::MeshWorkload workload;
     workload.add_program(tt::tt_metal::distributed::MeshCoordinateRange(device->shape()), std::move(program));
@@ -145,6 +175,7 @@ void fft_mesh(
     tt::tt_metal::distributed::Finish(cq);
     double exec_time = getElapsedTime(start_time);
 
+    // Transfer results back
     gettimeofday(&start_time, NULL);
     tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, result_r, result_data_r_dram, true);
     tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, result_i, result_data_i_dram, true);
@@ -152,28 +183,36 @@ void fft_mesh(
     double xfer_off_time = getElapsedTime(start_time);
 
     double total_time = xfer_on_time + exec_time + xfer_off_time;
-    printf("%s FFT of size %d: total time %.4f sec. %.4f sec transfer on, %.4f sec execution, %.4f sec transfer off\n", 
-            direction == FFT_FORWARD ? "Forwards" : "Backwards", domain_size, total_time, xfer_on_time, exec_time, xfer_off_time);
+    printf("%s FFT of size %d: total=%.4fs (xfer_on=%.4fs, exec=%.4fs, xfer_off=%.4fs)\n",
+           direction == FFT_FORWARD ? "Forward" : "Backward", 
+           domain_size, total_time, xfer_on_time, exec_time, xfer_off_time);
 }
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-      fprintf(stderr, "You must provide the size of the domain as an argument\n");
-      return -1;
+        fprintf(stderr, "Usage: %s <domain_size>\n", argv[0]);
+        fprintf(stderr, "  domain_size must be a power of 2 (e.g., 64, 128, 256, 512, 1024)\n");
+        return -1;
     }
 
     int domain_size = atoi(argv[1]);
     if (!checkIfPowerOfTwo(domain_size)) {
-      fprintf(stderr, "%d provided as domain size, but this must be a power of two\n", domain_size);
-      return -1;
+        fprintf(stderr, "Error: %d is not a power of two\n", domain_size);
+        return -1;
     }
 
+    printf("========================================\n");
+    printf("FFT Test - Domain Size: %d\n", domain_size);
+    printf("========================================\n\n");
+
+    // Create device
     auto device = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
     tt::tt_metal::distributed::MeshCommandQueue& cq = device->mesh_command_queue();
-    CoreCoord core = {0, 0};
 
+    CoreCoord core = {0, 0};
     uint32_t dram_tile_size = 4 * domain_size;
-    
+
+    // Create DRAM buffer config
     tt::tt_metal::distributed::DeviceLocalBufferConfig dram_config{
         .page_size = dram_tile_size,
         .buffer_type = tt::tt_metal::BufferType::DRAM
@@ -182,12 +221,14 @@ int main(int argc, char** argv) {
         .size = dram_tile_size
     };
 
+    // Create DRAM buffers
     auto in_data_r_dram_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
     auto in_data_i_dram_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
     auto result_data_r_dram_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
     auto result_data_i_dram_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
     auto twiddle_dram_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, device.get());
 
+    // Create L1 buffer config
     uint32_t cb_tile_size = 512 * 4;
     tt::tt_metal::distributed::DeviceLocalBufferConfig l1_config{
         .page_size = cb_tile_size,
@@ -197,105 +238,284 @@ int main(int argc, char** argv) {
         .size = cb_tile_size
     };
 
+    // Create L1 buffers for intermediate results
     auto step_results_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(l1_buffer_config, l1_config, device.get());
     auto step_results_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(l1_buffer_config, l1_config, device.get());
 
-    float * golden_r = (float*) malloc(sizeof(float) * domain_size);
-    float * golden_i = (float*) malloc(sizeof(float) * domain_size);
-    for (int i=0;i<domain_size;i++) {
-	    golden_r[i]=0.0f;
-	    golden_i[i]=0.0f;
-    }
-    golden_r[domain_size/2]=(float) domain_size;
-    golden_i[domain_size/2]=(float) domain_size*2;
-    
-    float * twiddle_factors = computeTwiddleFactors(domain_size);
+    // Compute twiddle factors
+    float* twiddle_factors = computeTwiddleFactors(domain_size);
     std::vector<float> twiddle_vec(twiddle_factors, twiddle_factors + domain_size);
 
-    std::vector<float> data_r_vec(golden_r, golden_r + domain_size);
-    std::vector<float> data_i_vec(golden_i, golden_i + domain_size);
+        //==========================================================
+    // TEST 1: Impulse Response Test (Continued)
+    //==========================================================
+    tt::tt_metal::Program program_impulse = create_fft_program(
+        core, domain_size,
+        in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+        result_data_r_dram_buffer, result_data_i_dram_buffer,
+        step_results_r_buffer, step_results_i_buffer,
+        FFT_FORWARD
+    );
+
+    fft_mesh(cq, device, std::move(program_impulse),
+             in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+             result_data_r_dram_buffer, result_data_i_dram_buffer,
+             impulse_r, impulse_i, twiddle_vec,
+             result_r, result_i, domain_size, FFT_FORWARD);
+
+    printf("Impulse FFT Output (first 10 elements):\n");
+    for (int i = 0; i < 10; i++) {
+        printf("  [%d] (%.6f, %.6f)\n", i, result_r[i], result_i[i]);
+    }
+
+    int impulse_correct = 0;
+    float tolerance = 0.5f;
+    for (int i = 0; i < domain_size; i++) {
+        if (fabs(result_r[i] - 1.0f) < tolerance && fabs(result_i[i]) < tolerance) {
+            impulse_correct++;
+        }
+    }
+    printf("Impulse Test: %d/%d correct (tolerance=%.2f)\n\n", 
+           impulse_correct, domain_size, tolerance);
+
+    //==========================================================
+    // TEST 2: DC Signal Test
+    //==========================================================
+    printf("---------- TEST 2: DC Signal Test ----------\n");
+    printf("Input: constant value 1.0 for all elements\n");
+    printf("Expected: DC component at index 0 = %d, rest = 0\n\n", domain_size);
+
+    std::vector<float> dc_r(domain_size, 1.0f);
+    std::vector<float> dc_i(domain_size, 0.0f);
+
+    std::vector<float> dc_result_r(domain_size, 0.0f);
+    std::vector<float> dc_result_i(domain_size, 0.0f);
+
+    tt::tt_metal::Program program_dc = create_fft_program(
+        core, domain_size,
+        in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+        result_data_r_dram_buffer, result_data_i_dram_buffer,
+        step_results_r_buffer, step_results_i_buffer,
+        FFT_FORWARD
+    );
+
+    fft_mesh(cq, device, std::move(program_dc),
+             in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+             result_data_r_dram_buffer, result_data_i_dram_buffer,
+             dc_r, dc_i, twiddle_vec,
+             dc_result_r, dc_result_i, domain_size, FFT_FORWARD);
+
+    printf("DC FFT Output (first 10 elements):\n");
+    for (int i = 0; i < 10; i++) {
+        printf("  [%d] (%.6f, %.6f)\n", i, dc_result_r[i], dc_result_i[i]);
+    }
+    printf("Expected [0] = (%d, 0)\n\n", domain_size);
+
+    //==========================================================
+    // TEST 3: Round Trip Test (Forward + Backward)
+    //==========================================================
+    printf("---------- TEST 3: Round Trip Test ----------\n");
+    printf("Input -> Forward FFT -> Backward FFT -> Output\n");
+    printf("Expected: Output should match Input\n\n");
+
+    // Create test signal
+    std::vector<float> test_r(domain_size);
+    std::vector<float> test_i(domain_size, 0.0f);
     
-    std::vector<float> result_r_vec(domain_size, 0.0f);
-    std::vector<float> result_i_vec(domain_size, 0.0f);
+    for (int i = 0; i < domain_size; i++) {
+        test_r[i] = (float)(i % 10);  // Pattern: 0,1,2,3,4,5,6,7,8,9,0,1,2,...
+    }
+
+    printf("Input (first 15 elements):\n");
+    for (int i = 0; i < 15; i++) {
+        printf("  [%d] (%.2f, %.2f)\n", i, test_r[i], test_i[i]);
+    }
+    printf("\n");
+
+    // Forward FFT
+    std::vector<float> fwd_result_r(domain_size, 0.0f);
+    std::vector<float> fwd_result_i(domain_size, 0.0f);
 
     tt::tt_metal::Program program_fwd = create_fft_program(
-        core, domain_size, in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
-        result_data_r_dram_buffer, result_data_i_dram_buffer, step_results_r_buffer, step_results_i_buffer, FFT_FORWARD
+        core, domain_size,
+        in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+        result_data_r_dram_buffer, result_data_i_dram_buffer,
+        step_results_r_buffer, step_results_i_buffer,
+        FFT_FORWARD
     );
 
-    fft_mesh(cq, device, std::move(program_fwd), in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
-             result_data_r_dram_buffer, result_data_i_dram_buffer, data_r_vec, data_i_vec, twiddle_vec, 
-             result_r_vec, result_i_vec, domain_size, FFT_FORWARD);
+    fft_mesh(cq, device, std::move(program_fwd),
+             in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+             result_data_r_dram_buffer, result_data_i_dram_buffer,
+             test_r, test_i, twiddle_vec,
+             fwd_result_r, fwd_result_i, domain_size, FFT_FORWARD);
 
-    tt::tt_metal::Program program_bck = create_fft_program(
-        core, domain_size, in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
-        result_data_r_dram_buffer, result_data_i_dram_buffer, step_results_r_buffer, step_results_i_buffer, FFT_BACKWARD
+    printf("After Forward FFT (first 10 elements):\n");
+    for (int i = 0; i < 10; i++) {
+        printf("  [%d] (%.6f, %.6f)\n", i, fwd_result_r[i], fwd_result_i[i]);
+    }
+    printf("\n");
+
+    // Backward FFT
+    std::vector<float> bwd_result_r(domain_size, 0.0f);
+    std::vector<float> bwd_result_i(domain_size, 0.0f);
+
+    tt::tt_metal::Program program_bwd = create_fft_program(
+        core, domain_size,
+        in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+        result_data_r_dram_buffer, result_data_i_dram_buffer,
+        step_results_r_buffer, step_results_i_buffer,
+        FFT_BACKWARD
     );
 
-    // For backwards pass, input is golden values
+    fft_mesh(cq, device, std::move(program_bwd),
+             in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+             result_data_r_dram_buffer, result_data_i_dram_buffer,
+             fwd_result_r, fwd_result_i, twiddle_vec,
+             bwd_result_r, bwd_result_i, domain_size, FFT_BACKWARD);
+
+    printf("After Backward FFT (raw, first 15 elements):\n");
+    for (int i = 0; i < 15; i++) {
+        printf("  [%d] (%.6f, %.6f)\n", i, bwd_result_r[i], bwd_result_i[i]);
+    }
+    printf("\n");
+
+    // Scale by 1/N for inverse FFT
+    descale(bwd_result_r.data(), bwd_result_i.data(), domain_size);
+
+    printf("After scaling by 1/N (first 15 elements):\n");
+    for (int i = 0; i < 15; i++) {
+        printf("  [%d] got (%.4f, %.4f), expected (%.2f, %.2f)\n", 
+               i, bwd_result_r[i], bwd_result_i[i], test_r[i], test_i[i]);
+    }
+    printf("\n");
+
+    // Compare round trip result with original
+    printf("Round Trip Comparison:\n");
+    compare(bwd_result_r.data(), bwd_result_i.data(), 
+            test_r.data(), test_i.data(), domain_size, 1.0f);
+
+    //==========================================================
+    // TEST 4: Sine Wave Test
+    //==========================================================
+    printf("\n---------- TEST 4: Sine Wave Test ----------\n");
+    printf("Input: sin(2*pi*k/N) with k=4 (4 cycles)\n");
+    printf("Expected: peaks at indices 4 and N-4\n\n");
+
+    int frequency = 4;
+    std::vector<float> sine_r(domain_size);
+    std::vector<float> sine_i(domain_size, 0.0f);
+    
     for (int i = 0; i < domain_size; i++) {
-        data_r_vec[i] = golden_r[i];
-        data_i_vec[i] = golden_i[i];
+        sine_r[i] = sin(2.0 * PI * frequency * i / domain_size);
     }
 
-    fft_mesh(cq, device, std::move(program_bck), in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
-             result_data_r_dram_buffer, result_data_i_dram_buffer, data_r_vec, data_i_vec, twiddle_vec, 
-             result_r_vec, result_i_vec, domain_size, FFT_BACKWARD);
+    std::vector<float> sine_result_r(domain_size, 0.0f);
+    std::vector<float> sine_result_i(domain_size, 0.0f);
 
-    moveorigin(result_r_vec.data(), result_i_vec.data(), domain_size);
-    descale(result_r_vec.data(), result_i_vec.data(), domain_size);
-    
-    // Fix index domain_size/2 mismatch (512) where golden equals domain_size but result equals 127.94
-    // due to inverse power scaling across N=1024
-    result_r_vec[domain_size/2] = round(result_r_vec[domain_size/2] * 8); // 128 * 8 = 1024
-    result_i_vec[domain_size/2] = round(result_i_vec[domain_size/2] * 16); // 128 * 16 = 2048
-    
-    compare(result_r_vec.data(), result_i_vec.data(), golden_r, golden_i, domain_size);
+    tt::tt_metal::Program program_sine = create_fft_program(
+        core, domain_size,
+        in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+        result_data_r_dram_buffer, result_data_i_dram_buffer,
+        step_results_r_buffer, step_results_i_buffer,
+        FFT_FORWARD
+    );
 
+    fft_mesh(cq, device, std::move(program_sine),
+             in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer,
+             result_data_r_dram_buffer, result_data_i_dram_buffer,
+             sine_r, sine_i, twiddle_vec,
+             sine_result_r, sine_result_i, domain_size, FFT_FORWARD);
+
+    printf("Sine Wave FFT - Magnitude at key frequencies:\n");
+    for (int i = 0; i <= 10; i++) {
+        float mag = sqrt(sine_result_r[i] * sine_result_r[i] + 
+                        sine_result_i[i] * sine_result_i[i]);
+        printf("  [%d] magnitude = %.4f %s\n", i, mag, 
+               (i == frequency) ? "<-- Expected peak" : "");
+    }
+    printf("  ...\n");
+    for (int i = domain_size - 10; i < domain_size; i++) {
+        float mag = sqrt(sine_result_r[i] * sine_result_r[i] + 
+                        sine_result_i[i] * sine_result_i[i]);
+        printf("  [%d] magnitude = %.4f %s\n", i, mag,
+               (i == domain_size - frequency) ? "<-- Expected peak" : "");
+    }
+
+    //==========================================================
+    // Summary
+    //==========================================================
+    printf("\n========================================\n");
+    printf("FFT Test Summary\n");
+    printf("========================================\n");
+    printf("Domain size: %d\n", domain_size);
+    printf("Test 1 (Impulse): %d/%d correct\n", impulse_correct, domain_size);
+    printf("Test 2 (DC): Expected %d at [0], Got %.4f\n", domain_size, dc_result_r[0]);
+    printf("Test 3 (Round trip): See comparison above\n");
+    printf("Test 4 (Sine wave): Check peaks at [%d] and [%d]\n", frequency, domain_size - frequency);
+    printf("========================================\n");
+
+    // Cleanup
     device->close();
-
     free(twiddle_factors);
-    free(golden_r);
-    free(golden_i);
+
+    return 0;
 }
 
-void compare(float * a_data_r, float * a_data_i, float * b_data_r, float * b_data_i, int domain_size) {
-  int matching = 0, missmatching = 0;
-  for (int i=0; i<domain_size;i++) {
-    float a_r=a_data_r[i];
-    float a_i=a_data_i[i];
-    float b_r=b_data_r[i];
-    float b_i=b_data_i[i];
+//==========================================================
+// Helper Functions
+//==========================================================
 
-    if (a_r != b_r || a_i != b_i) {
-      if(missmatching < 5) printf("Miss match index %d: (%.2f, %.2f) vs (%.2f, %.2f)\n", i, a_r, a_i, b_r, b_i);
-      missmatching++;
-    } else {
-      matching++;
+void compare(float* a_data_r, float* a_data_i, 
+             float* b_data_r, float* b_data_i, 
+             int domain_size, float tolerance) 
+{
+    int matching = 0, mismatching = 0;
+    
+    for (int i = 0; i < domain_size; i++) {
+        float diff_r = fabs(a_data_r[i] - b_data_r[i]);
+        float diff_i = fabs(a_data_i[i] - b_data_i[i]);
+        
+        if (diff_r > tolerance || diff_i > tolerance) {
+            if (mismatching < 10) {
+                printf("  Mismatch [%d]: got (%.4f, %.4f), expected (%.4f, %.4f)\n",
+                       i, a_data_r[i], a_data_i[i], b_data_r[i], b_data_i[i]);
+            }
+            mismatching++;
+        } else {
+            matching++;
+        }
     }
-  }
-  printf("Checked %d elements: %d match and %d missmatched\n", domain_size, matching, missmatching);
-}
-
-void moveorigin(float* data_r, float* data_i, int domain_size) {
-  for (int i=0;i<domain_size;i++) {
-    data_r[i]=data_r[i] * pow(-1, i);
-    data_i[i]=data_i[i] * pow(-1, i);
-  }
+    
+    if (mismatching > 10) {
+        printf("  ... and %d more mismatches\n", mismatching - 10);
+    }
+    
+    printf("Result: %d/%d match, %d mismatch (tolerance=%.4f)\n", 
+           matching, domain_size, mismatching, tolerance);
+    
+    if (matching == domain_size) {
+        printf("*** TEST PASSED ***\n");
+    } else {
+        printf("*** TEST FAILED ***\n");
+    }
 }
 
 void descale(float* data_r, float* data_i, int domain_size) {
-  for (int i=0;i<domain_size;i++) {
-    data_r[i]=data_r[i] / domain_size;
-    data_i[i]=-(data_i[i] / domain_size);
-  }
+    float scale = 1.0f / domain_size;
+    for (int i = 0; i < domain_size; i++) {
+        data_r[i] = data_r[i] * scale;
+        data_i[i] = data_i[i] * scale;
+    }
 }
 
 int checkIfPowerOfTwo(int v) {
-  return (v != 0) && ((v & (v - 1)) == 0);
+    return (v != 0) && ((v & (v - 1)) == 0);
 }
 
-CBHandle createCB(Program & program, CoreCoord & core, uint32_t cb_index, uint32_t num_tiles, uint32_t tile_size) {
+CBHandle createCB(Program& program, CoreCoord& core, 
+                  uint32_t cb_index, uint32_t num_tiles, uint32_t tile_size) 
+{
     CircularBufferConfig cb_config = 
         CircularBufferConfig(num_tiles * tile_size, {{cb_index, tt::DataFormat::Float32}})
             .set_page_size(cb_index, tile_size);
@@ -304,21 +524,22 @@ CBHandle createCB(Program & program, CoreCoord & core, uint32_t cb_index, uint32
 }
 
 float* computeTwiddleFactors(int n) {
-   int num_twiddle_factors=n/2;
-   float * twiddle_factors=(float*) malloc(sizeof(float) * num_twiddle_factors * 2);
-
-   for (int i=0;i<num_twiddle_factors;i++) {
-     float base_factor=(2.0 * PI * i)/(float) n;
-     twiddle_factors[i*2]=(float) cos((double) base_factor);
-     twiddle_factors[(i*2)+1]=(float) -sin((double) base_factor);
-   }
-
-   return twiddle_factors;
+    int num_twiddle_factors = n / 2;
+    float* twiddle_factors = (float*)malloc(sizeof(float) * num_twiddle_factors * 2);
+    
+    for (int i = 0; i < num_twiddle_factors; i++) {
+        float angle = (2.0 * PI * i) / (float)n;
+        twiddle_factors[i * 2] = (float)cos((double)angle);
+        twiddle_factors[(i * 2) + 1] = (float)(-sin((double)angle));
+    }
+    
+    return twiddle_factors;
 }
 
-[[maybe_unused]] static double getElapsedTime(struct timeval start_time) {
-  struct timeval curr_time;
-  gettimeofday(&curr_time, NULL);
-  long int elapsedtime = (curr_time.tv_sec * 1000000 + curr_time.tv_usec) - (start_time.tv_sec * 1000000 + start_time.tv_usec);
-  return elapsedtime / 1000000.0;
+static double getElapsedTime(struct timeval start_time) {
+    struct timeval curr_time;
+    gettimeofday(&curr_time, NULL);
+    long int elapsedtime = (curr_time.tv_sec * 1000000 + curr_time.tv_usec) - 
+                          (start_time.tv_sec * 1000000 + start_time.tv_usec);
+    return elapsedtime / 1000000.0;
 }

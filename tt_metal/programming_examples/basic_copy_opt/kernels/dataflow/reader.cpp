@@ -1,5 +1,8 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 #include <stdint.h>
-#include "api/dataflow/dataflow_api.h"
+#include "dataflow_api.h"
 
 void kernel_main() {
     uint32_t data_r_addr = get_arg_val<uint32_t>(0);
@@ -21,6 +24,7 @@ void kernel_main() {
     cb_reserve_back(cb_out_data_r, 1);
     cb_reserve_back(cb_out_data_i, 1);
     cb_reserve_back(cb_out_twiddle, 1);
+
     uint32_t cb_out_data_r_ptr = get_write_ptr(cb_out_data_r);
     uint32_t cb_out_data_i_ptr = get_write_ptr(cb_out_data_i);
     uint32_t cb_out_twiddle_ptr = get_write_ptr(cb_out_twiddle);
@@ -34,4 +38,3 @@ void kernel_main() {
     cb_push_back(cb_out_data_i, 1);
     cb_push_back(cb_out_twiddle, 1);
 }
-
