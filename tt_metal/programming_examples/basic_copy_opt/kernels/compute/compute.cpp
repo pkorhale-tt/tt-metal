@@ -226,26 +226,15 @@ void MAIN {
     cb_reserve_back(cb_data1_r, 1);
     cb_reserve_back(cb_data1_i, 1);
 
-    volatile uint *cb_ddr_data_r_addr, *cb_ddr_data_i_addr, *cb_data0_r_addr, *cb_data0_i_addr, *cb_data1_r_addr, *cb_data1_i_addr, *cb_ddr_twiddle_data_addr, *cb_twiddle_r_addr, *cb_twiddle_i_addr;
-    cb_get_tile(cb_ddr_data_r, 0, &cb_ddr_data_r_addr);
-    cb_get_tile(cb_ddr_data_i, 0, &cb_ddr_data_i_addr);
-    cb_get_tile(cb_data0_r, 0, &cb_data0_r_addr);
-    cb_get_tile(cb_data0_i, 0, &cb_data0_i_addr);
-    cb_get_tile(cb_data1_r, 0, &cb_data1_r_addr);
-    cb_get_tile(cb_data1_i, 0, &cb_data1_i_addr);
-    cb_get_tile(cb_ddr_twiddle_data, 0, &cb_ddr_twiddle_data_addr);
-    cb_get_tile(cb_twiddle_r, 0, &cb_twiddle_r_addr);
-    cb_get_tile(cb_twiddle_i, 0, &cb_twiddle_i_addr);
-
-    uint32_t idx_cb_ddr_data_r_addr = reinterpret_cast<uint32_t>(cb_ddr_data_r_addr);
-    uint32_t idx_cb_ddr_data_i_addr = reinterpret_cast<uint32_t>(cb_ddr_data_i_addr);
-    uint32_t idx_cb_data0_r_addr = reinterpret_cast<uint32_t>(cb_data0_r_addr);
-    uint32_t idx_cb_data0_i_addr = reinterpret_cast<uint32_t>(cb_data0_i_addr);
-    uint32_t idx_cb_data1_r_addr = reinterpret_cast<uint32_t>(cb_data1_r_addr);
-    uint32_t idx_cb_data1_i_addr = reinterpret_cast<uint32_t>(cb_data1_i_addr);
-    uint32_t idx_cb_ddr_twiddle_data_addr = reinterpret_cast<uint32_t>(cb_ddr_twiddle_data_addr);
-    uint32_t idx_cb_twiddle_r_addr = reinterpret_cast<uint32_t>(cb_twiddle_r_addr);
-    uint32_t idx_cb_twiddle_i_addr = reinterpret_cast<uint32_t>(cb_twiddle_i_addr);
+    uint32_t idx_cb_ddr_data_r_addr = get_tile_address(cb_ddr_data_r, 0);
+    uint32_t idx_cb_ddr_data_i_addr = get_tile_address(cb_ddr_data_i, 0);
+    uint32_t idx_cb_data0_r_addr = get_tile_address(cb_data0_r, 0);
+    uint32_t idx_cb_data0_i_addr = get_tile_address(cb_data0_i, 0);
+    uint32_t idx_cb_data1_r_addr = get_tile_address(cb_data1_r, 0);
+    uint32_t idx_cb_data1_i_addr = get_tile_address(cb_data1_i, 0);
+    uint32_t idx_cb_ddr_twiddle_data_addr = get_tile_address(cb_ddr_twiddle_data, 0);
+    uint32_t idx_cb_twiddle_r_addr = get_tile_address(cb_twiddle_r, 0);
+    uint32_t idx_cb_twiddle_i_addr = get_tile_address(cb_twiddle_i, 0);
 
     int num_steps=getLog(domain_size);
     for (int step=0; step <= num_steps; step++) {
@@ -341,27 +330,17 @@ void MAIN {
         cb_pop_front(cb_f0, 1);
         cb_pop_front(cb_f1, 1);
 
-        volatile uint *cb_out_data0_r_addr, cb_out_data0_i_addr, cb_out_data1_r_addr, cb_out_data1_i_addr;
-        cb_get_tile(cb_out_data0_r, 0, &cb_out_data0_r_addr);
-        cb_get_tile(cb_out_data0_i, 0, &cb_out_data0_i_addr);
-        cb_get_tile(cb_out_data1_r, 0, &cb_out_data1_r_addr);
-        cb_get_tile(cb_out_data1_i, 0, &cb_out_data1_i_addr);
-
-        uint32_t idx_cb_out_data0_r_addr = reinterpret_cast<uint32_t>(cb_out_data0_r_addr);
-        uint32_t idx_cb_out_data0_i_addr = reinterpret_cast<uint32_t>(cb_out_data0_i_addr);
-        uint32_t idx_cb_out_data1_r_addr = reinterpret_cast<uint32_t>(cb_out_data1_r_addr);
-        uint32_t idx_cb_out_data1_i_addr = reinterpret_cast<uint32_t>(cb_out_data1_i_addr);
+        uint32_t idx_cb_out_data0_r_addr = get_tile_address(cb_out_data0_r, 0);
+        uint32_t idx_cb_out_data0_i_addr = get_tile_address(cb_out_data0_i, 0);
+        uint32_t idx_cb_out_data1_r_addr = get_tile_address(cb_out_data1_r, 0);
+        uint32_t idx_cb_out_data1_i_addr = get_tile_address(cb_out_data1_i, 0);
 
         if (step == num_steps-1) {
             cb_reserve_back(cb_out_data_r, 1);
             cb_reserve_back(cb_out_data_i, 1);
 
-            volatile uint *cb_out_data_r_addr, cb_out_data_i_addr;
-            cb_get_tile(cb_out_data_r, 0, &cb_out_data_r_addr);
-            cb_get_tile(cb_out_data_i, 0, &cb_out_data_i_addr);
-
-            uint32_t idx_cb_out_data_r_addr = reinterpret_cast<uint32_t>(cb_out_data_r_addr);
-            uint32_t idx_cb_out_data_i_addr = reinterpret_cast<uint32_t>(cb_out_data_i_addr);
+            uint32_t idx_cb_out_data_r_addr = get_tile_address(cb_out_data_r, 0);
+            uint32_t idx_cb_out_data_i_addr = get_tile_address(cb_out_data_i, 0);
             copy_out(step, num_steps, domain_size, idx_cb_out_data_r_addr, idx_cb_out_data_i_addr, idx_cb_out_data0_r_addr, idx_cb_out_data0_i_addr, idx_cb_out_data1_r_addr, idx_cb_out_data1_i_addr);
             cb_push_back(cb_out_data_r, 1);
             cb_push_back(cb_out_data_i, 1);
