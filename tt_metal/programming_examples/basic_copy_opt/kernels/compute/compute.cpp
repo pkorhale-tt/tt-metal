@@ -1,12 +1,10 @@
 #include <cstdint>
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary_sfpu.h"
-#include "compute_kernel_api/eltwise_binary_sfpu.h"
-#include "compute_kernel_api/eltwise_unary/sfpu_split_includes.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/eltwise_unary/negative.h"
-#include "debug/dprint.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/eltwise_unary/sfpu_split_includes.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_unary/negative.h"
 
 #define USE_SFPU 1
 
@@ -55,16 +53,16 @@ void maths_sfpu_op(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt) {
     copy_tile(cb_in_2, 0, 1);
     if (OPERATION == ADD) {
         add_binary_tile_init();
-        add_binary_tile(0, 1);
+        add_binary_tile(0, 1, 0);
     } else if (OPERATION == SUB) {
         sub_binary_tile_init();
-        sub_binary_tile(0, 1);
+        sub_binary_tile(0, 1, 0);
     } else if (OPERATION == MUL) {
         mul_binary_tile_init();
-        mul_binary_tile(0, 1);
+        mul_binary_tile(0, 1, 0);
     } else if (OPERATION == DIV) {
         div_binary_tile_init();
-        div_binary_tile(0, 1);
+        div_binary_tile(0, 1, 0);
     }
     tile_regs_commit(); 
     if constexpr(CB_OP_IN1) cb_pop_front(cb_in_1, 1);
