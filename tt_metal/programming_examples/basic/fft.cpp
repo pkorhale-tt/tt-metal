@@ -145,8 +145,8 @@ void fft_mesh(
     double exec_time = getElapsedTime(start_time);
 
     gettimeofday(&start_time, NULL);
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, result_r, result_data_r_dram, false);
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, result_i, result_data_i_dram, false);
+    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, result_r, result_data_r_dram, true);
+    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, result_i, result_data_i_dram, true);
     tt::tt_metal::distributed::Finish(cq);
     double xfer_off_time = getElapsedTime(start_time);
 
