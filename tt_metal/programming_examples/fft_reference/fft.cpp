@@ -14,19 +14,19 @@ enum FFTDirection {
 };
 
 struct TTExecution {
-    Program *program;
+    tt::tt_metal::Program *program;
     CoreCoord *core;
-    KernelHandle *read_kernel, *write_kernel, *compute_kernel;
+    tt::tt_metal::KernelHandle *read_kernel, *write_kernel, *compute_kernel;
     std::shared_ptr<tt::tt_metal::Buffer> in_data_r_dram_buffer, in_data_i_dram_buffer, twiddle_dram_buffer, result_data_r_dram_buffer, result_data_i_dram_buffer;
     std::shared_ptr<tt::tt_metal::Buffer> read_in_buffer, twiddle_buffer;
 };
 
-void fft(CommandQueue&, TTExecution*, float*, float*, float*, float*, float*, uint32_t, enum FFTDirection);
+void fft(tt::tt_metal::CommandQueue&, TTExecution*, float*, float*, float*, float*, float*, uint32_t, enum FFTDirection);
 void compare(float*, float*, float*, float*, int);
 void moveorigin(float*, float*, int);
 void descale(float*, float*, int);
 int checkIfPowerOfTwo(int);
-CBHandle createCB(Program&, CoreCoord&, uint32_t, uint32_t, uint32_t);
+tt::tt_metal::CBHandle createCB(tt::tt_metal::Program&, CoreCoord&, uint32_t, uint32_t, uint32_t);
 float* computeTwiddleFactors(int);
 static double getElapsedTime(struct timeval);
 
@@ -46,8 +46,8 @@ int main(int argc, char** argv) {
     IDevice* device = CreateDevice(0);
 
     /* Setup program to execute along with its buffers and kernels to use */
-    CommandQueue& cq = device->command_queue();
-    Program program = CreateProgram();
+    tt::tt_metal::CommandQueue& cq = device->command_queue();
+    tt::tt_metal::Program program = tt::tt_metal::CreateProgram();
     CoreCoord core = {0, 0};
 
     uint32_t dram_tile_size = 4 * domain_size;
@@ -104,13 +104,13 @@ int main(int argc, char** argv) {
     std::shared_ptr<tt::tt_metal::Buffer> twiddle_buffer = CreateBuffer(l1_config);
 
     /* Specify data movement kernels for reading/writing data to/from DRAM */
-    KernelHandle reader_kernel_id = CreateKernel(
+    tt::tt_metal::KernelHandle reader_kernel_id = tt::tt_metal::CreateKernel(
         program,
         "kernels/dataflow/reader.cpp",
         core,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default});
 
-    KernelHandle writer_kernel_id = CreateKernel(
+    tt::tt_metal::KernelHandle writer_kernel_id = tt::tt_metal::CreateKernel(
         program,
         "kernels/dataflow/writer.cpp",
         core,
@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> compute_kernel_args = {};
 
     /* Use the add_tiles operation in the compute kernel */
-    KernelHandle compute_kernel_id = CreateKernel(
+    tt::tt_metal::KernelHandle compute_kernel_id = tt::tt_metal::CreateKernel(
         program,
         "kernels/compute/compute.cpp",
         core,
@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
     free(golden_i);
 }
 
-void fft(CommandQueue& cq, TTExecution * device_descriptor, float * input_r, float * input_i, float * twiddle_factors, float * result_r, float * result_i, uint32_t domain_size, enum FFTDirection direction) {        
+void fft(tt::tt_metal::CommandQueue& cq, TTExecution * device_descriptor, float * input_r, float * input_i, float * twiddle_factors, float * result_r, float * result_i, uint32_t domain_size, enum FFTDirection direction) {        
     // Since all interleaved buffers have size == page_size, they are entirely contained in the first DRAM bank
     uint32_t in_data_r_dram_bank_id = 0;
     uint32_t in_data_i_dram_bank_id = 0;
@@ -290,11 +290,11 @@ int checkIfPowerOfTwo(int v) {
   return (v != 0) && ((v & (v - 1)) == 0);
 }
 
-CBHandle createCB(Program & program, CoreCoord & core, uint32_t cb_index, uint32_t num_tiles, uint32_t tile_size) {
-    CircularBufferConfig cb_config = 
-        CircularBufferConfig(num_tiles * tile_size, {{cb_index, tt::DataFormat::Float32}})
+tt::tt_metal::CBHandle createCB(tt::tt_metal::Program & program, CoreCoord & core, uint32_t cb_index, uint32_t num_tiles, uint32_t tile_size) {
+    tt::tt_metal::CircularBufferConfig cb_config = 
+        tt::tt_metal::CircularBufferConfig(num_tiles * tile_size, {{cb_index, tt::DataFormat::Float32}})
             .set_page_size(cb_index, tile_size);
-    CBHandle cb = tt_metal::CreateCircularBuffer(program, core, cb_config);
+    tt::tt_metal::CBHandle cb = tt::tt_metal::CreateCircularBuffer(program, core, cb_config);
     return cb;
 }
 
