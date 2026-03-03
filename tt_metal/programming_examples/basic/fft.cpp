@@ -1,6 +1,5 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/device.hpp>
-#include <tt-metalium/distributed.hpp>
 #include <sys/time.h>
 #include <time.h>
 
@@ -22,14 +21,14 @@ struct TTExecution {
     std::shared_ptr<tt::tt_metal::Buffer> read_in_buffer, twiddle_buffer;
 };
 
-void fft(tt::tt_metal::distributed::MeshCommandQueue&, TTExecution*, float*, float*, float*, float*, float*, uint32_t, enum FFTDirection);
+void fft(CommandQueue&, TTExecution*, float*, float*, float*, float*, float*, uint32_t, enum FFTDirection);
 void compare(float*, float*, float*, float*, int);
 void moveorigin(float*, float*, int);
 void descale(float*, float*, int);
 int checkIfPowerOfTwo(int);
 CBHandle createCB(Program&, CoreCoord&, uint32_t, uint32_t, uint32_t);
 float* computeTwiddleFactors(int);
-[[maybe_unused]] static double getElapsedTime(struct timeval);
+[[maybe_unused]] [[maybe_unused]] static double getElapsedTime(struct timeval);
 
 int main(int argc, char** argv) {
     if (argc != 2) {
@@ -44,10 +43,10 @@ int main(int argc, char** argv) {
     }
 
     /* Silicon accelerator setup */
-    auto device = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
+    IDevice* device = CreateDevice(0);
 
     /* Setup program to execute along with its buffers and kernels to use */
-    tt::tt_metal::distributed::MeshCommandQueue& cq = device->mesh_command_queue();
+    CommandQueue& cq = device->command_queue();
     Program program = CreateProgram();
     CoreCoord core = {0, 0};
 
@@ -176,7 +175,7 @@ int main(int argc, char** argv) {
 
     compare(data_r, data_i, golden_r, golden_i, domain_size);
 
-    device->close();
+    CloseDevice(device);
 
     free(data_r);
     free(data_i);
@@ -185,7 +184,7 @@ int main(int argc, char** argv) {
     free(golden_i);
 }
 
-void fft(tt::tt_metal::distributed::MeshCommandQueue& cq, TTExecution * device_descriptor, float * input_r, float * input_i, float * twiddle_factors, float * result_r, float * result_i, uint32_t domain_size, enum FFTDirection direction) {        
+void fft(CommandQueue& cq, TTExecution * device_descriptor, float * input_r, float * input_i, float * twiddle_factors, float * result_r, float * result_i, uint32_t domain_size, enum FFTDirection direction) {        
     // Since all interleaved buffers have size == page_size, they are entirely contained in the first DRAM bank
     uint32_t in_data_r_dram_bank_id = 0;
     uint32_t in_data_i_dram_bank_id = 0;
@@ -312,7 +311,7 @@ float* computeTwiddleFactors(int n) {
    return twiddle_factors;
 }
 
-[[maybe_unused]] static double getElapsedTime(struct timeval start_time) {
+[[maybe_unused]] [[maybe_unused]] static double getElapsedTime(struct timeval start_time) {
   struct timeval curr_time;
   gettimeofday(&curr_time, NULL);
   long int elapsedtime = (curr_time.tv_sec * 1000000 + curr_time.tv_usec) - (start_time.tv_sec * 1000000 + start_time.tv_usec);
