@@ -1,46 +1,90 @@
-# Standard Operating Procedure (SOP): Testing FFT Kernels on TT-Metal
+Standard Operating Procedure (SOP): Testing FFT Kernels on TT-Metal (Wormhole)
 
-This document provides the standard commands and workflow for re-compiling and executing the single-core FFT kernels on a Tenstorrent Wormhole machine.
+This guide explains how to rebuild and run your single-core FFT kernel on the Tenstorrent Wormhole machine.
 
-## Prerequisites
+---
 
-Ensure you are in the python environment and located in your TT-Metal directory:
-```bash
+Prerequisites
+
+1. Activate your Python environment.
+2. Navigate to your TT-Metal directory:
+
 cd /proj_sw/user_dev/pkorhale/fft_metal/tt-metal
-```
 
-## Step 1: Building the Executable
+---
 
-Whenever you make a change to a `.cpp` host file or a compute/dataflow kernel inside `programming_examples/basic_fft/fft_single_core/`, you must rebuild the target.
+Step 1: Rebuild After Any Code Change
 
-To efficiently recompile **only** the necessary files for `basic_fft`:
-```bash
+Whenever you modify:
+
+* Any .cpp host file
+* Any compute kernel
+* Any dataflow kernel
+
+Inside:
+programming_examples/basic_fft/fft_single_core/
+
+Rebuild using:
+
 cmake --build build --target metal_example_basic_fft_single_core -j
-```
 
-*(Note: If you are modifying the original `fft` directory, swap the target name to `metal_example_fft_single_core` instead).*
+If you are modifying the original fft directory instead, use:
 
-## Step 2: Running the Executable
+cmake --build build --target metal_example_fft_single_core -j
 
-Because the shared Tenstorrent metalium library requires hardware-specific architecture bindings at runtime, you must prefix your standard execution command with `ARCH_NAME=wormhole_b0`.
+This command recompiles only the required FFT example.
 
-To run your compiled test:
-```bash
+---
+
+Step 2: Run the Executable
+
+You must always prefix the command with the architecture name:
+
 ARCH_NAME=wormhole_b0 ./build/programming_examples/metal_example_basic_fft_single_core
-```
 
-## Step 3: Verifying the Output
+Do not forget to include ARCH_NAME=wormhole_b0.
 
-Upon running the executable, the Tenstorrent host application will:
-1. Initialize the Wormhole machine (`tt_cluster`, `topology_discovery`)
-2. Load random bfloat16 testing data into circular buffers.
-3. Automatically execute the `.cpp` compute kernels on the RISC-V cores.
-4. Compare the hardware output row-by-row with a local CPU FP32 reference calculation.
+---
 
-If the output from the hardware matches the mathematical reference within the strict 5% relative tolerance limit, the terminal will print:
-```text
+Step 3: What Happens When You Run It
+
+When you execute the program, it will:
+
+1. Initialize the Wormhole machine.
+2. Load random bfloat16 input data.
+3. Execute your FFT kernel on the RISC-V cores.
+4. Compute a CPU FP32 reference result.
+5. Compare the hardware output with the CPU result.
+
+---
+
+Step 4: Verifying the Output
+
+If the FFT implementation is correct, you will see:
+
 Verification summary:  Max Diff = 0.0, Max RTol = 0.00%
 Test Passed
-```
 
-If it fails due to algorithmic mistakes or extreme precision loss, it will print `Test Failed` along with the exact expected and actual values for the first failed index.
+This means:
+
+* The FFT algorithm is correct.
+* The result is within the 5% relative tolerance limit.
+
+If there is an issue, you will see:
+
+Test Failed
+
+The program will print:
+
+* Expected value
+* Actual hardware value
+* Index where the mismatch occurred
+
+This usually indicates:
+
+* Algorithm mistake
+* Incorrect twiddle factor
+* Stage computation error
+* Precision issue.
+
+---
