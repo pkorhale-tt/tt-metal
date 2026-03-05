@@ -31,7 +31,7 @@ void kernel_main() {
     const InterleavedAddrGenFast<true> s1_i = { .bank_base_address = src1_i_addr, .page_size = tile_bytes, .data_format = DataFormat::Float16_b };
     const InterleavedAddrGenFast<true> tw_r = { .bank_base_address = twiddles_r_addr, .page_size = twiddle_bytes, .data_format = DataFormat::Float16_b };
     const InterleavedAddrGenFast<true> tw_i = { .bank_base_address = twiddles_i_addr, .page_size = twiddle_bytes, .data_format = DataFormat::Float16_b };
-
+fft
     for (uint32_t i = 0; i < num_tiles; i++) {
         // LHS
         cb_reserve_back(cb_id_in0_r, 1);

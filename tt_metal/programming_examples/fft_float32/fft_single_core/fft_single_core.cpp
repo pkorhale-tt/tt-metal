@@ -217,16 +217,46 @@ int main() {
                 // ═══════════════════════════════════════════════════════════════════
         // CREATE HOST DATA (Float32)
         // ═══════════════════════════════════════════════════════════════════
-        float max_val = 5.0f;
-        uint32_t seed = std::chrono::system_clock::now().time_since_epoch().count();
+        // float max_val = 5.0f;
+        // uint32_t seed = std::chrono::system_clock::now().time_since_epoch().count();
         
-        std::vector<float> src0_r_vec = create_random_float32_vector(tile_elems, max_val, seed);
-        std::vector<float> src0_i_vec = create_random_float32_vector(tile_elems, max_val, seed + 1);
-        std::vector<float> src1_r_vec = create_random_float32_vector(tile_elems, max_val, seed + 2);
-        std::vector<float> src1_i_vec = create_random_float32_vector(tile_elems, max_val, seed + 3);
-        std::vector<float> tw_r_vec = create_random_float32_vector(tile_elems, max_val, seed + 4);
-        std::vector<float> tw_i_vec = create_random_float32_vector(tile_elems, max_val, seed + 5);
+        // std::vector<float> src0_r_vec = create_random_float32_vector(tile_elems, max_val, seed);
+        // std::vector<float> src0_i_vec = create_random_float32_vector(tile_elems, max_val, seed + 1);
+        // std::vector<float> src1_r_vec = create_random_float32_vector(tile_elems, max_val, seed + 2);
+        // std::vector<float> src1_i_vec = create_random_float32_vector(tile_elems, max_val, seed + 3);
+        // std::vector<float> tw_r_vec = create_random_float32_vector(tile_elems, max_val, seed + 4);
+        // std::vector<float> tw_i_vec = create_random_float32_vector(tile_elems, max_val, seed + 5);
         
+        std::vector<float> src0_r_vec(tile_elems, 0.0f);
+        std::vector<float> src0_i_vec(tile_elems, 0.0f);
+        std::vector<float> src1_r_vec(tile_elems, 0.0f);
+        std::vector<float> src1_i_vec(tile_elems, 0.0f);
+        std::vector<float> tw_r_vec(tile_elems, 0.0f);
+        std::vector<float> tw_i_vec(tile_elems, 0.0f);
+
+        // Example FFT input: [1,2,3,4]
+        src0_r_vec[0] = 1;
+        src0_r_vec[1] = 3;
+
+        src1_r_vec[0] = 2;
+        src1_r_vec[1] = 4;
+
+        // Imaginary parts
+        src0_i_vec[0] = 0;
+        src0_i_vec[1] = 0;
+        src1_i_vec[0] = 0;
+        src1_i_vec[1] = 0;
+
+        // Twiddle factors
+        tw_r_vec[0] = 1;
+        tw_i_vec[0] = 0;
+
+        tw_r_vec[1] = 0;
+        tw_i_vec[1] = -1;
+            
+
+
+
         // ═══════════════════════════════════════════════════════════════════
         // WRITE INPUT DATA TO DEVICE
         // ═══════════════════════════════════════════════════════════════════
