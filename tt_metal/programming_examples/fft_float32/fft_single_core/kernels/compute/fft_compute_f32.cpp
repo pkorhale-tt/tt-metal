@@ -10,8 +10,6 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/copy_dest_values.h"
 
-namespace NAMESPACE {
-
 constexpr uint32_t ADD = 0;
 constexpr uint32_t SUB = 1;
 constexpr uint32_t MUL = 2;
@@ -218,5 +216,3 @@ void kernel_main() {
         }
     }
 }
-
-}  // namespace NAMESPACE
