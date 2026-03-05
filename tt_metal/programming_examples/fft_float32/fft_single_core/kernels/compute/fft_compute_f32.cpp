@@ -1,36 +1,39 @@
 // fft_compute_f32.cpp
+// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 #include <cstdint>
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/eltwise_unary/negative.h"
-#include "compute_kernel_api/tile_move_copy.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/negative.h"
 
-#define USE_SFPU 1
+namespace NAMESPACE {
 
-namespace fft_kernel {
-
-enum {
-    ADD = 0,
-    SUB = 1,
-    MUL = 2,
-    DIV = 3,
-    NEG = 4,
-};
+constexpr uint32_t ADD = 0;
+constexpr uint32_t SUB = 1;
+constexpr uint32_t MUL = 2;
+constexpr uint32_t NEG = 3;
 
 //-------------------------
 // SFPU Unary Operation
 //-------------------------
-template <int OPERATION, bool CB_OP_IN=false>
-void unary_sfpu_op(uint32_t cb_in, uint32_t cb_tgt) {
-    if constexpr(CB_OP_IN) cb_wait_front(cb_in, 1);
+template <uint32_t OPERATION>
+FORCE_INLINE void unary_sfpu_op(uint32_t cb_in, uint32_t cb_tgt, bool wait_in = true, bool pop_in = true) {
+    if (wait_in) cb_wait_front(cb_in, 1);
+    
     tile_regs_acquire();
     copy_tile_to_dst_init_short(cb_in);
     copy_tile(cb_in, 0, 0);
-    if (OPERATION == NEG) {
+    
+    if constexpr (OPERATION == NEG) {
         negative_tile_init();
         negative_tile(0);
     }
+    
     tile_regs_commit();
-    if constexpr(CB_OP_IN) cb_pop_front(cb_in, 1);
+    
+    if (pop_in) cb_pop_front(cb_in, 1);
+    
     cb_reserve_back(cb_tgt, 1);
     tile_regs_wait();
     pack_tile(0, cb_tgt);
@@ -39,37 +42,41 @@ void unary_sfpu_op(uint32_t cb_in, uint32_t cb_tgt) {
 }
 
 //-------------------------
-// SFPU Binary/Math Operation
+// SFPU Binary Operation
 //-------------------------
-template <int OPERATION, bool CB_OP_IN1=false, bool CB_OP_IN2=false>
-void maths_sfpu_op(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt) {
-    if constexpr(CB_OP_IN1) cb_wait_front(cb_in_1, 1);
-    if constexpr(CB_OP_IN2) cb_wait_front(cb_in_2, 1);
-
+template <uint32_t OPERATION>
+FORCE_INLINE void binary_sfpu_op(
+    uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
+    bool wait_in1 = true, bool wait_in2 = true,
+    bool pop_in1 = true, bool pop_in2 = true
+) {
+    if (wait_in1) cb_wait_front(cb_in_1, 1);
+    if (wait_in2) cb_wait_front(cb_in_2, 1);
+    
     tile_regs_acquire();
+    
     copy_tile_to_dst_init_short(cb_in_1);
     copy_tile(cb_in_1, 0, 0);
+    
     copy_tile_to_dst_init_short_with_dt(cb_in_1, cb_in_2);
     copy_tile(cb_in_2, 0, 1);
-
-    if (OPERATION == ADD) {
+    
+    if constexpr (OPERATION == ADD) {
         add_binary_tile_init();
         add_binary_tile(0, 1);
-    } else if (OPERATION == SUB) {
+    } else if constexpr (OPERATION == SUB) {
         sub_binary_tile_init();
         sub_binary_tile(0, 1);
-    } else if (OPERATION == MUL) {
+    } else if constexpr (OPERATION == MUL) {
         mul_binary_tile_init();
         mul_binary_tile(0, 1);
-    } else if (OPERATION == DIV) {
-        div_binary_tile_init();
-        div_binary_tile(0, 1);
     }
-
+    
     tile_regs_commit();
-    if constexpr(CB_OP_IN1) cb_pop_front(cb_in_1, 1);
-    if constexpr(CB_OP_IN2) cb_pop_front(cb_in_2, 1);
-
+    
+    if (pop_in1) cb_pop_front(cb_in_1, 1);
+    if (pop_in2) cb_pop_front(cb_in_2, 1);
+    
     cb_reserve_back(cb_tgt, 1);
     tile_regs_wait();
     pack_tile(0, cb_tgt);
@@ -78,97 +85,142 @@ void maths_sfpu_op(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt) {
 }
 
 //-------------------------
-// Compute log2 for FFT steps
+// Complex Multiply: (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
 //-------------------------
-int getLog(int n) {
-    int logn = 0;
-    while ((n >>= 1) > 0) logn++;
-    return logn;
-}
-
-//-------------------------
-// MAIN FFT Kernel
-//-------------------------
-void MAIN() {
-    uint32_t direction = get_arg_val<uint32_t>(0);   // 0=forward, 1=backward
-    uint32_t domain_size = get_arg_val<uint32_t>(1);
-
-    constexpr auto cb_data0_r = tt::CBIndex::c_0;
-    constexpr auto cb_data0_i = tt::CBIndex::c_1;
-    constexpr auto cb_data1_r = tt::CBIndex::c_2;
-    constexpr auto cb_data1_i = tt::CBIndex::c_3;
-    constexpr auto cb_twiddle_r = tt::CBIndex::c_4;
-    constexpr auto cb_twiddle_i = tt::CBIndex::c_5;
-    constexpr auto cb_out_data0_r = tt::CBIndex::c_16;
-    constexpr auto cb_out_data0_i = tt::CBIndex::c_17;
-    constexpr auto cb_out_data1_r = tt::CBIndex::c_18;
-    constexpr auto cb_out_data1_i = tt::CBIndex::c_19;
-
-    constexpr auto cb_intermediate0 = tt::CBIndex::c_23;
-    constexpr auto cb_intermediate1 = tt::CBIndex::c_24;
-    constexpr auto cb_intermediate2 = tt::CBIndex::c_25;
-    constexpr auto cb_f0 = tt::CBIndex::c_6;
-    constexpr auto cb_f1 = tt::CBIndex::c_7;
-
-    unary_op_init_common(cb_data1_r, cb_out_data1_r);
-    binary_op_init_common(cb_data1_r, cb_data1_i, cb_intermediate0);
-
-    copy_tile_to_dst_init_short(cb_data1_r);
-
-    int num_steps = getLog(domain_size);
-
-    for (int step = 0; step <= num_steps; step++) {
-        cb_wait_front(cb_data1_r, 1);
-        cb_wait_front(cb_data1_i, 1);
-        cb_wait_front(cb_twiddle_r, 1);
-        cb_wait_front(cb_twiddle_i, 1);
-
-        bool requires_imaginary_neg = (direction == 1 && step == 0);
-
-        if (requires_imaginary_neg) {
-            unary_sfpu_op<NEG>(cb_data1_i, cb_intermediate2);
-            cb_wait_front(cb_intermediate2, 1);
-        }
-
-        // Compute f0
-        maths_sfpu_op<MUL>(cb_data1_r, cb_twiddle_r, cb_intermediate0);
-        maths_sfpu_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_i, cb_intermediate1);
-        maths_sfpu_op<SUB,true,true>(cb_intermediate0, cb_intermediate1, cb_f0);
-
-        // Compute f1
-        maths_sfpu_op<MUL>(cb_data1_r, cb_twiddle_i, cb_intermediate0);
-        maths_sfpu_op<MUL>(requires_imaginary_neg ? cb_intermediate2 : cb_data1_i, cb_twiddle_r, cb_intermediate1);
-        maths_sfpu_op<ADD,true,true>(cb_intermediate0, cb_intermediate1, cb_f1);
-
-        cb_pop_front(cb_twiddle_r, 1);
-        cb_pop_front(cb_twiddle_i, 1);
-
-        cb_wait_front(cb_data0_r, 1);
-        cb_wait_front(cb_data0_i, 1);
-
-        if (requires_imaginary_neg) {
-            cb_pop_front(cb_intermediate2, 1);
-            unary_sfpu_op<NEG>(cb_data0_i, cb_intermediate2);
-            cb_wait_front(cb_intermediate2, 1);
-        }
-
-        cb_wait_front(cb_f0, 1);
-        cb_wait_front(cb_f1, 1);
-
-        maths_sfpu_op<SUB>(cb_data0_r, cb_f0, cb_out_data1_r);
-        maths_sfpu_op<SUB>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data1_i);
-        maths_sfpu_op<ADD>(cb_data0_r, cb_f0, cb_out_data0_r);
-        maths_sfpu_op<ADD>(requires_imaginary_neg ? cb_intermediate2 : cb_data0_i, cb_f1, cb_out_data0_i);
-
-        if (requires_imaginary_neg) cb_pop_front(cb_intermediate2, 1);
-
-        cb_pop_front(cb_f0, 1);
-        cb_pop_front(cb_f1, 1);
-        cb_pop_front(cb_data0_r, 1);
-        cb_pop_front(cb_data0_i, 1);
-        cb_pop_front(cb_data1_r, 1);
-        cb_pop_front(cb_data1_i, 1);
+FORCE_INLINE void complex_multiply(
+    uint32_t cb_a_r, uint32_t cb_a_i,
+    uint32_t cb_b_r, uint32_t cb_b_i,
+    uint32_t cb_out_r, uint32_t cb_out_i,
+    uint32_t cb_tmp0, uint32_t cb_tmp1,
+    bool wait_a = true, bool wait_b = true,
+    bool pop_a = true, bool pop_b = true
+) {
+    if (wait_a) {
+        cb_wait_front(cb_a_r, 1);
+        cb_wait_front(cb_a_i, 1);
+    }
+    if (wait_b) {
+        cb_wait_front(cb_b_r, 1);
+        cb_wait_front(cb_b_i, 1);
+    }
+    
+    // Real part: ac - bd
+    binary_sfpu_op<MUL>(cb_a_r, cb_b_r, cb_tmp0, false, false, false, false);
+    binary_sfpu_op<MUL>(cb_a_i, cb_b_i, cb_tmp1, false, false, false, false);
+    binary_sfpu_op<SUB>(cb_tmp0, cb_tmp1, cb_out_r, true, true, true, true);
+    
+    // Imaginary part: ad + bc
+    binary_sfpu_op<MUL>(cb_a_r, cb_b_i, cb_tmp0, false, false, false, false);
+    binary_sfpu_op<MUL>(cb_a_i, cb_b_r, cb_tmp1, false, false, false, false);
+    binary_sfpu_op<ADD>(cb_tmp0, cb_tmp1, cb_out_i, true, true, true, true);
+    
+    if (pop_a) {
+        cb_pop_front(cb_a_r, 1);
+        cb_pop_front(cb_a_i, 1);
+    }
+    if (pop_b) {
+        cb_pop_front(cb_b_r, 1);
+        cb_pop_front(cb_b_i, 1);
     }
 }
 
-} // namespace fft_kernel
+//-------------------------
+// FFT Butterfly Operation
+//-------------------------
+FORCE_INLINE void fft_butterfly(
+    uint32_t cb_even_r, uint32_t cb_even_i,
+    uint32_t cb_odd_r, uint32_t cb_odd_i,
+    uint32_t cb_tw_r, uint32_t cb_tw_i,
+    uint32_t cb_out0_r, uint32_t cb_out0_i,
+    uint32_t cb_out1_r, uint32_t cb_out1_i,
+    uint32_t cb_tmp0, uint32_t cb_tmp1,
+    uint32_t cb_tw_odd_r, uint32_t cb_tw_odd_i
+) {
+    // Compute W * O[k]
+    complex_multiply(
+        cb_odd_r, cb_odd_i,
+        cb_tw_r, cb_tw_i,
+        cb_tw_odd_r, cb_tw_odd_i,
+        cb_tmp0, cb_tmp1,
+        true, true, true, true
+    );
+    
+    cb_wait_front(cb_even_r, 1);
+    cb_wait_front(cb_even_i, 1);
+    cb_wait_front(cb_tw_odd_r, 1);
+    cb_wait_front(cb_tw_odd_i, 1);
+    
+    // X[k] = E[k] + W * O[k]
+    binary_sfpu_op<ADD>(cb_even_r, cb_tw_odd_r, cb_out0_r, false, false, false, false);
+    binary_sfpu_op<ADD>(cb_even_i, cb_tw_odd_i, cb_out0_i, false, false, false, false);
+    
+    // X[k + N/2] = E[k] - W * O[k]
+    binary_sfpu_op<SUB>(cb_even_r, cb_tw_odd_r, cb_out1_r, false, false, true, true);
+    binary_sfpu_op<SUB>(cb_even_i, cb_tw_odd_i, cb_out1_i, false, false, true, true);
+    
+    cb_pop_front(cb_even_r, 1);
+    cb_pop_front(cb_even_i, 1);
+}
+
+void MAIN {
+    uint32_t direction = get_arg_val<uint32_t>(0);
+    uint32_t num_butterflies = get_arg_val<uint32_t>(1);
+    
+    // Input CBs
+    constexpr auto cb_even_r = tt::CBIndex::c_0;
+    constexpr auto cb_even_i = tt::CBIndex::c_1;
+    constexpr auto cb_odd_r = tt::CBIndex::c_2;
+    constexpr auto cb_odd_i = tt::CBIndex::c_3;
+    constexpr auto cb_tw_r = tt::CBIndex::c_4;
+    constexpr auto cb_tw_i = tt::CBIndex::c_5;
+    
+    // Output CBs
+    constexpr auto cb_out0_r = tt::CBIndex::c_16;
+    constexpr auto cb_out0_i = tt::CBIndex::c_17;
+    constexpr auto cb_out1_r = tt::CBIndex::c_18;
+    constexpr auto cb_out1_i = tt::CBIndex::c_19;
+    
+    // Intermediate CBs
+    constexpr auto cb_tmp0 = tt::CBIndex::c_20;
+    constexpr auto cb_tmp1 = tt::CBIndex::c_21;
+    constexpr auto cb_tw_odd_r = tt::CBIndex::c_22;
+    constexpr auto cb_tw_odd_i = tt::CBIndex::c_23;
+    constexpr auto cb_neg_tmp = tt::CBIndex::c_24;
+    
+    // Initialize
+    unary_op_init_common(cb_odd_r, cb_out0_r);
+    binary_op_init_common(cb_odd_r, cb_odd_i, cb_tmp0);
+    copy_tile_to_dst_init_short(cb_odd_r);
+    
+    for (uint32_t bf = 0; bf < num_butterflies; bf++) {
+        if (direction == 1) {
+            // Inverse FFT: negate twiddle imaginary
+            cb_wait_front(cb_tw_i, 1);
+            unary_sfpu_op<NEG>(cb_tw_i, cb_neg_tmp, false, true);
+            
+            fft_butterfly(
+                cb_even_r, cb_even_i,
+                cb_odd_r, cb_odd_i,
+                cb_tw_r, cb_neg_tmp,
+                cb_out0_r, cb_out0_i,
+                cb_out1_r, cb_out1_i,
+                cb_tmp0, cb_tmp1,
+                cb_tw_odd_r, cb_tw_odd_i
+            );
+            cb_pop_front(cb_neg_tmp, 1);
+        } else {
+            // Forward FFT
+            fft_butterfly(
+                cb_even_r, cb_even_i,
+                cb_odd_r, cb_odd_i,
+                cb_tw_r, cb_tw_i,
+                cb_out0_r, cb_out0_i,
+                cb_out1_r, cb_out1_i,
+                cb_tmp0, cb_tmp1,
+                cb_tw_odd_r, cb_tw_odd_i
+            );
+        }
+    }
+}
+
+}  // namespace NAMESPACE
