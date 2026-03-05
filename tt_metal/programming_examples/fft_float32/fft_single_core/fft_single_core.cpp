@@ -1,14 +1,23 @@
 // fft_single_core.cpp
+// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 #include <cmath>
 #include <vector>
 #include <algorithm>
-#include "tt_metal/host_api.hpp"
-#include "tt_metal/common/constants.hpp"
-#include "tt_metal/detail/util.hpp"
-#include "tt_metal/common/bfloat16.hpp"
+#include <iostream>
+#include <iomanip>
+
+// New TT-Metal includes
+#include "tt_metal/api/tt-metalium/host_api.hpp"
+#include "tt_metal/api/tt-metalium/constants.hpp"
+#include "tt_metal/api/tt-metalium/util.hpp"
+#include "tt_metal/api/tt-metalium/bfloat16.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
+
+
 
 constexpr float PI = 3.14159265358979323846f;
 
