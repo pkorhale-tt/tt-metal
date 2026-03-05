@@ -66,13 +66,13 @@ FORCE_INLINE void binary_sfpu_op(
     
     if constexpr (OPERATION == ADD) {
         add_binary_tile_init();
-        add_binary_tile(0, 1);
+        add_binary_tile(0, 1, 0);
     } else if constexpr (OPERATION == SUB) {
         sub_binary_tile_init();
-        sub_binary_tile(0, 1);
+        sub_binary_tile(0, 1, 0);
     } else if constexpr (OPERATION == MUL) {
         mul_binary_tile_init();
-        mul_binary_tile(0, 1);
+        mul_binary_tile(0, 1, 0);
     }
     
     tile_regs_commit();
