@@ -2,6 +2,10 @@
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+// fft_single_core.cpp
+// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 #include <cmath>
 #include <vector>
 #include <algorithm>
@@ -10,10 +14,10 @@
 #include <cstdint>
 #include <cstring>
 
-#include "host_api.hpp"
-#include "common/constants.hpp"
-#include "common/bfloat16.hpp"
-#include "detail/util.hpp"
+// TT-Metal Host API - Try this format
+#include "tt_metal/api/tt-metalium/host_api.hpp"
+#include "tt_metal/api/tt-metalium/constants.hpp"
+#include "tt_metal/api/tt-metalium/detail/util.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
