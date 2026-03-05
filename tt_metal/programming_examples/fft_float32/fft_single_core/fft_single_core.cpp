@@ -17,7 +17,6 @@
 // TT-Metal Host API - Try this format
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
-#include "tt_metal/api/tt-metalium/detail/util.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -192,7 +191,7 @@ int main(int argc, char** argv) {
     
     CoreCoord core = {0, 0};
     
-    uint32_t single_tile_size = tt::tt_metal::detail::TileSize(tt::DataFormat::Float32);
+    uint32_t single_tile_size = tt::constants::TILE_HEIGHT * tt::constants::TILE_WIDTH * sizeof(float);
     
     // Create circular buffers
     // Input CBs
