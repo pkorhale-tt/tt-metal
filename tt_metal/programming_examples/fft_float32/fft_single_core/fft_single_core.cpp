@@ -332,7 +332,8 @@ int main(int argc, char** argv) {
         ComputeConfig{
             .math_fidelity = MathFidelity::HiFi4,
             .fp32_dest_acc_en = true,
-            .math_approx_mode = false
+            .math_approx_mode = false,
+            .defines = {{"ELTWISE_ALU", ""}}
         }
     );
     
