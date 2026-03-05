@@ -45,10 +45,10 @@ FORCE_INLINE void unary_sfpu_op(uint32_t cb_in, uint32_t cb_tgt, bool wait_in = 
 }
 
 //-------------------------
-// SFPU Binary Operation
+// Standard FPU Binary Operation
 //-------------------------
 template <uint32_t OPERATION>
-FORCE_INLINE void binary_sfpu_op(
+FORCE_INLINE void binary_fpu_op(
     uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
     bool wait_in1 = true, bool wait_in2 = true,
     bool pop_in1 = true, bool pop_in2 = true
@@ -58,21 +58,15 @@ FORCE_INLINE void binary_sfpu_op(
     
     tile_regs_acquire();
     
-    copy_tile_to_dst_init_short(cb_in_1);
-    copy_tile(cb_in_1, 0, 0);
-    
-    copy_tile_to_dst_init_short_with_dt(cb_in_1, cb_in_2);
-    copy_tile(cb_in_2, 0, 1);
-    
     if constexpr (OPERATION == ADD) {
-        add_binary_tile_init();
-        add_binary_tile(0, 1, 0);
+        add_tiles_init(cb_in_1, cb_in_2);
+        add_tiles(cb_in_1, cb_in_2, 0, 0, 0);
     } else if constexpr (OPERATION == SUB) {
-        sub_binary_tile_init();
-        sub_binary_tile(0, 1, 0);
+        sub_tiles_init(cb_in_1, cb_in_2);
+        sub_tiles(cb_in_1, cb_in_2, 0, 0, 0);
     } else if constexpr (OPERATION == MUL) {
-        mul_binary_tile_init();
-        mul_binary_tile(0, 1, 0);
+        mul_tiles_init(cb_in_1, cb_in_2);
+        mul_tiles(cb_in_1, cb_in_2, 0, 0, 0);
     }
     
     tile_regs_commit();
@@ -108,14 +102,14 @@ FORCE_INLINE void complex_multiply(
     }
     
     // Real part: ac - bd
-    binary_sfpu_op<MUL>(cb_a_r, cb_b_r, cb_tmp0, false, false, false, false);
-    binary_sfpu_op<MUL>(cb_a_i, cb_b_i, cb_tmp1, false, false, false, false);
-    binary_sfpu_op<SUB>(cb_tmp0, cb_tmp1, cb_out_r, true, true, true, true);
+    binary_fpu_op<MUL>(cb_a_r, cb_b_r, cb_tmp0, false, false, false, false);
+    binary_fpu_op<MUL>(cb_a_i, cb_b_i, cb_tmp1, false, false, false, false);
+    binary_fpu_op<SUB>(cb_tmp0, cb_tmp1, cb_out_r, true, true, true, true);
     
     // Imaginary part: ad + bc
-    binary_sfpu_op<MUL>(cb_a_r, cb_b_i, cb_tmp0, false, false, false, false);
-    binary_sfpu_op<MUL>(cb_a_i, cb_b_r, cb_tmp1, false, false, false, false);
-    binary_sfpu_op<ADD>(cb_tmp0, cb_tmp1, cb_out_i, true, true, true, true);
+    binary_fpu_op<MUL>(cb_a_r, cb_b_i, cb_tmp0, false, false, false, false);
+    binary_fpu_op<MUL>(cb_a_i, cb_b_r, cb_tmp1, false, false, false, false);
+    binary_fpu_op<ADD>(cb_tmp0, cb_tmp1, cb_out_i, true, true, true, true);
     
     if (pop_a) {
         cb_pop_front(cb_a_r, 1);
@@ -154,18 +148,18 @@ FORCE_INLINE void fft_butterfly(
     cb_wait_front(cb_tw_odd_i, 1);
     
     // X[k] = E[k] + W * O[k]
-    binary_sfpu_op<ADD>(cb_even_r, cb_tw_odd_r, cb_out0_r, false, false, false, false);
-    binary_sfpu_op<ADD>(cb_even_i, cb_tw_odd_i, cb_out0_i, false, false, false, false);
+    binary_fpu_op<ADD>(cb_even_r, cb_tw_odd_r, cb_out0_r, false, false, false, false);
+    binary_fpu_op<ADD>(cb_even_i, cb_tw_odd_i, cb_out0_i, false, false, false, false);
     
     // X[k + N/2] = E[k] - W * O[k]
-    binary_sfpu_op<SUB>(cb_even_r, cb_tw_odd_r, cb_out1_r, false, false, true, true);
-    binary_sfpu_op<SUB>(cb_even_i, cb_tw_odd_i, cb_out1_i, false, false, true, true);
+    binary_fpu_op<SUB>(cb_even_r, cb_tw_odd_r, cb_out1_r, false, false, true, true);
+    binary_fpu_op<SUB>(cb_even_i, cb_tw_odd_i, cb_out1_i, false, false, true, true);
     
     cb_pop_front(cb_even_r, 1);
     cb_pop_front(cb_even_i, 1);
 }
 
-void MAIN {
+void kernel_main() {
     uint32_t direction = get_arg_val<uint32_t>(0);
     uint32_t num_butterflies = get_arg_val<uint32_t>(1);
     
@@ -192,7 +186,6 @@ void MAIN {
     
     // Initialize
     unary_op_init_common(cb_odd_r, cb_out0_r);
-    binary_op_init_common(cb_odd_r, cb_odd_i, cb_tmp0);
     copy_tile_to_dst_init_short(cb_odd_r);
     
     for (uint32_t bf = 0; bf < num_butterflies; bf++) {
