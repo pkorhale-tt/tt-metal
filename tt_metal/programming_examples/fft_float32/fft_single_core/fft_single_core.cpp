@@ -17,6 +17,8 @@
 // TT-Metal Host API - Try this format
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
+#include "tt_metal/api/tt-metalium/distributed.hpp"
+#include "tt_metal/api/tt-metalium/mesh_workload.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -185,8 +187,9 @@ int main(int argc, char** argv) {
     
     // Initialize device
     int device_id = 0;
-    Device* device = CreateDevice(device_id);
-    CommandQueue& cq = device->command_queue();
+    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device = 
+        tt::tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
+    tt::tt_metal::distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
     Program program = CreateProgram();
     
     CoreCoord core = {0, 0};
@@ -280,24 +283,26 @@ int main(int argc, char** argv) {
         .set_page_size(cb_neg_tmp_id, single_tile_size);
     CreateCircularBuffer(program, core, cb_neg_tmp_config);
     
-        // Create DRAM buffers
-    tt::tt_metal::InterleavedBufferConfig dram_config{
-        .device = device,
-        .size = padded_size * sizeof(float),
+    // Create DRAM buffers
+    tt::tt_metal::distributed::DeviceLocalBufferConfig dram_config{
         .page_size = single_tile_size,
         .buffer_type = tt::tt_metal::BufferType::DRAM
     };
     
-    auto even_r_buffer = CreateBuffer(dram_config);
-    auto even_i_buffer = CreateBuffer(dram_config);
-    auto odd_r_buffer = CreateBuffer(dram_config);
-    auto odd_i_buffer = CreateBuffer(dram_config);
-    auto tw_r_buffer = CreateBuffer(dram_config);
-    auto tw_i_buffer = CreateBuffer(dram_config);
-    auto out0_r_buffer = CreateBuffer(dram_config);
-    auto out0_i_buffer = CreateBuffer(dram_config);
-    auto out1_r_buffer = CreateBuffer(dram_config);
-    auto out1_i_buffer = CreateBuffer(dram_config);
+    tt::tt_metal::distributed::ReplicatedBufferConfig buffer_config{
+        .size = padded_size * sizeof(float)
+    };
+    
+    auto even_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto even_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto odd_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto odd_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto tw_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto tw_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto out0_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto out0_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto out1_r_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
+    auto out1_i_buffer = tt::tt_metal::distributed::MeshBuffer::create(buffer_config, dram_config, mesh_device.get());
     
     // Create kernels
     auto reader_kernel = CreateKernel(
@@ -341,6 +346,10 @@ int main(int argc, char** argv) {
     std::vector<float> result_imag(padded_size, 0.0f);
     
     // Process FFT stage by stage
+    tt::tt_metal::distributed::MeshWorkload workload;
+    tt::tt_metal::distributed::MeshCoordinateRange device_range = tt::tt_metal::distributed::MeshCoordinateRange(mesh_device->shape());
+    workload.add_program(device_range, std::move(program));
+
     for (uint32_t stage = 0; stage < log2N; stage++) {
         uint32_t m = 1u << (stage + 1);
         uint32_t half_m = m / 2;
@@ -386,13 +395,13 @@ int main(int argc, char** argv) {
         auto tw_i_data = tilize_float_vector(tw_imag, butterfly_tiles, TILE_SIZE);
         
         // Write to DRAM
-        EnqueueWriteBuffer(cq, even_r_buffer, even_r_data, false);
-        EnqueueWriteBuffer(cq, even_i_buffer, even_i_data, false);
-        EnqueueWriteBuffer(cq, odd_r_buffer, odd_r_data, false);
-        EnqueueWriteBuffer(cq, odd_i_buffer, odd_i_data, false);
-        EnqueueWriteBuffer(cq, tw_r_buffer, tw_r_data, false);
-        EnqueueWriteBuffer(cq, tw_i_buffer, tw_i_data, false);
-        Finish(cq);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, even_r_buffer, even_r_data, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, even_i_buffer, even_i_data, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, odd_r_buffer, odd_r_data, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, odd_i_buffer, odd_i_data, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, tw_r_buffer, tw_r_data, false);
+        tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, tw_i_buffer, tw_i_data, false);
+        tt::tt_metal::distributed::Finish(cq);
         
         // Set runtime args for reader
         std::vector<uint32_t> reader_args = {
@@ -405,7 +414,9 @@ int main(int argc, char** argv) {
             butterfly_tiles,
             0  // start_tile
         };
-        SetRuntimeArgs(program, reader_kernel, core, reader_args);
+        auto& programs = workload.get_programs();
+        Program& prog = programs.begin()->second;
+        SetRuntimeArgs(prog, reader_kernel, core, reader_args);
         
         // Set runtime args for writer
         std::vector<uint32_t> writer_args = {
@@ -416,18 +427,18 @@ int main(int argc, char** argv) {
             butterfly_tiles,
             0  // start_tile
         };
-        SetRuntimeArgs(program, writer_kernel, core, writer_args);
+        SetRuntimeArgs(prog, writer_kernel, core, writer_args);
         
         // Set runtime args for compute
         std::vector<uint32_t> compute_args = {
             direction,
             butterfly_tiles
         };
-        SetRuntimeArgs(program, compute_kernel, core, compute_args);
+        SetRuntimeArgs(prog, compute_kernel, core, compute_args);
         
         // Execute program
-        EnqueueProgram(cq, program, false);
-        Finish(cq);
+        tt::tt_metal::distributed::EnqueueMeshWorkload(cq, workload, false);
+        tt::tt_metal::distributed::Finish(cq);
         
         // Read results
         std::vector<uint32_t> out0_r_data(butterfly_tiles * TILE_SIZE);
@@ -435,10 +446,10 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> out1_r_data(butterfly_tiles * TILE_SIZE);
         std::vector<uint32_t> out1_i_data(butterfly_tiles * TILE_SIZE);
         
-        EnqueueReadBuffer(cq, out0_r_buffer, out0_r_data, true);
-        EnqueueReadBuffer(cq, out0_i_buffer, out0_i_data, true);
-        EnqueueReadBuffer(cq, out1_r_buffer, out1_r_data, true);
-        EnqueueReadBuffer(cq, out1_i_buffer, out1_i_data, true);
+        tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_r_data, out0_r_buffer, true);
+        tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_i_data, out0_i_buffer, true);
+        tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_r_data, out1_r_buffer, true);
+        tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_i_data, out1_i_buffer, true);
         
         // Untilize results
         auto out0_real = untilize_to_float(out0_r_data, num_butterflies);
@@ -511,7 +522,7 @@ int main(int argc, char** argv) {
     }
     
     // Cleanup
-    CloseDevice(device);
+    mesh_device->close();
     
     std::cout << "\n=== Done ===" << std::endl;
     
