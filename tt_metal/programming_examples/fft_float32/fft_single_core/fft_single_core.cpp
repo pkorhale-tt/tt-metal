@@ -18,6 +18,8 @@
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
 #include "tt_metal/api/tt-metalium/distributed.hpp"
+#include "tt_metal/api/tt-metalium/base_types.hpp"
+#include <circular_buffer_constants.h>
 #include "tt_metal/api/tt-metalium/mesh_workload.hpp"
 
 using namespace tt;
@@ -174,7 +176,7 @@ int main(int argc, char** argv) {
     std::vector<float> input_imag(padded_size, 0.0f);
     
     for (uint32_t i = 0; i < N; i++) {
-        input_real[i] = (std::sin(2.0f * PI * 4.0f * i / N) + 0.5f * std::sin(2.0f * PI * 8.0f * i / N)) / 8.0f;
+        input_real[i] = std::sin(2.0f * PI * 4.0f * i / N) + 0.5f * std::sin(2.0f * PI * 8.0f * i / N);
         input_imag[i] = 0.0f;
     }
     
@@ -325,6 +327,25 @@ int main(int argc, char** argv) {
         }
     );
     
+    // Configure unpack_to_dest_mode so that Float32 CBs are unpacked
+    // directly to Float32 in the dest register, bypassing Tf32 truncation.
+    // Without this, Float32 data gets truncated to Tf32 (10-bit mantissa)
+    // during unpacking, losing ~13 bits of precision.
+    std::vector<UnpackToDestMode> unpack_modes(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
+    // Set all input CBs (c_0..c_5) to unpack as full Float32
+    unpack_modes[cb_even_r_id] = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_even_i_id] = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_odd_r_id]  = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_odd_i_id]  = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_tw_r_id]   = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_tw_i_id]   = UnpackToDestMode::UnpackToDestFp32;
+    // Also set intermediate CBs to Float32 unpack
+    unpack_modes[cb_tmp0_id]     = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_tmp1_id]     = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_tw_odd_r_id] = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_tw_odd_i_id] = UnpackToDestMode::UnpackToDestFp32;
+    unpack_modes[cb_neg_tmp_id]  = UnpackToDestMode::UnpackToDestFp32;
+
     auto compute_kernel = CreateKernel(
         program,
         "tt_metal/programming_examples/fft_float32/fft_single_core/kernels/compute/fft_compute_f32.cpp",
@@ -332,7 +353,8 @@ int main(int argc, char** argv) {
         ComputeConfig{
             .math_fidelity = MathFidelity::HiFi4,
             .fp32_dest_acc_en = true,
-            .math_approx_mode = false
+            .math_approx_mode = false,
+            .unpack_to_dest_mode = unpack_modes
         }
     );
     
