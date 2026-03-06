@@ -353,8 +353,8 @@ int main(int argc, char** argv) {
         ComputeConfig{
             .math_fidelity = MathFidelity::HiFi4,
             .fp32_dest_acc_en = true,
-            .math_approx_mode = false,
-            .unpack_to_dest_mode = unpack_modes
+            .unpack_to_dest_mode = unpack_modes,
+            .math_approx_mode = false
         }
     );
     
