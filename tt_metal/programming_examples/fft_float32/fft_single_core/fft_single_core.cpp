@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
     std::vector<float> input_imag(padded_size, 0.0f);
     
     for (uint32_t i = 0; i < N; i++) {
-        input_real[i] = std::sin(2.0f * PI * 4.0f * i / N) + 0.5f * std::sin(2.0f * PI * 8.0f * i / N);
+        input_real[i] = (std::sin(2.0f * PI * 4.0f * i / N) + 0.5f * std::sin(2.0f * PI * 8.0f * i / N)) / 8.0f;
         input_imag[i] = 0.0f;
     }
     
