@@ -13,6 +13,8 @@
 #include <iomanip>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 
 // TT-Metal Host API - Try this format
 #include "tt_metal/api/tt-metalium/host_api.hpp"
@@ -143,6 +145,37 @@ std::vector<float> untilize_to_float(const std::vector<uint32_t>& data, uint32_t
 }
 
 //----------------------------------
+// Load input data from a text file
+// Format: one line per sample, "real imag" (space-separated)
+// If only one value per line, imaginary part defaults to 0.0
+//----------------------------------
+bool load_input_from_file(const std::string& filename, std::vector<float>& real, std::vector<float>& imag, uint32_t N) {
+    std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        std::cerr << "Error: Cannot open input file: " << filename << std::endl;
+        return false;
+    }
+    
+    std::string line;
+    uint32_t count = 0;
+    while (std::getline(infile, line) && count < N) {
+        std::istringstream iss(line);
+        float r = 0.0f, im = 0.0f;
+        iss >> r;
+        iss >> im;  // If missing, stays 0.0
+        real[count] = r;
+        imag[count] = im;
+        count++;
+    }
+    
+    std::cout << "Loaded " << count << " samples from " << filename << std::endl;
+    if (count < N) {
+        std::cout << "  (remaining " << (N - count) << " samples zero-padded)" << std::endl;
+    }
+    return true;
+}
+
+//----------------------------------
 // Main function
 //----------------------------------
 int main(int argc, char** argv) {
@@ -153,14 +186,19 @@ int main(int argc, char** argv) {
     constexpr uint32_t TILE_SIZE = TILE_HEIGHT * TILE_WIDTH;
     
     uint32_t direction = 0;  // 0 = forward, 1 = inverse
+    std::string input_file = "";
     
     if (argc > 1) {
         direction = static_cast<uint32_t>(std::atoi(argv[1]));
+    }
+    if (argc > 2) {
+        input_file = argv[2];
     }
     
     std::cout << "=== TT-Metal FFT (Float32) ===" << std::endl;
     std::cout << "FFT Size: " << N << std::endl;
     std::cout << "Direction: " << (direction == 0 ? "Forward" : "Inverse") << std::endl;
+    std::cout << "Usage: " << argv[0] << " [direction: 0|1] [input_file.txt]" << std::endl;
     
     // Calculate dimensions
     uint32_t num_tiles = (N + TILE_SIZE - 1) / TILE_SIZE;
@@ -175,9 +213,17 @@ int main(int argc, char** argv) {
     std::vector<float> input_real(padded_size, 0.0f);
     std::vector<float> input_imag(padded_size, 0.0f);
     
-    for (uint32_t i = 0; i < N; i++) {
-        input_real[i] = std::sin(2.0f * PI * 4.0f * i / N) + 0.5f * std::sin(2.0f * PI * 8.0f * i / N);
-        input_imag[i] = 0.0f;
+    if (!input_file.empty()) {
+        // Load custom input from file
+        if (!load_input_from_file(input_file, input_real, input_imag, N)) {
+            return 1;
+        }
+    } else {
+        // Default test signal
+        for (uint32_t i = 0; i < N; i++) {
+            input_real[i] = std::sin(2.0f * PI * 4.0f * i / N) + 0.5f * std::sin(2.0f * PI * 8.0f * i / N);
+            input_imag[i] = 0.0f;
+        }
     }
     
     // Create reference copy for CPU validation
