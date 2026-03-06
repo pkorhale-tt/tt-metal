@@ -19,7 +19,7 @@
 #include "tt_metal/api/tt-metalium/constants.hpp"
 #include "tt_metal/api/tt-metalium/distributed.hpp"
 #include "tt_metal/api/tt-metalium/base_types.hpp"
-#include <circular_buffer_constants.h>
+// NUM_CIRCULAR_BUFFERS = 32 on Wormhole (from circular_buffer_constants.h)
 #include "tt_metal/api/tt-metalium/mesh_workload.hpp"
 
 using namespace tt;
@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
     // directly to Float32 in the dest register, bypassing Tf32 truncation.
     // Without this, Float32 data gets truncated to Tf32 (10-bit mantissa)
     // during unpacking, losing ~13 bits of precision.
-    std::vector<UnpackToDestMode> unpack_modes(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
+    std::vector<UnpackToDestMode> unpack_modes(32, UnpackToDestMode::Default);
     // Set all input CBs (c_0..c_5) to unpack as full Float32
     unpack_modes[cb_even_r_id] = UnpackToDestMode::UnpackToDestFp32;
     unpack_modes[cb_even_i_id] = UnpackToDestMode::UnpackToDestFp32;
