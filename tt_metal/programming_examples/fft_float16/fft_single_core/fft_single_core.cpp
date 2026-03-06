@@ -370,7 +370,7 @@ int main(int argc, char** argv) {
                 odd_real[butterfly_idx] = work_real[idx_odd];
                 odd_imag[butterfly_idx] = work_imag[idx_odd];
                 
-                float angle = (direction == 0 ? -2.0f : 2.0f) * PI * j / m;
+                float angle = -2.0f * PI * j / m;  // Always forward convention; device handles IFFT conjugation
                 tw_real[butterfly_idx] = std::cos(angle);
                 tw_imag[butterfly_idx] = std::sin(angle);
                 
