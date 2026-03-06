@@ -41,8 +41,7 @@ uint32_t bit_reverse(uint32_t x, uint32_t log2n) {
     return result;
 }
 
-void bit_reverse_permutation(std::vector<float>& real, std::vector<float>& imag) {
-    uint32_t n = real.size();
+void bit_reverse_permutation(std::vector<float>& real, std::vector<float>& imag, uint32_t n) {
     uint32_t log2n = 0;
     while ((1u << log2n) < n) log2n++;
     
@@ -63,7 +62,7 @@ void cpu_fft(std::vector<float>& real, std::vector<float>& imag, bool inverse = 
     uint32_t log2N = 0;
     while ((1u << log2N) < N) log2N++;
     
-    bit_reverse_permutation(real, imag);
+    bit_reverse_permutation(real, imag, N);
     
     for (uint32_t s = 0; s < log2N; s++) {
         uint32_t m = 1u << (s + 1);
@@ -405,7 +404,7 @@ int main(int argc, char** argv) {
     );
     
     // Apply bit-reversal to input
-    bit_reverse_permutation(input_real, input_imag);
+    bit_reverse_permutation(input_real, input_imag, N);
     
     // Working buffers
     std::vector<float> work_real = input_real;
