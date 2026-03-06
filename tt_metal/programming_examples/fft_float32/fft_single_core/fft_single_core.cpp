@@ -180,7 +180,7 @@ bool load_input_from_file(const std::string& filename, std::vector<float>& real,
 //----------------------------------
 int main(int argc, char** argv) {
     // FFT parameters
-    constexpr uint32_t N = 1024;
+    constexpr uint32_t N = 4;
     constexpr uint32_t TILE_HEIGHT = 32;
     constexpr uint32_t TILE_WIDTH = 32;
     constexpr uint32_t TILE_SIZE = TILE_HEIGHT * TILE_WIDTH;
