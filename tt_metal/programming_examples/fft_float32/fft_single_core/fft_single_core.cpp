@@ -179,13 +179,13 @@ bool load_input_from_file(const std::string& filename, std::vector<float>& real,
 //----------------------------------
 int main(int argc, char** argv) {
     // FFT parameters
-    constexpr uint32_t N = 4;
     constexpr uint32_t TILE_HEIGHT = 32;
     constexpr uint32_t TILE_WIDTH = 32;
     constexpr uint32_t TILE_SIZE = TILE_HEIGHT * TILE_WIDTH;
     
     uint32_t direction = 0;  // 0 = forward, 1 = inverse
     std::string input_file = "";
+    uint32_t N = 1024;  // Default FFT size
     
     if (argc > 1) {
         direction = static_cast<uint32_t>(std::atoi(argv[1]));
@@ -193,11 +193,19 @@ int main(int argc, char** argv) {
     if (argc > 2) {
         input_file = argv[2];
     }
+    if (argc > 3) {
+        N = static_cast<uint32_t>(std::atoi(argv[3]));
+        // Verify power of 2
+        if (N == 0 || (N & (N - 1)) != 0) {
+            std::cerr << "Error: N must be a power of 2, got " << N << std::endl;
+            return 1;
+        }
+    }
     
     std::cout << "=== TT-Metal FFT (Float32) ===" << std::endl;
     std::cout << "FFT Size: " << N << std::endl;
     std::cout << "Direction: " << (direction == 0 ? "Forward" : "Inverse") << std::endl;
-    std::cout << "Usage: " << argv[0] << " [direction: 0|1] [input_file.txt]" << std::endl;
+    std::cout << "Usage: " << argv[0] << " [direction: 0|1] [input_file.txt] [N]" << std::endl;
     
     // Calculate dimensions
     uint32_t num_tiles = (N + TILE_SIZE - 1) / TILE_SIZE;
