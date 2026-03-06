@@ -13,6 +13,7 @@
 constexpr uint32_t ADD = 0;
 constexpr uint32_t SUB = 1;
 constexpr uint32_t MUL = 2;
+constexpr uint32_t NEG = 3;
 #define USE_SFPU 0
 
 //-------------------------
