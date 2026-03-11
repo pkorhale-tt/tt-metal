@@ -2,46 +2,55 @@
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Changes vs original:
-//  1. All 4 NOC writes for a tile are issued together before a single
-//     noc_async_write_barrier() — down from 4 barriers/tile to 1.
-//  2. True double-buffering on drain side: cb_wait_front for all 4 output
-//     CBs is done together, then all 4 writes issued, then one barrier,
-//     then all 4 pops. This keeps the NOC write path saturated.
-//  3. Ordering: wait all → write all → barrier → pop all
-//     This is the write-side mirror of the reader's
-//     reserve all → read all → barrier → push all pattern.
+// ═══════════════════════════════════════════════════════════════════
+//  WRITER RESPONSIBILITIES
+// ═══════════════════════════════════════════════════════════════════
 //
-// Double-buffer pipeline diagram (per output CB, depth=2):
+//  Drains ONLY the final stage output CBs (c_16..c_19) to DRAM.
+//  All intermediate stages are handled by ping-pong L1 buffers —
+//  writer is NOT involved between stages.
 //
-//  Compute: [prod t0][prod t1][prod t2] ...
-//  Slot:    [  0  ][  1  ][  0  ][  1  ]
-//  Writer:       [W t0]      [W t1]      [W t2]
-//  NOC:          act         act         act   ← no idle stalls
+//  Pattern per tile:
+//    wait all 4 output CBs     ← compute must have pushed all 4
+//    write all 4 to DRAM       ← 4 noc_async_write_tile in one shot
+//    single barrier             ← 1 barrier covers all 4 writes
+//    pop all 4                  ← free slots for compute's next tile
+//
+//  NOC optimization:
+//    Previous: 4 barriers per tile
+//    This:     1 barrier per tile  → 4× better NOC utilization
+//
+//  Double-buffer benefit:
+//    Output CBs depth=2.
+//    Compute can push tile i+1 into second slot while
+//    writer is waiting for NOC to drain tile i.
+//    No stall between compute and writer.
+//
+// ═══════════════════════════════════════════════════════════════════
 
 #include <cstdint>
-#include "api/dataflow/dataflow_api.h"
+#include "dataflow_api.h"
 
 void kernel_main() {
-    // ── Runtime args ───────────────────────────────────────────────────────
+
+    // ── Runtime args ───────────────────────────────────────────────
     const uint32_t out0_r_addr = get_arg_val<uint32_t>(0);
     const uint32_t out0_i_addr = get_arg_val<uint32_t>(1);
     const uint32_t out1_r_addr = get_arg_val<uint32_t>(2);
     const uint32_t out1_i_addr = get_arg_val<uint32_t>(3);
     const uint32_t num_tiles   = get_arg_val<uint32_t>(4);
-    const uint32_t start_tile  = get_arg_val<uint32_t>(5);
 
-    // ── CB indices ─────────────────────────────────────────────────────────
+    // ── CB indices ─────────────────────────────────────────────────
     constexpr uint32_t cb_out0_r = tt::CBIndex::c_16;
     constexpr uint32_t cb_out0_i = tt::CBIndex::c_17;
     constexpr uint32_t cb_out1_r = tt::CBIndex::c_18;
     constexpr uint32_t cb_out1_i = tt::CBIndex::c_19;
 
-    // ── Tile size and data format ──────────────────────────────────────────
+    // ── Tile geometry ──────────────────────────────────────────────
     const uint32_t tile_bytes    = get_tile_size(cb_out0_r);
     const DataFormat data_format = get_dataformat(cb_out0_r);
 
-    // ── Address generators ─────────────────────────────────────────────────
+    // ── Address generators ─────────────────────────────────────────
     const InterleavedAddrGenFast<true> out0_r_gen = {
         .bank_base_address = out0_r_addr,
         .page_size         = tile_bytes,
@@ -65,54 +74,42 @@ void kernel_main() {
 
     if (num_tiles == 0) return;
 
-    // ── Main loop: wait-all → write-all → barrier → pop-all ───────────────
+    // ══════════════════════════════════════════════════════════════
+    //  DRAIN LOOP
     //
-    // Why this order?
+    //  Pattern: wait_all → write_all → barrier → pop_all
     //
-    //   wait-all:    Ensures all 4 tiles are ready before touching the NOC.
-    //                With CB depth=2 compute can be producing tile i+1 while
-    //                we are writing tile i — no stall.
+    //  Why this order:
+    //    wait_all:   ensure all 4 tiles are ready before NOC
+    //    write_all:  fire all 4 NOC writes back-to-back
+    //                NOC pipelines these efficiently
+    //    barrier:    one wait covers all 4 L1→DRAM transfers
+    //    pop_all:    free 4 slots → compute can fill them (depth=2)
     //
-    //   write-all:   Issue all 4 noc_async_write_tile calls back-to-back.
-    //                The NOC can pipeline / coalesce these more efficiently
-    //                than interleaved barrier-per-write.
-    //
-    //   barrier:     One noc_async_write_barrier() covers all 4 writes.
-    //                Previously there were 4 barriers per tile iteration.
-    //
-    //   pop-all:     Free all 4 CB slots together after the writes are done.
-    //                This gives compute the maximum window to fill the next
-    //                pair of slots.
-    //
-    // With output CB depth=2, the pipeline looks like:
-    //
-    //   Compute: [push t0_r][push t0_i][push t0_r1][push t0_i1]
-    //                                  [push t1_r] [push t1_i] ...
-    //   Writer:                        [wait t0]
-    //                                  [write all 4 t0] → barrier → pop
-    //                                              [wait t1] ...
-    //
-    // The writer's barrier overlaps with compute pushing t1.
+    //  With depth=2 output CBs:
+    //    compute pushes tile i+1 into slot 1 while
+    //    writer's barrier is waiting for tile i's NOC write.
+    //    Zero stall between compute and writer.
+    // ══════════════════════════════════════════════════════════════
 
-    for (uint32_t i = 0; i < num_tiles; i++) {
-        const uint32_t tile_idx = start_tile + i;
+    for (uint32_t t = 0; t < num_tiles; t++) {
 
-        // ── Wait for all 4 output tiles to be produced by compute ──────────
+        // ── Wait for all 4 output tiles ────────────────────────────
         cb_wait_front(cb_out0_r, 1);
         cb_wait_front(cb_out0_i, 1);
         cb_wait_front(cb_out1_r, 1);
         cb_wait_front(cb_out1_i, 1);
 
-        // ── Issue all 4 NOC writes before any barrier ──────────────────────
-        noc_async_write_tile(tile_idx, out0_r_gen, get_read_ptr(cb_out0_r));
-        noc_async_write_tile(tile_idx, out0_i_gen, get_read_ptr(cb_out0_i));
-        noc_async_write_tile(tile_idx, out1_r_gen, get_read_ptr(cb_out1_r));
-        noc_async_write_tile(tile_idx, out1_i_gen, get_read_ptr(cb_out1_i));
+        // ── Fire all 4 NOC writes before any barrier ───────────────
+        noc_async_write_tile(t, out0_r_gen, get_read_ptr(cb_out0_r));
+        noc_async_write_tile(t, out0_i_gen, get_read_ptr(cb_out0_i));
+        noc_async_write_tile(t, out1_r_gen, get_read_ptr(cb_out1_r));
+        noc_async_write_tile(t, out1_i_gen, get_read_ptr(cb_out1_i));
 
-        // ── Single barrier for all 4 L1→DRAM writes ───────────────────────
+        // ── Single barrier for all 4 L1→DRAM writes ───────────────
         noc_async_write_barrier();
 
-        // ── Free all 4 CB slots — compute can now refill them ──────────────
+        // ── Free all 4 slots — compute can refill (depth=2) ────────
         cb_pop_front(cb_out0_r, 1);
         cb_pop_front(cb_out0_i, 1);
         cb_pop_front(cb_out1_r, 1);
