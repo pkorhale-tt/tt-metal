@@ -292,8 +292,6 @@ int main(int argc, char** argv) {
     while ((1u << log2N) < N) log2N++;
     uint32_t half_N         = N / 2;
     uint32_t tiles_per_stage = (half_N + TILE_SIZE - 1) / TILE_SIZE;
-    uint32_t padded_half     = tiles_per_stage * TILE_SIZE;
-
     std::cout << "═══════════════════════════════════════\n";
     std::cout << " TT-Metal FFT (Optimised Single Core)\n";
     std::cout << "═══════════════════════════════════════\n";
@@ -386,7 +384,6 @@ int main(int argc, char** argv) {
 
     // Ping-pong inter-stage buffers
     // Size = tiles_per_stage × TILE_BYTES (entire stage fits)
-    uint32_t ping_pong_bytes = tiles_per_stage * TILE_BYTES;
     create_cb(program, core, tt::CBIndex::c_10, tiles_per_stage, TILE_BYTES);
     create_cb(program, core, tt::CBIndex::c_11, tiles_per_stage, TILE_BYTES);
     create_cb(program, core, tt::CBIndex::c_12, tiles_per_stage, TILE_BYTES);
