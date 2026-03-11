@@ -39,13 +39,11 @@
 // ═══════════════════════════════════════════════════════════════════
 
 #include <cstdint>
-#include "compute_kernel_api/tile_move_copy.h"
+#include "compute_kernel_api/common.h"
 #include "compute_kernel_api/eltwise_binary.h"
 #include "compute_kernel_api/eltwise_unary/negative.h"
 #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/eltwise_binary_sfpu.h"
 
-namespace NAMESPACE {
 
 // ── Operation tags ──────────────────────────────────────────────────
 constexpr uint32_t ADD = 0;
@@ -330,7 +328,7 @@ FORCE_INLINE void process_stage(
 //    1: num_stages       log2(N)
 //    2: tiles_per_stage  N/2 / TILE_SIZE  (butterflies per stage)
 // ═══════════════════════════════════════════════════════════════════
-void MAIN {
+void kernel_main() {
     const uint32_t direction       = get_arg_val<uint32_t>(0);
     const uint32_t num_stages      = get_arg_val<uint32_t>(1);
     const uint32_t tiles_per_stage = get_arg_val<uint32_t>(2);
@@ -446,5 +444,3 @@ void MAIN {
         );
     }
 }
-
-} // namespace NAMESPACE
