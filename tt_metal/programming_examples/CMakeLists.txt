@@ -25,6 +25,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/matmul)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/basic_fft)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float32)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float32_optimized)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float16)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/basic)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/basic_copy_opt)
@@ -43,6 +44,7 @@ add_custom_target(
         profiler_examples
         metal_example_fft_single_core
         metal_example_fft_float32_single_core
+        metal_example_fft_float32_optimized_single_core
         metal_example_fft_float16_single_core
         metal_example_fft_basic
         metal_example_fft_basic_copy_opt
