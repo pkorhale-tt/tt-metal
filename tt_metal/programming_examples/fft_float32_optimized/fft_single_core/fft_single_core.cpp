@@ -47,6 +47,8 @@
 // ═══════════════════════════════════════════════════════════════════
 
 #include <cmath>
+#include <fstream>
+#include <sstream>
 #include <vector>
 #include <algorithm>
 #include <iostream>
@@ -271,27 +273,195 @@ void create_cb(
 }
 
 // ════════════════════════════════════════════════════════════════════
+//  FILE READER
+//
+//  Format: space/newline/comma separated floats.
+//  Two modes:
+//    Real-only:      "1.0 2.0 3.0 4.0"
+//                    → input_r = values, input_i = zeros
+//    Interleaved:    "1.0 0.5 2.0 -0.5 ..."  (even=real, odd=imag)
+//                    → input_r[i]=val[2i], input_i[i]=val[2i+1]
+//                    Detected when N is provided and count == 2*N.
+//
+//  N is inferred as next power-of-2 >= count if not given on cmdline.
+// ════════════════════════════════════════════════════════════════════
+bool read_input_file(
+    const std::string& path,
+    uint32_t& N,
+    bool N_from_cmdline,
+    std::vector<float>& input_r,
+    std::vector<float>& input_i)
+{
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cerr << "Cannot open input file: " << path << "\n";
+        return false;
+    }
+
+    // Read all whitespace/comma separated floats
+    std::vector<float> vals;
+    std::string token;
+    while (f >> token) {
+        // strip trailing commas
+        if (!token.empty() && token.back() == ',')
+            token.pop_back();
+        if (token.empty()) continue;
+        try {
+            vals.push_back(std::stof(token));
+        } catch (...) {
+            std::cerr << "Bad token in file: '" << token << "'\n";
+            return false;
+        }
+    }
+
+    if (vals.empty()) {
+        std::cerr << "Input file is empty.\n";
+        return false;
+    }
+
+    uint32_t count = (uint32_t)vals.size();
+
+    // Determine if interleaved (real,imag pairs) or real-only
+    // Rule: if N given and count == 2*N  → interleaved
+    //       if N given and count == N    → real-only
+    //       if N not given               → real-only, infer N
+    bool interleaved = false;
+    if (N_from_cmdline) {
+        if (count == 2 * N) {
+            interleaved = true;
+            std::cout << " File mode     : interleaved real+imag (" << count << " values → N=" << N << ")\n";
+        } else if (count == N) {
+            std::cout << " File mode     : real-only (" << count << " values, imag=0)\n";
+        } else if (count < N) {
+            std::cerr << "File has " << count << " values but N=" << N
+                      << " requested. Padding with zeros.\n";
+        } else {
+            std::cerr << "File has " << count << " values but N=" << N
+                      << " — truncating to N.\n";
+            count = N;
+            vals.resize(N);
+        }
+    } else {
+        // Infer N: next power-of-2 >= count
+        N = 1;
+        while (N < count) N <<= 1;
+        std::cout << " File mode     : real-only (" << count << " values, N inferred as " << N << ")\n";
+    }
+
+    input_r.assign(N, 0.f);
+    input_i.assign(N, 0.f);
+
+    if (interleaved) {
+        for (uint32_t i = 0; i < N && 2*i+1 < (uint32_t)vals.size(); i++) {
+            input_r[i] = vals[2*i];
+            input_i[i] = vals[2*i+1];
+        }
+    } else {
+        for (uint32_t i = 0; i < N && i < (uint32_t)vals.size(); i++) {
+            input_r[i] = vals[i];
+        }
+    }
+
+    return true;
+}
+
+// ════════════════════════════════════════════════════════════════════
 //  MAIN
+//
+//  Usage:
+//    ./fft_single_core <direction> [input_file] [N]
+//
+//    direction   : 0 = forward FFT, 1 = inverse FFT
+//    input_file  : optional path to text file of floats
+//    N           : optional FFT size (power of 2)
+//                  if omitted and file given: inferred from file
+//                  if omitted and no file:    defaults to 1024
+//
+//  Examples:
+//    ./fft 0                                          # sine wave, N=1024
+//    ./fft 0 sample_input.txt 4                       # file, N=4
+//    ./fft 0 sample_input.txt                         # file, N inferred
+//    ./fft 1 sample_input.txt 8                       # IFFT, file, N=8
 // ════════════════════════════════════════════════════════════════════
 int main(int argc, char** argv) {
 
-    uint32_t direction  = 0;
-    uint32_t N          = 1024;
-    std::string in_file = "";
+    // ── Parse args ────────────────────────────────────────────────
+    //  argv[1] = direction  (required)
+    //  argv[2] = input_file (optional, detected by non-numeric)
+    //  argv[3] = N          (optional)
+    //  OR
+    //  argv[2] = N          (optional, if no file)
+    uint32_t    direction      = 0;
+    uint32_t    N              = 1024;
+    std::string in_file        = "";
+    bool        N_from_cmdline = false;
 
-    if (argc > 1) direction = std::atoi(argv[1]);
-    if (argc > 2) N          = std::atoi(argv[2]);
-    if (argc > 3) in_file    = argv[3];
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <direction 0|1> [input_file] [N]\n";
+        return 1;
+    }
 
-    // Validate N is power of 2
-    if (N == 0 || (N & (N-1)) != 0) {
-        std::cerr << "N must be power of 2\n"; return 1;
+    direction = (uint32_t)std::atoi(argv[1]);
+
+    // Scan remaining args: if arg looks like a path (has '.' or '/') → file
+    //                      if arg is a plain integer               → N
+    for (int i = 2; i < argc; i++) {
+        std::string a = argv[i];
+        bool looks_like_file = (a.find('.') != std::string::npos ||
+                                a.find('/') != std::string::npos ||
+                                a.find('\\') != std::string::npos);
+        if (looks_like_file && in_file.empty()) {
+            in_file = a;
+        } else {
+            // Try to parse as integer
+            try {
+                long v = std::stol(a);
+                N = (uint32_t)v;
+                N_from_cmdline = true;
+            } catch (...) {
+                // treat as file path if integer parse fails
+                if (in_file.empty()) in_file = a;
+            }
+        }
+    }
+
+    // Validate N is power of 2 (only if explicitly given — file path
+    // may override N later via inference)
+    if (N_from_cmdline && (N == 0 || (N & (N-1)) != 0)) {
+        std::cerr << "N must be a power of 2, got " << N << "\n";
+        return 1;
     }
 
     uint32_t log2N          = 0;
     while ((1u << log2N) < N) log2N++;
     uint32_t half_N         = N / 2;
     uint32_t tiles_per_stage = (half_N + TILE_SIZE - 1) / TILE_SIZE;
+    // ── Input signal ──────────────────────────────────────────────
+    std::vector<float> input_r(N, 0.f), input_i(N, 0.f);
+    if (!in_file.empty()) {
+        if (!read_input_file(in_file, N, N_from_cmdline, input_r, input_i))
+            return 1;
+        // N may have changed (inferred from file) — recompute derived values
+        log2N           = 0;
+        while ((1u << log2N) < N) log2N++;
+        half_N          = N / 2;
+        tiles_per_stage = (half_N + TILE_SIZE - 1) / TILE_SIZE;
+        input_r.resize(N, 0.f);
+        input_i.resize(N, 0.f);
+        if (N < 2 || (N & (N-1)) != 0) {
+            std::cerr << "Inferred N=" << N << " is not a valid power-of-2 >= 2\n";
+            return 1;
+        }
+    } else {
+        // Default: synthetic sine wave
+        for (uint32_t i = 0; i < N; i++) {
+            input_r[i] = std::sin(2.f * PI * 4.f * i / N)
+                       + 0.5f * std::sin(2.f * PI * 8.f * i / N);
+        }
+    }
+
+    // ── Print config (after file read so N is final) ─────────────
     std::cout << "═══════════════════════════════════════\n";
     std::cout << " TT-Metal FFT (Optimised Single Core)\n";
     std::cout << "═══════════════════════════════════════\n";
@@ -301,15 +471,6 @@ int main(int argc, char** argv) {
     std::cout << " tiles/stage   : " << tiles_per_stage << "\n";
     std::cout << " total twiddle : " << log2N * tiles_per_stage << " tiles\n";
     std::cout << "═══════════════════════════════════════\n";
-
-    // ── Input signal ──────────────────────────────────────────────
-    std::vector<float> input_r(N, 0.f), input_i(N, 0.f);
-    if (in_file.empty()) {
-        for (uint32_t i = 0; i < N; i++) {
-            input_r[i] = std::sin(2.f * PI * 4.f * i / N)
-                       + 0.5f * std::sin(2.f * PI * 8.f * i / N);
-        }
-    }
 
     // ── Reference FFT for validation ──────────────────────────────
     std::vector<float> ref_r(input_r), ref_i(input_i);
