@@ -566,7 +566,7 @@ int main(int argc, char** argv) {
     // ── Kernels ───────────────────────────────────────────────────
     auto reader_k = CreateKernel(
         program,
-        "kernels/dataflow/reader_fft_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/dataflow/reader_fft_f32.cpp",
         core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0,
@@ -575,7 +575,7 @@ int main(int argc, char** argv) {
 
     auto writer_k = CreateKernel(
         program,
-        "kernels/dataflow/writer_fft_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/dataflow/writer_fft_f32.cpp",
         core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
@@ -589,7 +589,7 @@ int main(int argc, char** argv) {
 
     auto compute_k = CreateKernel(
         program,
-        "kernels/compute/fft_compute_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/compute/fft_compute_f32.cpp",
         core,
         ComputeConfig{
             .math_fidelity       = MathFidelity::HiFi4,
