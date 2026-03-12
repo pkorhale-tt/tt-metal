@@ -38,12 +38,20 @@
 //
 // ═══════════════════════════════════════════════════════════════════
 
-#include <cstdint>
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/eltwise_unary/negative.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+// #include <cstdint>
+// #include "compute_kernel_api/common.h"
+// #include "api/compute/compute_kernel_api.h"
+// #include "compute_kernel_api/eltwise_binary.h"
+// #include "compute_kernel_api/eltwise_unary/negative.h"
+// #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
 
+
+#include <cstdint>
+
+#include "api/compute/compute_kernel_api.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/negative.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
 
 // ── Operation tags ──────────────────────────────────────────────────
 constexpr uint32_t ADD = 0;
