@@ -48,10 +48,12 @@
 
 #include <cstdint>
 
+#include "api/compute/common.h"
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_unary/negative.h"
 #include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/tile_move_copy.h"   // for copy_tile_*, copy_tile_to_dst_init_short, etc.
 
 // ── Operation tags ──────────────────────────────────────────────────
 constexpr uint32_t ADD = 0;
