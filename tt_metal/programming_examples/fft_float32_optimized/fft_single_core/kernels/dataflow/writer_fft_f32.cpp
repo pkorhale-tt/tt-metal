@@ -1,14 +1,6 @@
 // writer_fft_f32.cpp
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
-//
-// ═══════════════════════════════════════════════════════════════════
-//  WRITER — rewritten to use raw noc_async_write
-//
-//  Same fix as reader: replace InterleavedAddrGenFast with
-//  raw noc_async_write(src_l1_addr, dst_noc_addr, size).
-//  dst_noc_addr = buffer_base + tile_idx * TILE_BYTES
-// ═══════════════════════════════════════════════════════════════════
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -31,24 +23,20 @@ void kernel_main() {
     if (num_tiles == 0) return;
 
     for (uint32_t t = 0; t < num_tiles; t++) {
-        const uint32_t byte_off = t * TILE_BYTES;
+        const uint32_t off = t * TILE_BYTES;
 
-        // Wait for all 4 output tiles from compute
         cb_wait_front(cb_out0_r, 1);
         cb_wait_front(cb_out0_i, 1);
         cb_wait_front(cb_out1_r, 1);
         cb_wait_front(cb_out1_i, 1);
 
-        // Fire all 4 NOC writes
-        noc_async_write(get_read_ptr(cb_out0_r), out0_r_addr + byte_off, TILE_BYTES);
-        noc_async_write(get_read_ptr(cb_out0_i), out0_i_addr + byte_off, TILE_BYTES);
-        noc_async_write(get_read_ptr(cb_out1_r), out1_r_addr + byte_off, TILE_BYTES);
-        noc_async_write(get_read_ptr(cb_out1_i), out1_i_addr + byte_off, TILE_BYTES);
+        noc_async_write(get_read_ptr(cb_out0_r), get_noc_addr(out0_r_addr + off), TILE_BYTES);
+        noc_async_write(get_read_ptr(cb_out0_i), get_noc_addr(out0_i_addr + off), TILE_BYTES);
+        noc_async_write(get_read_ptr(cb_out1_r), get_noc_addr(out1_r_addr + off), TILE_BYTES);
+        noc_async_write(get_read_ptr(cb_out1_i), get_noc_addr(out1_i_addr + off), TILE_BYTES);
 
-        // One barrier for all 4
         noc_async_write_barrier();
 
-        // Free slots for compute
         cb_pop_front(cb_out0_r, 1);
         cb_pop_front(cb_out0_i, 1);
         cb_pop_front(cb_out1_r, 1);
