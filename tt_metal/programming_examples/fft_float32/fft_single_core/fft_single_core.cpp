@@ -1,685 +1,432 @@
-// fft_single_core_opt.cpp
+// fft_compute_f32.cpp
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 // ═══════════════════════════════════════════════════════════════════
-//  WHAT CHANGED VS ORIGINAL HOST
+//  ARCHITECTURE OVERVIEW
 // ═══════════════════════════════════════════════════════════════════
 //
-//  Original:
-//    for stage in 0..log2N:
-//      pack butterfly pairs on CPU    ← CPU work every stage
-//      compute cos/sin on CPU          ← CPU work every stage
-//      write to DRAM (PCIe)           ← PCIe write every stage
-//      EnqueueProgram                 ← kernel launch every stage
-//      read from DRAM (PCIe)          ← PCIe read every stage
-//      unpack results on CPU          ← CPU work every stage
-//    = log2(N) × (2 PCIe + CPU pack/unpack)
-//    For N=1024: 10 × ~450μs = ~4500μs overhead
+//  KEY CHANGE vs original: ALL log2(N) stages run on device.
+//  Host launches ONE kernel. No PCIe round-trips between stages.
 //
-//  Optimized:
-//    precompute ALL twiddles for ALL stages  ← once
-//    bit-reverse input                       ← once
-//    write input + twiddles to DRAM          ← once
-//    EnqueueProgram                          ← ONCE (all stages on chip)
-//    read result from DRAM                   ← once
-//    = 2 PCIe transfers total
-//    For N=1024: ~450μs total overhead  (~10× speedup)
+//  Data flow per stage:
+//    Stage 0:  DRAM input    ──► [butterfly] ──► ping_even + ping_odd
+//    Stage 1:  ping_even/odd ──► [butterfly] ──► pong_even + pong_odd
+//    Stage 2:  pong_even/odd ──► [butterfly] ──► ping_even + ping_odd
+//    ...
+//    Stage N-1:ping/pong     ──► [butterfly] ──► DRAM output
 //
-//  CB index map (must match compute kernel exactly):
-//    c_0/c_1   stage-0 even r/i          depth=2
-//    c_2/c_3   stage-0 odd  r/i          depth=2
-//    c_4/c_5   twiddle r/i               depth=2
-//    c_6/c_7   pong odd  r/i             depth=1  ← inter-stage
-//    c_10/c_11 ping even r/i             depth=1  ← inter-stage
-//    c_12/c_13 ping odd  r/i             depth=1  ← inter-stage
-//    c_14/c_15 pong even r/i             depth=1  ← inter-stage
-//    c_16/c_17 output X[k]       r/i     depth=2
-//    c_18/c_19 output X[k+N/2]   r/i     depth=2
-//    c_20..c_24 scratch                  depth=1
+//  SEPARATE even/odd CBs at every inter-stage level:
+//    ping_even_r/i  (c_10/c_11)   ping_odd_r/i  (c_12/c_13)
+//    pong_even_r/i  (c_14/c_15)   pong_odd_r/i  (c_6/c_7)
+//
+//  WHY separate: butterfly needs two tiles simultaneously (even + odd).
+//  Sharing one CB causes a deadlock — odd consumed first, even wait
+//  never resolves because the CB is already empty.
+//
+//  FPU init strategy:
+//    binary_op_init_common() called ONCE at kernel start.
+//    Per-op inits (add_tiles_init etc.) called ONLY when the operation
+//    changes from the previous call — tracked by `current_op`.
+//    This avoids corrupting unpacker state from repeated re-inits
+//    with different CB arguments across complex_mul / butterfly.
 //
 // ═══════════════════════════════════════════════════════════════════
 
-#include <cmath>
-#include <fstream>
-#include <sstream>
-#include <vector>
-#include <algorithm>
-#include <iostream>
-#include <iomanip>
 #include <cstdint>
-#include <cstring>
 
-#include "tt_metal/api/tt-metalium/host_api.hpp"
-#include "tt_metal/api/tt-metalium/constants.hpp"
-#include "tt_metal/api/tt-metalium/distributed.hpp"
-#include "tt_metal/api/tt-metalium/base_types.hpp"
-#include "tt_metal/api/tt-metalium/mesh_workload.hpp"
+#include "api/compute/common.h"
+#include "api/compute/compute_kernel_api.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/negative.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/tile_move_copy.h"
 
-using namespace tt;
-using namespace tt::tt_metal;
+// ── Operation tags ──────────────────────────────────────────────────
+constexpr uint32_t OP_NONE = 0;
+constexpr uint32_t OP_ADD  = 1;
+constexpr uint32_t OP_SUB  = 2;
+constexpr uint32_t OP_MUL  = 3;
 
-constexpr float PI = 3.14159265358979323846f;
-
-// ── Tile constants ───────────────────────────────────────────────────
-constexpr uint32_t TILE_H     = tt::constants::TILE_HEIGHT;  // 32
-constexpr uint32_t TILE_W     = tt::constants::TILE_WIDTH;   // 32
-constexpr uint32_t TILE_SIZE  = TILE_H * TILE_W;             // 1024
-constexpr uint32_t TILE_BYTES = TILE_SIZE * sizeof(float);   // 4096
-
-// ════════════════════════════════════════════════════════════════════
-//  UTILITY: float ↔ uint32
-// ════════════════════════════════════════════════════════════════════
-inline uint32_t f2u(float f) {
-    uint32_t u; std::memcpy(&u, &f, 4); return u;
-}
-inline float u2f(uint32_t u) {
-    float f; std::memcpy(&f, &u, 4); return f;
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  UTILITY: pack floats into uint32 tile vector
-// ════════════════════════════════════════════════════════════════════
-std::vector<uint32_t> pack_tiles(
-    const std::vector<float>& data,
-    uint32_t num_tiles)
-{
-    std::vector<uint32_t> out(num_tiles * TILE_SIZE, 0);
-    for (uint32_t i = 0; i < data.size() && i < out.size(); i++)
-        out[i] = f2u(data[i]);
-    return out;
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  UTILITY: unpack uint32 tile vector to floats
-// ════════════════════════════════════════════════════════════════════
-std::vector<float> unpack_tiles(
-    const std::vector<uint32_t>& data,
-    uint32_t num_elements)
-{
-    std::vector<float> out(num_elements);
-    for (uint32_t i = 0; i < num_elements && i < data.size(); i++)
-        out[i] = u2f(data[i]);
-    return out;
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  BIT-REVERSAL PERMUTATION
-// ════════════════════════════════════════════════════════════════════
-uint32_t bit_reverse(uint32_t x, uint32_t log2n) {
-    uint32_t r = 0;
-    for (uint32_t i = 0; i < log2n; i++) {
-        r = (r << 1) | (x & 1);
-        x >>= 1;
-    }
-    return r;
-}
-
-void bit_reverse_permutation(
-    std::vector<float>& real,
-    std::vector<float>& imag,
-    uint32_t N)
-{
-    uint32_t log2n = 0;
-    while ((1u << log2n) < N) log2n++;
-    for (uint32_t i = 0; i < N; i++) {
-        uint32_t j = bit_reverse(i, log2n);
-        if (i < j) {
-            std::swap(real[i], real[j]);
-            std::swap(imag[i], imag[j]);
-        }
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  REFERENCE CPU FFT (validation only)
-// ════════════════════════════════════════════════════════════════════
-void cpu_fft(std::vector<float>& real, std::vector<float>& imag, bool inv) {
-    uint32_t N = real.size(), log2N = 0;
-    while ((1u << log2N) < N) log2N++;
-    bit_reverse_permutation(real, imag, N);
-
-    for (uint32_t s = 0; s < log2N; s++) {
-        uint32_t m   = 1u << (s + 1);
-        float    ab  = (inv ? 2.f : -2.f) * PI / m;
-        for (uint32_t k = 0; k < N; k += m) {
-            for (uint32_t j = 0; j < m / 2; j++) {
-                float wr = std::cos(ab * j), wi = std::sin(ab * j);
-                uint32_t e = k + j, o = k + j + m / 2;
-                float tr = wr * real[o] - wi * imag[o];
-                float ti = wr * imag[o] + wi * real[o];
-                float er = real[e], ei = imag[e];
-                real[e] = er + tr; imag[e] = ei + ti;
-                real[o] = er - tr; imag[o] = ei - ti;
-            }
-        }
-    }
-    if (inv) {
-        for (uint32_t i = 0; i < N; i++) {
-            real[i] /= N; imag[i] /= N;
-        }
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  PRECOMPUTE ALL TWIDDLE FACTORS FOR ALL STAGES
+// ── CB index map ────────────────────────────────────────────────────
 //
-//  Layout: stage-major flat array.
-//    index = stage * tiles_per_stage * TILE_SIZE + tile * TILE_SIZE + elem
+//  INPUT CBs
+//    c_0  cb_even_r   stage-0 even real   depth=2
+//    c_1  cb_even_i   stage-0 even imag   depth=2
+//    c_2  cb_odd_r    stage-0 odd  real   depth=2
+//    c_3  cb_odd_i    stage-0 odd  imag   depth=2
+//    c_4  cb_tw_r     twiddle cos          depth=2
+//    c_5  cb_tw_i     twiddle sin          depth=2
 //
-//  Always stored as FORWARD twiddles: W_k = exp(-2πi·k/m) = (cos, -sin)
-//  Device conjugates for IFFT by negating the imaginary part (sfpu_neg).
-// ════════════════════════════════════════════════════════════════════
-std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
-precompute_all_twiddles(uint32_t N, uint32_t log2N, uint32_t tiles_per_stage)
+//  INTER-STAGE PING (compute owns)
+//    c_10 ping_even_r   depth=tiles_per_stage
+//    c_11 ping_even_i   depth=tiles_per_stage
+//    c_12 ping_odd_r    depth=tiles_per_stage
+//    c_13 ping_odd_i    depth=tiles_per_stage
+//
+//  INTER-STAGE PONG (compute owns)
+//    c_14 pong_even_r   depth=tiles_per_stage
+//    c_15 pong_even_i   depth=tiles_per_stage
+//    c_6  pong_odd_r    depth=tiles_per_stage
+//    c_7  pong_odd_i    depth=tiles_per_stage
+//
+//  OUTPUT CBs
+//    c_16 out0_r   X[k]     real   depth=2
+//    c_17 out0_i   X[k]     imag   depth=2
+//    c_18 out1_r   X[k+N/2] real   depth=2
+//    c_19 out1_i   X[k+N/2] imag   depth=2
+//
+//  SCRATCH (compute internal)
+//    c_20 tmp0        depth=1
+//    c_21 tmp1        depth=1
+//    c_22 tw_odd_r    depth=1
+//    c_23 tw_odd_i    depth=1
+//    c_24 neg_tw_i    depth=1
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  FPU BINARY OP  — init-guarded
+//
+//  current_op tracks which op was last initialised. We only call
+//  *_tiles_init() when switching ops, avoiding repeated re-inits
+//  with changing CB args that corrupt unpacker state.
+//
+//  Contract:
+//    Caller has cb_wait_front on cb_a and cb_b.
+//    Caller will cb_pop_front after this returns.
+//    This function writes one tile to cb_tgt.
+// ═══════════════════════════════════════════════════════════════════
+template <uint32_t OP>
+FORCE_INLINE void fpu_op(
+    uint32_t  cb_a,
+    uint32_t  cb_b,
+    uint32_t  cb_tgt,
+    uint32_t& current_op)
 {
-    const uint32_t total_tiles = log2N * tiles_per_stage;
-    std::vector<uint32_t> tw_r(total_tiles * TILE_SIZE, 0);
-    std::vector<uint32_t> tw_i(total_tiles * TILE_SIZE, 0);
-
-    for (uint32_t stage = 0; stage < log2N; stage++) {
-        uint32_t m      = 1u << (stage + 1);
-        uint32_t half_m = m / 2;
-
-        uint32_t bf_idx = 0;
-        for (uint32_t k = 0; k < N; k += m) {
-            for (uint32_t j = 0; j < half_m; j++) {
-                float angle = -2.0f * PI * (float)j / (float)m;
-                float wr    = std::cos(angle);
-                float wi    = std::sin(angle);
-
-                uint32_t flat = stage * tiles_per_stage * TILE_SIZE + bf_idx;
-                tw_r[flat] = f2u(wr);
-                tw_i[flat] = f2u(wi);
-
-                bf_idx++;
-            }
+    if (current_op != OP) {
+        if constexpr (OP == OP_ADD) {
+            add_tiles_init(cb_a, cb_b);
+        } else if constexpr (OP == OP_SUB) {
+            sub_tiles_init(cb_a, cb_b);
+        } else if constexpr (OP == OP_MUL) {
+            mul_tiles_init(cb_a, cb_b);
         }
+        current_op = OP;
     }
 
-    return {tw_r, tw_i};
+    tile_regs_acquire();
+    if constexpr (OP == OP_ADD) {
+        add_tiles(cb_a, cb_b, 0, 0, 0);
+    } else if constexpr (OP == OP_SUB) {
+        sub_tiles(cb_a, cb_b, 0, 0, 0);
+    } else if constexpr (OP == OP_MUL) {
+        mul_tiles(cb_a, cb_b, 0, 0, 0);
+    }
+    tile_regs_commit();
+
+    cb_reserve_back(cb_tgt, 1);
+    tile_regs_wait();
+    pack_tile(0, cb_tgt);
+    tile_regs_release();
+    cb_push_back(cb_tgt, 1);
 }
 
-// ════════════════════════════════════════════════════════════════════
-//  PREPARE STAGE 0 INPUT (even/odd split, bit-reversed)
+// ═══════════════════════════════════════════════════════════════════
+//  SFPU NEGATE
+//  Caller must cb_wait_front(cb_in) before and cb_pop_front after.
+// ═══════════════════════════════════════════════════════════════════
+FORCE_INLINE void sfpu_neg(uint32_t cb_in, uint32_t cb_tgt)
+{
+    tile_regs_acquire();
+    copy_tile_to_dst_init_short(cb_in);
+    copy_tile(cb_in, 0, 0);
+    negative_tile_init();
+    negative_tile(0);
+    tile_regs_commit();
+
+    cb_reserve_back(cb_tgt, 1);
+    tile_regs_wait();
+    pack_tile(0, cb_tgt);
+    tile_regs_release();
+    cb_push_back(cb_tgt, 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  COMPLEX MULTIPLY: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
 //
-//  After bit-reversal, butterfly pairs for stage 0 are:
-//    first half  → even inputs  (indices 0 .. N/2-1)
-//    second half → odd  inputs  (indices N/2 .. N-1)
+//  BORROWS:  cb_a_r, cb_a_i, cb_b_r, cb_b_i  (caller waited, will pop)
+//  PRODUCES: cb_out_r, cb_out_i               (caller must wait+pop)
+//  OWNS tmp: cb_tmp0, cb_tmp1                 (popped internally)
+// ═══════════════════════════════════════════════════════════════════
+FORCE_INLINE void complex_mul(
+    uint32_t  cb_a_r,   uint32_t cb_a_i,
+    uint32_t  cb_b_r,   uint32_t cb_b_i,
+    uint32_t  cb_out_r, uint32_t cb_out_i,
+    uint32_t  cb_tmp0,  uint32_t cb_tmp1,
+    uint32_t& current_op)
+{
+    // Real: ac - bd
+    fpu_op<OP_MUL>(cb_a_r, cb_b_r, cb_tmp0, current_op);   // tmp0 = ac
+    fpu_op<OP_MUL>(cb_a_i, cb_b_i, cb_tmp1, current_op);   // tmp1 = bd
+
+    cb_wait_front(cb_tmp0, 1);
+    cb_wait_front(cb_tmp1, 1);
+    fpu_op<OP_SUB>(cb_tmp0, cb_tmp1, cb_out_r, current_op); // out_r = ac-bd
+    cb_pop_front(cb_tmp0, 1);
+    cb_pop_front(cb_tmp1, 1);
+
+    // Imag: ad + bc
+    fpu_op<OP_MUL>(cb_a_r, cb_b_i, cb_tmp0, current_op);   // tmp0 = ad
+    fpu_op<OP_MUL>(cb_a_i, cb_b_r, cb_tmp1, current_op);   // tmp1 = bc
+
+    cb_wait_front(cb_tmp0, 1);
+    cb_wait_front(cb_tmp1, 1);
+    fpu_op<OP_ADD>(cb_tmp0, cb_tmp1, cb_out_i, current_op); // out_i = ad+bc
+    cb_pop_front(cb_tmp0, 1);
+    cb_pop_front(cb_tmp1, 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FFT BUTTERFLY
+//  X[k]     = E[k] + W·O[k]
+//  X[k+N/2] = E[k] - W·O[k]
 //
-//  Each is packed into separate tile arrays for separate DRAM buffers.
-// ════════════════════════════════════════════════════════════════════
-void prepare_stage0_input(
-    const std::vector<float>& src_r,
-    const std::vector<float>& src_i,
-    uint32_t N,
-    uint32_t tiles_per_stage,
-    std::vector<uint32_t>& even_r_tiles,
-    std::vector<uint32_t>& even_i_tiles,
-    std::vector<uint32_t>& odd_r_tiles,
-    std::vector<uint32_t>& odd_i_tiles)
+//  CRITICAL: cb_even_r/i and cb_odd_r/i MUST be different CBs.
+//
+//  OWNS (waits + pops): cb_even_r/i, cb_odd_r/i, cb_tw_odd_r/i
+//  BORROWS (caller waited, caller pops): cb_tw_r, cb_tw_i
+//  PRODUCES: cb_out0_r/i, cb_out1_r/i
+// ═══════════════════════════════════════════════════════════════════
+FORCE_INLINE void butterfly(
+    uint32_t  cb_even_r,   uint32_t cb_even_i,
+    uint32_t  cb_odd_r,    uint32_t cb_odd_i,
+    uint32_t  cb_tw_r,     uint32_t cb_tw_i,
+    uint32_t  cb_out0_r,   uint32_t cb_out0_i,
+    uint32_t  cb_out1_r,   uint32_t cb_out1_i,
+    uint32_t  cb_tmp0,     uint32_t cb_tmp1,
+    uint32_t  cb_tw_odd_r, uint32_t cb_tw_odd_i,
+    uint32_t& current_op)
 {
-    const uint32_t half_N = N / 2;
-    std::vector<float> even_r(half_N), even_i(half_N);
-    std::vector<float> odd_r(half_N),  odd_i(half_N);
+    // Step 1: W·O[k]  — consume odd input
+    cb_wait_front(cb_odd_r, 1);
+    cb_wait_front(cb_odd_i, 1);
 
-    for (uint32_t i = 0; i < half_N; i++) {
-        even_r[i] = src_r[i];
-        even_i[i] = src_i[i];
-        odd_r[i]  = src_r[i + half_N];
-        odd_i[i]  = src_i[i + half_N];
-    }
+    complex_mul(
+        cb_odd_r,    cb_odd_i,
+        cb_tw_r,     cb_tw_i,
+        cb_tw_odd_r, cb_tw_odd_i,
+        cb_tmp0,     cb_tmp1,
+        current_op
+    );
 
-    even_r_tiles = pack_tiles(even_r, tiles_per_stage);
-    even_i_tiles = pack_tiles(even_i, tiles_per_stage);
-    odd_r_tiles  = pack_tiles(odd_r,  tiles_per_stage);
-    odd_i_tiles  = pack_tiles(odd_i,  tiles_per_stage);
+    cb_pop_front(cb_odd_r, 1);
+    cb_pop_front(cb_odd_i, 1);
+    // tw_r, tw_i NOT popped — caller owns them
+
+    // Step 2: butterfly ADD / SUB
+    // Safe to wait on even here — it is a DIFFERENT CB from odd
+    cb_wait_front(cb_even_r,   1);
+    cb_wait_front(cb_even_i,   1);
+    cb_wait_front(cb_tw_odd_r, 1);
+    cb_wait_front(cb_tw_odd_i, 1);
+
+    fpu_op<OP_ADD>(cb_even_r, cb_tw_odd_r, cb_out0_r, current_op); // X[k] real
+    fpu_op<OP_ADD>(cb_even_i, cb_tw_odd_i, cb_out0_i, current_op); // X[k] imag
+
+    fpu_op<OP_SUB>(cb_even_r, cb_tw_odd_r, cb_out1_r, current_op); // X[k+N/2] real
+    fpu_op<OP_SUB>(cb_even_i, cb_tw_odd_i, cb_out1_i, current_op); // X[k+N/2] imag
+
+    cb_pop_front(cb_even_r,   1);
+    cb_pop_front(cb_even_i,   1);
+    cb_pop_front(cb_tw_odd_r, 1);
+    cb_pop_front(cb_tw_odd_i, 1);
 }
 
-// ════════════════════════════════════════════════════════════════════
-//  CREATE CIRCULAR BUFFER HELPER
-// ════════════════════════════════════════════════════════════════════
-void create_cb(
-    Program& program,
-    CoreCoord core,
-    uint32_t cb_id,
-    uint32_t num_tiles,
-    uint32_t tile_bytes)
+// ═══════════════════════════════════════════════════════════════════
+//  PROCESS ONE STAGE
+// ═══════════════════════════════════════════════════════════════════
+FORCE_INLINE void process_stage(
+    uint32_t  cb_even_r,   uint32_t cb_even_i,
+    uint32_t  cb_odd_r,    uint32_t cb_odd_i,
+    uint32_t  cb_tw_r,     uint32_t cb_tw_i,
+    uint32_t  cb_out0_r,   uint32_t cb_out0_i,
+    uint32_t  cb_out1_r,   uint32_t cb_out1_i,
+    uint32_t  cb_tmp0,     uint32_t cb_tmp1,
+    uint32_t  cb_tw_odd_r, uint32_t cb_tw_odd_i,
+    uint32_t  cb_neg_tw_i,
+    uint32_t  num_tiles,
+    bool      is_ifft,
+    uint32_t& current_op)
 {
-    CircularBufferConfig cfg =
-        CircularBufferConfig(
-            num_tiles * tile_bytes,
-            {{cb_id, tt::DataFormat::Float32}})
-        .set_page_size(cb_id, tile_bytes);
-    CreateCircularBuffer(program, core, cfg);
-}
+    for (uint32_t t = 0; t < num_tiles; t++) {
 
-// ════════════════════════════════════════════════════════════════════
-//  FILE READER
-// ════════════════════════════════════════════════════════════════════
-bool read_input_file(
-    const std::string& path,
-    uint32_t& N,
-    bool N_from_cmdline,
-    std::vector<float>& input_r,
-    std::vector<float>& input_i)
-{
-    std::ifstream f(path);
-    if (!f.is_open()) {
-        std::cerr << "Cannot open input file: " << path << "\n";
-        return false;
-    }
+        if (is_ifft) {
+            // Conjugate twiddle: negate imaginary part
+            cb_wait_front(cb_tw_i, 1);
+            sfpu_neg(cb_tw_i, cb_neg_tw_i);
+            cb_pop_front(cb_tw_i, 1);
 
-    std::vector<float> vals;
-    std::string token;
-    while (f >> token) {
-        if (!token.empty() && token.back() == ',')
-            token.pop_back();
-        if (token.empty()) continue;
-        try {
-            vals.push_back(std::stof(token));
-        } catch (...) {
-            std::cerr << "Bad token in file: '" << token << "'\n";
-            return false;
-        }
-    }
+            // sfpu_neg uses SFPU path — FPU op state is now unknown.
+            // Force re-init on the next fpu_op call.
+            current_op = OP_NONE;
 
-    if (vals.empty()) {
-        std::cerr << "Input file is empty.\n";
-        return false;
-    }
+            cb_wait_front(cb_tw_r,     1);
+            cb_wait_front(cb_neg_tw_i, 1);
 
-    uint32_t count = (uint32_t)vals.size();
-    bool interleaved = false;
+            butterfly(
+                cb_even_r,    cb_even_i,
+                cb_odd_r,     cb_odd_i,
+                cb_tw_r,      cb_neg_tw_i,
+                cb_out0_r,    cb_out0_i,
+                cb_out1_r,    cb_out1_i,
+                cb_tmp0,      cb_tmp1,
+                cb_tw_odd_r,  cb_tw_odd_i,
+                current_op
+            );
 
-    if (N_from_cmdline) {
-        if (count == 2 * N) {
-            interleaved = true;
-            std::cout << " File mode     : interleaved real+imag (" << count << " values → N=" << N << ")\n";
-        } else if (count == N) {
-            std::cout << " File mode     : real-only (" << count << " values, imag=0)\n";
-        } else if (count < N) {
-            std::cerr << "File has " << count << " values but N=" << N << " — padding with zeros.\n";
+            cb_pop_front(cb_tw_r,     1);
+            cb_pop_front(cb_neg_tw_i, 1);
+
         } else {
-            std::cerr << "File has " << count << " values but N=" << N << " — truncating to N.\n";
-            count = N;
-            vals.resize(N);
-        }
-    } else {
-        N = 1;
-        while (N < count) N <<= 1;
-        std::cout << " File mode     : real-only (" << count << " values, N inferred as " << N << ")\n";
-    }
+            cb_wait_front(cb_tw_r, 1);
+            cb_wait_front(cb_tw_i, 1);
 
-    input_r.assign(N, 0.f);
-    input_i.assign(N, 0.f);
+            butterfly(
+                cb_even_r,    cb_even_i,
+                cb_odd_r,     cb_odd_i,
+                cb_tw_r,      cb_tw_i,
+                cb_out0_r,    cb_out0_i,
+                cb_out1_r,    cb_out1_i,
+                cb_tmp0,      cb_tmp1,
+                cb_tw_odd_r,  cb_tw_odd_i,
+                current_op
+            );
 
-    if (interleaved) {
-        for (uint32_t i = 0; i < N && 2*i+1 < (uint32_t)vals.size(); i++) {
-            input_r[i] = vals[2*i];
-            input_i[i] = vals[2*i+1];
-        }
-    } else {
-        for (uint32_t i = 0; i < N && i < (uint32_t)vals.size(); i++) {
-            input_r[i] = vals[i];
+            cb_pop_front(cb_tw_r, 1);
+            cb_pop_front(cb_tw_i, 1);
         }
     }
-
-    return true;
 }
 
-// ════════════════════════════════════════════════════════════════════
-//  MAIN
+// ═══════════════════════════════════════════════════════════════════
+//  KERNEL MAIN
 //
-//  Usage:
-//    ./fft_single_core <direction> [input_file] [N]
-//
-//    direction : 0=forward FFT, 1=inverse FFT
-//    input_file: optional path to text file of floats
-//    N         : optional FFT size (power of 2)
-// ════════════════════════════════════════════════════════════════════
-int main(int argc, char** argv) {
+//  Runtime args:
+//    0: direction        0=forward, 1=inverse
+//    1: num_stages       log2(N)
+//    2: tiles_per_stage  (N/2 + TILE_SIZE-1) / TILE_SIZE
+// ═══════════════════════════════════════════════════════════════════
+void kernel_main() {
+    const uint32_t direction       = get_arg_val<uint32_t>(0);
+    const uint32_t num_stages      = get_arg_val<uint32_t>(1);
+    const uint32_t tiles_per_stage = get_arg_val<uint32_t>(2);
 
-    uint32_t    direction      = 0;
-    uint32_t    N              = 1024;
-    std::string in_file        = "";
-    bool        N_from_cmdline = false;
+    // ── CB declarations ────────────────────────────────────────────
+    constexpr auto cb_in_even_r   = tt::CBIndex::c_0;
+    constexpr auto cb_in_even_i   = tt::CBIndex::c_1;
+    constexpr auto cb_in_odd_r    = tt::CBIndex::c_2;
+    constexpr auto cb_in_odd_i    = tt::CBIndex::c_3;
+    constexpr auto cb_tw_r        = tt::CBIndex::c_4;
+    constexpr auto cb_tw_i        = tt::CBIndex::c_5;
 
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <direction 0|1> [input_file] [N]\n";
-        return 1;
-    }
+    constexpr auto cb_ping_even_r = tt::CBIndex::c_10;
+    constexpr auto cb_ping_even_i = tt::CBIndex::c_11;
+    constexpr auto cb_ping_odd_r  = tt::CBIndex::c_12;
+    constexpr auto cb_ping_odd_i  = tt::CBIndex::c_13;
 
-    direction = (uint32_t)std::atoi(argv[1]);
+    constexpr auto cb_pong_even_r = tt::CBIndex::c_14;
+    constexpr auto cb_pong_even_i = tt::CBIndex::c_15;
+    constexpr auto cb_pong_odd_r  = tt::CBIndex::c_6;
+    constexpr auto cb_pong_odd_i  = tt::CBIndex::c_7;
 
-    for (int i = 2; i < argc; i++) {
-        std::string a = argv[i];
-        bool looks_like_file = (a.find('.') != std::string::npos ||
-                                a.find('/') != std::string::npos ||
-                                a.find('\\') != std::string::npos);
-        if (looks_like_file && in_file.empty()) {
-            in_file = a;
-        } else {
-            try {
-                N = (uint32_t)std::stol(a);
-                N_from_cmdline = true;
-            } catch (...) {
-                if (in_file.empty()) in_file = a;
-            }
-        }
-    }
+    constexpr auto cb_out0_r      = tt::CBIndex::c_16;
+    constexpr auto cb_out0_i      = tt::CBIndex::c_17;
+    constexpr auto cb_out1_r      = tt::CBIndex::c_18;
+    constexpr auto cb_out1_i      = tt::CBIndex::c_19;
 
-    if (N_from_cmdline && (N == 0 || (N & (N-1)) != 0)) {
-        std::cerr << "N must be a power of 2, got " << N << "\n";
-        return 1;
-    }
+    constexpr auto cb_tmp0        = tt::CBIndex::c_20;
+    constexpr auto cb_tmp1        = tt::CBIndex::c_21;
+    constexpr auto cb_tw_odd_r    = tt::CBIndex::c_22;
+    constexpr auto cb_tw_odd_i    = tt::CBIndex::c_23;
+    constexpr auto cb_neg_tw_i    = tt::CBIndex::c_24;
 
-    uint32_t log2N           = 0;
-    while ((1u << log2N) < N) log2N++;
-    uint32_t half_N          = N / 2;
-    uint32_t tiles_per_stage = (half_N + TILE_SIZE - 1) / TILE_SIZE;
+    // ── One-time compute init ──────────────────────────────────────
+    // binary_op_init_common sets up unpacker for both src CBs.
+    // Per-op inits are done lazily inside fpu_op() via current_op.
+    binary_op_init_common(cb_in_even_r, cb_in_odd_r, cb_out0_r);
+    unary_op_init_common(cb_in_even_r, cb_out0_r);
+    copy_tile_to_dst_init_short(cb_in_even_r);
 
-    // ── Input signal ──────────────────────────────────────────────
-    std::vector<float> input_r(N, 0.f), input_i(N, 0.f);
-    if (!in_file.empty()) {
-        if (!read_input_file(in_file, N, N_from_cmdline, input_r, input_i))
-            return 1;
-        log2N           = 0;
-        while ((1u << log2N) < N) log2N++;
-        half_N          = N / 2;
-        tiles_per_stage = (half_N + TILE_SIZE - 1) / TILE_SIZE;
-        input_r.resize(N, 0.f);
-        input_i.resize(N, 0.f);
-        if (N < 2 || (N & (N-1)) != 0) {
-            std::cerr << "Inferred N=" << N << " is not a valid power-of-2 >= 2\n";
-            return 1;
-        }
-    } else {
-        for (uint32_t i = 0; i < N; i++) {
-            input_r[i] = std::sin(2.f * PI * 4.f * i / N)
-                       + 0.5f * std::sin(2.f * PI * 8.f * i / N);
-        }
-    }
+    const bool is_ifft = (direction == 1);
 
-    std::cout << "═══════════════════════════════════════\n";
-    std::cout << " TT-Metal FFT (Optimised Single Core)\n";
-    std::cout << "═══════════════════════════════════════\n";
-    std::cout << " N             : " << N          << "\n";
-    std::cout << " log2N         : " << log2N      << "\n";
-    std::cout << " Direction     : " << (direction ? "Inverse" : "Forward") << "\n";
-    std::cout << " tiles/stage   : " << tiles_per_stage << "\n";
-    std::cout << " total twiddle : " << log2N * tiles_per_stage << " tiles\n";
-    std::cout << "═══════════════════════════════════════\n";
+    // Tracks the last FPU op initialised.
+    // Prevents re-init with changing CB args — avoids unpacker corruption.
+    uint32_t current_op = OP_NONE;
 
-    // ── Reference FFT for validation ──────────────────────────────
-    std::vector<float> ref_r(input_r), ref_i(input_i);
-    cpu_fft(ref_r, ref_i, direction == 1);
-
-    // ── Bit-reverse input (once on host) ──────────────────────────
-    bit_reverse_permutation(input_r, input_i, N);
-
-    // ── Precompute ALL twiddles for ALL stages (once) ─────────────
-    auto [tw_r_tiles, tw_i_tiles] =
-        precompute_all_twiddles(N, log2N, tiles_per_stage);
-
-    // ── Prepare stage 0 even/odd split ────────────────────────────
-    std::vector<uint32_t> even_r_t, even_i_t, odd_r_t, odd_i_t;
-    prepare_stage0_input(
-        input_r, input_i, N, tiles_per_stage,
-        even_r_t, even_i_t, odd_r_t, odd_i_t);
-
-    // ── Device setup ──────────────────────────────────────────────
-    int device_id = 0;
-    auto mesh_device =
-        tt::tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
-    auto& cq = mesh_device->mesh_command_queue();
-    Program program = CreateProgram();
-    CoreCoord core  = {0, 0};
-
-    // ── DRAM buffer sizes ─────────────────────────────────────────
-    uint32_t input_buf_bytes   = tiles_per_stage * TILE_BYTES;
-    uint32_t twiddle_buf_bytes = log2N * tiles_per_stage * TILE_BYTES;
-    uint32_t output_buf_bytes  = tiles_per_stage * TILE_BYTES;
-
-    tt::tt_metal::distributed::DeviceLocalBufferConfig dram_cfg{
-        .page_size   = TILE_BYTES,
-        .buffer_type = tt::tt_metal::BufferType::DRAM
-    };
-
-    auto mk_buf = [&](uint32_t bytes) {
-        tt::tt_metal::distributed::ReplicatedBufferConfig rcfg{ .size = bytes };
-        return tt::tt_metal::distributed::MeshBuffer::create(
-            rcfg, dram_cfg, mesh_device.get());
-    };
-
-    auto buf_even_r = mk_buf(input_buf_bytes);
-    auto buf_even_i = mk_buf(input_buf_bytes);
-    auto buf_odd_r  = mk_buf(input_buf_bytes);
-    auto buf_odd_i  = mk_buf(input_buf_bytes);
-    auto buf_tw_r   = mk_buf(twiddle_buf_bytes);
-    auto buf_tw_i   = mk_buf(twiddle_buf_bytes);
-    auto buf_out0_r = mk_buf(output_buf_bytes);
-    auto buf_out0_i = mk_buf(output_buf_bytes);
-    auto buf_out1_r = mk_buf(output_buf_bytes);
-    auto buf_out1_i = mk_buf(output_buf_bytes);
-
-    // ── Circular buffers ──────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════
+    //  STAGE LOOP
     //
-    //  IO CBs: depth=2 (double-buffered)
-    //  Inter-stage ping/pong: depth=tiles_per_stage
-    //    Each side holds one full stage worth of data in L1.
-    //    Ping and pong alternate so no DRAM access between stages.
-    //    Even and odd are SEPARATE CBs — butterfly needs both
-    //    simultaneously without one blocking the other.
-    //  Intermediates: depth=1 (transient, immediately consumed)
+    //  Stage routing:
+    //
+    //  stage  | src_even        src_odd       | dst X[k]      dst X[k+N/2]
+    //  -------+---------------------------------+---------------------------
+    //  0      | c_0/c_1         c_2/c_3       | ping_even     ping_odd
+    //  1(odd) | ping_even       ping_odd      | pong_even     pong_odd
+    //  2(even)| pong_even       pong_odd      | ping_even     ping_odd
+    //  ...
+    //  last   | (ping/pong)     (ping/pong)   | c_16/c_17     c_18/c_19
+    //
+    //  Special: if num_stages==1, stage 0 IS the last stage.
+    //  The last-stage check takes priority over even/odd routing.
+    // ══════════════════════════════════════════════════════════════
 
-    constexpr uint32_t IO_DEPTH  = 2;
-    constexpr uint32_t TMP_DEPTH = 1;
+    for (uint32_t stage = 0; stage < num_stages; stage++) {
 
-    // Stage-0 input CBs (depth=2, double-buffered from DRAM)
-    create_cb(program, core, tt::CBIndex::c_0, IO_DEPTH, TILE_BYTES);  // even_r
-    create_cb(program, core, tt::CBIndex::c_1, IO_DEPTH, TILE_BYTES);  // even_i
-    create_cb(program, core, tt::CBIndex::c_2, IO_DEPTH, TILE_BYTES);  // odd_r
-    create_cb(program, core, tt::CBIndex::c_3, IO_DEPTH, TILE_BYTES);  // odd_i
+        // ── Source selection ───────────────────────────────────────
+        uint32_t src_even_r, src_even_i;
+        uint32_t src_odd_r,  src_odd_i;
 
-    // Twiddle CBs (depth=2, double-buffered from DRAM)
-    create_cb(program, core, tt::CBIndex::c_4, IO_DEPTH, TILE_BYTES);  // tw_r
-    create_cb(program, core, tt::CBIndex::c_5, IO_DEPTH, TILE_BYTES);  // tw_i
-
-    // Pong odd CBs (c_6/c_7 — safe, not used by reader or writer)
-    create_cb(program, core, tt::CBIndex::c_6,  tiles_per_stage, TILE_BYTES);  // pong_odd_r
-    create_cb(program, core, tt::CBIndex::c_7,  tiles_per_stage, TILE_BYTES);  // pong_odd_i
-
-    // Ping even/odd CBs
-    create_cb(program, core, tt::CBIndex::c_10, tiles_per_stage, TILE_BYTES);  // ping_even_r
-    create_cb(program, core, tt::CBIndex::c_11, tiles_per_stage, TILE_BYTES);  // ping_even_i
-    create_cb(program, core, tt::CBIndex::c_12, tiles_per_stage, TILE_BYTES);  // ping_odd_r
-    create_cb(program, core, tt::CBIndex::c_13, tiles_per_stage, TILE_BYTES);  // ping_odd_i
-
-    // Pong even CBs
-    create_cb(program, core, tt::CBIndex::c_14, tiles_per_stage, TILE_BYTES);  // pong_even_r
-    create_cb(program, core, tt::CBIndex::c_15, tiles_per_stage, TILE_BYTES);  // pong_even_i
-
-    // Output CBs (depth=2, double-buffered to DRAM)
-    create_cb(program, core, tt::CBIndex::c_16, IO_DEPTH, TILE_BYTES);  // out0_r  X[k]
-    create_cb(program, core, tt::CBIndex::c_17, IO_DEPTH, TILE_BYTES);  // out0_i
-    create_cb(program, core, tt::CBIndex::c_18, IO_DEPTH, TILE_BYTES);  // out1_r  X[k+N/2]
-    create_cb(program, core, tt::CBIndex::c_19, IO_DEPTH, TILE_BYTES);  // out1_i
-
-    // Scratch intermediates (depth=1)
-    create_cb(program, core, tt::CBIndex::c_20, TMP_DEPTH, TILE_BYTES);  // tmp0
-    create_cb(program, core, tt::CBIndex::c_21, TMP_DEPTH, TILE_BYTES);  // tmp1
-    create_cb(program, core, tt::CBIndex::c_22, TMP_DEPTH, TILE_BYTES);  // tw_odd_r
-    create_cb(program, core, tt::CBIndex::c_23, TMP_DEPTH, TILE_BYTES);  // tw_odd_i
-    create_cb(program, core, tt::CBIndex::c_24, TMP_DEPTH, TILE_BYTES);  // neg_tw_i
-
-    // ── Kernels ───────────────────────────────────────────────────
-    auto reader_k = CreateKernel(
-        program,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/dataflow/reader_fft_f32.cpp",
-        core,
-        DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_0,
-            .noc       = NOC::RISCV_0_default
-        });
-
-    auto writer_k = CreateKernel(
-        program,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/dataflow/writer_fft_f32.cpp",
-        core,
-        DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_1,
-            .noc       = NOC::RISCV_1_default
-        });
-
-    // UnpackToDestFp32 for all CBs — full FP32 precision throughout.
-    // Without this, Tf32 truncation (10-bit mantissa) accumulates
-    // across log2(N) stages — significant error for large N.
-    std::vector<UnpackToDestMode> unpack_modes(32, UnpackToDestMode::UnpackToDestFp32);
-
-    auto compute_k = CreateKernel(
-        program,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/compute/fft_compute_f32.cpp",
-        core,
-        ComputeConfig{
-            .math_fidelity       = MathFidelity::HiFi4,
-            .fp32_dest_acc_en    = true,
-            .unpack_to_dest_mode = unpack_modes,
-            .math_approx_mode    = false
-        });
-
-    // ── Runtime args ──────────────────────────────────────────────
-    std::vector<uint32_t> reader_args = {
-        buf_even_r->address(),
-        buf_even_i->address(),
-        buf_odd_r->address(),
-        buf_odd_i->address(),
-        buf_tw_r->address(),
-        buf_tw_i->address(),
-        tiles_per_stage,
-        log2N
-    };
-
-    std::vector<uint32_t> writer_args = {
-        buf_out0_r->address(),
-        buf_out0_i->address(),
-        buf_out1_r->address(),
-        buf_out1_i->address(),
-        tiles_per_stage
-    };
-
-    std::vector<uint32_t> compute_args = {
-        direction,
-        log2N,
-        tiles_per_stage
-    };
-
-    // ── Single workload ───────────────────────────────────────────
-    tt::tt_metal::distributed::MeshWorkload workload;
-    tt::tt_metal::distributed::MeshCoordinateRange device_range =
-        tt::tt_metal::distributed::MeshCoordinateRange(mesh_device->shape());
-    workload.add_program(device_range, std::move(program));
-
-    auto& prog = workload.get_programs().begin()->second;
-    SetRuntimeArgs(prog, reader_k,  core, reader_args);
-    SetRuntimeArgs(prog, writer_k,  core, writer_args);
-    SetRuntimeArgs(prog, compute_k, core, compute_args);
-
-    // ── Write inputs to DRAM (ONCE) ───────────────────────────────
-    std::cout << "Writing inputs to DRAM...\n";
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_even_r, even_r_t,   false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_even_i, even_i_t,   false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_odd_r,  odd_r_t,    false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_odd_i,  odd_i_t,    false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_tw_r,   tw_r_tiles, false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_tw_i,   tw_i_tiles, false);
-    tt::tt_metal::distributed::Finish(cq);
-
-    // ── Launch kernel ONCE (all stages on device) ─────────────────
-    std::cout << "Launching FFT kernel (all " << log2N << " stages on device)...\n";
-    tt::tt_metal::distributed::EnqueueMeshWorkload(cq, workload, false);
-    tt::tt_metal::distributed::Finish(cq);
-    std::cout << "Kernel complete.\n";
-
-    // ── Read results (ONCE) ───────────────────────────────────────
-    std::vector<uint32_t> out0_r_raw(tiles_per_stage * TILE_SIZE);
-    std::vector<uint32_t> out0_i_raw(tiles_per_stage * TILE_SIZE);
-    std::vector<uint32_t> out1_r_raw(tiles_per_stage * TILE_SIZE);
-    std::vector<uint32_t> out1_i_raw(tiles_per_stage * TILE_SIZE);
-
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_r_raw, buf_out0_r, true);
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_i_raw, buf_out0_i, true);
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_r_raw, buf_out1_r, true);
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_i_raw, buf_out1_i, true);
-
-    // ── Reconstruct result in natural order ───────────────────────
-    // out0 = X[0..N/2-1], out1 = X[N/2..N-1]
-    auto out0_r = unpack_tiles(out0_r_raw, half_N);
-    auto out0_i = unpack_tiles(out0_i_raw, half_N);
-    auto out1_r = unpack_tiles(out1_r_raw, half_N);
-    auto out1_i = unpack_tiles(out1_i_raw, half_N);
-
-    std::vector<float> result_r(N), result_i(N);
-    for (uint32_t i = 0; i < half_N; i++) {
-        result_r[i]          = out0_r[i];
-        result_i[i]          = out0_i[i];
-        result_r[i + half_N] = out1_r[i];
-        result_i[i + half_N] = out1_i[i];
-    }
-
-    // Apply 1/N scaling for IFFT
-    if (direction == 1) {
-        for (uint32_t i = 0; i < N; i++) {
-            result_r[i] /= N;
-            result_i[i] /= N;
+        if (stage == 0) {
+            src_even_r = cb_in_even_r;   src_even_i = cb_in_even_i;
+            src_odd_r  = cb_in_odd_r;    src_odd_i  = cb_in_odd_i;
+        } else if ((stage & 1) == 1) {
+            src_even_r = cb_ping_even_r; src_even_i = cb_ping_even_i;
+            src_odd_r  = cb_ping_odd_r;  src_odd_i  = cb_ping_odd_i;
+        } else {
+            src_even_r = cb_pong_even_r; src_even_i = cb_pong_even_i;
+            src_odd_r  = cb_pong_odd_r;  src_odd_i  = cb_pong_odd_i;
         }
+
+        // ── Destination selection ──────────────────────────────────
+        uint32_t dst0_r, dst0_i;
+        uint32_t dst1_r, dst1_i;
+
+        if (stage == num_stages - 1) {
+            // Last stage → DRAM output (writer drains to DRAM)
+            dst0_r = cb_out0_r;      dst0_i = cb_out0_i;
+            dst1_r = cb_out1_r;      dst1_i = cb_out1_i;
+        } else if ((stage & 1) == 0) {
+            // Even stage → ping
+            dst0_r = cb_ping_even_r; dst0_i = cb_ping_even_i;
+            dst1_r = cb_ping_odd_r;  dst1_i = cb_ping_odd_i;
+        } else {
+            // Odd stage → pong
+            dst0_r = cb_pong_even_r; dst0_i = cb_pong_even_i;
+            dst1_r = cb_pong_odd_r;  dst1_i = cb_pong_odd_i;
+        }
+
+        process_stage(
+            src_even_r,  src_even_i,
+            src_odd_r,   src_odd_i,
+            cb_tw_r,     cb_tw_i,
+            dst0_r,      dst0_i,
+            dst1_r,      dst1_i,
+            cb_tmp0,     cb_tmp1,
+            cb_tw_odd_r, cb_tw_odd_i,
+            cb_neg_tw_i,
+            tiles_per_stage,
+            is_ifft,
+            current_op
+        );
     }
-
-    // ── Validation ────────────────────────────────────────────────
-    std::cout << "\n═══════════════════════════════════════\n";
-    std::cout << " VALIDATION\n";
-    std::cout << "═══════════════════════════════════════\n";
-
-    float max_err_r = 0.f, max_err_i = 0.f, mean_err = 0.f;
-    for (uint32_t i = 0; i < N; i++) {
-        float er = std::abs(result_r[i] - ref_r[i]);
-        float ei = std::abs(result_i[i] - ref_i[i]);
-        max_err_r = std::max(max_err_r, er);
-        max_err_i = std::max(max_err_i, ei);
-        mean_err += er + ei;
-    }
-    mean_err /= 2 * N;
-
-    std::cout << " Max error  (real): " << max_err_r << "\n";
-    std::cout << " Max error  (imag): " << max_err_i << "\n";
-    std::cout << " Mean error       : " << mean_err  << "\n";
-
-    bool passed = (max_err_r < 1e-3f) && (max_err_i < 1e-3f);
-    std::cout << " Result: " << (passed ? "✓ PASSED" : "✗ FAILED") << "\n";
-
-    // ── Print first 16 outputs ────────────────────────────────────
-    std::cout << "\n═══════════════════════════════════════\n";
-    std::cout << " FIRST 16 RESULTS\n";
-    std::cout << "═══════════════════════════════════════\n";
-    std::cout << std::fixed << std::setprecision(5);
-    for (uint32_t i = 0; i < 16 && i < N; i++) {
-        std::cout
-            << " X[" << std::setw(3) << i << "] = "
-            << std::setw(12) << result_r[i]
-            << (result_i[i] >= 0 ? " + " : " - ")
-            << std::setw(12) << std::abs(result_i[i]) << "j"
-            << "   ref: "
-            << std::setw(12) << ref_r[i]
-            << (ref_i[i] >= 0 ? " + " : " - ")
-            << std::setw(12) << std::abs(ref_i[i]) << "j"
-            << "\n";
-    }
-
-    mesh_device->close();
-    std::cout << "\n═══════════════════════════════════════\n";
-    std::cout << " Done\n";
-    std::cout << "═══════════════════════════════════════\n";
-
-    return passed ? 0 : 1;
 }
