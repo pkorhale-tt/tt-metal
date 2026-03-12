@@ -17,14 +17,12 @@
 //    pop all 4                  ← free slots for compute's next tile
 //
 //  NOC optimization:
-//    Previous: 4 barriers per tile
-//    This:     1 barrier per tile  → 4× better NOC utilization
+//    1 barrier per tile → 4× better NOC utilization vs naive.
 //
 //  Double-buffer benefit:
 //    Output CBs depth=2.
-//    Compute can push tile i+1 into second slot while
-//    writer is waiting for NOC to drain tile i.
-//    No stall between compute and writer.
+//    Compute pushes tile i+1 into slot 1 while writer waits for
+//    NOC to drain tile i. No stall between compute and writer.
 //
 // ═══════════════════════════════════════════════════════════════════
 
@@ -77,39 +75,28 @@ void kernel_main() {
     // ══════════════════════════════════════════════════════════════
     //  DRAIN LOOP
     //
-    //  Pattern: wait_all → write_all → barrier → pop_all
-    //
-    //  Why this order:
-    //    wait_all:   ensure all 4 tiles are ready before NOC
-    //    write_all:  fire all 4 NOC writes back-to-back
-    //                NOC pipelines these efficiently
-    //    barrier:    one wait covers all 4 L1→DRAM transfers
-    //    pop_all:    free 4 slots → compute can fill them (depth=2)
+    //  wait_all → write_all → barrier → pop_all
     //
     //  With depth=2 output CBs:
     //    compute pushes tile i+1 into slot 1 while
-    //    writer's barrier is waiting for tile i's NOC write.
+    //    writer barrier waits for tile i's NOC write to complete.
     //    Zero stall between compute and writer.
     // ══════════════════════════════════════════════════════════════
 
     for (uint32_t t = 0; t < num_tiles; t++) {
 
-        // ── Wait for all 4 output tiles ────────────────────────────
         cb_wait_front(cb_out0_r, 1);
         cb_wait_front(cb_out0_i, 1);
         cb_wait_front(cb_out1_r, 1);
         cb_wait_front(cb_out1_i, 1);
 
-        // ── Fire all 4 NOC writes before any barrier ───────────────
         noc_async_write_tile(t, out0_r_gen, get_read_ptr(cb_out0_r));
         noc_async_write_tile(t, out0_i_gen, get_read_ptr(cb_out0_i));
         noc_async_write_tile(t, out1_r_gen, get_read_ptr(cb_out1_r));
         noc_async_write_tile(t, out1_i_gen, get_read_ptr(cb_out1_i));
 
-        // ── Single barrier for all 4 L1→DRAM writes ───────────────
         noc_async_write_barrier();
 
-        // ── Free all 4 slots — compute can refill (depth=2) ────────
         cb_pop_front(cb_out0_r, 1);
         cb_pop_front(cb_out0_i, 1);
         cb_pop_front(cb_out1_r, 1);
