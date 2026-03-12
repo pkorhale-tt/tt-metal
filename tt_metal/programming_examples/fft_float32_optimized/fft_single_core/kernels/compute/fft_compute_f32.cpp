@@ -26,10 +26,10 @@
 //
 //  FPU init strategy:
 //    binary_op_init_common() called ONCE at kernel start.
-//    Per-op inits (add_tiles_init etc.) called ONLY when the operation
-//    changes from the previous call — tracked by `current_op`.
-//    This avoids corrupting unpacker state from repeated re-inits
-//    with different CB arguments across complex_mul / butterfly.
+//    Per-op inits (*_tiles_init) called whenever EITHER the op type
+//    OR the source CB indices change. Both are tracked together via
+//    a packed key: (OP << 16) | (cb_a << 8) | cb_b.
+//    This prevents unpacker corruption from same-op/different-CB calls.
 //
 // ═══════════════════════════════════════════════════════════════════
 
@@ -47,6 +47,12 @@ constexpr uint32_t OP_NONE = 0;
 constexpr uint32_t OP_ADD  = 1;
 constexpr uint32_t OP_SUB  = 2;
 constexpr uint32_t OP_MUL  = 3;
+
+// Pack op + both CB ids into one uint32 key for change detection.
+// Re-init whenever op OR either CB changes.
+FORCE_INLINE uint32_t make_op_key(uint32_t op, uint32_t cb_a, uint32_t cb_b) {
+    return (op << 16) | (cb_a << 8) | cb_b;
+}
 
 // ── CB index map ────────────────────────────────────────────────────
 //
@@ -85,11 +91,12 @@ constexpr uint32_t OP_MUL  = 3;
 
 
 // ═══════════════════════════════════════════════════════════════════
-//  FPU BINARY OP  — init-guarded
+//  FPU BINARY OP — op+CB-aware init guard
 //
-//  current_op tracks which op was last initialised. We only call
-//  *_tiles_init() when switching ops, avoiding repeated re-inits
-//  with changing CB args that corrupt unpacker state.
+//  Re-initialises the FPU only when either the operation type OR
+//  the source CB indices change. Both must match to skip init.
+//  This is critical: calling mul_tiles(c_3, c_5) right after
+//  mul_tiles_init(c_2, c_4) silently reads wrong data on TT hardware.
 //
 //  Contract:
 //    Caller has cb_wait_front on cb_a and cb_b.
@@ -101,9 +108,10 @@ FORCE_INLINE void fpu_op(
     uint32_t  cb_a,
     uint32_t  cb_b,
     uint32_t  cb_tgt,
-    uint32_t& current_op)
+    uint32_t& last_key)   // packed (op, cb_a, cb_b) from last init
 {
-    if (current_op != OP) {
+    const uint32_t key = make_op_key(OP, cb_a, cb_b);
+    if (last_key != key) {
         if constexpr (OP == OP_ADD) {
             add_tiles_init(cb_a, cb_b);
         } else if constexpr (OP == OP_SUB) {
@@ -111,7 +119,7 @@ FORCE_INLINE void fpu_op(
         } else if constexpr (OP == OP_MUL) {
             mul_tiles_init(cb_a, cb_b);
         }
-        current_op = OP;
+        last_key = key;
     }
 
     tile_regs_acquire();
@@ -157,31 +165,34 @@ FORCE_INLINE void sfpu_neg(uint32_t cb_in, uint32_t cb_tgt)
 //  BORROWS:  cb_a_r, cb_a_i, cb_b_r, cb_b_i  (caller waited, will pop)
 //  PRODUCES: cb_out_r, cb_out_i               (caller must wait+pop)
 //  OWNS tmp: cb_tmp0, cb_tmp1                 (popped internally)
+//
+//  Note: all 4 MUL calls here have DIFFERENT (cb_a, cb_b) pairs.
+//  The last_key guard ensures each gets its own init call.
 // ═══════════════════════════════════════════════════════════════════
 FORCE_INLINE void complex_mul(
     uint32_t  cb_a_r,   uint32_t cb_a_i,
     uint32_t  cb_b_r,   uint32_t cb_b_i,
     uint32_t  cb_out_r, uint32_t cb_out_i,
     uint32_t  cb_tmp0,  uint32_t cb_tmp1,
-    uint32_t& current_op)
+    uint32_t& last_key)
 {
-    // Real: ac - bd
-    fpu_op<OP_MUL>(cb_a_r, cb_b_r, cb_tmp0, current_op);   // tmp0 = ac
-    fpu_op<OP_MUL>(cb_a_i, cb_b_i, cb_tmp1, current_op);   // tmp1 = bd
+    // Real part: ac - bd
+    fpu_op<OP_MUL>(cb_a_r, cb_b_r, cb_tmp0, last_key);  // ac  — init(a_r, b_r)
+    fpu_op<OP_MUL>(cb_a_i, cb_b_i, cb_tmp1, last_key);  // bd  — init(a_i, b_i) ← different CBs, re-inits
 
     cb_wait_front(cb_tmp0, 1);
     cb_wait_front(cb_tmp1, 1);
-    fpu_op<OP_SUB>(cb_tmp0, cb_tmp1, cb_out_r, current_op); // out_r = ac-bd
+    fpu_op<OP_SUB>(cb_tmp0, cb_tmp1, cb_out_r, last_key); // ac-bd
     cb_pop_front(cb_tmp0, 1);
     cb_pop_front(cb_tmp1, 1);
 
-    // Imag: ad + bc
-    fpu_op<OP_MUL>(cb_a_r, cb_b_i, cb_tmp0, current_op);   // tmp0 = ad
-    fpu_op<OP_MUL>(cb_a_i, cb_b_r, cb_tmp1, current_op);   // tmp1 = bc
+    // Imaginary part: ad + bc
+    fpu_op<OP_MUL>(cb_a_r, cb_b_i, cb_tmp0, last_key);  // ad  — init(a_r, b_i) ← different CBs
+    fpu_op<OP_MUL>(cb_a_i, cb_b_r, cb_tmp1, last_key);  // bc  — init(a_i, b_r) ← different CBs
 
     cb_wait_front(cb_tmp0, 1);
     cb_wait_front(cb_tmp1, 1);
-    fpu_op<OP_ADD>(cb_tmp0, cb_tmp1, cb_out_i, current_op); // out_i = ad+bc
+    fpu_op<OP_ADD>(cb_tmp0, cb_tmp1, cb_out_i, last_key); // ad+bc
     cb_pop_front(cb_tmp0, 1);
     cb_pop_front(cb_tmp1, 1);
 }
@@ -205,7 +216,7 @@ FORCE_INLINE void butterfly(
     uint32_t  cb_out1_r,   uint32_t cb_out1_i,
     uint32_t  cb_tmp0,     uint32_t cb_tmp1,
     uint32_t  cb_tw_odd_r, uint32_t cb_tw_odd_i,
-    uint32_t& current_op)
+    uint32_t& last_key)
 {
     // Step 1: W·O[k]  — consume odd input
     cb_wait_front(cb_odd_r, 1);
@@ -216,7 +227,7 @@ FORCE_INLINE void butterfly(
         cb_tw_r,     cb_tw_i,
         cb_tw_odd_r, cb_tw_odd_i,
         cb_tmp0,     cb_tmp1,
-        current_op
+        last_key
     );
 
     cb_pop_front(cb_odd_r, 1);
@@ -224,17 +235,17 @@ FORCE_INLINE void butterfly(
     // tw_r, tw_i NOT popped — caller owns them
 
     // Step 2: butterfly ADD / SUB
-    // Safe to wait on even here — it is a DIFFERENT CB from odd
+    // Safe to wait on even here — DIFFERENT CB from odd
     cb_wait_front(cb_even_r,   1);
     cb_wait_front(cb_even_i,   1);
     cb_wait_front(cb_tw_odd_r, 1);
     cb_wait_front(cb_tw_odd_i, 1);
 
-    fpu_op<OP_ADD>(cb_even_r, cb_tw_odd_r, cb_out0_r, current_op); // X[k] real
-    fpu_op<OP_ADD>(cb_even_i, cb_tw_odd_i, cb_out0_i, current_op); // X[k] imag
+    fpu_op<OP_ADD>(cb_even_r, cb_tw_odd_r, cb_out0_r, last_key); // X[k] real
+    fpu_op<OP_ADD>(cb_even_i, cb_tw_odd_i, cb_out0_i, last_key); // X[k] imag
 
-    fpu_op<OP_SUB>(cb_even_r, cb_tw_odd_r, cb_out1_r, current_op); // X[k+N/2] real
-    fpu_op<OP_SUB>(cb_even_i, cb_tw_odd_i, cb_out1_i, current_op); // X[k+N/2] imag
+    fpu_op<OP_SUB>(cb_even_r, cb_tw_odd_r, cb_out1_r, last_key); // X[k+N/2] real
+    fpu_op<OP_SUB>(cb_even_i, cb_tw_odd_i, cb_out1_i, last_key); // X[k+N/2] imag
 
     cb_pop_front(cb_even_r,   1);
     cb_pop_front(cb_even_i,   1);
@@ -256,7 +267,7 @@ FORCE_INLINE void process_stage(
     uint32_t  cb_neg_tw_i,
     uint32_t  num_tiles,
     bool      is_ifft,
-    uint32_t& current_op)
+    uint32_t& last_key)
 {
     for (uint32_t t = 0; t < num_tiles; t++) {
 
@@ -266,9 +277,9 @@ FORCE_INLINE void process_stage(
             sfpu_neg(cb_tw_i, cb_neg_tw_i);
             cb_pop_front(cb_tw_i, 1);
 
-            // sfpu_neg uses SFPU path — FPU op state is now unknown.
-            // Force re-init on the next fpu_op call.
-            current_op = OP_NONE;
+            // SFPU path invalidates FPU unpacker state entirely.
+            // Force full re-init on next fpu_op by resetting key.
+            last_key = make_op_key(OP_NONE, 0, 0);
 
             cb_wait_front(cb_tw_r,     1);
             cb_wait_front(cb_neg_tw_i, 1);
@@ -281,7 +292,7 @@ FORCE_INLINE void process_stage(
                 cb_out1_r,    cb_out1_i,
                 cb_tmp0,      cb_tmp1,
                 cb_tw_odd_r,  cb_tw_odd_i,
-                current_op
+                last_key
             );
 
             cb_pop_front(cb_tw_r,     1);
@@ -299,7 +310,7 @@ FORCE_INLINE void process_stage(
                 cb_out1_r,    cb_out1_i,
                 cb_tmp0,      cb_tmp1,
                 cb_tw_odd_r,  cb_tw_odd_i,
-                current_op
+                last_key
             );
 
             cb_pop_front(cb_tw_r, 1);
@@ -351,22 +362,23 @@ void kernel_main() {
     constexpr auto cb_neg_tw_i    = tt::CBIndex::c_24;
 
     // ── One-time compute init ──────────────────────────────────────
-    // binary_op_init_common sets up unpacker for both src CBs.
-    // Per-op inits are done lazily inside fpu_op() via current_op.
+    // binary_op_init_common sets up the packer/unpacker infrastructure.
+    // Per-op inits (*_tiles_init) are done lazily inside fpu_op()
+    // whenever the op type OR source CB pair changes.
     binary_op_init_common(cb_in_even_r, cb_in_odd_r, cb_out0_r);
     unary_op_init_common(cb_in_even_r, cb_out0_r);
     copy_tile_to_dst_init_short(cb_in_even_r);
 
     const bool is_ifft = (direction == 1);
 
-    // Tracks the last FPU op initialised.
-    // Prevents re-init with changing CB args — avoids unpacker corruption.
-    uint32_t current_op = OP_NONE;
+    // last_key tracks (op << 16 | cb_a << 8 | cb_b) of last FPU init.
+    // Initialised to an impossible value so first call always inits.
+    uint32_t last_key = make_op_key(OP_NONE, 0, 0);
 
     // ══════════════════════════════════════════════════════════════
     //  STAGE LOOP
     //
-    //  Stage routing:
+    //  Stage routing table:
     //
     //  stage  | src_even        src_odd       | dst X[k]      dst X[k+N/2]
     //  -------+---------------------------------+---------------------------
@@ -374,10 +386,10 @@ void kernel_main() {
     //  1(odd) | ping_even       ping_odd      | pong_even     pong_odd
     //  2(even)| pong_even       pong_odd      | ping_even     ping_odd
     //  ...
-    //  last   | (ping/pong)     (ping/pong)   | c_16/c_17     c_18/c_19
+    //  last   | (ping or pong)  (ping or pong)| c_16/c_17     c_18/c_19
     //
-    //  Special: if num_stages==1, stage 0 IS the last stage.
-    //  The last-stage check takes priority over even/odd routing.
+    //  If num_stages==1: stage 0 is last → dst goes straight to DRAM.
+    //  Last-stage check takes priority over even/odd ping-pong routing.
     // ══════════════════════════════════════════════════════════════
 
     for (uint32_t stage = 0; stage < num_stages; stage++) {
@@ -390,30 +402,37 @@ void kernel_main() {
             src_even_r = cb_in_even_r;   src_even_i = cb_in_even_i;
             src_odd_r  = cb_in_odd_r;    src_odd_i  = cb_in_odd_i;
         } else if ((stage & 1) == 1) {
+            // Odd stage: read from ping
             src_even_r = cb_ping_even_r; src_even_i = cb_ping_even_i;
             src_odd_r  = cb_ping_odd_r;  src_odd_i  = cb_ping_odd_i;
         } else {
+            // Even stage (>=2): read from pong
             src_even_r = cb_pong_even_r; src_even_i = cb_pong_even_i;
             src_odd_r  = cb_pong_odd_r;  src_odd_i  = cb_pong_odd_i;
         }
 
         // ── Destination selection ──────────────────────────────────
-        uint32_t dst0_r, dst0_i;
-        uint32_t dst1_r, dst1_i;
+        uint32_t dst0_r, dst0_i;   // X[k]
+        uint32_t dst1_r, dst1_i;   // X[k+N/2]
 
         if (stage == num_stages - 1) {
-            // Last stage → DRAM output (writer drains to DRAM)
+            // Last stage → DRAM output CBs (writer drains to DRAM)
             dst0_r = cb_out0_r;      dst0_i = cb_out0_i;
             dst1_r = cb_out1_r;      dst1_i = cb_out1_i;
         } else if ((stage & 1) == 0) {
-            // Even stage → ping
+            // Even stage (0, 2, 4…) → write to ping
             dst0_r = cb_ping_even_r; dst0_i = cb_ping_even_i;
             dst1_r = cb_ping_odd_r;  dst1_i = cb_ping_odd_i;
         } else {
-            // Odd stage → pong
+            // Odd stage (1, 3, 5…) → write to pong
             dst0_r = cb_pong_even_r; dst0_i = cb_pong_even_i;
             dst1_r = cb_pong_odd_r;  dst1_i = cb_pong_odd_i;
         }
+
+        // Between stages, the source CBs change completely.
+        // Force FPU re-init at the start of each stage so the
+        // unpacker is correctly configured for the new CB pair.
+        last_key = make_op_key(OP_NONE, 0, 0);
 
         process_stage(
             src_even_r,  src_even_i,
@@ -426,7 +445,7 @@ void kernel_main() {
             cb_neg_tw_i,
             tiles_per_stage,
             is_ifft,
-            current_op
+            last_key
         );
     }
 }
