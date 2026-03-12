@@ -29,7 +29,7 @@
 // ═══════════════════════════════════════════════════════════════════
 
 #include <cstdint>
-#include "api/tiling/dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 void kernel_main() {
 
