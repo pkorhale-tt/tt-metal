@@ -145,17 +145,19 @@ void kernel_main() {
             // Direct RISC-V dereference is synchronous, always ordered,
             // requires no barrier, and is faster for small data (< 1KB).
 
-            // Helper: read one float from L1 address
+            // Helper: read one float from an L1 byte address.
+            // Uses memcpy to avoid strict-aliasing violations.
             auto rd = [](uint32_t addr) -> float {
-                float v;
-                *reinterpret_cast<uint32_t*>(&v) =
-                    *reinterpret_cast<volatile uint32_t*>(addr);
+                uint32_t raw = *reinterpret_cast<volatile uint32_t*>(addr);
+                float v = 0.0f;
+                __builtin_memcpy(&v, &raw, sizeof(float));
                 return v;
             };
-            // Helper: write one float to L1 address
+            // Helper: write one float to an L1 byte address.
             auto wr = [](uint32_t addr, float v) {
-                *reinterpret_cast<volatile uint32_t*>(addr) =
-                    *reinterpret_cast<uint32_t*>(&v);
+                uint32_t raw = 0u;
+                __builtin_memcpy(&raw, &v, sizeof(float));
+                *reinterpret_cast<volatile uint32_t*>(addr) = raw;
             };
 
             // ── new_even ─────────────────────────────────────────
