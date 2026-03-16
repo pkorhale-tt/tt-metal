@@ -2,11 +2,14 @@
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#include <cstdint>
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary.h"
 
+#include <cstdint>
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/negative.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/copy_dest_values.h"
 namespace NAMESPACE {
 void MAIN {
     const uint32_t num_stages      = get_arg_val<uint32_t>(0);
