@@ -133,6 +133,31 @@ void kernel_main() {
             const uint32_t dst_or = get_write_ptr(cb_odd_r);
             const uint32_t dst_oi = get_write_ptr(cb_odd_i);
 
+            // ── Shuffle: direct RISC-V pointer writes (L1-to-L1) ────
+            //
+            // noc_async_write is NOT used here because:
+            //  a) The NOC does not guarantee ordering between two separate
+            //     write bursts to different destinations on the same core.
+            //  b) Both the new_even and new_odd loops issue NOC writes
+            //     concurrently; without a barrier between them the writes
+            //     can land out of order and corrupt both destination CBs.
+            //
+            // Direct RISC-V dereference is synchronous, always ordered,
+            // requires no barrier, and is faster for small data (< 1KB).
+
+            // Helper: read one float from L1 address
+            auto rd = [](uint32_t addr) -> float {
+                float v;
+                *reinterpret_cast<uint32_t*>(&v) =
+                    *reinterpret_cast<volatile uint32_t*>(addr);
+                return v;
+            };
+            // Helper: write one float to L1 address
+            auto wr = [](uint32_t addr, float v) {
+                *reinterpret_cast<volatile uint32_t*>(addr) =
+                    *reinterpret_cast<uint32_t*>(&v);
+            };
+
             // ── new_even ─────────────────────────────────────────
             uint32_t dst = 0;
             for (uint32_t g2 = 0; g2 < G2; g2++) {
@@ -149,11 +174,8 @@ void kernel_main() {
                         idx  = g_old * half_m + (offset - half_m);
                         srcr = src1r; srci = src1i;
                     }
-                    // L1-to-L1 write: 4 bytes at a time
-                    noc_async_write(srcr + idx * ELEM,
-                                    get_noc_addr(dst_er + dst * ELEM), ELEM);
-                    noc_async_write(srci + idx * ELEM,
-                                    get_noc_addr(dst_ei + dst * ELEM), ELEM);
+                    wr(dst_er + dst * ELEM, rd(srcr + idx * ELEM));
+                    wr(dst_ei + dst * ELEM, rd(srci + idx * ELEM));
                     dst++;
                 }
             }
@@ -174,15 +196,12 @@ void kernel_main() {
                         idx  = g_old * half_m + (offset - half_m);
                         srcr = src1r; srci = src1i;
                     }
-                    noc_async_write(srcr + idx * ELEM,
-                                    get_noc_addr(dst_or + dst * ELEM), ELEM);
-                    noc_async_write(srci + idx * ELEM,
-                                    get_noc_addr(dst_oi + dst * ELEM), ELEM);
+                    wr(dst_or + dst * ELEM, rd(srcr + idx * ELEM));
+                    wr(dst_oi + dst * ELEM, rd(srci + idx * ELEM));
                     dst++;
                 }
             }
-
-            noc_async_write_barrier();
+            // No barrier needed — direct RISC-V writes are synchronous.
 
             // Free compute's output slots
             cb_pop_front(cb_out0_r, num_tiles);
