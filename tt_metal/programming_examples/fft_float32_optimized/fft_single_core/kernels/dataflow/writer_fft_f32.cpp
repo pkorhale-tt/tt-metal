@@ -160,46 +160,60 @@ void kernel_main() {
                 *reinterpret_cast<volatile uint32_t*>(addr) = raw;
             };
 
-            // ── new_even ─────────────────────────────────────────
+            // ── Shuffle: single merged loop, bit-ops instead of divide ─
+            //
+            // m is always 2^(stage+1) so division and modulo are free:
+            //   f / m  ==  f >> (stage+1)   (right-shift)
+            //   f % m  ==  f &  (m-1)       (bitmask)
+            // Baby RISC-V has no hardware divider — avoiding / and % here
+            // saves ~40-100 cycles per element per stage.
+            //
+            // The new_even and new_odd loops share the same g2/j2 structure
+            // so they are merged into one pass to halve the loop overhead.
+
+            const uint32_t log2m  = stage + 1;   // log2(m)
+            const uint32_t m_mask = m - 1u;       // bitmask for f % m
+
             uint32_t dst = 0;
             for (uint32_t g2 = 0; g2 < G2; g2++) {
+                const uint32_t base_e = g2 * m2;
+                const uint32_t base_o = base_e + half_m2;
                 for (uint32_t j2 = 0; j2 < half_m2; j2++) {
-                    uint32_t f      = g2 * m2 + j2;
-                    uint32_t g_old  = f / m;
-                    uint32_t offset = f % m;
-                    uint32_t idx;
-                    uint32_t srcr, srci;
-                    if (offset < half_m) {
-                        idx  = g_old * half_m + offset;
-                        srcr = src0r; srci = src0i;
-                    } else {
-                        idx  = g_old * half_m + (offset - half_m);
-                        srcr = src1r; srci = src1i;
-                    }
-                    wr(dst_er + dst * ELEM, rd(srcr + idx * ELEM));
-                    wr(dst_ei + dst * ELEM, rd(srci + idx * ELEM));
-                    dst++;
-                }
-            }
 
-            // ── new_odd ──────────────────────────────────────────
-            dst = 0;
-            for (uint32_t g2 = 0; g2 < G2; g2++) {
-                for (uint32_t j2 = 0; j2 < half_m2; j2++) {
-                    uint32_t f      = g2 * m2 + half_m2 + j2;
-                    uint32_t g_old  = f / m;
-                    uint32_t offset = f % m;
-                    uint32_t idx;
-                    uint32_t srcr, srci;
-                    if (offset < half_m) {
-                        idx  = g_old * half_m + offset;
-                        srcr = src0r; srci = src0i;
-                    } else {
-                        idx  = g_old * half_m + (offset - half_m);
-                        srcr = src1r; srci = src1i;
+                    // ── new_even[dst] ───────────────────────────────
+                    {
+                        uint32_t f      = base_e + j2;
+                        uint32_t g_old  = f >> log2m;
+                        uint32_t offset = f &  m_mask;
+                        uint32_t idx, srcr, srci;
+                        if (offset < half_m) {
+                            idx = g_old * half_m + offset;
+                            srcr = src0r; srci = src0i;
+                        } else {
+                            idx = g_old * half_m + (offset - half_m);
+                            srcr = src1r; srci = src1i;
+                        }
+                        wr(dst_er + dst * ELEM, rd(srcr + idx * ELEM));
+                        wr(dst_ei + dst * ELEM, rd(srci + idx * ELEM));
                     }
-                    wr(dst_or + dst * ELEM, rd(srcr + idx * ELEM));
-                    wr(dst_oi + dst * ELEM, rd(srci + idx * ELEM));
+
+                    // ── new_odd[dst] ────────────────────────────────
+                    {
+                        uint32_t f      = base_o + j2;
+                        uint32_t g_old  = f >> log2m;
+                        uint32_t offset = f &  m_mask;
+                        uint32_t idx, srcr, srci;
+                        if (offset < half_m) {
+                            idx = g_old * half_m + offset;
+                            srcr = src0r; srci = src0i;
+                        } else {
+                            idx = g_old * half_m + (offset - half_m);
+                            srcr = src1r; srci = src1i;
+                        }
+                        wr(dst_or + dst * ELEM, rd(srcr + idx * ELEM));
+                        wr(dst_oi + dst * ELEM, rd(srci + idx * ELEM));
+                    }
+
                     dst++;
                 }
             }
