@@ -330,21 +330,21 @@ int main(int argc, char** argv) {
     // CORRECT:
     auto reader_k = CreateKernel(
         prog,
-        "kernels/dataflow/reader_fft_f32_opt.cpp",
+        "kernels/dataflow/reader_fft_f32.cpp",
         core,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default}
     );
 
     auto writer_k = CreateKernel(
         prog,
-        "kernels/dataflow/writer_fft_f32_opt.cpp",
+        "kernels/dataflow/writer_fft_f32.cpp",
         core,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default}
     );
 
     auto compute_k = CreateKernel(
         prog,
-        "kernels/compute/fft_compute_f32_opt.cpp",
+        "kernels/compute/fft_compute_f32.cpp",
         core,
         ComputeConfig{.math_fidelity = MathFidelity::HiFi2, .fp32_dest_acc_en = true, .math_approx_mode = false}
     );
