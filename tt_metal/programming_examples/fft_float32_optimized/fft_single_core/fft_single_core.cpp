@@ -326,8 +326,6 @@ int main(int argc, char** argv) {
     create_cb(prog, core, 19, tiles, TILE_BYTES);  // out1_i
     
     // ✅ NO tmp CBs (20-23) — compute uses DST registers directly
-    
-    // CORRECT:
     auto reader_k = CreateKernel(
         prog,
         "kernels/dataflow/reader_fft_f32.cpp",
@@ -348,7 +346,7 @@ int main(int argc, char** argv) {
         core,
         ComputeConfig{.math_fidelity = MathFidelity::HiFi2, .fp32_dest_acc_en = true, .math_approx_mode = false}
     );
-    
+
     std::vector<uint32_t> reader_args = {
         b_er->address(), b_ei->address(),
         b_or->address(), b_oi->address(),
