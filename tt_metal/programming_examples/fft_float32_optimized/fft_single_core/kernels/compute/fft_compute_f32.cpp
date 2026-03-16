@@ -17,11 +17,12 @@
 //   4. tw_i_to_use variable removed — all uses replaced with cb_tw_i directly.
 
 #include <cstdint>
-#include "api/compute/common.h"
-#include "api/compute/compute_kernel_api.h"
-#include "api/compute/eltwise_binary.h"
-#include "api/compute/eltwise_unary.h"
 #include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/negative.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/copy_dest_values.h"
 
 void kernel_main() {
     const uint32_t direction       = get_arg_val<uint32_t>(0);
