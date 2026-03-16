@@ -9,17 +9,18 @@
 #include <iomanip>
 #include <cstdint>
 #include <cstring>
-#include "tt_metal/host_api.hpp"
-#include "tt_metal/common/constants.hpp"
-#include "tt_metal/detail/tt_metal.hpp"
-#include "tt_metal/impl/dispatch/command_queue.hpp"
+#include "tt_metal/api/tt-metalium/host_api.hpp"
+#include "tt_metal/api/tt-metalium/constants.hpp"
+#include "tt_metal/api/tt-metalium/distributed.hpp"
+#include "tt_metal/api/tt-metalium/base_types.hpp"
+#include "tt_metal/api/tt-metalium/mesh_workload.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
 
 constexpr float PI = 3.14159265358979323846f;
-constexpr uint32_t TILE_H     = 32;
-constexpr uint32_t TILE_W     = 32;
+constexpr uint32_t TILE_H     = tt::constants::TILE_HEIGHT;
+constexpr uint32_t TILE_W     = tt::constants::TILE_WIDTH;
 constexpr uint32_t TILE_SIZE  = TILE_H * TILE_W;
 constexpr uint32_t TILE_BYTES = TILE_SIZE * sizeof(float);
 
@@ -281,8 +282,8 @@ int main(int argc, char** argv) {
     
     // Device
     int dev_id = 0;
-    Device* device = CreateDevice(dev_id);
-    CommandQueue& cq = device->command_queue();
+    auto mesh = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(dev_id);
+    auto& cq = mesh->mesh_command_queue();
     
     Program prog = CreateProgram();
     CoreCoord core = {0, 0};
@@ -291,17 +292,14 @@ int main(int argc, char** argv) {
     uint32_t tw_bytes = log2N * tiles * TILE_BYTES;
     uint32_t out_bytes = tiles * TILE_BYTES;
     
-    InterleavedBufferConfig dram_config{
-        .device = device,
-        .size = in_bytes,
-        .page_size = TILE_BYTES,
-        .buffer_type = BufferType::DRAM
+    tt::tt_metal::distributed::DeviceLocalBufferConfig dram{
+        .page_size = TILE_BYTES, 
+        .buffer_type = tt::tt_metal::BufferType::DRAM
     };
     
-    auto mk = [&](uint32_t size) {
-        InterleavedBufferConfig cfg = dram_config;
-        cfg.size = size;
-        return CreateBuffer(cfg);
+    auto mk = [&](uint32_t b) {
+        tt::tt_metal::distributed::ReplicatedBufferConfig rc{.size = b};
+        return tt::tt_metal::distributed::MeshBuffer::create(rc, dram, mesh.get());
     };
     
     auto b_er = mk(in_bytes), b_ei = mk(in_bytes);
@@ -365,31 +363,37 @@ int main(int argc, char** argv) {
     
     std::vector<uint32_t> compute_args = {log2N, tiles};
     
-    SetRuntimeArgs(prog, reader_k, core, reader_args);
-    SetRuntimeArgs(prog, writer_k, core, writer_args);
-    SetRuntimeArgs(prog, compute_k, core, compute_args);
+    tt::tt_metal::distributed::MeshWorkload wl;
+    tt::tt_metal::distributed::MeshCoordinateRange rng =
+        tt::tt_metal::distributed::MeshCoordinateRange(mesh->shape());
+    wl.add_program(rng, std::move(prog));
+    auto& p = wl.get_programs().begin()->second;
+    
+    SetRuntimeArgs(p, reader_k, core, reader_args);
+    SetRuntimeArgs(p, writer_k, core, writer_args);
+    SetRuntimeArgs(p, compute_k, core, compute_args);
     
     std::cout << "Writing inputs to DRAM...\n";
-    EnqueueWriteBuffer(cq, b_er, even_r_t, false);
-    EnqueueWriteBuffer(cq, b_ei, even_i_t, false);
-    EnqueueWriteBuffer(cq, b_or, odd_r_t, false);
-    EnqueueWriteBuffer(cq, b_oi, odd_i_t, false);
-    EnqueueWriteBuffer(cq, b_tr, tw_r_t, false);
-    EnqueueWriteBuffer(cq, b_ti, tw_i_t, false);
+    using namespace tt::tt_metal::distributed;
+    EnqueueWriteMeshBuffer(cq, b_er, even_r_t, false);
+    EnqueueWriteMeshBuffer(cq, b_ei, even_i_t, false);
+    EnqueueWriteMeshBuffer(cq, b_or, odd_r_t, false);
+    EnqueueWriteMeshBuffer(cq, b_oi, odd_i_t, false);
+    EnqueueWriteMeshBuffer(cq, b_tr, tw_r_t, false);
+    EnqueueWriteMeshBuffer(cq, b_ti, tw_i_t, false);
     Finish(cq);
     
     std::cout << "Launching FFT kernel (" << log2N << " stages on device)...\n";
-    EnqueueProgram(cq, prog, false);
-    Finish(cq);
+    EnqueueMeshWorkload(cq, wl, true);
     std::cout << "Kernel complete.\n";
     
     std::vector<uint32_t> o0r_raw(tiles * TILE_SIZE), o0i_raw(tiles * TILE_SIZE);
     std::vector<uint32_t> o1r_raw(tiles * TILE_SIZE), o1i_raw(tiles * TILE_SIZE);
     
-    EnqueueReadBuffer(cq, b_o0r, o0r_raw, true);
-    EnqueueReadBuffer(cq, b_o0i, o0i_raw, true);
-    EnqueueReadBuffer(cq, b_o1r, o1r_raw, true);
-    EnqueueReadBuffer(cq, b_o1i, o1i_raw, true);
+    EnqueueReadMeshBuffer(cq, o0r_raw, b_o0r, true);
+    EnqueueReadMeshBuffer(cq, o0i_raw, b_o0i, true);
+    EnqueueReadMeshBuffer(cq, o1r_raw, b_o1r, true);
+    EnqueueReadMeshBuffer(cq, o1i_raw, b_o1i, true);
     
     auto o0r = unpack_tiles(o0r_raw, half_N);
     auto o0i = unpack_tiles(o0i_raw, half_N);
@@ -447,7 +451,7 @@ int main(int argc, char** argv) {
                   << std::setw(12) << std::abs(ref_i[i]) << "j\n";
     }
     
-    CloseDevice(device);
+    mesh->close();
     
     std::cout << "\n═══════════════════════════════════════\n Done\n";
     std::cout << "═══════════════════════════════════════\n";
