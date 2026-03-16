@@ -47,19 +47,17 @@
 //  23  cb_tw_odd_i   scratch
 
 #include <cstdint>
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary_sfpu.h"
-#include "compute_kernel_api/eltwise_unary/sfpu_split_includes.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/eltwise_unary/negative.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/negative.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/copy_dest_values.h"
 
 // Hardware DMA register instructions for PACK/MATH/UNPACK parallel copy
 #include "ckernel.h"
 #include "ckernel_defs.h"
 #include "noc_nonblocking_api.h"
-
-namespace NAMESPACE {
 
 // ── Low-level 32-bit load: reads one float (4 bytes) from an L1 address
 // into hardware data register DATA_REG using DMA register ADDR_REG/BASE_REG.
@@ -129,25 +127,25 @@ inline void shuffle_element(
     ));
 }
 
-void MAIN {
+void kernel_main() {
     const uint32_t num_stages      = get_arg_val<uint32_t>(0);
     const uint32_t tiles_per_stage = get_arg_val<uint32_t>(1);
     const uint32_t half_N          = get_arg_val<uint32_t>(2);  // N/2 elements
 
-    constexpr uint32_t cb_even_r   = tt::CBIndex::c_0;
-    constexpr uint32_t cb_even_i   = tt::CBIndex::c_1;
-    constexpr uint32_t cb_odd_r    = tt::CBIndex::c_2;
-    constexpr uint32_t cb_odd_i    = tt::CBIndex::c_3;
-    constexpr uint32_t cb_tw_r     = tt::CBIndex::c_4;
-    constexpr uint32_t cb_tw_i     = tt::CBIndex::c_5;
-    constexpr uint32_t cb_out0_r   = tt::CBIndex::c_16;
-    constexpr uint32_t cb_out0_i   = tt::CBIndex::c_17;
-    constexpr uint32_t cb_out1_r   = tt::CBIndex::c_18;
-    constexpr uint32_t cb_out1_i   = tt::CBIndex::c_19;
-    constexpr uint32_t cb_tmp0     = tt::CBIndex::c_20;
-    constexpr uint32_t cb_tmp1     = tt::CBIndex::c_21;
-    constexpr uint32_t cb_tw_odd_r = tt::CBIndex::c_22;
-    constexpr uint32_t cb_tw_odd_i = tt::CBIndex::c_23;
+    constexpr uint32_t cb_even_r   = 0;
+    constexpr uint32_t cb_even_i   = 1;
+    constexpr uint32_t cb_odd_r    = 2;
+    constexpr uint32_t cb_odd_i    = 3;
+    constexpr uint32_t cb_tw_r     = 4;
+    constexpr uint32_t cb_tw_i     = 5;
+    constexpr uint32_t cb_out0_r   = 16;
+    constexpr uint32_t cb_out0_i   = 17;
+    constexpr uint32_t cb_out1_r   = 18;
+    constexpr uint32_t cb_out1_i   = 19;
+    constexpr uint32_t cb_tmp0     = 20;
+    constexpr uint32_t cb_tmp1     = 21;
+    constexpr uint32_t cb_tw_odd_r = 22;
+    constexpr uint32_t cb_tw_odd_i = 23;
 
     constexpr uint32_t ELEM = sizeof(float);  // 4 bytes
 
@@ -359,5 +357,3 @@ void MAIN {
         }
     }
 }
-
-} // namespace NAMESPACE
