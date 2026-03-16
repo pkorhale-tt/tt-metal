@@ -208,11 +208,14 @@ void prepare_stage0_input(
     std::vector<float> even_r(half_N), even_i(half_N);
     std::vector<float> odd_r(half_N),  odd_i(half_N);
 
+    // FIX: split by stride-2 (even-indexed / odd-indexed elements),
+    // NOT by first-half / second-half.  After bit-reversal the DIT butterfly
+    // expects even[i] = src[2*i] and odd[i] = src[2*i+1].
     for (uint32_t i = 0; i < half_N; i++) {
-        even_r[i] = src_r[i];
-        even_i[i] = src_i[i];
-        odd_r[i]  = src_r[i + half_N];
-        odd_i[i]  = src_i[i + half_N];
+        even_r[i] = src_r[2 * i];
+        even_i[i] = src_i[2 * i];
+        odd_r[i]  = src_r[2 * i + 1];
+        odd_i[i]  = src_i[2 * i + 1];
     }
 
     even_r_tiles = pack_tiles(even_r, tiles_per_stage);
