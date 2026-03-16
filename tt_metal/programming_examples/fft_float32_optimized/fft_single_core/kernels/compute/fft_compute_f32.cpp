@@ -3,18 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Changes vs original:
-//   1. direction is evaluated ONCE above all loops into is_ifft (bool).
-//      Original code re-evaluated "if (direction == 1)" every tile×stage —
-//      needless branch on a value that never changes.
-//   2. IFFT per-tile twiddle negation branch removed entirely.
-//      The host now pre-negates tw_i when direction==1 before upload, so
-//      cb_tw_i already holds the correct sign.  Deleted: cb_reserve_back,
-//      tile_regs_acquire/commit/wait/release, copy_tile, negative_tile,
-//      pack_tile, cb_push_back, cb_wait_front for cb_neg_tw_i — that is
-//      9 extra API calls per tile per stage saved on the IFFT path.
-//   3. cb_neg_tw_i (CB 24) no longer referenced here.  Its CreateCircularBuffer
-//      call should also be removed on the host (frees 4 KB of L1 SRAM).
-//   4. tw_i_to_use variable removed — all uses replaced with cb_tw_i directly.
+//   1. direction evaluated ONCE — inner loop no longer branches on it.
+//   2. IFFT per-tile twiddle negation removed — host pre-negates tw_i.
+//   3. cb_neg_tw_i (CB 24) removed entirely.
+//   4. Updated API: binary_op_init_common / mul_tiles_init / add_tiles_init /
+//      sub_tiles_init all now take a third ocb argument (output CB).
 
 #include <cstdint>
 #include "api/compute/tile_move_copy.h"
@@ -29,11 +22,8 @@ void kernel_main() {
     const uint32_t num_stages      = get_arg_val<uint32_t>(1);
     const uint32_t tiles_per_stage = get_arg_val<uint32_t>(2);
 
-    // Evaluate direction ONCE — never changes during kernel execution.
-    // Keeping it for potential future use (e.g. post-IFFT 1/N scaling flag),
-    // but the inner loop no longer branches on it.
-    // NOTE: actual twiddle sign flip for IFFT is now done on the host.
-    (void)direction;  // suppress unused-variable warning if no other use
+    // direction no longer used inside kernel — twiddle sign baked on host.
+    (void)direction;
 
     // CB indices
     constexpr uint32_t cb_in_even_r   = 0;
@@ -41,7 +31,7 @@ void kernel_main() {
     constexpr uint32_t cb_in_odd_r    = 2;
     constexpr uint32_t cb_in_odd_i    = 3;
     constexpr uint32_t cb_tw_r        = 4;
-    constexpr uint32_t cb_tw_i        = 5;   // sign already correct for FFT or IFFT
+    constexpr uint32_t cb_tw_i        = 5;
     constexpr uint32_t cb_pong_odd_r  = 6;
     constexpr uint32_t cb_pong_odd_i  = 7;
     constexpr uint32_t cb_ping_even_r = 10;
@@ -54,16 +44,14 @@ void kernel_main() {
     constexpr uint32_t cb_out0_i      = 17;
     constexpr uint32_t cb_out1_r      = 18;
     constexpr uint32_t cb_out1_i      = 19;
+    constexpr uint32_t cb_tmp0        = 20;
+    constexpr uint32_t cb_tmp1        = 21;
+    constexpr uint32_t cb_tw_odd_r    = 22;
+    constexpr uint32_t cb_tw_odd_i    = 23;
+    // CB 24 removed — IFFT negation now done on host.
 
-    // Scratch CBs for intermediate computation
-    constexpr uint32_t cb_tmp0     = 20;  // tw_r * odd_r
-    constexpr uint32_t cb_tmp1     = 21;  // tw_i * odd_i
-    constexpr uint32_t cb_tw_odd_r = 22;  // t_r = tw_r*odd_r - tw_i*odd_i
-    constexpr uint32_t cb_tw_odd_i = 23;  // t_i = tw_r*odd_i + tw_i*odd_r
-    // CB 24 (cb_neg_tw_i) removed — negation now done on host.
-
-    // Initialize binary compute engine once.
-    binary_op_init_common(cb_in_even_r, cb_in_odd_r);
+    // One-time init: icb0, icb1, ocb  (updated 3-arg API)
+    binary_op_init_common(cb_in_even_r, cb_in_odd_r, cb_tmp0);
 
     for (uint32_t stage = 0; stage < num_stages; stage++) {
 
@@ -93,28 +81,19 @@ void kernel_main() {
         uint32_t dst1_r, dst1_i;
 
         if (stage == num_stages - 1) {
-            dst0_r = cb_out0_r;
-            dst0_i = cb_out0_i;
-            dst1_r = cb_out1_r;
-            dst1_i = cb_out1_i;
+            dst0_r = cb_out0_r;  dst0_i = cb_out0_i;
+            dst1_r = cb_out1_r;  dst1_i = cb_out1_i;
         } else if ((stage & 1) == 0) {
-            dst0_r = cb_ping_even_r;
-            dst0_i = cb_ping_even_i;
-            dst1_r = cb_ping_odd_r;
-            dst1_i = cb_ping_odd_i;
+            dst0_r = cb_ping_even_r;  dst0_i = cb_ping_even_i;
+            dst1_r = cb_ping_odd_r;   dst1_i = cb_ping_odd_i;
         } else {
-            dst0_r = cb_pong_even_r;
-            dst0_i = cb_pong_even_i;
-            dst1_r = cb_pong_odd_r;
-            dst1_i = cb_pong_odd_i;
+            dst0_r = cb_pong_even_r;  dst0_i = cb_pong_even_i;
+            dst1_r = cb_pong_odd_r;   dst1_i = cb_pong_odd_i;
         }
 
         // ── Process all tiles in this stage ───────────────────────
         for (uint32_t t = 0; t < tiles_per_stage; t++) {
 
-            // ════════════════════════════════════════════════════════
-            // Wait for all inputs
-            // ════════════════════════════════════════════════════════
             cb_wait_front(cb_tw_r,    1);
             cb_wait_front(cb_tw_i,    1);
             cb_wait_front(src_odd_r,  1);
@@ -123,18 +102,13 @@ void kernel_main() {
             cb_wait_front(src_even_i, 1);
 
             // ════════════════════════════════════════════════════════
-            // Step 1: Compute t_r = tw_r * odd_r - tw_i * odd_i
-            //
-            // cb_tw_i already holds the correct sign:
-            //   forward FFT → host stored  -sin(angle)
-            //   inverse FFT → host stored  +sin(angle)  (conjugate)
-            // No per-tile negation branch needed here.
+            // Step 1: t_r = tw_r * odd_r  -  tw_i * odd_i
             // ════════════════════════════════════════════════════════
 
             // tmp0 = tw_r * odd_r
             cb_reserve_back(cb_tmp0, 1);
             tile_regs_acquire();
-            mul_tiles_init(cb_tw_r, src_odd_r);
+            mul_tiles_init(cb_tw_r, src_odd_r, cb_tmp0);
             mul_tiles(cb_tw_r, src_odd_r, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -145,7 +119,7 @@ void kernel_main() {
             // tmp1 = tw_i * odd_i
             cb_reserve_back(cb_tmp1, 1);
             tile_regs_acquire();
-            mul_tiles_init(cb_tw_i, src_odd_i);
+            mul_tiles_init(cb_tw_i, src_odd_i, cb_tmp1);
             mul_tiles(cb_tw_i, src_odd_i, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -158,7 +132,7 @@ void kernel_main() {
             cb_wait_front(cb_tmp1, 1);
             cb_reserve_back(cb_tw_odd_r, 1);
             tile_regs_acquire();
-            sub_tiles_init(cb_tmp0, cb_tmp1);
+            sub_tiles_init(cb_tmp0, cb_tmp1, cb_tw_odd_r);
             sub_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -169,13 +143,13 @@ void kernel_main() {
             cb_pop_front(cb_tmp1, 1);
 
             // ════════════════════════════════════════════════════════
-            // Step 2: Compute t_i = tw_r * odd_i + tw_i * odd_r
+            // Step 2: t_i = tw_r * odd_i  +  tw_i * odd_r
             // ════════════════════════════════════════════════════════
 
             // tmp0 = tw_r * odd_i
             cb_reserve_back(cb_tmp0, 1);
             tile_regs_acquire();
-            mul_tiles_init(cb_tw_r, src_odd_i);
+            mul_tiles_init(cb_tw_r, src_odd_i, cb_tmp0);
             mul_tiles(cb_tw_r, src_odd_i, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -186,7 +160,7 @@ void kernel_main() {
             // tmp1 = tw_i * odd_r
             cb_reserve_back(cb_tmp1, 1);
             tile_regs_acquire();
-            mul_tiles_init(cb_tw_i, src_odd_r);
+            mul_tiles_init(cb_tw_i, src_odd_r, cb_tmp1);
             mul_tiles(cb_tw_i, src_odd_r, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -199,7 +173,7 @@ void kernel_main() {
             cb_wait_front(cb_tmp1, 1);
             cb_reserve_back(cb_tw_odd_i, 1);
             tile_regs_acquire();
-            add_tiles_init(cb_tmp0, cb_tmp1);
+            add_tiles_init(cb_tmp0, cb_tmp1, cb_tw_odd_i);
             add_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -210,7 +184,7 @@ void kernel_main() {
             cb_pop_front(cb_tmp1, 1);
 
             // ════════════════════════════════════════════════════════
-            // Step 3: Compute out0 = even + t
+            // Step 3: out0 = even + t
             // ════════════════════════════════════════════════════════
             cb_wait_front(cb_tw_odd_r, 1);
             cb_wait_front(cb_tw_odd_i, 1);
@@ -218,7 +192,7 @@ void kernel_main() {
             // out0_r = even_r + tw_odd_r
             cb_reserve_back(dst0_r, 1);
             tile_regs_acquire();
-            add_tiles_init(src_even_r, cb_tw_odd_r);
+            add_tiles_init(src_even_r, cb_tw_odd_r, dst0_r);
             add_tiles(src_even_r, cb_tw_odd_r, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -229,7 +203,7 @@ void kernel_main() {
             // out0_i = even_i + tw_odd_i
             cb_reserve_back(dst0_i, 1);
             tile_regs_acquire();
-            add_tiles_init(src_even_i, cb_tw_odd_i);
+            add_tiles_init(src_even_i, cb_tw_odd_i, dst0_i);
             add_tiles(src_even_i, cb_tw_odd_i, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -238,13 +212,13 @@ void kernel_main() {
             cb_push_back(dst0_i, 1);
 
             // ════════════════════════════════════════════════════════
-            // Step 4: Compute out1 = even - t
+            // Step 4: out1 = even - t
             // ════════════════════════════════════════════════════════
 
             // out1_r = even_r - tw_odd_r
             cb_reserve_back(dst1_r, 1);
             tile_regs_acquire();
-            sub_tiles_init(src_even_r, cb_tw_odd_r);
+            sub_tiles_init(src_even_r, cb_tw_odd_r, dst1_r);
             sub_tiles(src_even_r, cb_tw_odd_r, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -255,7 +229,7 @@ void kernel_main() {
             // out1_i = even_i - tw_odd_i
             cb_reserve_back(dst1_i, 1);
             tile_regs_acquire();
-            sub_tiles_init(src_even_i, cb_tw_odd_i);
+            sub_tiles_init(src_even_i, cb_tw_odd_i, dst1_i);
             sub_tiles(src_even_i, cb_tw_odd_i, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
@@ -266,12 +240,12 @@ void kernel_main() {
             // ════════════════════════════════════════════════════════
             // Step 5: Pop all consumed inputs
             // ════════════════════════════════════════════════════════
-            cb_pop_front(cb_tw_r,    1);
-            cb_pop_front(cb_tw_i,    1);
-            cb_pop_front(src_odd_r,  1);
-            cb_pop_front(src_odd_i,  1);
-            cb_pop_front(src_even_r, 1);
-            cb_pop_front(src_even_i, 1);
+            cb_pop_front(cb_tw_r,     1);
+            cb_pop_front(cb_tw_i,     1);
+            cb_pop_front(src_odd_r,   1);
+            cb_pop_front(src_odd_i,   1);
+            cb_pop_front(src_even_r,  1);
+            cb_pop_front(src_even_i,  1);
             cb_pop_front(cb_tw_odd_r, 1);
             cb_pop_front(cb_tw_odd_i, 1);
         }
