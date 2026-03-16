@@ -1,6 +1,17 @@
-// fft_single_core_opt.cpp
+// fft_single_core_opt.cpp  — OPTIMISED
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Changes vs original:
+//   1. precompute_all_twiddles() now accepts `direction` and pre-applies the
+//      conjugate sign for IFFT (negates the imaginary part of every twiddle
+//      before upload).  The compute kernel no longer needs to negate tw_i
+//      per-tile — the branch and CB 24 (cb_neg_tw_i) are gone.
+//   2. CB depths for twiddle CBs (4,5) and output CBs (16-19) are set to
+//      tiles_per_stage instead of the fixed IO_DEPTH=2.  This lets the
+//      batched reader push/pop a full stage at once without deadlocking.
+//   3. CB 24 (cb_neg_tw_i) no longer created — frees 4 KB of L1 SRAM.
+//   4. compute_args no longer passes direction (kernel ignores it now).
 
 #include <cmath>
 #include <fstream>
@@ -47,7 +58,8 @@ inline float u2f(uint32_t u) {
 // ════════════════════════════════════════════════════════════════════
 //  UTILITY: pack floats into uint32 tile vector
 // ════════════════════════════════════════════════════════════════════
-std::vector<uint32_t> pack_tiles(const std::vector<float>& data, uint32_t num_tiles) {
+std::vector<uint32_t> pack_tiles(const std::vector<float>& data,
+                                  uint32_t num_tiles) {
     std::vector<uint32_t> out(num_tiles * TILE_SIZE, 0);
     for (uint32_t i = 0; i < data.size() && i < out.size(); i++) {
         out[i] = f2u(data[i]);
@@ -58,7 +70,8 @@ std::vector<uint32_t> pack_tiles(const std::vector<float>& data, uint32_t num_ti
 // ════════════════════════════════════════════════════════════════════
 //  UTILITY: unpack uint32 tile vector to floats
 // ════════════════════════════════════════════════════════════════════
-std::vector<float> unpack_tiles(const std::vector<uint32_t>& data, uint32_t num_elements) {
+std::vector<float> unpack_tiles(const std::vector<uint32_t>& data,
+                                 uint32_t num_elements) {
     std::vector<float> out(num_elements);
     for (uint32_t i = 0; i < num_elements && i < data.size(); i++) {
         out[i] = u2f(data[i]);
@@ -78,7 +91,9 @@ uint32_t bit_reverse(uint32_t x, uint32_t log2n) {
     return r;
 }
 
-void bit_reverse_permutation(std::vector<float>& real, std::vector<float>& imag, uint32_t N) {
+void bit_reverse_permutation(std::vector<float>& real,
+                              std::vector<float>& imag,
+                              uint32_t N) {
     uint32_t log2n = 0;
     while ((1u << log2n) < N) log2n++;
 
@@ -125,7 +140,7 @@ void cpu_fft(std::vector<float>& real, std::vector<float>& imag, bool inv) {
         }
     }
 
-        if (inv) {
+    if (inv) {
         for (uint32_t i = 0; i < N; i++) {
             real[i] /= N;
             imag[i] /= N;
@@ -135,12 +150,23 @@ void cpu_fft(std::vector<float>& real, std::vector<float>& imag, bool inv) {
 
 // ════════════════════════════════════════════════════════════════════
 //  PRECOMPUTE ALL TWIDDLE FACTORS FOR ALL STAGES
+//
+//  CHANGED: now accepts `direction`.
+//  For forward FFT (direction==0): angle = -2π·j/m  → wi = sin(-2π·j/m)
+//  For inverse FFT (direction==1): angle = +2π·j/m  → wi = sin(+2π·j/m)
+//  The sign flip (conjugate twiddle) is baked in here on the host so the
+//  compute kernel never needs to negate tw_i per-tile.
 // ════════════════════════════════════════════════════════════════════
 std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
-precompute_all_twiddles(uint32_t N, uint32_t log2N, uint32_t tiles_per_stage) {
+precompute_all_twiddles(uint32_t N, uint32_t log2N,
+                        uint32_t tiles_per_stage, uint32_t direction) {
     const uint32_t total_tiles = log2N * tiles_per_stage;
     std::vector<uint32_t> tw_r(total_tiles * TILE_SIZE, 0);
     std::vector<uint32_t> tw_i(total_tiles * TILE_SIZE, 0);
+
+    // sign = -1 → forward FFT angle (-2π·j/m)
+    // sign = +1 → inverse FFT angle (+2π·j/m)  [conjugate twiddle]
+    const float sign = (direction == 1) ? 1.0f : -1.0f;
 
     for (uint32_t stage = 0; stage < log2N; stage++) {
         uint32_t m = 1u << (stage + 1);
@@ -149,7 +175,7 @@ precompute_all_twiddles(uint32_t N, uint32_t log2N, uint32_t tiles_per_stage) {
 
         for (uint32_t k = 0; k < N; k += m) {
             for (uint32_t j = 0; j < half_m; j++) {
-                float angle = -2.0f * PI * (float)j / (float)m;
+                float angle = sign * 2.0f * PI * (float)j / (float)m;
                 float wr = std::cos(angle);
                 float wi = std::sin(angle);
 
@@ -180,30 +206,26 @@ void prepare_stage0_input(
     const uint32_t half_N = N / 2;
 
     std::vector<float> even_r(half_N), even_i(half_N);
-    std::vector<float> odd_r(half_N), odd_i(half_N);
+    std::vector<float> odd_r(half_N),  odd_i(half_N);
 
     for (uint32_t i = 0; i < half_N; i++) {
         even_r[i] = src_r[i];
         even_i[i] = src_i[i];
-        odd_r[i] = src_r[i + half_N];
-        odd_i[i] = src_i[i + half_N];
+        odd_r[i]  = src_r[i + half_N];
+        odd_i[i]  = src_i[i + half_N];
     }
 
     even_r_tiles = pack_tiles(even_r, tiles_per_stage);
     even_i_tiles = pack_tiles(even_i, tiles_per_stage);
-    odd_r_tiles = pack_tiles(odd_r, tiles_per_stage);
-    odd_i_tiles = pack_tiles(odd_i, tiles_per_stage);
+    odd_r_tiles  = pack_tiles(odd_r,  tiles_per_stage);
+    odd_i_tiles  = pack_tiles(odd_i,  tiles_per_stage);
 }
 
 // ════════════════════════════════════════════════════════════════════
 //  CREATE CIRCULAR BUFFER HELPER
 // ════════════════════════════════════════════════════════════════════
-void create_cb(
-    Program& program,
-    CoreCoord core,
-    uint32_t cb_id,
-    uint32_t num_tiles,
-    uint32_t tile_bytes)
+void create_cb(Program& program, CoreCoord core,
+               uint32_t cb_id, uint32_t num_tiles, uint32_t tile_bytes)
 {
     CircularBufferConfig cfg =
         CircularBufferConfig(
@@ -232,9 +254,7 @@ bool read_input_file(
     std::vector<float> vals;
     std::string token;
     while (f >> token) {
-        if (!token.empty() && token.back() == ',') {
-            token.pop_back();
-        }
+        if (!token.empty() && token.back() == ',') token.pop_back();
         if (token.empty()) continue;
         try {
             vals.push_back(std::stof(token));
@@ -255,27 +275,33 @@ bool read_input_file(
     if (N_from_cmdline) {
         if (count == 2 * N) {
             interleaved = true;
-            std::cout << " File mode     : interleaved real+imag (" << count << " values → N=" << N << ")\n";
+            std::cout << " File mode     : interleaved real+imag ("
+                      << count << " values → N=" << N << ")\n";
         } else if (count == N) {
-            std::cout << " File mode     : real-only (" << count << " values, imag=0)\n";
+            std::cout << " File mode     : real-only ("
+                      << count << " values, imag=0)\n";
         } else if (count < N) {
-            std::cerr << "File has " << count << " values but N=" << N << " — padding with zeros.\n";
+            std::cerr << "File has " << count
+                      << " values but N=" << N << " — padding with zeros.\n";
         } else {
-            std::cerr << "File has " << count << " values but N=" << N << " — truncating to N.\n";
+            std::cerr << "File has " << count
+                      << " values but N=" << N << " — truncating to N.\n";
             count = N;
             vals.resize(N);
         }
     } else {
         N = 1;
         while (N < count) N <<= 1;
-        std::cout << " File mode     : real-only (" << count << " values, N inferred as " << N << ")\n";
+        std::cout << " File mode     : real-only (" << count
+                  << " values, N inferred as " << N << ")\n";
     }
 
     input_r.assign(N, 0.f);
     input_i.assign(N, 0.f);
 
     if (interleaved) {
-        for (uint32_t i = 0; i < N && 2 * i + 1 < (uint32_t)vals.size(); i++) {
+        for (uint32_t i = 0;
+             i < N && 2 * i + 1 < (uint32_t)vals.size(); i++) {
             input_r[i] = vals[2 * i];
             input_i[i] = vals[2 * i + 1];
         }
@@ -298,7 +324,8 @@ int main(int argc, char** argv) {
     bool N_from_cmdline = false;
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <direction 0|1> [input_file] [N]\n";
+        std::cerr << "Usage: " << argv[0]
+                  << " <direction 0|1> [input_file] [N]\n";
         return 1;
     }
 
@@ -338,7 +365,6 @@ int main(int argc, char** argv) {
         if (!read_input_file(in_file, N, N_from_cmdline, input_r, input_i)) {
             return 1;
         }
-
         log2N = 0;
         while ((1u << log2N) < N) log2N++;
         half_N = N / 2;
@@ -347,7 +373,8 @@ int main(int argc, char** argv) {
         input_i.resize(N, 0.f);
 
         if (N < 2 || (N & (N - 1)) != 0) {
-            std::cerr << "Inferred N=" << N << " is not a valid power-of-2 >= 2\n";
+            std::cerr << "Inferred N=" << N
+                      << " is not a valid power-of-2 >= 2\n";
             return 1;
         }
     } else {
@@ -375,7 +402,10 @@ int main(int argc, char** argv) {
     bit_reverse_permutation(input_r, input_i, N);
 
     // ── Precompute ALL twiddles for ALL stages (once) ─────────────
-    auto [tw_r_tiles, tw_i_tiles] = precompute_all_twiddles(N, log2N, tiles_per_stage);
+    // CHANGED: pass direction so IFFT conjugate sign is baked in here.
+    // The compute kernel no longer needs to negate tw_i per-tile.
+    auto [tw_r_tiles, tw_i_tiles] =
+        precompute_all_twiddles(N, log2N, tiles_per_stage, direction);
 
     // ── Prepare stage 0 even/odd split ────────────────────────────
     std::vector<uint32_t> even_r_t, even_i_t, odd_r_t, odd_i_t;
@@ -385,104 +415,108 @@ int main(int argc, char** argv) {
 
     // ── Device setup ──────────────────────────────────────────────
     int device_id = 0;
-    auto mesh_device = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
+    auto mesh_device =
+        tt::tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
     auto& cq = mesh_device->mesh_command_queue();
 
     Program program = CreateProgram();
     CoreCoord core = {0, 0};
 
     // ── DRAM buffer sizes ─────────────────────────────────────────
-    uint32_t input_buf_bytes = tiles_per_stage * TILE_BYTES;
+    uint32_t input_buf_bytes   = tiles_per_stage * TILE_BYTES;
     uint32_t twiddle_buf_bytes = log2N * tiles_per_stage * TILE_BYTES;
-    uint32_t output_buf_bytes = tiles_per_stage * TILE_BYTES;
+    uint32_t output_buf_bytes  = tiles_per_stage * TILE_BYTES;
 
     tt::tt_metal::distributed::DeviceLocalBufferConfig dram_cfg{
-        .page_size = TILE_BYTES,
+        .page_size   = TILE_BYTES,
         .buffer_type = tt::tt_metal::BufferType::DRAM
     };
 
     auto mk_buf = [&](uint32_t bytes) {
         tt::tt_metal::distributed::ReplicatedBufferConfig rcfg{.size = bytes};
-        return tt::tt_metal::distributed::MeshBuffer::create(rcfg, dram_cfg, mesh_device.get());
+        return tt::tt_metal::distributed::MeshBuffer::create(
+            rcfg, dram_cfg, mesh_device.get());
     };
 
-    auto buf_even_r = mk_buf(input_buf_bytes);
-    auto buf_even_i = mk_buf(input_buf_bytes);
-    auto buf_odd_r = mk_buf(input_buf_bytes);
-    auto buf_odd_i = mk_buf(input_buf_bytes);
-    auto buf_tw_r = mk_buf(twiddle_buf_bytes);
-    auto buf_tw_i = mk_buf(twiddle_buf_bytes);
-    auto buf_out0_r = mk_buf(output_buf_bytes);
-    auto buf_out0_i = mk_buf(output_buf_bytes);
-    auto buf_out1_r = mk_buf(output_buf_bytes);
-    auto buf_out1_i = mk_buf(output_buf_bytes);
+    auto buf_even_r  = mk_buf(input_buf_bytes);
+    auto buf_even_i  = mk_buf(input_buf_bytes);
+    auto buf_odd_r   = mk_buf(input_buf_bytes);
+    auto buf_odd_i   = mk_buf(input_buf_bytes);
+    auto buf_tw_r    = mk_buf(twiddle_buf_bytes);
+    auto buf_tw_i    = mk_buf(twiddle_buf_bytes);
+    auto buf_out0_r  = mk_buf(output_buf_bytes);
+    auto buf_out0_i  = mk_buf(output_buf_bytes);
+    auto buf_out1_r  = mk_buf(output_buf_bytes);
+    auto buf_out1_i  = mk_buf(output_buf_bytes);
 
     // ── Circular buffers ──────────────────────────────────────────
-    constexpr uint32_t IO_DEPTH = 2;
+    //
+    // CHANGED: CB depths are now set to tiles_per_stage (not a fixed 2)
+    // so that batched reader/writer can push/pop a full stage at once.
+    //
+    // Input CBs (stage 0 even/odd) — depth = tiles_per_stage
+    create_cb(program, core,  0, tiles_per_stage, TILE_BYTES);  // cb_in_even_r
+    create_cb(program, core,  1, tiles_per_stage, TILE_BYTES);  // cb_in_even_i
+    create_cb(program, core,  2, tiles_per_stage, TILE_BYTES);  // cb_in_odd_r
+    create_cb(program, core,  3, tiles_per_stage, TILE_BYTES);  // cb_in_odd_i
+
+    // Twiddle CBs — depth = tiles_per_stage (same reason)
+    create_cb(program, core,  4, tiles_per_stage, TILE_BYTES);  // cb_tw_r
+    create_cb(program, core,  5, tiles_per_stage, TILE_BYTES);  // cb_tw_i
+
+    // Ping-pong intermediate CBs — depth = tiles_per_stage
+    create_cb(program, core,  6, tiles_per_stage, TILE_BYTES);  // cb_pong_odd_r
+    create_cb(program, core,  7, tiles_per_stage, TILE_BYTES);  // cb_pong_odd_i
+    create_cb(program, core, 10, tiles_per_stage, TILE_BYTES);  // cb_ping_even_r
+    create_cb(program, core, 11, tiles_per_stage, TILE_BYTES);  // cb_ping_even_i
+    create_cb(program, core, 12, tiles_per_stage, TILE_BYTES);  // cb_ping_odd_r
+    create_cb(program, core, 13, tiles_per_stage, TILE_BYTES);  // cb_ping_odd_i
+    create_cb(program, core, 14, tiles_per_stage, TILE_BYTES);  // cb_pong_even_r
+    create_cb(program, core, 15, tiles_per_stage, TILE_BYTES);  // cb_pong_even_i
+
+    // Output CBs — depth = tiles_per_stage so batched writer can wait
+    // for the full stage before writing to DRAM
+    create_cb(program, core, 16, tiles_per_stage, TILE_BYTES);  // cb_out0_r
+    create_cb(program, core, 17, tiles_per_stage, TILE_BYTES);  // cb_out0_i
+    create_cb(program, core, 18, tiles_per_stage, TILE_BYTES);  // cb_out1_r
+    create_cb(program, core, 19, tiles_per_stage, TILE_BYTES);  // cb_out1_i
+
+    // Scratch intermediate CBs — depth 1 is correct (used and freed per op)
     constexpr uint32_t TMP_DEPTH = 1;
-
-    // Stage-0 input CBs
-    create_cb(program, core, 0, IO_DEPTH, TILE_BYTES);   // even_r
-    create_cb(program, core, 1, IO_DEPTH, TILE_BYTES);   // even_i
-    create_cb(program, core, 2, IO_DEPTH, TILE_BYTES);   // odd_r
-    create_cb(program, core, 3, IO_DEPTH, TILE_BYTES);   // odd_i
-
-    // Twiddle CBs
-    create_cb(program, core, 4, IO_DEPTH, TILE_BYTES);   // tw_r
-    create_cb(program, core, 5, IO_DEPTH, TILE_BYTES);   // tw_i
-
-    // Pong odd CBs
-    create_cb(program, core, 6, tiles_per_stage, TILE_BYTES);   // pong_odd_r
-    create_cb(program, core, 7, tiles_per_stage, TILE_BYTES);   // pong_odd_i
-
-        // Ping even/odd CBs
-    create_cb(program, core, 10, tiles_per_stage, TILE_BYTES);  // ping_even_r
-    create_cb(program, core, 11, tiles_per_stage, TILE_BYTES);  // ping_even_i
-    create_cb(program, core, 12, tiles_per_stage, TILE_BYTES);  // ping_odd_r
-    create_cb(program, core, 13, tiles_per_stage, TILE_BYTES);  // ping_odd_i
-
-    // Pong even CBs
-    create_cb(program, core, 14, tiles_per_stage, TILE_BYTES);  // pong_even_r
-    create_cb(program, core, 15, tiles_per_stage, TILE_BYTES);  // pong_even_i
-
-    // Output CBs
-    create_cb(program, core, 16, IO_DEPTH, TILE_BYTES);  // out0_r
-    create_cb(program, core, 17, IO_DEPTH, TILE_BYTES);  // out0_i
-    create_cb(program, core, 18, IO_DEPTH, TILE_BYTES);  // out1_r
-    create_cb(program, core, 19, IO_DEPTH, TILE_BYTES);  // out1_i
-
-    // Scratch intermediates
-    create_cb(program, core, 20, TMP_DEPTH, TILE_BYTES);  // tmp0
-    create_cb(program, core, 21, TMP_DEPTH, TILE_BYTES);  // tmp1
-    create_cb(program, core, 22, TMP_DEPTH, TILE_BYTES);  // tw_odd_r
-    create_cb(program, core, 23, TMP_DEPTH, TILE_BYTES);  // tw_odd_i
-    create_cb(program, core, 24, TMP_DEPTH, TILE_BYTES);  // neg_tw_i
+    create_cb(program, core, 20, TMP_DEPTH, TILE_BYTES);  // cb_tmp0
+    create_cb(program, core, 21, TMP_DEPTH, TILE_BYTES);  // cb_tmp1
+    create_cb(program, core, 22, TMP_DEPTH, TILE_BYTES);  // cb_tw_odd_r
+    create_cb(program, core, 23, TMP_DEPTH, TILE_BYTES);  // cb_tw_odd_i
+    // CB 24 (cb_neg_tw_i) REMOVED — IFFT negation now done on host.
 
     // ── Kernels ───────────────────────────────────────────────────
     auto reader_k = CreateKernel(
         program,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/dataflow/reader_fft_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core"
+        "/kernels/dataflow/reader_fft_f32.cpp",
         core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0,
-            .noc = NOC::RISCV_0_default
+            .noc       = NOC::RISCV_0_default
         });
 
     auto writer_k = CreateKernel(
         program,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/dataflow/writer_fft_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core"
+        "/kernels/dataflow/writer_fft_f32.cpp",
         core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
-            .noc = NOC::RISCV_1_default
+            .noc       = NOC::RISCV_1_default
         });
 
     auto compute_k = CreateKernel(
         program,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/compute/fft_compute_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core"
+        "/kernels/compute/fft_compute_f32.cpp",
         core,
         ComputeConfig{
-            .math_fidelity = MathFidelity::HiFi4,
+            .math_fidelity    = MathFidelity::HiFi4,
             .fp32_dest_acc_en = true,
             .math_approx_mode = false
         });
@@ -507,8 +541,10 @@ int main(int argc, char** argv) {
         tiles_per_stage
     };
 
+    // CHANGED: direction no longer passed to compute kernel —
+    // the kernel no longer uses it (twiddle sign baked in on host).
     std::vector<uint32_t> compute_args = {
-        direction,
+        0,               // direction placeholder (unused — kept for ABI compat)
         log2N,
         tiles_per_stage
     };
@@ -516,26 +552,34 @@ int main(int argc, char** argv) {
     // ── Single workload ───────────────────────────────────────────
     tt::tt_metal::distributed::MeshWorkload workload;
     tt::tt_metal::distributed::MeshCoordinateRange device_range =
-        tt::tt_metal::distributed::MeshCoordinateRange(mesh_device->shape());
+        tt::tt_metal::distributed::MeshCoordinateRange(
+            mesh_device->shape());
     workload.add_program(device_range, std::move(program));
 
     auto& prog = workload.get_programs().begin()->second;
-    SetRuntimeArgs(prog, reader_k, core, reader_args);
-    SetRuntimeArgs(prog, writer_k, core, writer_args);
+    SetRuntimeArgs(prog, reader_k,  core, reader_args);
+    SetRuntimeArgs(prog, writer_k,  core, writer_args);
     SetRuntimeArgs(prog, compute_k, core, compute_args);
 
     // ── Write inputs to DRAM (ONCE) ───────────────────────────────
     std::cout << "Writing inputs to DRAM...\n";
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_even_r, even_r_t, false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_even_i, even_i_t, false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_odd_r, odd_r_t, false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_odd_i, odd_i_t, false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_tw_r, tw_r_tiles, false);
-    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(cq, buf_tw_i, tw_i_tiles, false);
+    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+        cq, buf_even_r, even_r_t, false);
+    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+        cq, buf_even_i, even_i_t, false);
+    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+        cq, buf_odd_r, odd_r_t, false);
+    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+        cq, buf_odd_i, odd_i_t, false);
+    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+        cq, buf_tw_r, tw_r_tiles, false);
+    tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+        cq, buf_tw_i, tw_i_tiles, false);
     tt::tt_metal::distributed::Finish(cq);
 
     // ── Launch kernel ONCE (all stages on device) ─────────────────
-    std::cout << "Launching FFT kernel (all " << log2N << " stages on device)...\n";
+    std::cout << "Launching FFT kernel (all " << log2N
+              << " stages on device)...\n";
     tt::tt_metal::distributed::EnqueueMeshWorkload(cq, workload, true);
     std::cout << "Kernel complete.\n";
 
@@ -545,10 +589,14 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> out1_r_raw(tiles_per_stage * TILE_SIZE);
     std::vector<uint32_t> out1_i_raw(tiles_per_stage * TILE_SIZE);
 
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_r_raw, buf_out0_r, true);
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out0_i_raw, buf_out0_i, true);
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_r_raw, buf_out1_r, true);
-    tt::tt_metal::distributed::EnqueueReadMeshBuffer(cq, out1_i_raw, buf_out1_i, true);
+    tt::tt_metal::distributed::EnqueueReadMeshBuffer(
+        cq, out0_r_raw, buf_out0_r, true);
+    tt::tt_metal::distributed::EnqueueReadMeshBuffer(
+        cq, out0_i_raw, buf_out0_i, true);
+    tt::tt_metal::distributed::EnqueueReadMeshBuffer(
+        cq, out1_r_raw, buf_out1_r, true);
+    tt::tt_metal::distributed::EnqueueReadMeshBuffer(
+        cq, out1_i_raw, buf_out1_i, true);
 
     // ── Reconstruct result in natural order ───────────────────────
     auto out0_r = unpack_tiles(out0_r_raw, half_N);
@@ -558,13 +606,13 @@ int main(int argc, char** argv) {
 
     std::vector<float> result_r(N), result_i(N);
     for (uint32_t i = 0; i < half_N; i++) {
-        result_r[i] = out0_r[i];
-        result_i[i] = out0_i[i];
-        result_r[i + half_N] = out1_r[i];
-        result_i[i + half_N] = out1_i[i];
+        result_r[i]           = out0_r[i];
+        result_i[i]           = out0_i[i];
+        result_r[i + half_N]  = out1_r[i];
+        result_i[i + half_N]  = out1_i[i];
     }
 
-    // Apply 1/N scaling for IFFT
+    // Apply 1/N scaling for IFFT on host
     if (direction == 1) {
         for (uint32_t i = 0; i < N; i++) {
             result_r[i] /= N;
@@ -589,7 +637,7 @@ int main(int argc, char** argv) {
 
     std::cout << " Max error  (real): " << max_err_r << "\n";
     std::cout << " Max error  (imag): " << max_err_i << "\n";
-    std::cout << " Mean error       : " << mean_err << "\n";
+    std::cout << " Mean error       : " << mean_err  << "\n";
 
     bool passed = (max_err_r < 1e-3f) && (max_err_i < 1e-3f);
     std::cout << " Result: " << (passed ? "✓ PASSED" : "✗ FAILED") << "\n";
