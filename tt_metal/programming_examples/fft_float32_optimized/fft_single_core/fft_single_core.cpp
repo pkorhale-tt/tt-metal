@@ -325,24 +325,23 @@ int main(int argc, char** argv) {
     create_cb(prog, core, 18, tiles, TILE_BYTES);  // out1_r
     create_cb(prog, core, 19, tiles, TILE_BYTES);  // out1_i
     
-    // ✅ NO tmp CBs (20-23) — compute uses DST registers directly
     auto reader_k = CreateKernel(
         prog,
-        "kernels/dataflow/reader_fft_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/dataflow/reader_fft_f32.cpp",
         core,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default}
     );
 
     auto writer_k = CreateKernel(
         prog,
-        "kernels/dataflow/writer_fft_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/dataflow/writer_fft_f32.cpp",
         core,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default}
     );
 
     auto compute_k = CreateKernel(
         prog,
-        "kernels/compute/fft_compute_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/compute/fft_compute_f32.cpp",
         core,
         ComputeConfig{.math_fidelity = MathFidelity::HiFi2, .fp32_dest_acc_en = true, .math_approx_mode = false}
     );
