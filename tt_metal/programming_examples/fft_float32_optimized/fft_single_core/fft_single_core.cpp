@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
     
     auto compute_k = CreateKernel(
         prog,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/compute/fft_compute_f32_opt.cpp",
+        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core/kernels/compute/fft_compute_f32.cpp",
         core,
         ComputeConfig{.math_fidelity = MathFidelity::HiFi2, .fp32_dest_acc_en = true, .math_approx_mode = false}
     );
