@@ -1,4 +1,4 @@
-// fft_single_core_opt.cpp  — OPTIMAL v2: compact twiddle table
+// fft_single_core_opt.cpp  — OPTIMAL v3: compact twiddles + parallel shuffle
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
     uint32_t compact_bytes = half_N * sizeof(float);           // compact twiddle (N/2 floats)
 
     std::cout<<"════════════════════════════════════════\n";
-    std::cout<<" TT-Metal FFT  (Optimal v2 — compact twiddles)\n";
+    std::cout<<" TT-Metal FFT  (Optimal v3 — parallel shuffle)\n";
     std::cout<<"════════════════════════════════════════\n";
     std::cout<<" N           : "<<N<<"\n";
     std::cout<<" log2N       : "<<log2N<<"\n";
@@ -280,8 +280,8 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> writer_args = {
         b_o0r->address(), b_o0i->address(),
         b_o1r->address(), b_o1i->address(),
-        tiles, log2N, half_N};
-    std::vector<uint32_t> compute_args = {log2N, tiles};
+        tiles};
+    std::vector<uint32_t> compute_args = {log2N, tiles, half_N};
 
     tt::tt_metal::distributed::MeshWorkload wl;
     tt::tt_metal::distributed::MeshCoordinateRange rng =
