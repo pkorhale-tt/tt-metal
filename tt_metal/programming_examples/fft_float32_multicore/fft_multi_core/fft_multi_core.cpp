@@ -161,7 +161,7 @@ uint32_t detect_available_cores(IDevice* device, uint32_t max_requested, uint32_
 //  - This FFT example creates a fixed sequence of CB IDs per core:
 //      0,1,2,3,4,5,16,17,18,19,20,21,22,23,10,11
 //    i.e. 16 CBs per core, each TILE_BYTES in size.
-//  - CB "slot index" for a given ID is fixed by that order.
+
 uint32_t cb_slot_index_from_id(uint32_t cb_id) {
     // Creation order in the for(c) loop:
     //  idx 0: id 0
@@ -198,7 +198,6 @@ uint32_t cb_slot_index_from_id(uint32_t cb_id) {
         case 10: return 14;
         case 11: return 15;
         default:
-            // For safety; this example only uses the IDs above.
             TT_FATAL(false, "Unexpected CB ID {} in FFT example", cb_id);
             return 0;
     }
@@ -213,10 +212,19 @@ uint32_t cb_base_addr_for_core_and_id(
     return l1_unreserved_base + slot * bytes;
 }
 
+// ── Simple numeric check for argv parsing ─────────────────────────────
+bool is_uint_str(const char* s) {
+    if (!s || !*s) return false;
+    for (const char* p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
-                  << " <direction:0|1> [N] [num_cores]\n"
+                  << " <direction:0|1> [N] [num_cores] [other args...]\n"
                   << " num_cores: optional override (must be power of 2).\n"
                   << " If omitted, auto-detected from device.\n";
         return 1;
@@ -225,17 +233,27 @@ int main(int argc, char** argv) {
     uint32_t N = 1024;
     uint32_t user_cores_request = 0;
 
+    // Safely parse only numeric extra args as N / num_cores
     for (int i = 2; i < argc; i++) {
+        if (!is_uint_str(argv[i])) {
+            // Non-numeric arg (e.g., a file path) – ignore for FFT params
+            continue;
+        }
         uint32_t v = (uint32_t)std::stoul(argv[i]);
+        // Heuristic: small power-of-2 values (<=64) treated as core count
         if (v >= 2 && v <= 64 && (v & (v-1)) == 0)
             user_cores_request = v;
         else if (v >= 2 && (v & (v-1)) == 0)
             N = v;
         else
-            std::cerr << "Warning: ignoring argument " << v
+            std::cerr << "Warning: ignoring numeric argument " << v
                       << " (not a power of 2)\n";
     }
-    if (N < 2 || (N & (N-1))) { std::cerr << "N must be power of 2\n"; return 1; }
+
+    if (N < 2 || (N & (N-1))) {
+        std::cerr << "N must be power of 2\n";
+        return 1;
+    }
 
     // ── Open mesh device ─────────────────────────────────────────────
     int dev_id = 0;
@@ -283,7 +301,7 @@ int main(int argc, char** argv) {
               << (4*total_tiles*TILE_BYTES) / 1024 << " KB\n";
     std::cout << "════════════════════════════════════════════════\n";
 
-    // ── Generate input signal ───────────────────────────────────────
+    // ── Generate input signal (synthetic) ───────────────────────────
     std::vector<float> ir(N,0.f), ii(N,0.f);
     for (uint32_t i = 0; i < N; i++)
         ir[i] = std::sin(2.f*PI*4.f*i/N) + 0.5f*std::sin(2.f*PI*8.f*i/N);
@@ -332,7 +350,8 @@ int main(int argc, char** argv) {
     auto b_cmp_i = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
 
     // ── Circular buffers on each core ──────────────────────────────
-    // We record CB IDs but no longer try to call program.circular_buffers()
+    // We record CB IDs (for consistency with original code),
+    // but we compute addresses analytically from L1 base + slot index.
     std::vector<std::array<uint32_t, 4>> cb_ids(num_cores);
 
     for (uint32_t c = 0; c < num_cores; c++) {
@@ -393,7 +412,6 @@ int main(int argc, char** argv) {
         });
 
     // ── L1 base for program-local CBs ──────────────────────────────
-    // This is the base address where program-local L1 allocations start.
     uint32_t l1_unreserved_base =
         device->allocator()->get_base_allocator_addr(HalMemType::L1);
 
@@ -462,8 +480,8 @@ int main(int argc, char** argv) {
     }
 
     // ── Mesh workload ──────────────────────────────────────────────
-    MeshWorkload wl;
-    MeshCoordinateRange rng = MeshCoordinateRange(mesh->shape());
+    distributed::MeshWorkload wl;
+    distributed::MeshCoordinateRange rng = distributed::MeshCoordinateRange(mesh->shape());
     wl.add_program(rng, std::move(prog));
 
     // ── Upload inputs ──────────────────────────────────────────────
