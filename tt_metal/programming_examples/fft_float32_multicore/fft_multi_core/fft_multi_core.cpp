@@ -145,7 +145,7 @@ precompute_compact_twiddles(uint32_t N, uint32_t direction) {
 // ── CB creation helper ────────────────────────────────────────────────
 // Returns the CBHandle from CreateCircularBuffer.
 // To get the runtime L1 address of a locally-allocated CB, use
-//   program.get_circular_buffer(handle)->address()
+//   program.circular_buffers().at(handle)->address()
 // NOT CircularBufferConfig::locally_allocated_address() — that method
 // does not exist. CircularBufferConfig only has globally_allocated_address()
 // for pre-pinned CBs; locally-allocated CBs have no address in their config.
@@ -461,22 +461,19 @@ int main(int argc, char** argv) {
             cx_noc_x[s] = partner_physical.x;
             cx_noc_y[s] = partner_physical.y;
 
-            // Get partner CB L1 addresses via CircularBuffer::address().
+            // Get partner CB L1 addresses.
             //
-            // CircularBufferConfig has NO locally_allocated_address() method.
-            // That method lives on CircularBuffer (the runtime object), not
-            // on CircularBufferConfig (the build-time descriptor).
+            // Program::get_circular_buffer() does NOT exist.
+            // Program::circular_buffers() returns a const vector<shared_ptr<CircularBuffer>>
+            // indexed by CBHandle (which is the vector index).
             //
             // Correct path:
             //   CBHandle h = CreateCircularBuffer(prog, core, cfg);
-            //   uint32_t addr = prog.get_circular_buffer(h)->address();
-            //
-            // This returns the L1 address the program allocated for that CB,
-            // which is the same value get_write_ptr(cb_id) returns on-device.
-            cx_er[s] = prog.get_circular_buffer(cb_handles[partner_id][0])->address();
-            cx_ei[s] = prog.get_circular_buffer(cb_handles[partner_id][1])->address();
-            cx_or[s] = prog.get_circular_buffer(cb_handles[partner_id][2])->address();
-            cx_oi[s] = prog.get_circular_buffer(cb_handles[partner_id][3])->address();
+            //   uint32_t addr = prog.circular_buffers().at(h)->address();
+            cx_er[s] = prog.circular_buffers().at(cb_handles[partner_id][0])->address();
+            cx_ei[s] = prog.circular_buffers().at(cb_handles[partner_id][1])->address();
+            cx_or[s] = prog.circular_buffers().at(cb_handles[partner_id][2])->address();
+            cx_oi[s] = prog.circular_buffers().at(cb_handles[partner_id][3])->address();
         }
 
         for (auto v : cx_noc_x) writer_args.push_back(v);
