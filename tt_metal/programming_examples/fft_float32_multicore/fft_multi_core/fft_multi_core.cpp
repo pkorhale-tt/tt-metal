@@ -143,11 +143,11 @@ precompute_compact_twiddles(uint32_t N, uint32_t direction) {
 }
 
 // ── CB creation helper ────────────────────────────────────────────────
-void create_cb(Program& p, CoreCoord c, uint32_t id, uint32_t ntiles, uint32_t bytes) {
+CBHandle create_cb(Program& p, CoreCoord c, uint32_t id, uint32_t ntiles, uint32_t bytes) {
     CircularBufferConfig cfg =
         CircularBufferConfig(ntiles*bytes, {{id, tt::DataFormat::Float32}})
             .set_page_size(id, bytes);
-    CreateCircularBuffer(p, c, cfg);
+    return CreateCircularBuffer(p, c, cfg);
 }
 
 // ── NOC coordinate helper ─────────────────────────────────────────────
@@ -345,13 +345,19 @@ int main(int argc, char** argv) {
     auto b_cmp_i = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
 
     // ── Circular buffers — same layout on every core ──────────────────
+    // We store CBHandles for CB 0-3 (even_r/i, odd_r/i) per core because
+    // GetCircularBufferConfig(Program&, CBHandle) needs the handle returned
+    // by CreateCircularBuffer — NOT a CoreCoord.  These handles let us look
+    // up each partner core's L1 base address for cross-core NOC writes.
+    std::vector<std::array<CBHandle, 4>> cb_handles(num_cores);
+
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
-        // Input and inter-stage (depth=1 — back-pressure synchronisation)
-        create_cb(prog, cc,  0, 1, TILE_BYTES);  // even_r
-        create_cb(prog, cc,  1, 1, TILE_BYTES);  // even_i
-        create_cb(prog, cc,  2, 1, TILE_BYTES);  // odd_r
-        create_cb(prog, cc,  3, 1, TILE_BYTES);  // odd_i
+        // Save handles for CB 0-3 — queried later for cross-core L1 addrs
+        cb_handles[c][0] = create_cb(prog, cc,  0, 1, TILE_BYTES);  // even_r
+        cb_handles[c][1] = create_cb(prog, cc,  1, 1, TILE_BYTES);  // even_i
+        cb_handles[c][2] = create_cb(prog, cc,  2, 1, TILE_BYTES);  // odd_r
+        cb_handles[c][3] = create_cb(prog, cc,  3, 1, TILE_BYTES);  // odd_i
         create_cb(prog, cc,  4, 1, TILE_BYTES);  // tw_r (expanded)
         create_cb(prog, cc,  5, 1, TILE_BYTES);  // tw_i
         create_cb(prog, cc, 16, 1, TILE_BYTES);  // out0_r
@@ -362,7 +368,6 @@ int main(int argc, char** argv) {
         create_cb(prog, cc, 21, 1, TILE_BYTES);  // tmp1
         create_cb(prog, cc, 22, 1, TILE_BYTES);  // tw_odd_r
         create_cb(prog, cc, 23, 1, TILE_BYTES);  // tw_odd_i
-        // Compact twiddle: holds N/2 floats in a tile-sized CB
         create_cb(prog, cc, 10, 1, TILE_BYTES);  // compact_r
         create_cb(prog, cc, 11, 1, TILE_BYTES);  // compact_i
     }
@@ -450,19 +455,17 @@ int main(int argc, char** argv) {
             cx_noc_x[s] = partner_physical.x;
             cx_noc_y[s] = partner_physical.y;
 
-            // Get partner's CB 0-3 L1 base addresses.
-            // On TT-Metal the CB base address is accessible via
-            // GetCircularBufferConfig().  We query it from the program.
-            CoreCoord partner_cc = {partner_id, 0};
-            auto& cfg_er = GetCircularBufferConfig(prog, partner_cc, 0);
-            auto& cfg_ei = GetCircularBufferConfig(prog, partner_cc, 1);
-            auto& cfg_or = GetCircularBufferConfig(prog, partner_cc, 2);
-            auto& cfg_oi = GetCircularBufferConfig(prog, partner_cc, 3);
-
-            cx_er[s] = cfg_er.locally_allocated_address().value();
-            cx_ei[s] = cfg_ei.locally_allocated_address().value();
-            cx_or[s] = cfg_or.locally_allocated_address().value();
-            cx_oi[s] = cfg_oi.locally_allocated_address().value();
+            // FIX: GetCircularBufferConfig(Program&, CBHandle) takes a CBHandle
+            // (the value returned by CreateCircularBuffer), NOT a CoreCoord.
+            // We stored these handles in cb_handles[core_id][cb_index] above.
+            cx_er[s] = GetCircularBufferConfig(prog, cb_handles[partner_id][0])
+                           .locally_allocated_address().value();
+            cx_ei[s] = GetCircularBufferConfig(prog, cb_handles[partner_id][1])
+                           .locally_allocated_address().value();
+            cx_or[s] = GetCircularBufferConfig(prog, cb_handles[partner_id][2])
+                           .locally_allocated_address().value();
+            cx_oi[s] = GetCircularBufferConfig(prog, cb_handles[partner_id][3])
+                           .locally_allocated_address().value();
         }
 
         for (auto v : cx_noc_x) writer_args.push_back(v);
