@@ -1,4 +1,4 @@
-// fft_multicore_opt.cpp — MULTICORE FFT host driver (updated)
+// fft_multi_core.cpp — MULTICORE FFT host driver (updated for current tt-metal)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -160,26 +160,8 @@ uint32_t detect_available_cores(IDevice* device, uint32_t max_requested, uint32_
 //  - Each CB created here has size TILE_BYTES and depth=1 (one tile).
 //  - This FFT example creates a fixed sequence of CB IDs per core:
 //      0,1,2,3,4,5,16,17,18,19,20,21,22,23,10,11
-//    i.e. 16 CBs per core, each TILE_BYTES in size.
 
 uint32_t cb_slot_index_from_id(uint32_t cb_id) {
-    // Creation order in the for(c) loop:
-    //  idx 0: id 0
-    //  idx 1: id 1
-    //  idx 2: id 2
-    //  idx 3: id 3
-    //  idx 4: id 4
-    //  idx 5: id 5
-    //  idx 6: id 16
-    //  idx 7: id 17
-    //  idx 8: id 18
-    //  idx 9: id 19
-    //  idx10: id 20
-    //  idx11: id 21
-    //  idx12: id 22
-    //  idx13: id 23
-    //  idx14: id 10
-    //  idx15: id 11
     switch (cb_id) {
         case 0:  return 0;
         case 1:  return 1;
@@ -350,8 +332,6 @@ int main(int argc, char** argv) {
     auto b_cmp_i = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
 
     // ── Circular buffers on each core ──────────────────────────────
-    // We record CB IDs (for consistency with original code),
-    // but we compute addresses analytically from L1 base + slot index.
     std::vector<std::array<uint32_t, 4>> cb_ids(num_cores);
 
     for (uint32_t c = 0; c < num_cores; c++) {
@@ -379,11 +359,11 @@ int main(int argc, char** argv) {
         create_cb(prog, cc, 11, 1, TILE_BYTES); // compact_i
     }
 
-    // ── Kernels ────────────────────────────────────────────────────
+    // ── Kernels (paths match your tree) ─────────────────────────────
     KernelHandle reader_k = CreateKernel(
         prog,
-        "tt_metal/programming_examples/fft_float32_multicore/"
-        "kernels/dataflow/reader_fft_f32_mc.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/"
+        "kernels/dataflow/reader_fft_f32.cpp",
         core_range,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0,
@@ -392,8 +372,8 @@ int main(int argc, char** argv) {
 
     KernelHandle writer_k = CreateKernel(
         prog,
-        "tt_metal/programming_examples/fft_float32_multicore/"
-        "kernels/dataflow/writer_fft_f32_mc.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/"
+        "kernels/dataflow/writer_fft_f32.cpp",
         core_range,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
@@ -402,13 +382,13 @@ int main(int argc, char** argv) {
 
     KernelHandle compute_k = CreateKernel(
         prog,
-        "tt_metal/programming_examples/fft_float32_multicore/"
+        "tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/"
         "kernels/compute/fft_compute_f32.cpp",
         core_range,
         ComputeConfig{
-            .math_fidelity   = MathFidelity::HiFi4,
-            .fp32_dest_acc_en= true,
-            .math_approx_mode= false
+            .math_fidelity    = MathFidelity::HiFi4,
+            .fp32_dest_acc_en = true,
+            .math_approx_mode = false
         });
 
     // ── L1 base for program-local CBs ──────────────────────────────
