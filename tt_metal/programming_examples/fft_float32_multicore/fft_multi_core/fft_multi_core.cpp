@@ -240,6 +240,12 @@ int main(int argc, char** argv) {
     Program prog = CreateProgram();
     CoreRange core_range({0,0}, {num_cores-1, 0});
 
+    // ── Semaphores for cross-core sync (one per core per cross stage) ──
+    // Each core needs log2_cores semaphores — one per cross-core stage.
+    // We create one semaphore handle per core; the writer kernel resets
+    // it to 0 at the start of each cross-core stage before use.
+    SemaphoreHandle sem_handle = CreateSemaphore(prog, core_range, 0);
+
     using namespace tt::tt_metal::distributed;
     DeviceLocalBufferConfig dram_tile{
         .page_size = TILE_BYTES, .buffer_type = BufferType::DRAM };
@@ -324,6 +330,9 @@ int main(int argc, char** argv) {
                   << std::hex << cb_l1_addr(l1_base, id) << std::dec << "\n";
 
     // ── Per-core runtime args ─────────────────────────────────────────
+    const uint32_t tile_bytes = TILE_BYTES;
+    constexpr uint32_t ELEM  = sizeof(float);
+
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
         uint32_t tile_offset = c * local_tiles;
@@ -337,16 +346,21 @@ int main(int argc, char** argv) {
 
         std::vector<uint32_t> compute_args = { log2N, local_tiles };
 
+        const uint32_t core_elem_base = tile_offset * (tile_bytes / ELEM);
         std::vector<uint32_t> writer_args = {
             b_o0r->address(), b_o0i->address(),
             b_o1r->address(), b_o1i->address(),
             local_tiles, log2N, local_half,
-            half_N, num_cores, c, log2_cores, tile_offset
+            half_N, num_cores, c, log2_cores, tile_offset,
+            core_elem_base   // arg 12: global element base for local shuffle
         };
 
         std::vector<uint32_t> cx_noc_x(log2_cores), cx_noc_y(log2_cores);
         std::vector<uint32_t> cx_er(log2_cores), cx_ei(log2_cores);
         std::vector<uint32_t> cx_or(log2_cores), cx_oi(log2_cores);
+
+        std::vector<uint32_t> cx_p_sem(log2_cores);  // partner semaphore L1 addr
+        std::vector<uint32_t> cx_my_sem(log2_cores); // my semaphore L1 addr
 
         for (uint32_t s = 0; s < log2_cores; s++) {
             uint32_t partner_id = c ^ (num_cores >> (s + 1));
@@ -356,22 +370,27 @@ int main(int argc, char** argv) {
             cx_noc_x[s] = partner_physical.x;
             cx_noc_y[s] = partner_physical.y;
 
-            // ── Analytical CB address ──────────────────────────────────
-            // All cores have identical CB layout in L1 (same creation order,
-            // same sizes). l1_base is the same on every core, so the address
-            // of CB 0 on core 5 is the same as CB 0 on core 0.
-            cx_er[s] = cb_l1_addr(l1_base, 0);  // even_r
-            cx_ei[s] = cb_l1_addr(l1_base, 1);  // even_i
-            cx_or[s] = cb_l1_addr(l1_base, 2);  // odd_r
-            cx_oi[s] = cb_l1_addr(l1_base, 3);  // odd_i
+            // CB addresses — same on all cores (identical layout)
+            cx_er[s] = cb_l1_addr(l1_base, 0);
+            cx_ei[s] = cb_l1_addr(l1_base, 1);
+            cx_or[s] = cb_l1_addr(l1_base, 2);
+            cx_oi[s] = cb_l1_addr(l1_base, 3);
+
+            // Semaphore addresses
+            // GetSemaphoreAddr returns the L1 address of the semaphore
+            // on a given logical core.
+            cx_p_sem[s]  = GetSemaphoreAddr(prog, {partner_id, 0}, sem_handle);
+            cx_my_sem[s] = GetSemaphoreAddr(prog, {c, 0},          sem_handle);
         }
 
-        for (auto v : cx_noc_x) writer_args.push_back(v);
-        for (auto v : cx_noc_y) writer_args.push_back(v);
-        for (auto v : cx_er)    writer_args.push_back(v);
-        for (auto v : cx_ei)    writer_args.push_back(v);
-        for (auto v : cx_or)    writer_args.push_back(v);
-        for (auto v : cx_oi)    writer_args.push_back(v);
+        for (auto v : cx_noc_x)  writer_args.push_back(v);
+        for (auto v : cx_noc_y)  writer_args.push_back(v);
+        for (auto v : cx_er)     writer_args.push_back(v);
+        for (auto v : cx_ei)     writer_args.push_back(v);
+        for (auto v : cx_or)     writer_args.push_back(v);
+        for (auto v : cx_oi)     writer_args.push_back(v);
+        for (auto v : cx_p_sem)  writer_args.push_back(v);
+        for (auto v : cx_my_sem) writer_args.push_back(v);
 
         SetRuntimeArgs(prog, reader_k,  cc, reader_args);
         SetRuntimeArgs(prog, writer_k,  cc, writer_args);
