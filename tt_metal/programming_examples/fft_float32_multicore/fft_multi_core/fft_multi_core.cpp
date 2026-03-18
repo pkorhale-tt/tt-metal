@@ -128,9 +128,20 @@ uint32_t detect_available_cores(IDevice* device, uint32_t max_requested, uint32_
     }
     std::cout << " Usable row-0 cores: " << usable << "\n";
 
-    uint32_t cap = std::min({usable, max_requested, N / 2});
+    // Constraint: local_half = N/(2*num_cores) must be >= TILE_SIZE (1024).
+    // So num_cores <= N / (2 * TILE_SIZE).
+    // This is the hard architectural limit — the FPU butterfly operates on
+    // full tiles, so each core must own at least one full tile of elements.
+    uint32_t max_by_tile = N / (2 * TILE_SIZE);
+    if (max_by_tile == 0) max_by_tile = 1;
+
+    uint32_t cap = std::min({usable, max_requested, N / 2, max_by_tile});
     uint32_t result = 1;
     while (result * 2 <= cap) result *= 2;
+
+    std::cout << " Max cores for N=" << N << " : " << max_by_tile
+              << "  (N must be >= 2*cores*" << TILE_SIZE << ")\n";
+    std::cout << " Selected cores  : " << result << "\n";
     return result;
 }
 
@@ -171,7 +182,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     uint32_t direction = (uint32_t)std::atoi(argv[1]);
-    uint32_t N = 1024;
+    // Default N=16384 so that with 8 cores: local_half = 16384/(2*8) = 1024 = TILE_SIZE.
+    // Rule: N must be >= 2 * num_cores * TILE_SIZE (2 * cores * 1024).
+    // N=1024 only works with num_cores=1 giving local_half=512 which is STILL < TILE_SIZE.
+    // Smallest valid N for any multicore run is 2*1*1024=2048 (1 core).
+    uint32_t N = 16384;
     uint32_t user_cores_request = 0;
 
     for (int i = 2; i < argc; i++) {
@@ -203,6 +218,9 @@ int main(int argc, char** argv) {
     uint32_t half_N     = N / 2;
     uint32_t local_half = half_N / num_cores;
     uint32_t local_tiles= (local_half + TILE_SIZE - 1) / TILE_SIZE;
+
+    // detect_available_cores() already enforces local_half >= TILE_SIZE
+    // by capping num_cores at N/(2*TILE_SIZE). No further check needed.
     uint32_t total_tiles= local_tiles * num_cores;
     uint32_t compact_bytes = half_N * sizeof(float);
 
