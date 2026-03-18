@@ -40,6 +40,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <fstream>
+#include <string>
 
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
@@ -176,6 +178,60 @@ bool is_uint_str(const char* s) {
     return true;
 }
 
+// ── File input reader ─────────────────────────────────────────────────
+// Reads a text file of floats into a single row of N_row real values.
+// Supports:
+//   - Plain real values:      one value per line or space-separated
+//   - Interleaved complex:    pairs (re im) → sets both ir and ii
+// If the file has fewer than N_row values, the rest are zero-padded.
+// If more, only the first N_row are used.
+// Returns false on error.
+bool read_input_file(const std::string& path, uint32_t N_row,
+                     std::vector<float>& ir, std::vector<float>& ii) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cerr << "Cannot open input file: " << path << "\n";
+        return false;
+    }
+    std::vector<float> vals;
+    std::string tok;
+    while (f >> tok) {
+        // Strip trailing comma (some export formats add them)
+        if (!tok.empty() && tok.back() == ',') tok.pop_back();
+        if (tok.empty()) continue;
+        try { vals.push_back(std::stof(tok)); }
+        catch (...) {
+            std::cerr << "Bad token in file: '" << tok << "'\n";
+            return false;
+        }
+    }
+    if (vals.empty()) { std::cerr << "Empty input file\n"; return false; }
+
+    ir.assign(N_row, 0.f);
+    ii.assign(N_row, 0.f);
+
+    bool interleaved = (vals.size() >= 2*N_row);
+    if (interleaved) {
+        // Treat as interleaved re/im pairs
+        std::cout << " File mode: interleaved complex ("
+                  << vals.size() << " values → " << N_row << " complex)\n";
+        for (uint32_t i = 0; i < N_row && 2*i+1 < vals.size(); i++) {
+            ir[i] = vals[2*i];
+            ii[i] = vals[2*i+1];
+        }
+    } else {
+        // Treat as real-only
+        std::cout << " File mode: real-only ("
+                  << vals.size() << " values → " << N_row << " points)\n";
+        if (vals.size() < N_row)
+            std::cout << " Note: " << N_row - vals.size()
+                      << " values zero-padded\n";
+        for (uint32_t i = 0; i < N_row && i < vals.size(); i++)
+            ir[i] = vals[i];
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
@@ -183,13 +239,18 @@ int main(int argc, char** argv) {
                   << " Default: forward FFT, N_row=1024, num_rows=8\n";
         return 1;
     }
-    uint32_t direction = (uint32_t)std::atoi(argv[1]);
-    uint32_t N_row     = 1024;   // size of each 1D FFT
-    uint32_t num_rows  = 8;      // total number of rows (independent FFTs)
-    uint32_t user_cores= 0;
+    uint32_t direction  = (uint32_t)std::atoi(argv[1]);
+    uint32_t N_row      = 1024;
+    uint32_t num_rows   = 8;
+    uint32_t user_cores = 0;
+    std::string in_file = "";
 
     for (int i = 2; i < argc; i++) {
-        if (!is_uint_str(argv[i])) continue;
+        if (!is_uint_str(argv[i])) {
+            // Non-numeric → treat as file path
+            in_file = argv[i];
+            continue;
+        }
         uint32_t v = (uint32_t)std::stoul(argv[i]);
         if (v >= 2 && v <= 64 && (v&(v-1))==0) user_cores = v;
         else if (v > 64 && (v&(v-1))==0) {
@@ -226,13 +287,31 @@ int main(int argc, char** argv) {
     std::cout << " Direction    : " << (direction?"Inverse":"Forward") << "\n";
     std::cout << "════════════════════════════════════════════════\n";
 
-    // Generate input: num_rows rows of N_row-point signals
+    // Generate or load input
     uint32_t total_elems = total_N;
     std::vector<float> ir(total_elems, 0.f), ii(total_elems, 0.f);
-    for (uint32_t row = 0; row < num_rows; row++)
-        for (uint32_t i = 0; i < N_row; i++)
-            ir[row*N_row + i] = std::sin(2.f*PI*4.f*i/N_row)
-                               + 0.5f*std::sin(2.f*PI*8.f*i/N_row);
+
+    if (!in_file.empty()) {
+        // Load from file — same data broadcast to all rows
+        std::cout << " Input file  : " << in_file << "\n";
+        std::vector<float> row_r, row_i;
+        if (!read_input_file(in_file, N_row, row_r, row_i)) {
+            mesh->close(); return 1;
+        }
+        // Broadcast the same row to all rows
+        for (uint32_t row = 0; row < num_rows; row++) {
+            for (uint32_t i = 0; i < N_row; i++) {
+                ir[row*N_row + i] = row_r[i];
+                ii[row*N_row + i] = row_i[i];
+            }
+        }
+    } else {
+        // Synthetic: sin wave at frequency 4 + 0.5*sin at frequency 8
+        for (uint32_t row = 0; row < num_rows; row++)
+            for (uint32_t i = 0; i < N_row; i++)
+                ir[row*N_row + i] = std::sin(2.f*PI*4.f*i/N_row)
+                                  + 0.5f*std::sin(2.f*PI*8.f*i/N_row);
+    }
 
     // CPU reference: FFT each row independently
     std::vector<float> ref_r(ir), ref_i(ii);
