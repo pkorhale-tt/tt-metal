@@ -382,8 +382,8 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> cx_er(log2_cores), cx_ei(log2_cores);
         std::vector<uint32_t> cx_or(log2_cores), cx_oi(log2_cores);
 
-        std::vector<uint32_t> cx_p_sem(log2_cores);  // partner semaphore L1 addr
-        std::vector<uint32_t> cx_my_sem(log2_cores); // my semaphore L1 addr
+        std::vector<uint32_t> cx_p_sem(log2_cores, 0u);
+        std::vector<uint32_t> cx_my_sem(log2_cores, 0u);
 
         for (uint32_t s = 0; s < log2_cores; s++) {
             uint32_t partner_id = c ^ (num_cores >> (s + 1));
@@ -399,11 +399,10 @@ int main(int argc, char** argv) {
             cx_or[s] = cb_l1_addr(l1_base, 2);
             cx_oi[s] = cb_l1_addr(l1_base, 3);
 
-            // Sync flag addresses in L1 scratch region.
-            // Same l1_sync_base on every core (identical L1 layout).
-            // Flag for stage s is at l1_sync_base + s * sizeof(uint32_t).
-            cx_p_sem[s]  = l1_sync_base + s * sizeof(uint32_t);
-            cx_my_sem[s] = l1_sync_base + s * sizeof(uint32_t);
+            // Semaphore addresses unused (no NOC exchange in corrected design).
+            // Kept in args layout for compatibility; writer ignores them.
+            cx_p_sem[s]  = 0;
+            cx_my_sem[s] = 0;
         }
 
         for (auto v : cx_noc_x)  writer_args.push_back(v);
