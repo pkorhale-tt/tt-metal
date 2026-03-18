@@ -304,8 +304,13 @@ int main(int argc, char** argv) {
         create_cb(prog, cc, 21, 1, TILE_BYTES); // slot 11 tmp1
         create_cb(prog, cc, 22, 1, TILE_BYTES); // slot 12 tw_odd_r
         create_cb(prog, cc, 23, 1, TILE_BYTES); // slot 13 tw_odd_i
-        create_cb(prog, cc, 10, 1, TILE_BYTES); // slot 14 compact_r
-        create_cb(prog, cc, 11, 1, TILE_BYTES); // slot 15 compact_i
+        // Compact twiddle CB must hold half_N floats (not just TILE_BYTES).
+        // For N=16384: half_N=8192 floats = 32768 bytes = 8 tiles.
+        // Using ntiles = (half_N * sizeof(float) + TILE_BYTES - 1) / TILE_BYTES
+        create_cb(prog, cc, 10, (compact_bytes + TILE_BYTES - 1) / TILE_BYTES,
+                  compact_bytes); // slot 14 compact_r
+        create_cb(prog, cc, 11, (compact_bytes + TILE_BYTES - 1) / TILE_BYTES,
+                  compact_bytes); // slot 15 compact_i
     }
 
     KernelHandle reader_k = CreateKernel(prog,
