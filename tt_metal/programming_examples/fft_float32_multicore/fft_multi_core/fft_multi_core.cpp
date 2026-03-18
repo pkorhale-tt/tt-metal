@@ -240,19 +240,6 @@ int main(int argc, char** argv) {
     Program prog = CreateProgram();
     CoreRange core_range({0,0}, {num_cores-1, 0});
 
-    // ── Cross-core sync via L1 scratch flags ─────────────────────────
-    // SemaphoreHandle / GetSemaphoreAddr do not exist in this tt-metal
-    // version. Instead we reserve a small L1 scratch region AFTER all
-    // CBs for sync flags. Each core has log2_cores 4-byte flag slots
-    // starting at l1_sync_base = l1_base + NUM_CBS * TILE_BYTES.
-    // The writer kernel resets each flag to 0, NOC-increments the
-    // partner's flag, then spin-waits on its own flag reaching 1.
-    // This is equivalent to noc_semaphore_inc / noc_semaphore_wait
-    // but uses plain L1 addresses with no API dependency.
-    constexpr uint32_t NUM_CBS     = 16;   // total CBs created per core
-    const     uint32_t l1_sync_base = l1_base + NUM_CBS * TILE_BYTES;
-    // Sync flag layout: flag[s] at l1_sync_base + s*4  (s = stage index)
-
     using namespace tt::tt_metal::distributed;
     DeviceLocalBufferConfig dram_tile{
         .page_size = TILE_BYTES, .buffer_type = BufferType::DRAM };
@@ -328,6 +315,12 @@ int main(int argc, char** argv) {
     // creation sequences.  The base is the same on every Tensix core.
     uint32_t l1_base =
         device->allocator()->get_base_allocator_addr(HalMemType::L1);
+
+    // Sync flag region: sits just after the 16 CBs in L1.
+    // Each stage s uses a 4-byte flag at l1_sync_base + s*4.
+    // noc_semaphore_inc / noc_semaphore_wait operate on this address.
+    constexpr uint32_t NUM_CBS      = 16;
+    const     uint32_t l1_sync_base = l1_base + NUM_CBS * TILE_BYTES;
 
     std::cout << " l1_base = 0x" << std::hex << l1_base << std::dec << "\n";
     // Debug: print CB 0-3 addresses so you can verify they match
