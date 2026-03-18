@@ -93,7 +93,12 @@ std::pair<std::vector<uint32_t>,std::vector<uint32_t>>
 precompute_compact_twiddles(uint32_t N, uint32_t direction) {
     uint32_t half_N = N/2;
     float sign = (direction==1) ? 1.f : -1.f;
-    std::vector<uint32_t> tw_r(TILE_SIZE, 0u), tw_i(TILE_SIZE, 0u);
+    // BUG FIX: vector must be half_N entries, not TILE_SIZE.
+    // TILE_SIZE=1024 but half_N can be 8192 for N=16384.
+    // Writing beyond TILE_SIZE corrupted the heap → malloc crash.
+    // The DRAM buffer for compact twiddles is also sized to half_N*sizeof(float),
+    // so the vector must match that exactly.
+    std::vector<uint32_t> tw_r(half_N, 0u), tw_i(half_N, 0u);
     for (uint32_t k = 0; k < half_N; k++) {
         float angle = sign * 2.f*PI*(float)k/(float)N;
         tw_r[k] = f2u(std::cos(angle));
