@@ -325,7 +325,7 @@ int main(int argc, char** argv) {
         "tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/"
         "kernels/compute/fft_compute_f32.cpp",
         core_range,
-        ComputeConfig{.math_fidelity=MathFidelity::HiFi4,
+        ComputeConfig{.math_fidelity=MathFidelity::HiFi2,
                       .fp32_dest_acc_en=true,.math_approx_mode=false});
 
     for (uint32_t c = 0; c < num_cores; c++) {
