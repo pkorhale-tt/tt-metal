@@ -339,11 +339,8 @@ int main(int argc, char** argv) {
     uint32_t l1_base =
         device->allocator()->get_base_allocator_addr(HalMemType::L1);
 
-    // Sync flag region: sits just after the 16 CBs in L1.
-    // Each stage s uses a 4-byte flag at l1_sync_base + s*4.
-    // noc_semaphore_inc / noc_semaphore_wait operate on this address.
-    constexpr uint32_t NUM_CBS      = 16;
-    const     uint32_t l1_sync_base = l1_base + NUM_CBS * TILE_BYTES;
+    // Sync flags no longer needed — cross-core exchange removed.
+    // Each core selects out0 or out1 locally; no NOC writes between cores.
 
     std::cout << " l1_base = 0x" << std::hex << l1_base << std::dec << "\n";
     // Debug: print CB 0-3 addresses so you can verify they match
