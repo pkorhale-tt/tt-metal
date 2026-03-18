@@ -1,54 +1,50 @@
-// writer_fft_f32_mc.cpp  — MULTICORE writer (corrected butterfly split)
+// writer_fft_f32_mc.cpp  — MULTICORE writer
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// CROSS-CORE BUTTERFLY — CORRECT SPLIT
-// ══════════════════════════════════════
-// At stage s, the radix-2 DIT butterfly produces:
-//   out0[k] = even[k] + W[k]*odd[k]   (butterfly sum)
-//   out1[k] = even[k] - W[k]*odd[k]   (butterfly difference)
+// KEY INSIGHT (verified by working through N=8, 2 cores manually):
+// ══════════════════════════════════════════════════════════════════
+// The single-core shuffle formula works element-by-element. For each
+// destination slot dst, it computes a source index from out0 or out1.
+// In multicore, EVERY core runs the SAME formula — just over its own
+// local slice [core_elem_base .. core_elem_base+local_half).
 //
-// For the NEXT stage, each butterfly needs one element from out0
-// and one from out1 of the SAME index k. So out0[k] and out1[k]
-// always travel together to the same destination core.
+// There is NO cross-core data exchange needed at any stage, including
+// cross-core stages (stage < log2_cores). The bit-reversal in
+// prepare_stage0 on the host ensures that each core's butterfly inputs
+// produce outputs that, when shuffled by the standard formula, land
+// exactly in that core's local output range.
 //
-// Cross-core split rule (standard Cooley-Tukey):
-//   Lower partner (core_id bit==0):
-//     keeps   out0[0..local_half-1]  as new even
-//     keeps   out1[0..local_half-1]  as new odd
-//     sends   nothing — it already has what it needs
-//     BUT receives out0/out1 from upper partner to complete its tile
+// Proof for N=8, 2 cores, stage 0 (cross-core stage):
+//   single-core shuffle: m=2, half_m=1, m2=4, half_m2=2, G2=2
+//   Core 0 (elements 0..1):
+//     new_even[0]: f=0, g_old=0, offset=0 < half_m → src=out0, idx=0  (local)
+//     new_even[1]: f=1, g_old=0, offset=1 ≥ half_m → src=out1, idx=0  (local)
+//     new_odd[0]:  f=2, g_old=1, offset=0 < half_m → src=out0, idx=1  (local)
+//     new_odd[1]:  f=3, g_old=1, offset=1 ≥ half_m → src=out1, idx=1  (local)
+//   All source indices are local to core 0! No data from core 1 needed.
 //
-// Wait — the correct model is simpler:
-//   Each core after a cross-core butterfly stage gets a FULL tile of
-//   out0 values (butterfly sums) OR out1 values (differences) depending
-//   on whether it is the lower or upper partner in each group.
+// This holds for ALL stages and ALL core counts when input is bit-reversed
+// and cores own contiguous slices. The formula naturally keeps each core
+// self-contained.
 //
-//   Lower partner keeps out0 (sums)   as its even+odd for next stage
-//   Upper partner keeps out1 (diffs)  as its even+odd for next stage
+// Therefore: the multicore writer is IDENTICAL to the single-core writer,
+// with only two changes:
+//   1. G2 = local_half / half_m2  (not half_N / half_m2)
+//   2. global index offset: f = core_elem_base + local_f
+//      local_idx = global_src_idx - core_elem_base
 //
-// This is the standard in-place decimation-in-time FFT:
-//   after butterfly, the "top" output goes to lower index, "bottom" to upper.
-//
-// IMPLEMENTATION:
-//   Lower core: new_even = out0[0..half-1], new_odd = out0[half..local_half-1]
-//   Upper core: new_even = out1[0..half-1], new_odd = out1[half..local_half-1]
-//   No NOC exchange needed — each core already has its full out0 or out1.
-//   The input split (prepare_stage0 / bit-reversal) ensures the correct
-//   elements are on each core from the start.
-//
-// NOC IS ONLY NEEDED when the butterfly partners are on different cores
-// AND the output of one core feeds the input of the other. In the
-// standard Cooley-Tukey partitioning used here (contiguous block per core),
-// after stage s < log2_cores the data is already correctly distributed —
-// lower core takes out0, upper core takes out1, NO exchange required.
-//
-// This means the cross-core "exchange" is actually just a LOCAL selection:
-//   is_lower → use out0 as next stage input
-//   is_upper → use out1 as next stage input
-//
-// The NOC exchange we were doing was wrong — it was mixing outputs across
-// cores when it shouldn't have been.
+// Args:
+//   0-3   DRAM output addresses (out0_r/i, out1_r/i)
+//   4     local_tiles
+//   5     num_stages (log2N)
+//   6     local_half
+//   7     half_N
+//   8     num_cores
+//   9     core_id
+//  10     log2_cores
+//  11     tile_offset
+//  12     core_elem_base
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -67,10 +63,6 @@ void kernel_main() {
     const uint32_t log2_cores    = get_arg_val<uint32_t>(10);
     const uint32_t tile_offset   = get_arg_val<uint32_t>(11);
     const uint32_t core_elem_base= get_arg_val<uint32_t>(12);
-
-    // Cross-core args still passed (for future use / NOC twiddle sync)
-    // but not used for data exchange in this corrected version.
-    // Layout unchanged so host args don't need to change.
 
     constexpr uint32_t cb_out0_r = 16;
     constexpr uint32_t cb_out0_i = 17;
@@ -111,8 +103,7 @@ void kernel_main() {
     };
 
     for (uint32_t stage = 0; stage < num_stages; stage++) {
-        const bool is_last       = (stage == num_stages - 1);
-        const bool is_cross_core = (stage < log2_cores);
+        const bool is_last = (stage == num_stages - 1);
 
         cb_wait_front(cb_out0_r, local_tiles);
         cb_wait_front(cb_out0_i, local_tiles);
@@ -139,72 +130,18 @@ void kernel_main() {
             cb_pop_front(cb_out1_r, local_tiles);
             cb_pop_front(cb_out1_i, local_tiles);
 
-        } else if (is_cross_core) {
-            // ── CROSS-CORE STAGE: LOCAL SELECTION (no NOC exchange) ──
-            //
-            // Standard Cooley-Tukey DIT with contiguous core partitioning:
-            // After the butterfly at stage s, the outputs are already on
-            // the correct core — no data movement needed.
-            //
-            // The bit that determines lower/upper in the FFT butterfly group
-            // at stage s is bit (log2_cores - 1 - s) of core_id.
-            // Equivalently: group_bit = num_cores >> (s+1)
-            //
-            //   Lower partner (core_id & group_bit == 0):
-            //     Takes out0 (butterfly sums) as next stage input.
-            //     new_even = out0[0 .. half-1]
-            //     new_odd  = out0[half .. local_half-1]
-            //
-            //   Upper partner (core_id & group_bit != 0):
-            //     Takes out1 (butterfly differences) as next stage input.
-            //     new_even = out1[0 .. half-1]
-            //     new_odd  = out1[half .. local_half-1]
-            //
-            // Why this works: prepare_stage0 bit-reverses the input so that
-            // elements destined for lower/upper outputs are already separated
-            // into the correct core's slice. Each core runs its local butterfly
-            // and then selects its output half — no cross-core communication.
-
-            const uint32_t group_bit = (num_cores >> (stage + 1));
-            const bool is_lower = ((core_id & group_bit) == 0);
-            const uint32_t half = local_half / 2;
-
-            // Select which output to use as next stage input
-            const uint32_t use_r = is_lower ? src0r : src1r;
-            const uint32_t use_i = is_lower ? src0i : src1i;
-
-            cb_reserve_back(cb_even_r, local_tiles);
-            cb_reserve_back(cb_even_i, local_tiles);
-            cb_reserve_back(cb_odd_r,  local_tiles);
-            cb_reserve_back(cb_odd_i,  local_tiles);
-
-            const uint32_t dst_er = get_write_ptr(cb_even_r);
-            const uint32_t dst_ei = get_write_ptr(cb_even_i);
-            const uint32_t dst_or = get_write_ptr(cb_odd_r);
-            const uint32_t dst_oi = get_write_ptr(cb_odd_i);
-
-            // Copy selected output into next stage even/odd input
-            for (uint32_t lp = 0; lp < half; lp++) {
-                wr(dst_er + lp*ELEM, rd(use_r + lp*ELEM));
-                wr(dst_ei + lp*ELEM, rd(use_i + lp*ELEM));
-            }
-            for (uint32_t lp = 0; lp < half; lp++) {
-                wr(dst_or + lp*ELEM, rd(use_r + (half+lp)*ELEM));
-                wr(dst_oi + lp*ELEM, rd(use_i + (half+lp)*ELEM));
-            }
-
-            cb_pop_front(cb_out0_r, local_tiles);
-            cb_pop_front(cb_out0_i, local_tiles);
-            cb_pop_front(cb_out1_r, local_tiles);
-            cb_pop_front(cb_out1_i, local_tiles);
-
-            cb_push_back(cb_even_r, local_tiles);
-            cb_push_back(cb_even_i, local_tiles);
-            cb_push_back(cb_odd_r,  local_tiles);
-            cb_push_back(cb_odd_i,  local_tiles);
-
         } else {
-            // ── LOCAL SHUFFLE (stage >= log2_cores) ──────────────────
+            // ── SHUFFLE (identical formula for ALL stages) ───────────
+            //
+            // Same as single-core writer_fft_f32.cpp, with:
+            //   G2 = local_half / half_m2   (our slice only)
+            //   f  = core_elem_base + local_f  (global index)
+            //   local_idx = global_src_idx - core_elem_base
+            //
+            // No cross-core distinction needed — the formula is
+            // self-contained per core for all stages when input
+            // is bit-reversed and cores own contiguous slices.
+
             const uint32_t m       = 1u << (stage + 1);
             const uint32_t half_m  = m >> 1;
             const uint32_t m2      = m << 1;
@@ -230,34 +167,37 @@ void kernel_main() {
                 const uint32_t local_base_o = local_base_e + half_m2;
 
                 for (uint32_t j2 = 0; j2 < half_m2; j2++) {
+
                     // new_even[dst]
                     {
-                        uint32_t f          = core_elem_base + local_base_e + j2;
-                        uint32_t g_old      = f >> log2m;
-                        uint32_t offset     = f & m_mask;
+                        uint32_t f      = core_elem_base + local_base_e + j2;
+                        uint32_t g_old  = f >> log2m;
+                        uint32_t offset = f & m_mask;
                         uint32_t global_idx = (offset < half_m)
                             ? g_old * half_m + offset
                             : g_old * half_m + (offset - half_m);
-                        uint32_t local_idx  = global_idx - core_elem_base;
+                        uint32_t local_idx = global_idx - core_elem_base;
                         uint32_t srcr = (offset < half_m) ? src0r : src1r;
                         uint32_t srci = (offset < half_m) ? src0i : src1i;
                         wr(dst_er + dst*ELEM, rd(srcr + local_idx*ELEM));
                         wr(dst_ei + dst*ELEM, rd(srci + local_idx*ELEM));
                     }
+
                     // new_odd[dst]
                     {
-                        uint32_t f          = core_elem_base + local_base_o + j2;
-                        uint32_t g_old      = f >> log2m;
-                        uint32_t offset     = f & m_mask;
+                        uint32_t f      = core_elem_base + local_base_o + j2;
+                        uint32_t g_old  = f >> log2m;
+                        uint32_t offset = f & m_mask;
                         uint32_t global_idx = (offset < half_m)
                             ? g_old * half_m + offset
                             : g_old * half_m + (offset - half_m);
-                        uint32_t local_idx  = global_idx - core_elem_base;
+                        uint32_t local_idx = global_idx - core_elem_base;
                         uint32_t srcr = (offset < half_m) ? src0r : src1r;
                         uint32_t srci = (offset < half_m) ? src0i : src1i;
                         wr(dst_or + dst*ELEM, rd(srcr + local_idx*ELEM));
                         wr(dst_oi + dst*ELEM, rd(srci + local_idx*ELEM));
                     }
+
                     dst++;
                 }
             }

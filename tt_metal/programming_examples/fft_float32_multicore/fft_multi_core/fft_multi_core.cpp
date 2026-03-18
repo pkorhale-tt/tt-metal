@@ -375,41 +375,8 @@ int main(int argc, char** argv) {
             core_elem_base   // arg 12: global element base for local shuffle
         };
 
-        std::vector<uint32_t> cx_noc_x(log2_cores), cx_noc_y(log2_cores);
-        std::vector<uint32_t> cx_er(log2_cores), cx_ei(log2_cores);
-        std::vector<uint32_t> cx_or(log2_cores), cx_oi(log2_cores);
+        // No cross-core args needed — shuffle is self-contained per core.
 
-        std::vector<uint32_t> cx_p_sem(log2_cores, 0u);
-        std::vector<uint32_t> cx_my_sem(log2_cores, 0u);
-
-        for (uint32_t s = 0; s < log2_cores; s++) {
-            uint32_t partner_id = c ^ (num_cores >> (s + 1));
-
-            CoreCoord partner_physical =
-                device->worker_core_from_logical_core({partner_id, 0});
-            cx_noc_x[s] = partner_physical.x;
-            cx_noc_y[s] = partner_physical.y;
-
-            // CB addresses — same on all cores (identical layout)
-            cx_er[s] = cb_l1_addr(l1_base, 0);
-            cx_ei[s] = cb_l1_addr(l1_base, 1);
-            cx_or[s] = cb_l1_addr(l1_base, 2);
-            cx_oi[s] = cb_l1_addr(l1_base, 3);
-
-            // Semaphore addresses unused (no NOC exchange in corrected design).
-            // Kept in args layout for compatibility; writer ignores them.
-            cx_p_sem[s]  = 0;
-            cx_my_sem[s] = 0;
-        }
-
-        for (auto v : cx_noc_x)  writer_args.push_back(v);
-        for (auto v : cx_noc_y)  writer_args.push_back(v);
-        for (auto v : cx_er)     writer_args.push_back(v);
-        for (auto v : cx_ei)     writer_args.push_back(v);
-        for (auto v : cx_or)     writer_args.push_back(v);
-        for (auto v : cx_oi)     writer_args.push_back(v);
-        for (auto v : cx_p_sem)  writer_args.push_back(v);
-        for (auto v : cx_my_sem) writer_args.push_back(v);
 
         SetRuntimeArgs(prog, reader_k,  cc, reader_args);
         SetRuntimeArgs(prog, writer_k,  cc, writer_args);
