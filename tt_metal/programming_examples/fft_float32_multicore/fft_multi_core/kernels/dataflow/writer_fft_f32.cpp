@@ -138,15 +138,24 @@ void kernel_main() {
             //   f  = core_elem_base + local_f  (global index)
             //   local_idx = global_src_idx - core_elem_base
             //
-            // No cross-core distinction needed — the formula is
-            // self-contained per core for all stages when input
-            // is bit-reversed and cores own contiguous slices.
+            // IMPORTANT: when half_m2 > local_half (late stages), G2=0
+            // and the loop does nothing. In those stages the entire
+            // local tile is a single butterfly group spanning multiple
+            // cores. But since the bit-reversed partition ensures each
+            // core's out0/out1 are already in the right order, we just
+            // pass out0 directly as even and out1 as odd for next stage.
+            // This is the correct behaviour — no shuffle needed.
 
             const uint32_t m       = 1u << (stage + 1);
             const uint32_t half_m  = m >> 1;
             const uint32_t m2      = m << 1;
             const uint32_t half_m2 = m2 >> 1;
-            const uint32_t G2      = local_half / half_m2;
+            // G2: number of complete next-stage groups in our slice.
+            // When half_m2 > local_half, G2=0 meaning our whole slice
+            // is part of one large group — handled by the fallback below.
+            const uint32_t G2      = (half_m2 <= local_half)
+                                     ? local_half / half_m2
+                                     : 0u;
 
             cb_reserve_back(cb_even_r, local_tiles);
             cb_reserve_back(cb_even_i, local_tiles);
@@ -199,6 +208,29 @@ void kernel_main() {
                     }
 
                     dst++;
+                }
+            }
+
+            // Fallback: if G2==0 (late stages where group spans multiple
+            // tiles), copy out0 → even and out1 → odd directly.
+            // The bit-reversed input ensures out0[k] and out1[k] are
+            // already the correct even/odd pair for the next stage.
+            if (G2 == 0) {
+                for (uint32_t lp = 0; lp < local_half/2; lp++) {
+                    wr(dst_er + lp*ELEM, rd(src0r + lp*ELEM));
+                    wr(dst_ei + lp*ELEM, rd(src0i + lp*ELEM));
+                    wr(dst_or + lp*ELEM, rd(src1r + lp*ELEM));
+                    wr(dst_oi + lp*ELEM, rd(src1i + lp*ELEM));
+                }
+                for (uint32_t lp = 0; lp < local_half/2; lp++) {
+                    wr(dst_er + (local_half/2 + lp)*ELEM,
+                       rd(src0r + (local_half/2 + lp)*ELEM));
+                    wr(dst_ei + (local_half/2 + lp)*ELEM,
+                       rd(src0i + (local_half/2 + lp)*ELEM));
+                    wr(dst_or + (local_half/2 + lp)*ELEM,
+                       rd(src1r + (local_half/2 + lp)*ELEM));
+                    wr(dst_oi + (local_half/2 + lp)*ELEM,
+                       rd(src1i + (local_half/2 + lp)*ELEM));
                 }
             }
 
