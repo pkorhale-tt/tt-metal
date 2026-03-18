@@ -164,10 +164,15 @@ uint32_t detect_available_cores(IDevice* device, uint32_t max_req,
         } catch (...) { break; }
     }
     std::cout << " Usable row-0 cores: " << usable << "\n";
-    // Cap: num_cores must divide num_rows evenly
     uint32_t cap = std::min(usable, max_req);
+    // In auto mode (num_rows=0), just return largest power-of-2 available.
+    // Otherwise ensure num_rows divides evenly by num_cores.
     uint32_t result = 1;
-    while (result*2 <= cap && num_rows % (result*2) == 0) result *= 2;
+    if (num_rows == 0) {
+        while (result*2 <= cap) result *= 2;
+    } else {
+        while (result*2 <= cap && num_rows % (result*2) == 0) result *= 2;
+    }
     std::cout << " Selected cores: " << result << "\n";
     return result;
 }
@@ -236,18 +241,18 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
                   << " <direction:0|1> [N_row] [num_rows] [num_cores]\n"
-                  << " Default: forward FFT, N_row=1024, num_rows=8\n";
+                  << " Default: forward FFT, N_row=1024, num_rows=auto (128 rows/core)\n";
         return 1;
     }
     uint32_t direction  = (uint32_t)std::atoi(argv[1]);
     uint32_t N_row      = 1024;
-    uint32_t num_rows   = 8;
+    uint32_t num_rows   = 0;    // 0 = auto: num_cores * rows_per_core_target
     uint32_t user_cores = 0;
+    uint32_t rows_per_core_target = 128;  // target rows per core when auto
     std::string in_file = "";
 
     for (int i = 2; i < argc; i++) {
         if (!is_uint_str(argv[i])) {
-            // Non-numeric → treat as file path
             in_file = argv[i];
             continue;
         }
@@ -267,6 +272,16 @@ int main(int argc, char** argv) {
 
     uint32_t max_req   = user_cores > 0 ? user_cores : 64u;
     uint32_t num_cores = detect_available_cores(device, max_req, num_rows);
+
+    // Auto num_rows: fill all cores with rows_per_core_target rows each
+    // This maximises utilisation — all 8 cores stay busy the entire launch.
+    if (num_rows == 0)
+        num_rows = num_cores * rows_per_core_target;
+
+    // Ensure num_rows is divisible by num_cores
+    num_rows = (num_rows / num_cores) * num_cores;
+    if (num_rows == 0) num_rows = num_cores;
+
     uint32_t rows_per_core = num_rows / num_cores;
 
     uint32_t log2_row  = 0; while ((1u<<log2_row) < N_row) log2_row++;
@@ -285,6 +300,11 @@ int main(int argc, char** argv) {
     std::cout << " log2(N_row)  : " << log2_row << "\n";
     std::cout << " tiles/row    : " << tiles_per_row << "\n";
     std::cout << " Direction    : " << (direction?"Inverse":"Forward") << "\n";
+    std::cout << " Total FFTs   : " << num_rows
+              << "  (" << num_cores << " cores × "
+              << rows_per_core << " rows)\n";
+    std::cout << " Total points : " << (uint64_t)num_rows * N_row / 1024
+              << " K complex samples\n";
     std::cout << "════════════════════════════════════════════════\n";
 
     // Generate or load input
@@ -487,17 +507,20 @@ int main(int argc, char** argv) {
     if (direction==1)
         for (uint32_t i=0;i<total_N;i++){ result_r[i]/=N_row; result_i[i]/=N_row; }
 
-    // Validate: check first row only (all rows are identical)
+    // Validate all rows — with many rows per core, any shuffle error
+    // in a non-first row would be invisible if we only check row 0.
     std::cout << "\n════════════════════════════════════════════════\n";
-    std::cout << " VALIDATION (row 0)\n";
+    std::cout << " VALIDATION (all " << num_rows << " rows)\n";
     std::cout << "════════════════════════════════════════════════\n";
     float mer=0.f, mei=0.f, me=0.f;
-    for (uint32_t i=0;i<N_row;i++) {
-        float er=std::abs(result_r[i]-ref_r[i]);
-        float ei=std::abs(result_i[i]-ref_i[i]);
-        mer=std::max(mer,er); mei=std::max(mei,ei); me+=er+ei;
+    for (uint32_t row=0; row<num_rows; row++) {
+        for (uint32_t i=0;i<N_row;i++) {
+            float er=std::abs(result_r[row*N_row+i]-ref_r[row*N_row+i]);
+            float ei=std::abs(result_i[row*N_row+i]-ref_i[row*N_row+i]);
+            mer=std::max(mer,er); mei=std::max(mei,ei); me+=er+ei;
+        }
     }
-    me /= 2*N_row;
+    me /= 2*total_N;
     std::cout << " Max error (real): " << mer << "\n";
     std::cout << " Max error (imag): " << mei << "\n";
     std::cout << " Mean error      : " << me  << "\n";
@@ -510,7 +533,7 @@ int main(int argc, char** argv) {
     std::cout << " Result: " << (passed?"✓ PASSED":"✗ FAILED") << "\n";
 
     std::cout << "\n════════════════════════════════════════════════\n";
-    std::cout << " FIRST 16 RESULTS (row 0)\n";
+    std::cout << " FIRST 16 RESULTS (row 0 of " << num_rows << ")\n";
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << std::fixed << std::setprecision(5);
     for (uint32_t i=0;i<16&&i<N_row;i++) {
