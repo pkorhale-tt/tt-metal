@@ -1,15 +1,9 @@
 // reader_fft_f32.cpp — MULTICORE reader (PORTABLE FIX)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
-//
-// CHANGES:
-//  1. Removed all low-level DMA intrinsics (TT_SETDMAREG, TT_LOADIND, TT_STOREIND).
-//  2. Use noc_async_read() for all memory transfers (portable across all Metal targets).
-//  3. Added outer loop over rows_per_core.
-//  4. Compact twiddles loaded once and kept resident.
 
 #include <cstdint>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 void kernel_main() {
     const uint32_t even_r_addr    = get_arg_val<uint32_t>(0);
