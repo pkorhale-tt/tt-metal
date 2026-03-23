@@ -1,11 +1,4 @@
-// reader_fft_f32.cpp — MULTICORE reader (STAGE-OUTER FIX)
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
-// SPDX-License-Identifier: Apache-2.0
-//
-// CRITICAL FIX: Stage loop OUTSIDE row loop.
-// Each stage's twiddles for all rows must be loaded before
-// compute/writer move to the next stage.
-
+// reader_fft_f32.cpp — STREAMING OPTIMIZED
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 
@@ -57,7 +50,7 @@ void kernel_main() {
 
     if (local_tiles == 0 || num_stages == 0 || rows_per_core == 0) return;
 
-    // Load compact twiddle table once (shared across all rows)
+    // Load compact twiddles once
     cb_reserve_back(cb_compact_r, 1);
     cb_reserve_back(cb_compact_i, 1);
     noc_async_read_tile(0, cmp_r_gen, get_write_ptr(cb_compact_r));
@@ -74,63 +67,59 @@ void kernel_main() {
     volatile float* cmp_r_ptr = reinterpret_cast<volatile float*>(cmp_r_base);
     volatile float* cmp_i_ptr = reinterpret_cast<volatile float*>(cmp_i_base);
 
-    // ── STAGE 0: Load all rows' even/odd inputs ──────────────────────────
+    // ── STREAMING LOOP: one tile at a time through entire pipeline ───────
     for (uint32_t row = 0; row < rows_per_core; row++) {
         const uint32_t row_tile_offset = tile_offset + row * local_tiles;
+        const uint32_t row_elem_base   = row_tile_offset * (tile_bytes / sizeof(float));
 
-        cb_reserve_back(cb_even_r, local_tiles);
-        cb_reserve_back(cb_even_i, local_tiles);
-        cb_reserve_back(cb_odd_r,  local_tiles);
-        cb_reserve_back(cb_odd_i,  local_tiles);
+        for (uint32_t stage = 0; stage < num_stages; stage++) {
+            const uint32_t half_m      = 1u << stage;
+            const uint32_t N_over_m    = half_N >> stage;
+            const uint32_t half_m_mask = half_m - 1u;
 
-        for (uint32_t t = 0; t < local_tiles; t++) {
-            uint32_t gt = row_tile_offset + t;
-            noc_async_read_tile(gt, even_r_gen,
-                get_write_ptr(cb_even_r) + t * tile_bytes);
-            noc_async_read_tile(gt, even_i_gen,
-                get_write_ptr(cb_even_i) + t * tile_bytes);
-            noc_async_read_tile(gt, odd_r_gen,
-                get_write_ptr(cb_odd_r)  + t * tile_bytes);
-            noc_async_read_tile(gt, odd_i_gen,
-                get_write_ptr(cb_odd_i)  + t * tile_bytes);
-        }
-        noc_async_read_barrier();
+            for (uint32_t t = 0; t < local_tiles; t++) {
+                // Stage 0: load input data from DRAM
+                if (stage == 0) {
+                    uint32_t gt = row_tile_offset + t;
+                    
+                    cb_reserve_back(cb_even_r, 1);
+                    cb_reserve_back(cb_even_i, 1);
+                    cb_reserve_back(cb_odd_r,  1);
+                    cb_reserve_back(cb_odd_i,  1);
+                    
+                    noc_async_read_tile(gt, even_r_gen, get_write_ptr(cb_even_r));
+                    noc_async_read_tile(gt, even_i_gen, get_write_ptr(cb_even_i));
+                    noc_async_read_tile(gt, odd_r_gen,  get_write_ptr(cb_odd_r));
+                    noc_async_read_tile(gt, odd_i_gen,  get_write_ptr(cb_odd_i));
+                    noc_async_read_barrier();
+                    
+                    cb_push_back(cb_even_r, 1);
+                    cb_push_back(cb_even_i, 1);
+                    cb_push_back(cb_odd_r,  1);
+                    cb_push_back(cb_odd_i,  1);
+                }
 
-        cb_push_back(cb_even_r, local_tiles);
-        cb_push_back(cb_even_i, local_tiles);
-        cb_push_back(cb_odd_r,  local_tiles);
-        cb_push_back(cb_odd_i,  local_tiles);
-    }
+                // All stages: expand twiddles for this tile
+                cb_reserve_back(cb_tw_r, 1);
+                cb_reserve_back(cb_tw_i, 1);
 
-    // ── STAGES: Process each stage for all rows ──────────────────────────
-    for (uint32_t stage = 0; stage < num_stages; stage++) {
-        const uint32_t half_m      = 1u << stage;
-        const uint32_t N_over_m    = half_N >> stage;
-        const uint32_t half_m_mask = half_m - 1u;
+                uint32_t dst_r = get_write_ptr(cb_tw_r);
+                uint32_t dst_i = get_write_ptr(cb_tw_i);
 
-        // Expand twiddles for this stage, for all rows
-        for (uint32_t row = 0; row < rows_per_core; row++) {
-            const uint32_t row_tile_offset = tile_offset + row * local_tiles;
-            const uint32_t row_elem_base   = row_tile_offset * (tile_bytes / sizeof(float));
+                volatile float* tw_r_ptr = reinterpret_cast<volatile float*>(dst_r);
+                volatile float* tw_i_ptr = reinterpret_cast<volatile float*>(dst_i);
 
-            cb_reserve_back(cb_tw_r, local_tiles);
-            cb_reserve_back(cb_tw_i, local_tiles);
+                uint32_t tile_elem_base = row_elem_base + t * (tile_bytes / sizeof(float));
+                for (uint32_t lp = 0; lp < local_half; lp++) {
+                    const uint32_t p   = tile_elem_base + lp;
+                    const uint32_t idx = (p & half_m_mask) * N_over_m;
+                    tw_r_ptr[lp] = cmp_r_ptr[idx];
+                    tw_i_ptr[lp] = cmp_i_ptr[idx];
+                }
 
-            uint32_t dst_r = get_write_ptr(cb_tw_r);
-            uint32_t dst_i = get_write_ptr(cb_tw_i);
-
-            volatile float* tw_r_ptr = reinterpret_cast<volatile float*>(dst_r);
-            volatile float* tw_i_ptr = reinterpret_cast<volatile float*>(dst_i);
-
-            for (uint32_t lp = 0; lp < local_half; lp++) {
-                const uint32_t p   = row_elem_base + lp;
-                const uint32_t idx = (p & half_m_mask) * N_over_m;
-                tw_r_ptr[lp] = cmp_r_ptr[idx];
-                tw_i_ptr[lp] = cmp_i_ptr[idx];
+                cb_push_back(cb_tw_r, 1);
+                cb_push_back(cb_tw_i, 1);
             }
-
-            cb_push_back(cb_tw_r, local_tiles);
-            cb_push_back(cb_tw_i, local_tiles);
         }
     }
 
