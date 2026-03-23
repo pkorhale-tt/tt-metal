@@ -1,51 +1,43 @@
-// fft_compute_f32.cpp  — MULTICORE: per-core butterfly kernel (OPTIMIZED)
+// fft_compute_f32.cpp  — MULTICORE butterfly kernel (FIXED)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// OPTIMIZATIONS vs original:
+// ROOT CAUSE OF CORRUPTION (previous version):
+//   mul_tiles() advances the LLK read pointer of each source CB internally.
+//   When two separate tile_regs sessions both called mul_tiles on the same
+//   source CBs (tw_r, tw_i, odd_r, odd_i), the second session read the NEXT
+//   tile in those CBs — a different row's data — producing NaN/Inf.
 //
-//  1. BATCHED tile_regs acquire/release
-//     Original: acquire → mul → commit → wait → pack → release  ×8 per butterfly
-//     Optimized: acquire ONCE → all 8 math ops in one register-file session → release ONCE
-//     Tensix tile registers can hold many in-flight tiles simultaneously.
-//     Eliminating 7 unnecessary acquire/commit/wait/release round-trips per butterfly
-//     removes the dominant source of compute-kernel stall cycles.
+// FIX — 4-phase butterfly, each CB read exactly once:
 //
-//  2. Init calls moved OUTSIDE the tile loop
-//     Original: mul_tiles_init / add_tiles_init / sub_tiles_init called once per tile
-//     Optimized: called once per stage (they only need re-calling when CB source changes,
-//     which happens at stage boundaries, not tile boundaries within a stage).
-//     Saves ~6 FPU reconfiguration sequences per tile.
+//   Phase 1 (session A): Compute all 4 partial products from tw/odd CBs.
+//                        Pack all 4 to scratch CBs. Pop tw/odd immediately.
+//   Phase 2 (session B): Subtract partials → t_r. Pack to cb_tmp0.
+//   Phase 3 (session C): Add partials → t_i. Pack to cb_tmp1.
+//   Phase 4 (session D): Compute even±t, pack all 4 outputs. Pop even+scratch.
 //
-//  3. Intermediate scratch CBs eliminated for t_r / t_i
-//     Original used cb_tmp0/cb_tmp1 as staging buffers between complex-multiply steps,
-//     which required push/wait/pop pairs and round-tripped data through L1 SRAM.
-//     Optimized: the complex multiply (tw * odd) is computed entirely within the
-//     single tile-register session — tw_r*odd_r and tw_i*odd_i both land in named
-//     tile register slots, then the subtraction also happens in-register.
-//     cb_tmp0/cb_tmp1 are now only used for the final pack staging (required by API),
-//     but we do a single push/pop pair at the end rather than interleaved ones.
+//   tw_r, tw_i, odd_r, odd_i: read in Phase 1 only, popped immediately after.
+//   even_r, even_i: read in Phase 4 only, popped immediately after.
+//   No CB is read in more than one session.
 //
-//  4. CB wait coalesced to top of tile loop
-//     All six input CBs are waited on together before any math. This allows the
-//     NOC read-ahead (issued by the reader RISC-V) to complete as a batch, rather
-//     than serialising on individual waits scattered through the butterfly.
+// OPTIMIZATIONS:
+//   - mul/add/sub_tiles_init() called once per stage (outside tile loop)
+//   - All input CBs waited on together at start of tile loop
+//   - All 4 output CBs packed before tile_regs_release() in Phase 4
 //
-// CB map (identical to original — reader/writer unchanged):
+// CB map:
 //   0  cb_even_r    stage input even real
 //   1  cb_even_i    stage input even imag
 //   2  cb_odd_r     stage input odd  real
 //   3  cb_odd_i     stage input odd  imag
 //   4  cb_tw_r      expanded twiddle real
 //   5  cb_tw_i      expanded twiddle imag
-//  16  cb_out0_r    butterfly sum real      (even + t)
+//  16  cb_out0_r    butterfly sum real
 //  17  cb_out0_i    butterfly sum imag
-//  18  cb_out1_r    butterfly diff real     (even - t)
+//  18  cb_out1_r    butterfly diff real
 //  19  cb_out1_i    butterfly diff imag
-//  20  cb_tmp0      scratch (t_r staging)
-//  21  cb_tmp1      scratch (t_i staging)
-//  22  cb_tw_odd_r  W*odd real  (t_r)
-//  23  cb_tw_odd_i  W*odd imag  (t_i)
+//  20  cb_tmp0      scratch (tw_r*odd_r and tw_r*odd_i staging, then t_r)
+//  21  cb_tmp1      scratch (tw_i*odd_i and tw_i*odd_r staging, then t_i)
 
 #include <cstdint>
 #include "api/compute/tile_move_copy.h"
@@ -55,62 +47,40 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/copy_dest_values.h"
 
-// Tile register slot assignments (stable across the single session per butterfly)
-// Using named slots avoids magic numbers and documents data flow clearly.
-constexpr uint32_t SLOT_TR_A = 0;  // tw_r * odd_r   (partial t_r)
-constexpr uint32_t SLOT_TR_B = 1;  // tw_i * odd_i   (partial t_r)
-constexpr uint32_t SLOT_TI_A = 2;  // tw_r * odd_i   (partial t_i)
-constexpr uint32_t SLOT_TI_B = 3;  // tw_i * odd_r   (partial t_i)
-constexpr uint32_t SLOT_T_R  = 4;  // t_r = SLOT_TR_A - SLOT_TR_B
-constexpr uint32_t SLOT_T_I  = 5;  // t_i = SLOT_TI_A + SLOT_TI_B
+// CB indices for the two extra scratch CBs used as t_i partials staging
+// We reuse cb_tmp0/cb_tmp1 with a push/pop protocol — they are FIFO CBs.
+// Depth must be >= 2 tiles (configured in host). After Phase 1 they hold:
+//   cb_tmp0: [tw_r*odd_r, tw_r*odd_i]  (2 tiles)
+//   cb_tmp1: [tw_i*odd_i, tw_i*odd_r]  (2 tiles)
+// After Phase 2 (t_r sub), cb_tmp0 front = t_r (1 tile).
+// After Phase 3 (t_i add), cb_tmp1 front = t_i (1 tile).
 
 void kernel_main() {
-    // arg 0: total FFT stages (log2N)
-    // arg 1: tiles this core handles per stage
     const uint32_t num_stages      = get_arg_val<uint32_t>(0);
     const uint32_t tiles_per_stage = get_arg_val<uint32_t>(1);
 
-    constexpr uint32_t cb_even_r   = 0;
-    constexpr uint32_t cb_even_i   = 1;
-    constexpr uint32_t cb_odd_r    = 2;
-    constexpr uint32_t cb_odd_i    = 3;
-    constexpr uint32_t cb_tw_r     = 4;
-    constexpr uint32_t cb_tw_i     = 5;
-    constexpr uint32_t cb_out0_r   = 16;
-    constexpr uint32_t cb_out0_i   = 17;
-    constexpr uint32_t cb_out1_r   = 18;
-    constexpr uint32_t cb_out1_i   = 19;
-    constexpr uint32_t cb_tmp0     = 20;
-    constexpr uint32_t cb_tmp1     = 21;
-    constexpr uint32_t cb_tw_odd_r = 22;
-    constexpr uint32_t cb_tw_odd_i = 23;
+    constexpr uint32_t cb_even_r = 0;
+    constexpr uint32_t cb_even_i = 1;
+    constexpr uint32_t cb_odd_r  = 2;
+    constexpr uint32_t cb_odd_i  = 3;
+    constexpr uint32_t cb_tw_r   = 4;
+    constexpr uint32_t cb_tw_i   = 5;
+    constexpr uint32_t cb_out0_r = 16;
+    constexpr uint32_t cb_out0_i = 17;
+    constexpr uint32_t cb_out1_r = 18;
+    constexpr uint32_t cb_out1_i = 19;
+    constexpr uint32_t cb_tmp0   = 20;
+    constexpr uint32_t cb_tmp1   = 21;
 
-    // One-time init for the binary op infrastructure.
-    // This configures the SFPU/FPU pipeline and does NOT need repeating
-    // per stage or per tile — it is sticky until kernel_main() exits.
     binary_op_init_common(cb_even_r, cb_odd_r, cb_tmp0);
 
     for (uint32_t stage = 0; stage < num_stages; stage++) {
-
-        // ── OPTIMIZATION 2: Init calls once per stage, not per tile ──────
-        // These reconfigure the FPU source CB pointers. They only need
-        // re-calling when the CB pair changes — which happens at each new
-        // stage boundary (twiddle CBs are re-filled each stage), not
-        // between tiles within a stage.
-        //
-        // Order matters: the last init call sets the active FPU source pair.
-        // We call all of them here so each op below is ready to fire
-        // without any reconfiguration inside the tile loop.
-        mul_tiles_init(cb_tw_r,  cb_odd_r,  cb_tmp0);   // for tw_r*odd_r
-        // (other source pairs will re-init inline only when source CBs differ)
+        // OPTIMIZATION: init once per stage, sticky until next stage.
+        mul_tiles_init(cb_tw_r, cb_odd_r, cb_tmp0);
 
         for (uint32_t t = 0; t < tiles_per_stage; t++) {
 
-            // ── OPTIMIZATION 4: Coalesced CB wait at top of tile loop ─────
-            // Wait for ALL inputs before beginning math. This gives the NOC
-            // DMA the maximum possible time to prefetch and maximises the
-            // chance that all six tiles are already resident in L1 by the
-            // time the FPU needs them.
+            // OPTIMIZATION: coalesced wait — all inputs before any math.
             cb_wait_front(cb_tw_r,   1);
             cb_wait_front(cb_tw_i,   1);
             cb_wait_front(cb_odd_r,  1);
@@ -118,167 +88,135 @@ void kernel_main() {
             cb_wait_front(cb_even_r, 1);
             cb_wait_front(cb_even_i, 1);
 
-            // ── OPTIMIZATION 1 & 3: Single tile_regs session per butterfly ─
-            //
-            // All eight arithmetic steps of one Cooley-Tukey butterfly are
-            // executed inside a single acquire/release window. Tile register
-            // slots 0-5 hold all intermediate values in the Tensix register
-            // file — no intermediate L1 round-trips.
-            //
-            // Butterfly math:
-            //   t_r = tw_r*odd_r − tw_i*odd_i
-            //   t_i = tw_r*odd_i + tw_i*odd_r
-            //   out0_r = even_r + t_r,  out0_i = even_i + t_i
-            //   out1_r = even_r − t_r,  out1_i = even_i − t_i
+            // ── PHASE 1: 4 partial products from tw and odd CBs ───────────
+            // Each of tw_r, tw_i, odd_r, odd_i is read ONCE in this session.
+            // Results packed to cb_tmp0 (x2) and cb_tmp1 (x2) before release.
+            // tw/odd CBs popped immediately after — never read again.
+
+            cb_reserve_back(cb_tmp0, 2);
+            cb_reserve_back(cb_tmp1, 2);
 
             tile_regs_acquire();
 
-            // ── Step 1: tw_r * odd_r → SLOT_TR_A ────────────────────────
             mul_tiles_init(cb_tw_r, cb_odd_r, cb_tmp0);
-            mul_tiles(cb_tw_r, cb_odd_r, 0, 0, SLOT_TR_A);
+            mul_tiles(cb_tw_r, cb_odd_r, 0, 0, 0);   // slot 0 = tw_r * odd_r
 
-            // ── Step 2: tw_i * odd_i → SLOT_TR_B ────────────────────────
             mul_tiles_init(cb_tw_i, cb_odd_i, cb_tmp0);
-            mul_tiles(cb_tw_i, cb_odd_i, 0, 0, SLOT_TR_B);
+            mul_tiles(cb_tw_i, cb_odd_i, 0, 0, 1);   // slot 1 = tw_i * odd_i
 
-            // ── Step 3: tw_r * odd_i → SLOT_TI_A ────────────────────────
             mul_tiles_init(cb_tw_r, cb_odd_i, cb_tmp0);
-            mul_tiles(cb_tw_r, cb_odd_i, 0, 0, SLOT_TI_A);
+            mul_tiles(cb_tw_r, cb_odd_i, 0, 0, 2);   // slot 2 = tw_r * odd_i
 
-            // ── Step 4: tw_i * odd_r → SLOT_TI_B ────────────────────────
             mul_tiles_init(cb_tw_i, cb_odd_r, cb_tmp0);
-            mul_tiles(cb_tw_i, cb_odd_r, 0, 0, SLOT_TI_B);
+            mul_tiles(cb_tw_i, cb_odd_r, 0, 0, 3);   // slot 3 = tw_i * odd_r
 
-            // ── Step 5: t_r = SLOT_TR_A − SLOT_TR_B → SLOT_T_R ──────────
-            // sub_tiles operating on already-computed register slots.
-            // We pack TR_A and TR_B to scratch CBs so sub_tiles can read them,
-            // then do the subtraction. This is the minimum required staging —
-            // the Tensix binary op unit reads from CBs, not directly from
-            // tile register slots.
             tile_regs_commit();
             tile_regs_wait();
 
-            // Pack partial products to scratch CBs for the subtraction pass
-            cb_reserve_back(cb_tmp0, 1);
-            pack_tile(SLOT_TR_A, cb_tmp0);
-            cb_push_back(cb_tmp0, 1);
-
-            cb_reserve_back(cb_tmp1, 1);
-            pack_tile(SLOT_TR_B, cb_tmp1);
-            cb_push_back(cb_tmp1, 1);
-
-            tile_regs_release();
-
-            // ── t_r subtraction in a fresh session ───────────────────────
-            cb_wait_front(cb_tmp0, 1);
-            cb_wait_front(cb_tmp1, 1);
-
-            tile_regs_acquire();
-            sub_tiles_init(cb_tmp0, cb_tmp1, cb_tw_odd_r);
-            sub_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);
-
-            cb_reserve_back(cb_tw_odd_r, 1);
-            tile_regs_commit(); tile_regs_wait();
-            pack_tile(0, cb_tw_odd_r);
-            tile_regs_release();
-            cb_push_back(cb_tw_odd_r, 1);
-            cb_pop_front(cb_tmp0, 1);
-            cb_pop_front(cb_tmp1, 1);
-
-            // ── t_i addition in a fresh session ──────────────────────────
-            // Pack TI_A and TI_B from earlier (already computed above)
-            // We re-use tmp0/tmp1 for the t_i partials.
-            //
-            // NOTE: Because tile_regs were released above, we need to
-            // recompute TI_A and TI_B. In a future revision these could be
-            // cached to a separate scratch CB during the first session above.
-            // For now we redo the two multiplies — this is still 2x fewer
-            // acquire/release cycles than the original 8x pattern.
-
-            cb_reserve_back(cb_tmp0, 1);
-            tile_regs_acquire();
-            mul_tiles_init(cb_tw_r, cb_odd_i, cb_tmp0);
-            mul_tiles(cb_tw_r, cb_odd_i, 0, 0, 0);
-            tile_regs_commit(); tile_regs_wait();
+            // Pack: tmp0[0] = tw_r*odd_r, tmp0[1] = tw_r*odd_i
             pack_tile(0, cb_tmp0);
+            pack_tile(2, cb_tmp0);
+            // Pack: tmp1[0] = tw_i*odd_i, tmp1[1] = tw_i*odd_r
+            pack_tile(1, cb_tmp1);
+            pack_tile(3, cb_tmp1);
+
             tile_regs_release();
+
+            cb_push_back(cb_tmp0, 2);
+            cb_push_back(cb_tmp1, 2);
+
+            // Pop all tw/odd CBs — fully consumed, never re-read.
+            cb_pop_front(cb_tw_r,  1);
+            cb_pop_front(cb_tw_i,  1);
+            cb_pop_front(cb_odd_r, 1);
+            cb_pop_front(cb_odd_i, 1);
+
+            // ── PHASE 2: t_r = (tw_r*odd_r) - (tw_i*odd_i) ──────────────
+            // tmp0 front = tw_r*odd_r, tmp1 front = tw_i*odd_i
+
+            cb_wait_front(cb_tmp0, 2);
+            cb_wait_front(cb_tmp1, 2);
+
+            cb_reserve_back(cb_tmp0, 1); // will hold t_r
+
+            tile_regs_acquire();
+            sub_tiles_init(cb_tmp0, cb_tmp1, cb_tmp0);
+            sub_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);    // slot 0 = t_r
+            tile_regs_commit(); tile_regs_wait();
+            pack_tile(0, cb_tmp0);                    // pack t_r
+            tile_regs_release();
+
             cb_push_back(cb_tmp0, 1);
 
-            cb_reserve_back(cb_tmp1, 1);
+            // Pop the two partial products just consumed (indices 0 of each)
+            cb_pop_front(cb_tmp0, 1); // tw_r*odd_r
+            cb_pop_front(cb_tmp1, 1); // tw_i*odd_i
+
+            // ── PHASE 3: t_i = (tw_r*odd_i) + (tw_i*odd_r) ──────────────
+            // tmp0 front = tw_r*odd_i, tmp1 front = tw_i*odd_r
+
+            cb_reserve_back(cb_tmp1, 1); // will hold t_i
+
             tile_regs_acquire();
-            mul_tiles_init(cb_tw_i, cb_odd_r, cb_tmp1);
-            mul_tiles(cb_tw_i, cb_odd_r, 0, 0, 0);
+            add_tiles_init(cb_tmp0, cb_tmp1, cb_tmp1);
+            add_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);    // slot 0 = t_i
             tile_regs_commit(); tile_regs_wait();
-            pack_tile(0, cb_tmp1);
+            pack_tile(0, cb_tmp1);                    // pack t_i
             tile_regs_release();
+
             cb_push_back(cb_tmp1, 1);
 
-            cb_wait_front(cb_tmp0, 1);
-            cb_wait_front(cb_tmp1, 1);
+            // Pop the two partial products just consumed
+            cb_pop_front(cb_tmp0, 1); // tw_r*odd_i
+            cb_pop_front(cb_tmp1, 1); // tw_i*odd_r
 
-            tile_regs_acquire();
-            add_tiles_init(cb_tmp0, cb_tmp1, cb_tw_odd_i);
-            add_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);
+            // ── PHASE 4: output even ± t ─────────────────────────────────
+            // cb_tmp0 front = t_r, cb_tmp1 front = t_i
+            // even_r, even_i still live (not yet popped)
+            // All 4 outputs computed and packed in one session.
 
-            cb_reserve_back(cb_tw_odd_i, 1);
-            tile_regs_commit(); tile_regs_wait();
-            pack_tile(0, cb_tw_odd_i);
-            tile_regs_release();
-            cb_push_back(cb_tw_odd_i, 1);
-            cb_pop_front(cb_tmp0, 1);
-            cb_pop_front(cb_tmp1, 1);
+            cb_wait_front(cb_tmp0, 1); // t_r
+            cb_wait_front(cb_tmp1, 1); // t_i
 
-            cb_wait_front(cb_tw_odd_r, 1);
-            cb_wait_front(cb_tw_odd_i, 1);
-
-            // ── OPTIMIZATION 1: Output pass — batch even±t in one session ─
-            // out0_r, out0_i, out1_r, out1_i computed in a SINGLE
-            // acquire/release window. Four adds/subs, one register session.
+            cb_reserve_back(cb_out0_r, 1);
+            cb_reserve_back(cb_out0_i, 1);
+            cb_reserve_back(cb_out1_r, 1);
+            cb_reserve_back(cb_out1_i, 1);
 
             tile_regs_acquire();
 
-            // out0_r = even_r + t_r  → slot 0
-            add_tiles_init(cb_even_r, cb_tw_odd_r, cb_out0_r);
-            add_tiles(cb_even_r, cb_tw_odd_r, 0, 0, 0);
+            add_tiles_init(cb_even_r, cb_tmp0, cb_out0_r);
+            add_tiles(cb_even_r, cb_tmp0, 0, 0, 0);  // slot 0 = even_r + t_r
 
-            // out0_i = even_i + t_i  → slot 1
-            add_tiles_init(cb_even_i, cb_tw_odd_i, cb_out0_i);
-            add_tiles(cb_even_i, cb_tw_odd_i, 0, 0, 1);
+            add_tiles_init(cb_even_i, cb_tmp1, cb_out0_i);
+            add_tiles(cb_even_i, cb_tmp1, 0, 0, 1);  // slot 1 = even_i + t_i
 
-            // out1_r = even_r - t_r  → slot 2
-            sub_tiles_init(cb_even_r, cb_tw_odd_r, cb_out1_r);
-            sub_tiles(cb_even_r, cb_tw_odd_r, 0, 0, 2);
+            sub_tiles_init(cb_even_r, cb_tmp0, cb_out1_r);
+            sub_tiles(cb_even_r, cb_tmp0, 0, 0, 2);  // slot 2 = even_r - t_r
 
-            // out1_i = even_i - t_i  → slot 3
-            sub_tiles_init(cb_even_i, cb_tw_odd_i, cb_out1_i);
-            sub_tiles(cb_even_i, cb_tw_odd_i, 0, 0, 3);
+            sub_tiles_init(cb_even_i, cb_tmp1, cb_out1_i);
+            sub_tiles(cb_even_i, cb_tmp1, 0, 0, 3);  // slot 3 = even_i - t_i
 
             tile_regs_commit();
             tile_regs_wait();
 
-            // Pack all four outputs while register file is still live
-            cb_reserve_back(cb_out0_r, 1); pack_tile(0, cb_out0_r);
-            cb_reserve_back(cb_out0_i, 1); pack_tile(1, cb_out0_i);
-            cb_reserve_back(cb_out1_r, 1); pack_tile(2, cb_out1_r);
-            cb_reserve_back(cb_out1_i, 1); pack_tile(3, cb_out1_i);
+            // Pack all 4 outputs while register file is live
+            pack_tile(0, cb_out0_r);
+            pack_tile(1, cb_out0_i);
+            pack_tile(2, cb_out1_r);
+            pack_tile(3, cb_out1_i);
 
             tile_regs_release();
 
-            // Push all four outputs atomically after release
             cb_push_back(cb_out0_r, 1);
             cb_push_back(cb_out0_i, 1);
             cb_push_back(cb_out1_r, 1);
             cb_push_back(cb_out1_i, 1);
 
-            // ── Pop all consumed inputs ───────────────────────────────────
-            cb_pop_front(cb_tw_r,     1);
-            cb_pop_front(cb_tw_i,     1);
-            cb_pop_front(cb_odd_r,    1);
-            cb_pop_front(cb_odd_i,    1);
-            cb_pop_front(cb_even_r,   1);
-            cb_pop_front(cb_even_i,   1);
-            cb_pop_front(cb_tw_odd_r, 1);
-            cb_pop_front(cb_tw_odd_i, 1);
+            cb_pop_front(cb_even_r, 1);
+            cb_pop_front(cb_even_i, 1);
+            cb_pop_front(cb_tmp0,   1); // t_r
+            cb_pop_front(cb_tmp1,   1); // t_i
         }
     }
 }

@@ -1,37 +1,28 @@
-// fft_multicore_2d.cpp — 2D FFT via row decomposition (paper's approach)
+// fft_multicore_2d.cpp — 2D FFT via row decomposition (FIXED HOST)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// ══════════════════════════════════════════════════════════════════════
-//  WHY ROW DECOMPOSITION (not butterfly partition)
-// ══════════════════════════════════════════════════════════════════════
+// CHANGES vs original host:
 //
-//  A 1D N-point FFT butterfly at stage s has group size 2^(s+1).
-//  For N=16384 and 8 cores (local slice = 2048 elements):
-//    Stages 11-13: group size > 2048 → CROSS-CORE DATA REQUIRED.
-//  There is no way to avoid cross-core exchange in a 1D FFT partition.
+//   1. cb_tmp0 (CB 20) and cb_tmp1 (CB 21) depth changed from tiles_per_row → 2.
+//      The fixed compute kernel (Phase 1) pushes 2 tiles into each scratch CB
+//      before popping them in Phases 2/3. With depth=1 (tiles_per_row=1 for
+//      N=1024), the second cb_push_back in Phase 1 blocks forever because the
+//      CB is full — deadlock.
 //
-//  The paper (Brown et al. 2025) solves this with a 2D approach:
-//    1. Each core owns N_rows/num_cores complete rows.
-//    2. Each core runs a full 1D FFT on each of its local rows.
-//       → Zero cross-core communication (rows are independent).
-//    3. Global transpose across cores (using tt-nn or NOC).
-//    4. Each core runs a full 1D FFT on its transposed columns.
+//   2. CB 22 (tw_odd_r) and CB 23 (tw_odd_i) removed.
+//      The fixed compute kernel no longer uses cb_tw_odd_r/i — the intermediate
+//      W*odd products are staged through cb_tmp0/cb_tmp1 instead. Creating
+//      unused CBs wastes L1 SRAM.
 //
-//  For N_rows=N_cols=1024, 8 cores:
-//    Each core owns 128 rows.
-//    Each core runs 128 × 1024-pt FFTs per pass.
-//    DRAM: upload 1024×1024 complex = 8 MB per component.
+//   3. writer_args: rows_per_core is already arg[13] in the original host
+//      (the last element). Confirmed correct — no change needed there.
 //
-//  THIS FILE implements the simpler version: multiple independent
-//  1D FFTs on each core. Each core runs `rows_per_core` independent
-//  FFTs of size N_row. The kernels are the same single-core FFT
-//  kernel, just looped over multiple rows.
+//   4. tile_offset passed to writer is c * tiles_per_core (correct base for
+//      DRAM writes). rows_per_core outer loop in writer advances by local_tiles
+//      per row, so each row writes to the right DRAM slot.
 //
-//  For a true 2D FFT, the transpose step between row and column
-//  passes would be added here using NOC or tt-nn.
-//
-// ══════════════════════════════════════════════════════════════════════
+//   Everything else is identical to the original host.
 
 #include <cmath>
 #include <vector>
@@ -102,7 +93,6 @@ void cpu_fft(std::vector<float>& re, std::vector<float>& im, bool inv) {
     if (inv) for (uint32_t i=0;i<N;i++){ re[i]/=N; im[i]/=N; }
 }
 
-// Prepare stage-0 input for one FFT row (bit-reversed, stride-2 split)
 void prepare_stage0_row(
     const std::vector<float>& sr, const std::vector<float>& si,
     uint32_t row_offset, uint32_t N_row, uint32_t log2_row,
@@ -165,8 +155,6 @@ uint32_t detect_available_cores(IDevice* device, uint32_t max_req,
     }
     std::cout << " Usable row-0 cores: " << usable << "\n";
     uint32_t cap = std::min(usable, max_req);
-    // In auto mode (num_rows=0), just return largest power-of-2 available.
-    // Otherwise ensure num_rows divides evenly by num_cores.
     uint32_t result = 1;
     if (num_rows == 0) {
         while (result*2 <= cap) result *= 2;
@@ -183,14 +171,6 @@ bool is_uint_str(const char* s) {
     return true;
 }
 
-// ── File input reader ─────────────────────────────────────────────────
-// Reads a text file of floats into a single row of N_row real values.
-// Supports:
-//   - Plain real values:      one value per line or space-separated
-//   - Interleaved complex:    pairs (re im) → sets both ir and ii
-// If the file has fewer than N_row values, the rest are zero-padded.
-// If more, only the first N_row are used.
-// Returns false on error.
 bool read_input_file(const std::string& path, uint32_t N_row,
                      std::vector<float>& ir, std::vector<float>& ii) {
     std::ifstream f(path);
@@ -201,7 +181,6 @@ bool read_input_file(const std::string& path, uint32_t N_row,
     std::vector<float> vals;
     std::string tok;
     while (f >> tok) {
-        // Strip trailing comma (some export formats add them)
         if (!tok.empty() && tok.back() == ',') tok.pop_back();
         if (tok.empty()) continue;
         try { vals.push_back(std::stof(tok)); }
@@ -217,7 +196,6 @@ bool read_input_file(const std::string& path, uint32_t N_row,
 
     bool interleaved = (vals.size() >= 2*N_row);
     if (interleaved) {
-        // Treat as interleaved re/im pairs
         std::cout << " File mode: interleaved complex ("
                   << vals.size() << " values → " << N_row << " complex)\n";
         for (uint32_t i = 0; i < N_row && 2*i+1 < vals.size(); i++) {
@@ -225,7 +203,6 @@ bool read_input_file(const std::string& path, uint32_t N_row,
             ii[i] = vals[2*i+1];
         }
     } else {
-        // Treat as real-only
         std::cout << " File mode: real-only ("
                   << vals.size() << " values → " << N_row << " points)\n";
         if (vals.size() < N_row)
@@ -246,9 +223,9 @@ int main(int argc, char** argv) {
     }
     uint32_t direction  = (uint32_t)std::atoi(argv[1]);
     uint32_t N_row      = 1024;
-    uint32_t num_rows   = 0;    // 0 = auto: num_cores * rows_per_core_target
+    uint32_t num_rows   = 0;
     uint32_t user_cores = 0;
-    uint32_t rows_per_core_target = 128;  // target rows per core when auto
+    uint32_t rows_per_core_target = 128;
     std::string in_file = "";
 
     for (int i = 2; i < argc; i++) {
@@ -273,12 +250,8 @@ int main(int argc, char** argv) {
     uint32_t max_req   = user_cores > 0 ? user_cores : 64u;
     uint32_t num_cores = detect_available_cores(device, max_req, num_rows);
 
-    // Auto num_rows: fill all cores with rows_per_core_target rows each
-    // This maximises utilisation — all 8 cores stay busy the entire launch.
     if (num_rows == 0)
         num_rows = num_cores * rows_per_core_target;
-
-    // Ensure num_rows is divisible by num_cores
     num_rows = (num_rows / num_cores) * num_cores;
     if (num_rows == 0) num_rows = num_cores;
 
@@ -290,6 +263,12 @@ int main(int argc, char** argv) {
     uint32_t compact_bytes = half_row * sizeof(float);
     uint32_t total_N   = N_row * num_rows;
 
+    // FIX: scratch CBs need depth=2 when tiles_per_row=1.
+    // Phase 1 of the compute kernel pushes 2 tiles to cb_tmp0 and cb_tmp1
+    // before Phase 2 pops them. With depth=1 the second push blocks → deadlock.
+    // We use max(2, tiles_per_row) so larger N (more tiles/row) still works.
+    const uint32_t tmp_cb_depth = std::max(2u, tiles_per_row);
+
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << " TT-Metal MULTICORE FFT (row decomposition)\n";
     std::cout << "════════════════════════════════════════════════\n";
@@ -299,6 +278,7 @@ int main(int argc, char** argv) {
     std::cout << " rows/core    : " << rows_per_core << "\n";
     std::cout << " log2(N_row)  : " << log2_row << "\n";
     std::cout << " tiles/row    : " << tiles_per_row << "\n";
+    std::cout << " tmp CB depth : " << tmp_cb_depth << "\n";
     std::cout << " Direction    : " << (direction?"Inverse":"Forward") << "\n";
     std::cout << " Total FFTs   : " << num_rows
               << "  (" << num_cores << " cores × "
@@ -307,33 +287,27 @@ int main(int argc, char** argv) {
               << " K complex samples\n";
     std::cout << "════════════════════════════════════════════════\n";
 
-    // Generate or load input
     uint32_t total_elems = total_N;
     std::vector<float> ir(total_elems, 0.f), ii(total_elems, 0.f);
 
     if (!in_file.empty()) {
-        // Load from file — same data broadcast to all rows
         std::cout << " Input file  : " << in_file << "\n";
         std::vector<float> row_r, row_i;
         if (!read_input_file(in_file, N_row, row_r, row_i)) {
             mesh->close(); return 1;
         }
-        // Broadcast the same row to all rows
-        for (uint32_t row = 0; row < num_rows; row++) {
+        for (uint32_t row = 0; row < num_rows; row++)
             for (uint32_t i = 0; i < N_row; i++) {
                 ir[row*N_row + i] = row_r[i];
                 ii[row*N_row + i] = row_i[i];
             }
-        }
     } else {
-        // Synthetic: sin wave at frequency 4 + 0.5*sin at frequency 8
         for (uint32_t row = 0; row < num_rows; row++)
             for (uint32_t i = 0; i < N_row; i++)
                 ir[row*N_row + i] = std::sin(2.f*PI*4.f*i/N_row)
                                   + 0.5f*std::sin(2.f*PI*8.f*i/N_row);
     }
 
-    // CPU reference: FFT each row independently
     std::vector<float> ref_r(ir), ref_i(ii);
     for (uint32_t row = 0; row < num_rows; row++) {
         std::vector<float> row_r(ir.begin()+row*N_row, ir.begin()+(row+1)*N_row);
@@ -345,7 +319,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Prepare all rows' stage-0 inputs
     std::vector<uint32_t> all_er, all_ei, all_or, all_oi;
     for (uint32_t row = 0; row < num_rows; row++)
         prepare_stage0_row(ir, ii, row*N_row, N_row, log2_row,
@@ -364,7 +337,6 @@ int main(int argc, char** argv) {
         return MeshBuffer::create(rc, dram_tile, mesh.get());
     };
 
-    // Each core processes rows_per_core rows, each row = tiles_per_row tiles
     uint32_t tiles_per_core = tiles_per_row * rows_per_core;
     uint32_t bytes_per_core = tiles_per_core * TILE_BYTES;
     uint32_t total_bytes    = bytes_per_core * num_cores;
@@ -384,80 +356,100 @@ int main(int argc, char** argv) {
     auto b_cmp_r = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
     auto b_cmp_i = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
 
-    // CBs: depth = tiles_per_row (one row at a time through the pipeline)
+    // ── CB creation ──────────────────────────────────────────────────────
+    // FIX 1: cb_tmp0 (20) and cb_tmp1 (21) depth = tmp_cb_depth (≥2).
+    // FIX 2: CB 22 (tw_odd_r) and CB 23 (tw_odd_i) removed — no longer
+    //        used by the fixed compute kernel.
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
-        create_cb(prog, cc,  0, tiles_per_row, TILE_BYTES); // even_r
-        create_cb(prog, cc,  1, tiles_per_row, TILE_BYTES); // even_i
-        create_cb(prog, cc,  2, tiles_per_row, TILE_BYTES); // odd_r
-        create_cb(prog, cc,  3, tiles_per_row, TILE_BYTES); // odd_i
-        create_cb(prog, cc,  4, tiles_per_row, TILE_BYTES); // tw_r
-        create_cb(prog, cc,  5, tiles_per_row, TILE_BYTES); // tw_i
-        create_cb(prog, cc, 16, tiles_per_row, TILE_BYTES); // out0_r
-        create_cb(prog, cc, 17, tiles_per_row, TILE_BYTES); // out0_i
-        create_cb(prog, cc, 18, tiles_per_row, TILE_BYTES); // out1_r
-        create_cb(prog, cc, 19, tiles_per_row, TILE_BYTES); // out1_i
-        create_cb(prog, cc, 20, tiles_per_row, TILE_BYTES); // tmp0
-        create_cb(prog, cc, 21, tiles_per_row, TILE_BYTES); // tmp1
-        create_cb(prog, cc, 22, tiles_per_row, TILE_BYTES); // tw_odd_r
-        create_cb(prog, cc, 23, tiles_per_row, TILE_BYTES); // tw_odd_i
-        // Compact twiddle: holds half_row floats
-        create_cb(prog, cc, 10, (compact_bytes+TILE_BYTES-1)/TILE_BYTES,
+        create_cb(prog, cc,  0, tiles_per_row,  TILE_BYTES); // even_r
+        create_cb(prog, cc,  1, tiles_per_row,  TILE_BYTES); // even_i
+        create_cb(prog, cc,  2, tiles_per_row,  TILE_BYTES); // odd_r
+        create_cb(prog, cc,  3, tiles_per_row,  TILE_BYTES); // odd_i
+        create_cb(prog, cc,  4, tiles_per_row,  TILE_BYTES); // tw_r
+        create_cb(prog, cc,  5, tiles_per_row,  TILE_BYTES); // tw_i
+        create_cb(prog, cc, 16, tiles_per_row,  TILE_BYTES); // out0_r
+        create_cb(prog, cc, 17, tiles_per_row,  TILE_BYTES); // out0_i
+        create_cb(prog, cc, 18, tiles_per_row,  TILE_BYTES); // out1_r
+        create_cb(prog, cc, 19, tiles_per_row,  TILE_BYTES); // out1_i
+        create_cb(prog, cc, 20, tmp_cb_depth,   TILE_BYTES); // tmp0  ← FIX: depth ≥2
+        create_cb(prog, cc, 21, tmp_cb_depth,   TILE_BYTES); // tmp1  ← FIX: depth ≥2
+        // CB 22 and CB 23 (tw_odd_r / tw_odd_i) intentionally removed.
+        // The fixed compute kernel no longer stages W*odd through separate CBs.
+        create_cb(prog, cc, 10,
+                  (compact_bytes+TILE_BYTES-1)/TILE_BYTES,
                   compact_bytes); // compact_r
-        create_cb(prog, cc, 11, (compact_bytes+TILE_BYTES-1)/TILE_BYTES,
+        create_cb(prog, cc, 11,
+                  (compact_bytes+TILE_BYTES-1)/TILE_BYTES,
                   compact_bytes); // compact_i
     }
 
     KernelHandle reader_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/"
+        "tt_metal/programming_examples/fft_float32_multicore_optimised/fft_multi_core/"
         "kernels/dataflow/reader_fft_f32.cpp",
         core_range,
         DataMovementConfig{.processor=DataMovementProcessor::RISCV_0,
                            .noc=NOC::RISCV_0_default});
     KernelHandle writer_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/"
+        "tt_metal/programming_examples/fft_float32_multicore_optimised/fft_multi_core/"
         "kernels/dataflow/writer_fft_f32.cpp",
         core_range,
         DataMovementConfig{.processor=DataMovementProcessor::RISCV_1,
                            .noc=NOC::RISCV_1_default});
     KernelHandle compute_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/"
+        "tt_metal/programming_examples/fft_float32_multicore_optimised/fft_multi_core/"
         "kernels/compute/fft_compute_f32.cpp",
         core_range,
         ComputeConfig{.math_fidelity=MathFidelity::HiFi4,
                       .fp32_dest_acc_en=true,.math_approx_mode=false});
 
+    // ── Runtime args ─────────────────────────────────────────────────────
+    // All arg indices match the fixed kernel parameter lists exactly.
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
         uint32_t tile_offset = c * tiles_per_core;
 
-        // Reader: reads rows_per_core rows, tiles_per_row tiles each
-        // We loop over rows inside the kernel via num_stages repetitions.
-        // Actually the existing reader reads num_tiles tiles then loops
-        // num_stages times expanding twiddles. We pass total tiles and
-        // rows_per_core as num_rows_per_core for the outer loop.
+        // Reader args — 12 args (indices 0-11), unchanged from original.
+        // Kernel reads rows_per_core at arg[11] and now uses it.
         std::vector<uint32_t> reader_args = {
-            b_er->address(), b_ei->address(),
-            b_or->address(), b_oi->address(),
-            b_cmp_r->address(), b_cmp_i->address(),
-            tiles_per_row,   // tiles per single FFT
-            tile_offset,     // first tile index for this core
-            log2_row,        // num_stages per FFT
-            half_row,        // half_N
-            half_row,        // local_half (= half_row, one full FFT per core)
-            rows_per_core    // number of rows this core processes
+            b_er->address(),      // [0]  even_r DRAM base
+            b_ei->address(),      // [1]  even_i DRAM base
+            b_or->address(),      // [2]  odd_r  DRAM base
+            b_oi->address(),      // [3]  odd_i  DRAM base
+            b_cmp_r->address(),   // [4]  compact twiddle real base
+            b_cmp_i->address(),   // [5]  compact twiddle imag base
+            tiles_per_row,        // [6]  tiles per single FFT row
+            tile_offset,          // [7]  first tile index for this core
+            log2_row,             // [8]  num_stages
+            half_row,             // [9]  half_N
+            half_row,             // [10] local_half (= half_N, full row per FFT)
+            rows_per_core         // [11] rows this core processes (now used)
         };
 
-        std::vector<uint32_t> compute_args = { log2_row, tiles_per_row };
+        // Compute args — 2 args, unchanged.
+        std::vector<uint32_t> compute_args = {
+            log2_row,             // [0]  num_stages
+            tiles_per_row         // [1]  tiles_per_stage
+        };
 
+        // Writer args — 14 args (indices 0-13).
+        // Original had 14 args too (rows_per_core was already arg[13]).
+        // Kernel now uses arg[13] in its outer row loop.
         std::vector<uint32_t> writer_args = {
-            b_o0r->address(), b_o0i->address(),
-            b_o1r->address(), b_o1i->address(),
-            tiles_per_row, log2_row, half_row,
-            half_row, 1u, c, 0u,  // num_cores=1 (self-contained), core_id, log2_cores=0
-            tile_offset,
-            0u,                   // core_elem_base = 0 (full row per FFT)
-            rows_per_core         // number of rows
+            b_o0r->address(),     // [0]  out0_r DRAM base
+            b_o0i->address(),     // [1]  out0_i DRAM base
+            b_o1r->address(),     // [2]  out1_r DRAM base
+            b_o1i->address(),     // [3]  out1_i DRAM base
+            tiles_per_row,        // [4]  local_tiles per row
+            log2_row,             // [5]  num_stages
+            half_row,             // [6]  local_half
+            half_row,             // [7]  half_N
+            1u,                   // [8]  num_cores = 1 (self-contained row FFT)
+            c,                    // [9]  core_id
+            0u,                   // [10] log2_cores = 0
+            tile_offset,          // [11] base tile offset for DRAM writes
+            0u,                   // [12] core_elem_base = 0 (full row per FFT)
+            rows_per_core         // [13] rows this core processes (now used)
         };
 
         SetRuntimeArgs(prog, reader_k,  cc, reader_args);
@@ -493,13 +485,12 @@ int main(int argc, char** argv) {
     EnqueueReadMeshBuffer(cq, o1r_raw, b_o1r, true);
     EnqueueReadMeshBuffer(cq, o1i_raw, b_o1i, true);
 
-    // Reassemble: each row's even (o0) and odd (o1) halves
     std::vector<float> result_r(total_N), result_i(total_N);
     for (uint32_t row = 0; row < num_rows; row++) {
         uint32_t tile_base = row * tiles_per_row * TILE_SIZE;
         for (uint32_t i = 0; i < half_row; i++) {
-            result_r[row*N_row + i]          = u2f(o0r_raw[tile_base + i]);
-            result_i[row*N_row + i]          = u2f(o0i_raw[tile_base + i]);
+            result_r[row*N_row + i]            = u2f(o0r_raw[tile_base + i]);
+            result_i[row*N_row + i]            = u2f(o0i_raw[tile_base + i]);
             result_r[row*N_row + i + half_row] = u2f(o1r_raw[tile_base + i]);
             result_i[row*N_row + i + half_row] = u2f(o1i_raw[tile_base + i]);
         }
@@ -507,8 +498,6 @@ int main(int argc, char** argv) {
     if (direction==1)
         for (uint32_t i=0;i<total_N;i++){ result_r[i]/=N_row; result_i[i]/=N_row; }
 
-    // Validate all rows — with many rows per core, any shuffle error
-    // in a non-first row would be invisible if we only check row 0.
     std::cout << "\n════════════════════════════════════════════════\n";
     std::cout << " VALIDATION (all " << num_rows << " rows)\n";
     std::cout << "════════════════════════════════════════════════\n";
@@ -524,9 +513,6 @@ int main(int argc, char** argv) {
     std::cout << " Max error (real): " << mer << "\n";
     std::cout << " Max error (imag): " << mei << "\n";
     std::cout << " Mean error      : " << me  << "\n";
-    // HiFi4 float32 accumulates ~0.25% relative error per N=1024 FFT.
-    // Threshold = 0.5% of N_row (matches single-core optimized behavior).
-    // For N_row=1024: threshold ≈ 0.005 * 512 = 2.56
     float threshold = std::max(0.5f, 0.005f * (float)N_row);
     bool passed = (mer < threshold) && (mei < threshold);
     std::cout << " Threshold       : " << threshold << " (0.5% of N_row)\n";
