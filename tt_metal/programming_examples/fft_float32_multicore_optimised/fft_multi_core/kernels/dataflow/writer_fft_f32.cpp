@@ -1,4 +1,4 @@
-// writer_fft_f32.cpp — MULTICORE writer (PORTABLE FIX)
+// writer_fft_f32.cpp — MULTICORE writer (STAGE-OUTER FIX)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -52,13 +52,13 @@ void kernel_main() {
         for (uint32_t i = 0; i < count; i++) dst[i] = src[i];
     };
 
-    // Outer loop over rows
-    for (uint32_t row = 0; row < rows_per_core; row++) {
-        const uint32_t row_tile_offset = tile_offset + row * local_tiles;
-        const uint32_t row_elem_base   = row_tile_offset * (tile_bytes / sizeof(float));
+    // ── STAGE-OUTER LOOP (matches reader and compute order) ──────────────
+    for (uint32_t stage = 0; stage < num_stages; stage++) {
+        const bool is_last = (stage == num_stages - 1);
 
-        for (uint32_t stage = 0; stage < num_stages; stage++) {
-            const bool is_last = (stage == num_stages - 1);
+        for (uint32_t row = 0; row < rows_per_core; row++) {
+            const uint32_t row_tile_offset = tile_offset + row * local_tiles;
+            const uint32_t row_elem_base   = row_tile_offset * (tile_bytes / sizeof(float));
 
             cb_wait_front(cb_out0_r, local_tiles);
             cb_wait_front(cb_out0_i, local_tiles);
@@ -115,7 +115,6 @@ void kernel_main() {
                         const uint32_t lb_e = g2 * m2;
                         const uint32_t lb_o = lb_e + half_m2;
 
-                        // Block A
                         {
                             uint32_t f0    = row_elem_base + lb_e;
                             uint32_t g_old = f0 >> log2m;
@@ -127,7 +126,6 @@ void kernel_main() {
                                 copy_floats(&dst_ei[dst], &s0i[ls], half_m);
                             }
                         }
-                        // Block B
                         {
                             uint32_t f0    = row_elem_base + lb_e + half_m;
                             uint32_t g_old = f0 >> log2m;
@@ -139,7 +137,6 @@ void kernel_main() {
                                 copy_floats(&dst_ei[dst + half_m], &s1i[ls], half_m);
                             }
                         }
-                        // Block C
                         {
                             uint32_t f0    = row_elem_base + lb_o;
                             uint32_t g_old = f0 >> log2m;
@@ -151,7 +148,6 @@ void kernel_main() {
                                 copy_floats(&dst_oi[dst], &s0i[ls], half_m);
                             }
                         }
-                        // Block D
                         {
                             uint32_t f0    = row_elem_base + lb_o + half_m;
                             uint32_t g_old = f0 >> log2m;

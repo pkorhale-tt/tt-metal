@@ -1,6 +1,10 @@
-// reader_fft_f32.cpp — MULTICORE reader (PORTABLE FIX)
+// reader_fft_f32.cpp — MULTICORE reader (STAGE-OUTER FIX)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// CRITICAL FIX: Stage loop OUTSIDE row loop.
+// Each stage's twiddles for all rows must be loaded before
+// compute/writer move to the next stage.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -67,12 +71,13 @@ void kernel_main() {
     const uint32_t cmp_r_base = get_read_ptr(cb_compact_r);
     const uint32_t cmp_i_base = get_read_ptr(cb_compact_i);
 
-    // Outer loop over rows assigned to this core
+    volatile float* cmp_r_ptr = reinterpret_cast<volatile float*>(cmp_r_base);
+    volatile float* cmp_i_ptr = reinterpret_cast<volatile float*>(cmp_i_base);
+
+    // ── STAGE 0: Load all rows' even/odd inputs ──────────────────────────
     for (uint32_t row = 0; row < rows_per_core; row++) {
         const uint32_t row_tile_offset = tile_offset + row * local_tiles;
-        const uint32_t row_elem_base   = row_tile_offset * (tile_bytes / sizeof(float));
 
-        // Load stage-0 inputs for this row
         cb_reserve_back(cb_even_r, local_tiles);
         cb_reserve_back(cb_even_i, local_tiles);
         cb_reserve_back(cb_odd_r,  local_tiles);
@@ -95,12 +100,18 @@ void kernel_main() {
         cb_push_back(cb_even_i, local_tiles);
         cb_push_back(cb_odd_r,  local_tiles);
         cb_push_back(cb_odd_i,  local_tiles);
+    }
 
-        // Per-stage twiddle expansion
-        for (uint32_t stage = 0; stage < num_stages; stage++) {
-            const uint32_t half_m      = 1u << stage;
-            const uint32_t N_over_m    = half_N >> stage;
-            const uint32_t half_m_mask = half_m - 1u;
+    // ── STAGES: Process each stage for all rows ──────────────────────────
+    for (uint32_t stage = 0; stage < num_stages; stage++) {
+        const uint32_t half_m      = 1u << stage;
+        const uint32_t N_over_m    = half_N >> stage;
+        const uint32_t half_m_mask = half_m - 1u;
+
+        // Expand twiddles for this stage, for all rows
+        for (uint32_t row = 0; row < rows_per_core; row++) {
+            const uint32_t row_tile_offset = tile_offset + row * local_tiles;
+            const uint32_t row_elem_base   = row_tile_offset * (tile_bytes / sizeof(float));
 
             cb_reserve_back(cb_tw_r, local_tiles);
             cb_reserve_back(cb_tw_i, local_tiles);
@@ -108,11 +119,8 @@ void kernel_main() {
             uint32_t dst_r = get_write_ptr(cb_tw_r);
             uint32_t dst_i = get_write_ptr(cb_tw_i);
 
-            // Scalar expansion using portable memory accesses
-            volatile float* cmp_r_ptr = reinterpret_cast<volatile float*>(cmp_r_base);
-            volatile float* cmp_i_ptr = reinterpret_cast<volatile float*>(cmp_i_base);
-            volatile float* tw_r_ptr  = reinterpret_cast<volatile float*>(dst_r);
-            volatile float* tw_i_ptr  = reinterpret_cast<volatile float*>(dst_i);
+            volatile float* tw_r_ptr = reinterpret_cast<volatile float*>(dst_r);
+            volatile float* tw_i_ptr = reinterpret_cast<volatile float*>(dst_i);
 
             for (uint32_t lp = 0; lp < local_half; lp++) {
                 const uint32_t p   = row_elem_base + lp;
