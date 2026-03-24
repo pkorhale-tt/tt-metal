@@ -44,7 +44,6 @@ void kernel_main() {
             const uint32_t cb_odd_i  = (stage == 0) ? cb_stage0_odd_i  : cb_next_odd_i;
 
             for (uint32_t t = 0; t < tiles_per_stage; t++) {
-                // Wait for sources first so init never observes an empty source CB.
                 cb_wait_front(cb_tw_r,   1);
                 cb_wait_front(cb_tw_i,   1);
                 cb_wait_front(cb_odd_r,  1);
@@ -52,10 +51,8 @@ void kernel_main() {
                 cb_wait_front(cb_even_r, 1);
                 cb_wait_front(cb_even_i, 1);
 
-                // Re-init every tile to avoid stale CB-to-unpacker wiring across stages/rows.
-                binary_op_init_common(cb_tw_r, cb_odd_r, cb_tmp0);
-
                 cb_reserve_back(cb_tmp0, 1);
+                binary_op_init_common(cb_tw_r, cb_odd_r, cb_tmp0);
                 tile_regs_acquire();
                 mul_tiles_init(cb_tw_r, cb_odd_r, cb_tmp0);
                 mul_tiles(cb_tw_r, cb_odd_r, 0, 0, 0);
@@ -66,6 +63,7 @@ void kernel_main() {
                 cb_push_back(cb_tmp0, 1);
 
                 cb_reserve_back(cb_tmp1, 1);
+                binary_op_init_common(cb_tw_i, cb_odd_i, cb_tmp1);
                 tile_regs_acquire();
                 mul_tiles_init(cb_tw_i, cb_odd_i, cb_tmp1);
                 mul_tiles(cb_tw_i, cb_odd_i, 0, 0, 0);
@@ -78,6 +76,7 @@ void kernel_main() {
                 cb_wait_front(cb_tmp0, 1);
                 cb_wait_front(cb_tmp1, 1);
                 cb_reserve_back(cb_tmp2, 1);
+                binary_op_init_common(cb_tmp0, cb_tmp1, cb_tmp2);
                 tile_regs_acquire();
                 sub_tiles_init(cb_tmp0, cb_tmp1, cb_tmp2);
                 sub_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);
@@ -90,6 +89,7 @@ void kernel_main() {
                 cb_pop_front(cb_tmp1, 1);
 
                 cb_reserve_back(cb_tmp0, 1);
+                binary_op_init_common(cb_tw_r, cb_odd_i, cb_tmp0);
                 tile_regs_acquire();
                 mul_tiles_init(cb_tw_r, cb_odd_i, cb_tmp0);
                 mul_tiles(cb_tw_r, cb_odd_i, 0, 0, 0);
@@ -100,6 +100,7 @@ void kernel_main() {
                 cb_push_back(cb_tmp0, 1);
 
                 cb_reserve_back(cb_tmp1, 1);
+                binary_op_init_common(cb_tw_i, cb_odd_r, cb_tmp1);
                 tile_regs_acquire();
                 mul_tiles_init(cb_tw_i, cb_odd_r, cb_tmp1);
                 mul_tiles(cb_tw_i, cb_odd_r, 0, 0, 0);
@@ -117,6 +118,7 @@ void kernel_main() {
                 cb_wait_front(cb_tmp0, 1);
                 cb_wait_front(cb_tmp1, 1);
                 cb_reserve_back(cb_tmp3, 1);
+                binary_op_init_common(cb_tmp0, cb_tmp1, cb_tmp3);
                 tile_regs_acquire();
                 add_tiles_init(cb_tmp0, cb_tmp1, cb_tmp3);
                 add_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);
@@ -132,6 +134,7 @@ void kernel_main() {
                 cb_wait_front(cb_tmp3, 1);
 
                 cb_reserve_back(cb_out0_r, 1);
+                binary_op_init_common(cb_even_r, cb_tmp2, cb_out0_r);
                 tile_regs_acquire();
                 add_tiles_init(cb_even_r, cb_tmp2, cb_out0_r);
                 add_tiles(cb_even_r, cb_tmp2, 0, 0, 0);
@@ -142,6 +145,7 @@ void kernel_main() {
                 cb_push_back(cb_out0_r, 1);
 
                 cb_reserve_back(cb_out0_i, 1);
+                binary_op_init_common(cb_even_i, cb_tmp3, cb_out0_i);
                 tile_regs_acquire();
                 add_tiles_init(cb_even_i, cb_tmp3, cb_out0_i);
                 add_tiles(cb_even_i, cb_tmp3, 0, 0, 0);
@@ -152,6 +156,7 @@ void kernel_main() {
                 cb_push_back(cb_out0_i, 1);
 
                 cb_reserve_back(cb_out1_r, 1);
+                binary_op_init_common(cb_even_r, cb_tmp2, cb_out1_r);
                 tile_regs_acquire();
                 sub_tiles_init(cb_even_r, cb_tmp2, cb_out1_r);
                 sub_tiles(cb_even_r, cb_tmp2, 0, 0, 0);
@@ -162,6 +167,7 @@ void kernel_main() {
                 cb_push_back(cb_out1_r, 1);
 
                 cb_reserve_back(cb_out1_i, 1);
+                binary_op_init_common(cb_even_i, cb_tmp3, cb_out1_i);
                 tile_regs_acquire();
                 sub_tiles_init(cb_even_i, cb_tmp3, cb_out1_i);
                 sub_tiles(cb_even_i, cb_tmp3, 0, 0, 0);
