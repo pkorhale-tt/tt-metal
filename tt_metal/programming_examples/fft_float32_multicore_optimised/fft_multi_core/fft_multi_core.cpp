@@ -292,7 +292,7 @@ int main(int argc, char** argv) {
         uint32_t l = 0; while ((1u << l) < N_row) l++; return l; }();
     const uint32_t half_row      = N_row / 2;
     const uint32_t tiles_per_row = (half_row + TILE_SIZE - 1) / TILE_SIZE;
-    const uint32_t compact_bytes = half_row * sizeof(float);
+    [[maybe_unused]] const uint32_t compact_bytes = half_row * sizeof(float);
     const uint32_t total_N       = N_row * num_rows;
 
     std::cout << "════════════════════════════════════════════════\n";
