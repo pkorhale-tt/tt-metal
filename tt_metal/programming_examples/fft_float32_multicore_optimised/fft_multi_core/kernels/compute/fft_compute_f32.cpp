@@ -89,10 +89,6 @@ void kernel_main() {
         return;
     }
 
-    // Sticky FPU config — valid for the lifetime of this kernel.
-    // Called once here so the FPU is not reconfigured on every tile.
-    binary_op_init_common(cb_stage0_even_r, cb_stage0_odd_r, cb_tmp0);
-
     for (uint32_t row = 0; row < rows_per_core; row++) {
         for (uint32_t stage = 0; stage < num_stages; stage++) {
 
@@ -102,6 +98,21 @@ void kernel_main() {
             const uint32_t cb_even_i = (stage == 0) ? cb_stage0_even_i : cb_next_even_i;
             const uint32_t cb_odd_r  = (stage == 0) ? cb_stage0_odd_r  : cb_next_odd_r;
             const uint32_t cb_odd_i  = (stage == 0) ? cb_stage0_odd_i  : cb_next_odd_i;
+
+            // FIX: binary_op_init_common must be called here, inside the
+            // stage loop, with the ACTUAL source CBs for this stage.
+            //
+            // Previously it was called once before all loops with
+            // (cb_stage0_even_r=0, cb_stage0_odd_r=2, cb_tmp0=20).
+            // On Tensix, this call programs the unpacker's SRCA/SRCB FIFO
+            // mapping. Stage 1+ uses cb_tw_r=4 and cb_next_odd_r=8, so the
+            // unpacker was still wired to CB0/CB2 when it needed CB4/CB8,
+            // causing the FPU to stall waiting for tiles that would never
+            // arrive from the wrong CBs — the exact hang seen on hardware.
+            //
+            // Using cb_tw_r as the first arg covers all mul_tiles calls
+            // (A1, A2) consistently across every stage.
+            binary_op_init_common(cb_tw_r, cb_odd_r, cb_tmp0);
 
             for (uint32_t t = 0; t < tiles_per_stage; t++) {
 
