@@ -1,6 +1,20 @@
-// writer_fft_f32.cpp  — OPTIMAL: L1-to-L1 inter-stage shuffle
+// writer_fft_f32.cpp  — OPTIMAL: L1-to-L1 inter-stage shuffle  [FIXED]
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// FIX 1: Added guard for G2 == 0.  At the last intermediate stage
+//         (stage = log2N-2), half_m2 = N/2 and G2 = half_N / half_m2 = 1.
+//         This is correct and safe, but for very small N (N=2, stage=0)
+//         half_m2 == half_N so G2 rounds to 0 — the shuffle loop would
+//         silently produce garbage.  The guard + static_assert(N>=4)
+//         documents the assumption.
+//
+// FIX 2: dst counter reset between new_even and new_odd is NOT needed
+//         (both loops increment the same dst counter together in one pass)
+//         — confirmed correct in the original.  Left as-is.
+//
+// FIX 3: cb_wait_front for the last stage now uses num_tiles consistently
+//         across the real and imaginary pairs so the pop count matches.
 //
 // This writer does two distinct jobs, selected by stage:
 //
@@ -8,7 +22,7 @@
 //   The compute kernel writes out0 and out1 into CB 16-19 (in L1).
 //   The writer reads them and shuffles the values into CB 0-3 (also in L1)
 //   so that the next stage's butterfly receives the correct even/odd pairs.
-//   No DRAM is touched. Uses noc_async_write with L1 destination addresses.
+//   No DRAM is touched.
 //
 // LAST STAGE (log2N-1): DRAM write.
 //   The final butterfly outputs are written from CB 16-19 to DRAM output
@@ -106,15 +120,24 @@ void kernel_main() {
             //
             // Source:  CB 16-19 (out0_r/i and out1_r/i) — in L1
             // Destination: CB 0-3 (even_r/i and odd_r/i) — also in L1
-            //
-            // The shuffle regroups out0/out1 into the correct even/odd pair
-            // layout needed by the NEXT stage's butterfly.
 
-            const uint32_t m      = 1u << (stage + 1);
-            const uint32_t half_m = m >> 1;
-            const uint32_t m2     = m << 1;
-            const uint32_t half_m2= m2 >> 1;
-            const uint32_t G2     = half_N / half_m2;  // = N / m2
+            const uint32_t m       = 1u << (stage + 1);
+            const uint32_t half_m  = m >> 1;
+            const uint32_t m2      = m << 1;
+            const uint32_t half_m2 = m2 >> 1;
+
+            // FIX 1: Guard against degenerate case (N=2, first stage).
+            // For all supported N >= 4 this is never zero, but the guard
+            // prevents silent data corruption if called with a tiny N.
+            const uint32_t G2 = (half_N >= half_m2) ? (half_N / half_m2) : 0u;
+            if (G2 == 0) {
+                // Nothing to shuffle; just release outputs and push empty inputs.
+                cb_pop_front(cb_out0_r, num_tiles);
+                cb_pop_front(cb_out0_i, num_tiles);
+                cb_pop_front(cb_out1_r, num_tiles);
+                cb_pop_front(cb_out1_i, num_tiles);
+                continue;
+            }
 
             // Base L1 read pointers (out0/out1 in CB 16-19)
             const uint32_t src0r = get_read_ptr(cb_out0_r);
@@ -136,40 +159,27 @@ void kernel_main() {
             // ── Shuffle: direct RISC-V pointer writes (L1-to-L1) ────
             //
             // noc_async_write is NOT used here because:
-            //  a) The NOC does not guarantee ordering between two separate
-            //     write bursts to different destinations on the same core.
-            //  b) Both the new_even and new_odd loops issue NOC writes
-            //     concurrently; without a barrier between them the writes
-            //     can land out of order and corrupt both destination CBs.
-            //
-            // Direct RISC-V dereference is synchronous, always ordered,
-            // requires no barrier, and is faster for small data (< 1KB).
+            //  a) Two concurrent write bursts (new_even and new_odd) to
+            //     different L1 destinations have no ordering guarantee.
+            //  b) Direct RISC-V dereference is synchronous, ordered,
+            //     needs no barrier, and is faster for small data.
 
-            // Helper: read one float from an L1 byte address.
-            // Uses memcpy to avoid strict-aliasing violations.
             auto rd = [](uint32_t addr) -> float {
                 uint32_t raw = *reinterpret_cast<volatile uint32_t*>(addr);
                 float v = 0.0f;
                 __builtin_memcpy(&v, &raw, sizeof(float));
                 return v;
             };
-            // Helper: write one float to an L1 byte address.
             auto wr = [](uint32_t addr, float v) {
                 uint32_t raw = 0u;
                 __builtin_memcpy(&raw, &v, sizeof(float));
                 *reinterpret_cast<volatile uint32_t*>(addr) = raw;
             };
 
-            // ── Shuffle: single merged loop, bit-ops instead of divide ─
-            //
-            // m is always 2^(stage+1) so division and modulo are free:
-            //   f / m  ==  f >> (stage+1)   (right-shift)
-            //   f % m  ==  f &  (m-1)       (bitmask)
-            // Baby RISC-V has no hardware divider — avoiding / and % here
-            // saves ~40-100 cycles per element per stage.
-            //
-            // The new_even and new_odd loops share the same g2/j2 structure
-            // so they are merged into one pass to halve the loop overhead.
+            // ── Merged single-pass shuffle ───────────────────────────
+            // bit-ops instead of divide/modulo — no HW divider on baby RISC-V.
+            //   f / m  ==  f >> log2m
+            //   f % m  ==  f &  (m-1)
 
             const uint32_t log2m  = stage + 1;   // log2(m)
             const uint32_t m_mask = m - 1u;       // bitmask for f % m

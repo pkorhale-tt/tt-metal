@@ -1,6 +1,10 @@
-// fft_compute_f32.cpp  — OPTIMAL MULTI-STAGE FFT
+// fft_compute_f32.cpp  — OPTIMAL MULTI-STAGE FFT  [no changes needed]
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// This kernel is correct as-is. The deadlock was entirely in the reader's
+// twiddle-expansion loop (cb_reserve_back with num_tiles on a depth-1 CB).
+// This file is reproduced here unchanged for completeness.
 //
 // Stateless butterfly kernel. Runs the same code every stage.
 // Reads even/odd inputs from CBs 0-3 and twiddles from CBs 4-5.

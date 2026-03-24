@@ -1,17 +1,30 @@
-// fft_single_core_opt.cpp  — OPTIMAL v2: compact twiddle table
+// fft_single_core_opt.cpp  — OPTIMAL v2: compact twiddle table  [FIXED]
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// FIX 1 (host): CB 4/5 (twiddle real/imag) depth changed from 1 to num_tiles.
+//   The reader now pushes one tile at a time inside its per-tile loop, so
+//   compute can pipeline: while compute processes tile k, the reader can
+//   already be filling tile k+1 into the next slot.  Without this, the
+//   CB with depth=1 was safe only for N<=1024 (num_tiles==1).  For larger N
+//   depth must equal num_tiles so the reader never stalls waiting for compute
+//   to drain a slot before it can write the next tile in the same stage.
+//
+//   NOTE: if you intentionally want to keep depth=1 to save L1 (1.3 MB per
+//   Tensix core is limited), the reader fix alone (reserve-1-at-a-time) is
+//   sufficient to avoid deadlock — the reader will just pause between tiles.
+//   Increase depth to num_tiles only if profiling shows the reader is the
+//   bottleneck within a stage.
+//
+// FIX 2 (host): CB 0-3 (even/odd inputs) depth changed from 1 to num_tiles.
+//   The reader uploads all num_tiles in one burst (cb_reserve_back num_tiles),
+//   so the CB must have at least num_tiles slots.  With depth=1 and
+//   num_tiles>1 the initial cb_reserve_back in the reader blocks immediately.
 //
 // DRAM traffic (N=1024):
 //   Upload: 8 KB input + 4 KB compact twiddles = 12 KB  (was 88 KB)
 //   Download: 8 KB result
 //   Total: 20 KB  — matches mesham's design, ~5× less than previous version
-//
-// Change from v1: twiddle storage reduced from log2N×N/2 to N/2 values.
-//   Host uploads compact twiddle table once (N/2 entries).
-//   Reader expands per stage in L1 using:
-//     slot p: j = p & (half_m-1),  idx = j * (N >> (stage+1))
-//   Compute kernel unchanged — still uses fast FPU mul_tiles/add_tiles.
 
 #include <cmath>
 #include <fstream>
@@ -96,8 +109,6 @@ void prepare_stage0(const std::vector<float>& sr, const std::vector<float>& si,
 }
 
 // Compact twiddle table: N/2 entries, direction-aware sign.
-// compact[k] = (cos(sign*2π*k/N), sin(sign*2π*k/N))  k=0..N/2-1
-// Stored as interleaved (r,i) pairs, packed into tiles.
 std::pair<std::vector<uint32_t>,std::vector<uint32_t>>
 precompute_compact_twiddles(uint32_t N, uint32_t direction) {
     uint32_t half_N = N/2;
@@ -167,18 +178,18 @@ int main(int argc, char** argv) {
         log2N=0; while((1u<<log2N)<N) log2N++;
         half_N=N/2; tiles=(half_N+TILE_SIZE-1)/TILE_SIZE;
         ir.resize(N,0.f); ii.resize(N,0.f);
-        if (N<2||(N&(N-1))) { std::cerr<<"Invalid N="<<N<<"\n"; return 1; }
+        if (N<4||(N&(N-1))) { std::cerr<<"Invalid N="<<N<<" (must be power of 2, >= 4)\n"; return 1; }
     } else {
         for (uint32_t i=0;i<N;i++)
             ir[i]=std::sin(2.f*PI*4.f*i/N)+0.5f*std::sin(2.f*PI*8.f*i/N);
     }
 
     // DRAM sizes
-    uint32_t in_bytes      = tiles * TILE_BYTES;               // per input CB
-    uint32_t compact_bytes = half_N * sizeof(float);           // compact twiddle (N/2 floats)
+    uint32_t in_bytes      = tiles * TILE_BYTES;
+    uint32_t compact_bytes = half_N * sizeof(float);
 
     std::cout<<"════════════════════════════════════════\n";
-    std::cout<<" TT-Metal FFT  (Optimal v2 — compact twiddles)\n";
+    std::cout<<" TT-Metal FFT  (Optimal v2 — compact twiddles) [FIXED]\n";
     std::cout<<"════════════════════════════════════════\n";
     std::cout<<" N           : "<<N<<"\n";
     std::cout<<" log2N       : "<<log2N<<"\n";
@@ -197,7 +208,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> even_r_t, even_i_t, odd_r_t, odd_i_t;
     prepare_stage0(ir,ii,N,log2N,tiles,even_r_t,even_i_t,odd_r_t,odd_i_t);
 
-    // Compact twiddle table (N/2 entries, packed into one tile each)
+    // Compact twiddle table
     auto [cmp_r_t, cmp_i_t] = precompute_compact_twiddles(N, direction);
 
     // Device setup
@@ -214,47 +225,53 @@ int main(int argc, char** argv) {
         tt::tt_metal::distributed::ReplicatedBufferConfig rc{.size=bytes};
         return tt::tt_metal::distributed::MeshBuffer::create(rc,dram,mesh.get());
     };
-    // Input DRAM buffers (tile-sized)
     auto b_er  = mk_tile(in_bytes);
     auto b_ei  = mk_tile(in_bytes);
     auto b_or  = mk_tile(in_bytes);
     auto b_oi  = mk_tile(in_bytes);
-    // Compact twiddle DRAM buffers (N/2 floats each — may be < one tile)
     tt::tt_metal::distributed::DeviceLocalBufferConfig dram_cmp{
         .page_size=compact_bytes, .buffer_type=tt::tt_metal::BufferType::DRAM};
     tt::tt_metal::distributed::ReplicatedBufferConfig rc_cmp{.size=compact_bytes};
     auto b_cmp_r = tt::tt_metal::distributed::MeshBuffer::create(rc_cmp,dram_cmp,mesh.get());
     auto b_cmp_i = tt::tt_metal::distributed::MeshBuffer::create(rc_cmp,dram_cmp,mesh.get());
-    // Output DRAM buffers
     auto b_o0r = mk_tile(in_bytes);
     auto b_o0i = mk_tile(in_bytes);
     auto b_o1r = mk_tile(in_bytes);
     auto b_o1i = mk_tile(in_bytes);
 
-    // Circular buffers
-    // Input CBs 0-3: depth=1 tile (stage-0 from reader; stages 1+ from writer shuffle)
-    create_cb(prog,core, 0, 1, TILE_BYTES);   // even_r
-    create_cb(prog,core, 1, 1, TILE_BYTES);   // even_i
-    create_cb(prog,core, 2, 1, TILE_BYTES);   // odd_r
-    create_cb(prog,core, 3, 1, TILE_BYTES);   // odd_i
-    // Twiddle CBs 4-5: depth=1 tile (reader re-fills every stage)
-    create_cb(prog,core, 4, 1, TILE_BYTES);   // tw_r (expanded per stage)
-    create_cb(prog,core, 5, 1, TILE_BYTES);   // tw_i
-    // Output CBs 16-19: depth=1 tile (compute writes, writer drains)
-    create_cb(prog,core,16, 1, TILE_BYTES);   // out0_r
-    create_cb(prog,core,17, 1, TILE_BYTES);   // out0_i
-    create_cb(prog,core,18, 1, TILE_BYTES);   // out1_r
-    create_cb(prog,core,19, 1, TILE_BYTES);   // out1_i
-    // Scratch CBs 20-23: depth=1 tile
-    create_cb(prog,core,20, 1, TILE_BYTES);   // tmp0
-    create_cb(prog,core,21, 1, TILE_BYTES);   // tmp1
-    create_cb(prog,core,22, 1, TILE_BYTES);   // tw_odd_r
-    create_cb(prog,core,23, 1, TILE_BYTES);   // tw_odd_i
-    // Compact twiddle CBs 10-11: depth=1, size=compact_bytes
-    // These hold the N/2 compact values that the reader reads from DRAM once
-    // and keeps in L1 for the duration of all stages.
-    create_cb(prog,core,10, 1, TILE_BYTES);   // cb_compact_r (N/2 entries)
-    create_cb(prog,core,11, 1, TILE_BYTES);   // cb_compact_i
+    // ── Circular buffers ──────────────────────────────────────────────
+    //
+    // FIX 2: CB 0-3 depth = num_tiles (was 1).
+    //   The reader does cb_reserve_back(cb_even_r, num_tiles) in one shot
+    //   before the DRAM burst, so these CBs must hold num_tiles pages.
+    //
+    // FIX 1: CB 4/5 depth = num_tiles (was 1).
+    //   Allows the reader's per-tile twiddle loop to pipeline with compute:
+    //   reader fills tile k+1 while compute works on tile k.
+    //   If L1 is tight, depth=1 is also safe with the reader fix — it just
+    //   means reader and compute alternate one tile at a time.
+
+    // Input CBs 0-3: depth = num_tiles
+    create_cb(prog,core, 0, tiles, TILE_BYTES);   // even_r
+    create_cb(prog,core, 1, tiles, TILE_BYTES);   // even_i
+    create_cb(prog,core, 2, tiles, TILE_BYTES);   // odd_r
+    create_cb(prog,core, 3, tiles, TILE_BYTES);   // odd_i
+    // Twiddle CBs 4-5: depth = num_tiles (pipeline reader ↔ compute)
+    create_cb(prog,core, 4, tiles, TILE_BYTES);   // tw_r
+    create_cb(prog,core, 5, tiles, TILE_BYTES);   // tw_i
+    // Output CBs 16-19: depth = num_tiles
+    create_cb(prog,core,16, tiles, TILE_BYTES);   // out0_r
+    create_cb(prog,core,17, tiles, TILE_BYTES);   // out0_i
+    create_cb(prog,core,18, tiles, TILE_BYTES);   // out1_r
+    create_cb(prog,core,19, tiles, TILE_BYTES);   // out1_i
+    // Scratch CBs 20-23: depth=1 (per-tile intermediates, same as before)
+    create_cb(prog,core,20, 1, TILE_BYTES);       // tmp0
+    create_cb(prog,core,21, 1, TILE_BYTES);       // tmp1
+    create_cb(prog,core,22, 1, TILE_BYTES);       // tw_odd_r
+    create_cb(prog,core,23, 1, TILE_BYTES);       // tw_odd_i
+    // Compact twiddle CBs 10-11: depth=1 (uploaded once, kept in L1)
+    create_cb(prog,core,10, 1, TILE_BYTES);       // cb_compact_r
+    create_cb(prog,core,11, 1, TILE_BYTES);       // cb_compact_i
 
     auto reader_k = CreateKernel(prog,
         "tt_metal/programming_examples/fft_float32_optimized/fft_single_core"
@@ -335,7 +352,6 @@ int main(int argc, char** argv) {
     std::cout<<" Max error (real): "<<mer<<"\n";
     std::cout<<" Max error (imag): "<<mei<<"\n";
     std::cout<<" Mean error      : "<<me<<"\n";
-    // Threshold 0.5f: accounts for accumulated float32 rounding in HiFi4 mode
     bool passed = (mer<0.5f)&&(mei<0.5f);
     std::cout<<" Result: "<<(passed?"✓ PASSED":"✗ FAILED")<<"\n";
 

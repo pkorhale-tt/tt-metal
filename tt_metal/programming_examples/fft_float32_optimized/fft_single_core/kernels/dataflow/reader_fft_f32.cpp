@@ -1,6 +1,13 @@
-// reader_fft_f32.cpp  — OPTIMAL v2: compact twiddle table
+// reader_fft_f32.cpp  — OPTIMAL v2: compact twiddle table  [FIXED]
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// FIX: cb_reserve_back(cb_tw_r/i, num_tiles) was called BEFORE the inner
+//      tile loop, trying to reserve ALL tile slots at once. CB 4/5 have
+//      depth=1, so if num_tiles > 1 this blocks forever because compute
+//      can only free 1 slot at a time — deadlock.
+//      Fix: reserve/push exactly 1 slot per tile, inside the loop, so
+//      the producer and consumer can pipeline one tile at a time.
 //
 // DRAM traffic (N=1024):
 //   Upload: 4 input tiles (8 KB) + 1 compact twiddle tile (8 KB) = 16 KB
@@ -10,20 +17,17 @@
 // The compact twiddle table has N/2 entries:
 //   compact[k] = (cos(sign*2π*k/N), sin(sign*2π*k/N))  k=0..N/2-1
 //
-// The reader uploads this once, then before each stage it expands
-// the compact table into a per-element tile in L1 using the formula:
+// Before each stage the reader expands the compact table into a
+// per-element twiddle tile in L1 using the formula:
 //   slot p: j = p & (half_m-1),  idx = j * (N >> (stage+1))
 //   expanded[p] = compact[idx]
-//
-// This keeps the FPU tile-op butterfly (1024 elements per cycle) while
-// cutting twiddle DRAM storage from log2N×N/2 to N/2 values.
 //
 // CB map:
 //   0  cb_even_r   stage input even real  (stage 0: from DRAM; stages 1+: from writer)
 //   1  cb_even_i   stage input even imag
 //   2  cb_odd_r    stage input odd  real
 //   3  cb_odd_i    stage input odd  imag
-//   4  cb_tw_r     expanded twiddle real  (reader fills per stage)
+//   4  cb_tw_r     expanded twiddle real  (reader fills per stage, depth=1 tile)
 //   5  cb_tw_i     expanded twiddle imag
 //  10  cb_compact_r  compact twiddle real (uploaded once from DRAM, kept in L1)
 //  11  cb_compact_i  compact twiddle imag
@@ -117,7 +121,7 @@ void kernel_main() {
     // ── Step 2: Per-stage twiddle expansion ───────────────────────────
     // Before each stage, expand compact[j * (N >> (stage+1))] into the
     // per-element twiddle tile that the compute kernel expects.
-    // This runs entirely in L1 — no DRAM access per stage.
+    // Runs entirely in L1 — no DRAM access per stage.
     //
     // Expansion formula:
     //   half_m   = 1 << stage
@@ -127,43 +131,61 @@ void kernel_main() {
     //     j   = p & half_m_mask
     //     idx = j * N_over_m
     //     expanded[p] = compact[idx]
+    //
+    // TILE LOOP: CB 4/5 have depth=1. We must reserve/push exactly ONE
+    // tile at a time inside the loop so compute can drain each tile
+    // before we refill. Reserving num_tiles slots up-front deadlocks
+    // whenever num_tiles > 1 because the single-slot CB is never fully
+    // free from compute's perspective until it pops the current tile.
+
+    // Elements per tile (TILE_SIZE = TILE_H * TILE_W = 1024 for FP32 tiles)
+    const uint32_t elems_per_tile = tile_bytes / ELEM;
 
     for (uint32_t stage = 0; stage < num_stages; stage++) {
         const uint32_t half_m      = 1u << stage;
         const uint32_t N_over_m    = half_N >> stage;   // = N >> (stage+1)
         const uint32_t half_m_mask = half_m - 1u;
 
-        // Reserve one twiddle tile slot
-        cb_reserve_back(cb_tw_r, num_tiles);
-        cb_reserve_back(cb_tw_i, num_tiles);
-        const uint32_t dst_r = get_write_ptr(cb_tw_r);
-        const uint32_t dst_i = get_write_ptr(cb_tw_i);
+        // ── FIX: reserve and push ONE tile at a time ──────────────────
+        // Previously this reserved num_tiles slots before the loop, which
+        // deadlocked for num_tiles > 1 against a depth-1 CB.
+        for (uint32_t tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
 
-        // Expand: direct RISC-V reads from compact CB, writes to twiddle CB
-        for (uint32_t p = 0; p < half_N; p++) {
-            uint32_t j   = p & half_m_mask;
-            uint32_t idx = j * N_over_m;
+            cb_reserve_back(cb_tw_r, 1);   // wait for compute to free the slot
+            cb_reserve_back(cb_tw_i, 1);
 
-            // Read compact[idx] via uint32 (avoids strict-aliasing)
-            uint32_t raw_r = *reinterpret_cast<volatile uint32_t*>(
-                                 cmp_r_base + idx * ELEM);
-            uint32_t raw_i = *reinterpret_cast<volatile uint32_t*>(
-                                 cmp_i_base + idx * ELEM);
-            // Write to expanded tile slot p
-            *reinterpret_cast<volatile uint32_t*>(dst_r + p * ELEM) = raw_r;
-            *reinterpret_cast<volatile uint32_t*>(dst_i + p * ELEM) = raw_i;
+            const uint32_t dst_r = get_write_ptr(cb_tw_r);
+            const uint32_t dst_i = get_write_ptr(cb_tw_i);
+
+            // Element range for this tile
+            const uint32_t p_start = tile_idx * elems_per_tile;
+            const uint32_t p_end   = p_start + elems_per_tile;
+            // Clamp to actual data size (last tile may be partial)
+            const uint32_t p_limit = (p_end > half_N) ? half_N : p_end;
+
+            // Expand: direct RISC-V reads from compact CB, writes to twiddle CB
+            for (uint32_t p = p_start; p < p_limit; p++) {
+                uint32_t j   = p & half_m_mask;
+                uint32_t idx = j * N_over_m;
+
+                // Read compact[idx] via uint32 (avoids strict-aliasing)
+                uint32_t raw_r = *reinterpret_cast<volatile uint32_t*>(
+                                     cmp_r_base + idx * ELEM);
+                uint32_t raw_i = *reinterpret_cast<volatile uint32_t*>(
+                                     cmp_i_base + idx * ELEM);
+                // Write to expanded tile at local offset (p - p_start)
+                const uint32_t local_off = (p - p_start) * ELEM;
+                *reinterpret_cast<volatile uint32_t*>(dst_r + local_off) = raw_r;
+                *reinterpret_cast<volatile uint32_t*>(dst_i + local_off) = raw_i;
+            }
+
+            cb_push_back(cb_tw_r, 1);
+            cb_push_back(cb_tw_i, 1);
         }
-
-        cb_push_back(cb_tw_r, num_tiles);
-        cb_push_back(cb_tw_i, num_tiles);
-
-        // Wait for compute + writer to finish this stage before overwriting
-        // the twiddle slot (CB depth=1, so cb_reserve_back at next iteration
-        // will block until compute pops it).
-        // Also wait for writer to signal that next stage's even/odd is ready.
-        // (For stage 0 the even/odd was pushed above; for stages 1+ the writer
-        //  pushes after its shuffle. We don't need to wait here — the compute
-        //  kernel's cb_wait_front handles synchronisation.)
+        // After all tiles for this stage are pushed, compute and writer
+        // handle their synchronisation via CB depth semantics.
+        // The next cb_reserve_back at the start of the next stage's tile
+        // loop will naturally block until compute has popped the last tile.
     }
 
     // Compact twiddle CBs are no longer needed
