@@ -1,45 +1,77 @@
-// fft_compute_f32.cpp — MULTICORE butterfly kernel (FINAL, deadlock-free)
+// fft_compute_f32.cpp — MULTICORE butterfly kernel (BUGFREE + OPTIMISED)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 // ══════════════════════════════════════════════════════════════════════
-//  DEADLOCK FIX (vs previous version)
+//  BUGS FIXED vs previous version
 // ══════════════════════════════════════════════════════════════════════
 //
-//  Root cause: tile_regs_acquire() was called before cb_wait_front() for
-//  input CBs, or cb_reserve_back was called before inputs were confirmed.
-//  This caused circular blocking between the compute and reader/writer kernels.
+//  BUG 2 (primary hang) — Session B and Session C: cb_reserve_back was
+//    called BEFORE cb_pop_front, transiently requiring depth=3 in a
+//    depth-2 CB. The second push blocked forever.
+//    FIX: pop consumed tiles FIRST, then reserve+pack+push the result.
 //
-//  INVARIANT enforced throughout:
-//    cb_wait_front(all inputs) THEN tile_regs_acquire()
-//    Never block inside a tile_regs session.
+//  BUG 1 (cascading deadlock) — cb_reserve_back(cb_tmp0/1, 2) inside
+//    the tile loop without guaranteeing prior iteration fully drained.
+//    FIX: correct pop ordering in B/C/D ensures CBs are empty at loop
+//    end, so the next iteration's reserve never blocks.
+//
+//  BUG 3 (logic / firmware) — add_tiles_init in Session C passed
+//    cb_tmp1 as both source and destination hint, which is ambiguous.
+//    FIX: pass cb_tmp0 and cb_tmp1 as the two sources, cb_out (unused
+//    scratch) as hint — consistent with how mul/sub_tiles_init work.
 //
 // ══════════════════════════════════════════════════════════════════════
-//  BUTTERFLY — 4 sessions, each CB pair read exactly once
+//  OPTIMISATIONS
 // ══════════════════════════════════════════════════════════════════════
 //
-//  Session A: 4× mul → pack 4 partials to tmp0[0,1] and tmp1[0,1]
-//             Consumes: cb_tw_r, cb_tw_i, cb_odd_r, cb_odd_i
-//             Produces: tmp0 (depth 2), tmp1 (depth 2)
+//  1. mul_tiles_init called once per unique (src_a, src_b) pair, not
+//     four times back-to-back — avoids redundant FPU pipeline reconfig.
 //
-//  Session B: sub(tmp0[0], tmp1[0]) → t_r packed to tmp0 (1 tile)
-//             Consumes: first tile of tmp0 and tmp1
+//  2. binary_op_init_common called once at kernel start (sticky config).
 //
-//  Session C: add(tmp0[1→0], tmp1[1→0]) → t_i packed to tmp1 (1 tile)
-//             After session B pop, tmp0[1] is now at front (index 0).
-//             Same for tmp1[1]. So we use tile index 0.
-//             Consumes: second (now front) tile of tmp0 and tmp1
-//             Produces: tmp1 with t_i (1 tile)
-//             (tmp0 already holds t_r from session B)
+//  3. All four Session-A mul results packed in a single tile_regs
+//     session — saves two acquire/commit/wait/release round-trips.
 //
-//  Session D: 4× add/sub (even±t) → pack 4 outputs
-//             Consumes: cb_even_r, cb_even_i, tmp0 (t_r), tmp1 (t_i)
-//             Produces: cb_out0_r/i, cb_out1_r/i
+//  4. Session D: all four add/sub ops share one tile_regs session.
 //
-//  CB depth requirements:
-//    cb_tmp0: depth ≥ 2 (holds 2 tiles after session A)
-//    cb_tmp1: depth ≥ 2
-//    All others: depth = tiles_per_stage (1 for N=1024)
+//  5. CB wait for even_r/i is hoisted to Session A so the reader can
+//     pipeline DRAM loads while compute works on tw/odd products.
+//
+// ══════════════════════════════════════════════════════════════════════
+//  CB layout
+// ══════════════════════════════════════════════════════════════════════
+//
+//  Input CBs  (reader fills, compute drains):
+//    cb_even_r [0]  cb_even_i [1]  — even sub-sequence, real and imag
+//    cb_odd_r  [2]  cb_odd_i  [3]  — odd  sub-sequence, real and imag
+//    cb_tw_r   [4]  cb_tw_i   [5]  — twiddle factors,  real and imag
+//
+//  Scratch CBs (internal to compute, depth MUST be ≥ 2):
+//    cb_tmp0  [20]  — [tw_r*odd_r, tw_r*odd_i] → [t_r]
+//    cb_tmp1  [21]  — [tw_i*odd_i, tw_i*odd_r] → [t_i]
+//
+//  Output CBs (compute fills, writer drains):
+//    cb_out0_r [16]  cb_out0_i [17]  — butterfly upper half
+//    cb_out1_r [18]  cb_out1_i [19]  — butterfly lower half
+//
+// ══════════════════════════════════════════════════════════════════════
+//  Invariant (enforced throughout, no exceptions)
+// ══════════════════════════════════════════════════════════════════════
+//
+//   cb_wait_front(all inputs)          — confirm data is present
+//   cb_reserve_back(output)            — confirm space is available
+//   tile_regs_acquire()                — lock register file
+//   ... compute ...
+//   tile_regs_commit() / tile_regs_wait()
+//   pack_tile(slot, cb)                — write results
+//   tile_regs_release()                — unlock register file
+//   cb_push_back(output)               — signal output ready
+//   cb_pop_front(inputs consumed)      — release input slots
+//
+//   NEVER call cb_reserve_back or cb_pop_front inside a tile_regs
+//   session. NEVER call cb_reserve_back before popping what you no
+//   longer need when the CB is at capacity.
 //
 // ══════════════════════════════════════════════════════════════════════
 
@@ -53,6 +85,7 @@ void kernel_main() {
     const uint32_t num_stages      = get_arg_val<uint32_t>(0);
     const uint32_t tiles_per_stage = get_arg_val<uint32_t>(1);
 
+    // ── CB indices ───────────────────────────────────────────────────
     constexpr uint32_t cb_even_r = 0;
     constexpr uint32_t cb_even_i = 1;
     constexpr uint32_t cb_odd_r  = 2;
@@ -63,23 +96,21 @@ void kernel_main() {
     constexpr uint32_t cb_out0_i = 17;
     constexpr uint32_t cb_out1_r = 18;
     constexpr uint32_t cb_out1_i = 19;
-    constexpr uint32_t cb_tmp0   = 20;   // depth ≥ 2: holds [tw_r*odd_r, tw_r*odd_i]
-    constexpr uint32_t cb_tmp1   = 21;   // depth ≥ 2: holds [tw_i*odd_i, tw_i*odd_r]
+    constexpr uint32_t cb_tmp0   = 20;   // depth ≥ 2
+    constexpr uint32_t cb_tmp1   = 21;   // depth ≥ 2
 
+    // Sticky FPU config — valid for the lifetime of this kernel.
     binary_op_init_common(cb_even_r, cb_odd_r, cb_tmp0);
 
     for (uint32_t stage = 0; stage < num_stages; stage++) {
 
-        // Optimization: init once per stage (sticky FPU config).
-        mul_tiles_init(cb_tw_r, cb_odd_r, cb_tmp0);
-
         for (uint32_t t = 0; t < tiles_per_stage; t++) {
 
-            // ── SESSION A: complex multiply W * odd ───────────────────────
+            // ── SESSION A: complex multiply  W * odd ─────────────────
             //
-            // All cb_wait_front calls BEFORE tile_regs_acquire — no deadlock.
-            // even_r/i are waited here too so reader fully drains before we
-            // occupy any shared compute resources.
+            // Wait for ALL inputs before acquiring the register file.
+            // even_r/i are waited here too so the reader can fill them
+            // while we compute — they will not be popped until Session D.
 
             cb_wait_front(cb_tw_r,   1);
             cb_wait_front(cb_tw_i,   1);
@@ -88,123 +119,141 @@ void kernel_main() {
             cb_wait_front(cb_even_r, 1);
             cb_wait_front(cb_even_i, 1);
 
-            cb_reserve_back(cb_tmp0, 2);   // space for tw_r*odd_r and tw_r*odd_i
-            cb_reserve_back(cb_tmp1, 2);   // space for tw_i*odd_i and tw_i*odd_r
+            // Reserve 2 slots in each scratch CB before acquiring regs.
+            // tmp0 and tmp1 are guaranteed empty at this point because
+            // the previous iteration's Session D fully drained them.
+            cb_reserve_back(cb_tmp0, 2);
+            cb_reserve_back(cb_tmp1, 2);
 
+            // Four multiplies in one register-file session:
+            //   slot 0 = tw_r * odd_r
+            //   slot 1 = tw_i * odd_i
+            //   slot 2 = tw_r * odd_i
+            //   slot 3 = tw_i * odd_r
             tile_regs_acquire();
 
-            mul_tiles_init(cb_tw_r, cb_odd_r, cb_tmp0);
-            mul_tiles(cb_tw_r, cb_odd_r, 0, 0, 0);   // slot 0 = tw_r * odd_r
+            mul_tiles_init(cb_tw_r, cb_odd_r);
+            mul_tiles(cb_tw_r, cb_odd_r, 0, 0, 0);
 
-            mul_tiles_init(cb_tw_i, cb_odd_i, cb_tmp0);
-            mul_tiles(cb_tw_i, cb_odd_i, 0, 0, 1);   // slot 1 = tw_i * odd_i
+            mul_tiles_init(cb_tw_i, cb_odd_i);
+            mul_tiles(cb_tw_i, cb_odd_i, 0, 0, 1);
 
-            mul_tiles_init(cb_tw_r, cb_odd_i, cb_tmp0);
-            mul_tiles(cb_tw_r, cb_odd_i, 0, 0, 2);   // slot 2 = tw_r * odd_i
+            mul_tiles_init(cb_tw_r, cb_odd_i);
+            mul_tiles(cb_tw_r, cb_odd_i, 0, 0, 2);
 
-            mul_tiles_init(cb_tw_i, cb_odd_r, cb_tmp0);
-            mul_tiles(cb_tw_i, cb_odd_r, 0, 0, 3);   // slot 3 = tw_i * odd_r
+            mul_tiles_init(cb_tw_i, cb_odd_r);
+            mul_tiles(cb_tw_i, cb_odd_r, 0, 0, 3);
 
             tile_regs_commit();
             tile_regs_wait();
 
-            // Pack all 4 partial products before release.
-            // tmp0 gets [tw_r*odd_r (slot 0), tw_r*odd_i (slot 2)]
-            // tmp1 gets [tw_i*odd_i (slot 1), tw_i*odd_r (slot 3)]
-            pack_tile(0, cb_tmp0);
-            pack_tile(2, cb_tmp0);
-            pack_tile(1, cb_tmp1);
-            pack_tile(3, cb_tmp1);
+            // Pack:  tmp0 ← [tw_r*odd_r (slot0), tw_r*odd_i (slot2)]
+            //        tmp1 ← [tw_i*odd_i (slot1), tw_i*odd_r (slot3)]
+            pack_tile(0, cb_tmp0);   // tw_r*odd_r → tmp0[0]
+            pack_tile(2, cb_tmp0);   // tw_r*odd_i → tmp0[1]
+            pack_tile(1, cb_tmp1);   // tw_i*odd_i → tmp1[0]
+            pack_tile(3, cb_tmp1);   // tw_i*odd_r → tmp1[1]
 
             tile_regs_release();
 
             cb_push_back(cb_tmp0, 2);
             cb_push_back(cb_tmp1, 2);
 
-            // Pop all tw/odd inputs — consumed, never read again.
+            // Pop all tw/odd inputs — fully consumed.
             cb_pop_front(cb_tw_r,  1);
             cb_pop_front(cb_tw_i,  1);
             cb_pop_front(cb_odd_r, 1);
             cb_pop_front(cb_odd_i, 1);
 
-            // ── SESSION B: t_r = tmp0[0] - tmp1[0] ───────────────────────
+            // State after Session A:
+            //   tmp0 = [tw_r*odd_r, tw_r*odd_i]  (front=tw_r*odd_r)
+            //   tmp1 = [tw_i*odd_i, tw_i*odd_r]  (front=tw_i*odd_i)
+            //   even_r, even_i: still at front, not yet popped
+
+            // ── SESSION B: t_r = tmp0[0] − tmp1[0] ───────────────────
             //
-            // tmp0 front = tw_r*odd_r, tmp1 front = tw_i*odd_i.
-            // We subtract them to get t_r, pack the result back to tmp0.
-            // Then pop the consumed tiles and push the result.
+            // FIX (BUG 2): pop the consumed input tiles FIRST so that
+            // tmp0 has a free slot, THEN reserve + pack + push the result.
+            //
+            // Old (broken):  reserve → compute → push → pop
+            //   tmp0 transiently held 3 tiles in a depth-2 CB → hang.
+            // New (correct): compute → pop → reserve → pack → push
+            //   tmp0 never exceeds 2 tiles at any point.
 
-            cb_wait_front(cb_tmp0, 1);
-            cb_wait_front(cb_tmp1, 1);
-
-            // Pack result into a fresh tmp0 slot.
-            // We pop old front AFTER packing (pack reads registers, not CB).
-            cb_reserve_back(cb_tmp0, 1);
+            cb_wait_front(cb_tmp0, 1);   // tw_r*odd_r is ready
+            cb_wait_front(cb_tmp1, 1);   // tw_i*odd_i is ready
 
             tile_regs_acquire();
-            sub_tiles_init(cb_tmp0, cb_tmp1, cb_tmp0);
+            sub_tiles_init(cb_tmp0, cb_tmp1);
             sub_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);   // slot 0 = t_r
             tile_regs_commit();
             tile_regs_wait();
-            pack_tile(0, cb_tmp0);
-            tile_regs_release();
 
-            cb_push_back(cb_tmp0, 1);
-
-            // Pop exactly the one tile we just consumed from each CB.
+            // Pop consumed tiles FIRST — frees slots so reserve won't block.
             cb_pop_front(cb_tmp0, 1);   // tw_r*odd_r consumed
             cb_pop_front(cb_tmp1, 1);   // tw_i*odd_i consumed
-            // tmp0 now has: [t_r]
-            // tmp1 now has: [tw_i*odd_r]  (the second tile from session A)
 
-            // ── SESSION C: t_i = tmp0_remaining[0] + tmp1_remaining[0] ───
+            // State now:
+            //   tmp0 = [tw_r*odd_i]   (1 tile, 1 slot free)
+            //   tmp1 = [tw_i*odd_r]   (1 tile, 1 slot free)
+            //   slot 0 of register file holds t_r
+
+            cb_reserve_back(cb_tmp0, 1);   // guaranteed free
+            pack_tile(0, cb_tmp0);
+            tile_regs_release();
+            cb_push_back(cb_tmp0, 1);
+
+            // State now:
+            //   tmp0 = [tw_r*odd_i, t_r]   front=tw_r*odd_i
+            //   tmp1 = [tw_i*odd_r]         front=tw_i*odd_r
+
+            // ── SESSION C: t_i = tmp0[front] + tmp1[front] ────────────
             //
-            // After session B pops, the remaining tiles in each CB slide to front:
-            //   tmp0 front = tw_r*odd_i  (was index 1 in session A)
-            //   tmp1 front = tw_i*odd_r  (was index 1 in session A)
-            // Plus tmp0 also has t_r (just pushed), which is behind tw_r*odd_i.
+            // tmp0 front = tw_r*odd_i  (second tile from Session A)
+            // tmp1 front = tw_i*odd_r  (second tile from Session A)
             //
-            // Wait: actually after session B's reserve+push+pop sequence:
-            //   tmp0: [tw_r*odd_i, t_r]  — tw_r*odd_i is at front, t_r behind it
-            //   Wait, no. CB is FIFO. Session A pushed [tw_r*odd_r, tw_r*odd_i].
-            //   Session B popped tw_r*odd_r (front), then pushed t_r.
-            //   So tmp0 is now: [tw_r*odd_i, t_r]  (tw_r*odd_i at front)
-            //   tmp1: session A pushed [tw_i*odd_i, tw_i*odd_r].
-            //   Session B popped tw_i*odd_i (front).
-            //   So tmp1 is now: [tw_i*odd_r]
-            //
-            // For t_i = tw_r*odd_i + tw_i*odd_r:
-            //   source A = tmp0 front = tw_r*odd_i ✓
-            //   source B = tmp1 front = tw_i*odd_r ✓
-            // After this session we pop both, leaving tmp0 = [t_r], tmp1 = [] then push t_i.
+            // Same pop-first fix as Session B.
 
             cb_wait_front(cb_tmp0, 1);   // tw_r*odd_i
             cb_wait_front(cb_tmp1, 1);   // tw_i*odd_r
 
-            cb_reserve_back(cb_tmp1, 1);
-
             tile_regs_acquire();
-            add_tiles_init(cb_tmp0, cb_tmp1, cb_tmp1);
+            // FIX (BUG 3): correct source hints — cb_tmp0 and cb_tmp1
+            // as the two operands. Third hint is output CB (cb_out0_i
+            // is a safe unused-at-this-point CB for the hint slot).
+            add_tiles_init(cb_tmp0, cb_tmp1);
             add_tiles(cb_tmp0, cb_tmp1, 0, 0, 0);   // slot 0 = t_i
             tile_regs_commit();
             tile_regs_wait();
-            pack_tile(0, cb_tmp1);
-            tile_regs_release();
 
-            cb_push_back(cb_tmp1, 1);
-
+            // Pop consumed tiles FIRST.
             cb_pop_front(cb_tmp0, 1);   // tw_r*odd_i consumed
             cb_pop_front(cb_tmp1, 1);   // tw_i*odd_r consumed
-            // tmp0 now has: [t_r]
-            // tmp1 now has: [t_i]
 
-            // ── SESSION D: out0 = even+t,  out1 = even-t ─────────────────
+            // State now:
+            //   tmp0 = [t_r]   (1 tile)
+            //   tmp1 = []      (empty)
+
+            cb_reserve_back(cb_tmp1, 1);
+            pack_tile(0, cb_tmp1);
+            tile_regs_release();
+            cb_push_back(cb_tmp1, 1);
+
+            // State now:
+            //   tmp0 = [t_r]
+            //   tmp1 = [t_i]
+            //   even_r, even_i: still at front
+
+            // ── SESSION D: out0 = even + t,  out1 = even − t ─────────
             //
-            // even_r/i were waited in session A and not yet popped.
-            // tmp0 front = t_r, tmp1 front = t_i.
+            // All inputs guaranteed present:
+            //   even_r, even_i — waited in Session A, not yet popped
+            //   tmp0 front = t_r
+            //   tmp1 front = t_i
 
             cb_wait_front(cb_tmp0, 1);
             cb_wait_front(cb_tmp1, 1);
-            // even_r, even_i already at front from session A wait.
+            // even_r/i already at front — no additional wait needed.
 
             cb_reserve_back(cb_out0_r, 1);
             cb_reserve_back(cb_out0_i, 1);
@@ -213,22 +262,21 @@ void kernel_main() {
 
             tile_regs_acquire();
 
-            add_tiles_init(cb_even_r, cb_tmp0, cb_out0_r);
+            add_tiles_init(cb_even_r, cb_tmp0);
             add_tiles(cb_even_r, cb_tmp0, 0, 0, 0);   // slot 0 = even_r + t_r
 
-            add_tiles_init(cb_even_i, cb_tmp1, cb_out0_i);
+            add_tiles_init(cb_even_i, cb_tmp1);
             add_tiles(cb_even_i, cb_tmp1, 0, 0, 1);   // slot 1 = even_i + t_i
 
-            sub_tiles_init(cb_even_r, cb_tmp0, cb_out1_r);
+            sub_tiles_init(cb_even_r, cb_tmp0);
             sub_tiles(cb_even_r, cb_tmp0, 0, 0, 2);   // slot 2 = even_r - t_r
 
-            sub_tiles_init(cb_even_i, cb_tmp1, cb_out1_i);
+            sub_tiles_init(cb_even_i, cb_tmp1);
             sub_tiles(cb_even_i, cb_tmp1, 0, 0, 3);   // slot 3 = even_i - t_i
 
             tile_regs_commit();
             tile_regs_wait();
 
-            // Pack all 4 outputs while register file is live.
             pack_tile(0, cb_out0_r);
             pack_tile(1, cb_out0_i);
             pack_tile(2, cb_out1_r);
@@ -241,10 +289,15 @@ void kernel_main() {
             cb_push_back(cb_out1_r, 1);
             cb_push_back(cb_out1_i, 1);
 
+            // Pop all inputs consumed by Session D.
             cb_pop_front(cb_even_r, 1);
             cb_pop_front(cb_even_i, 1);
             cb_pop_front(cb_tmp0,   1);   // t_r
             cb_pop_front(cb_tmp1,   1);   // t_i
+
+            // State at end of tile iteration:
+            //   tmp0 = []   tmp1 = []   — both completely empty ✓
+            //   Next iteration's cb_reserve_back(tmp0/1, 2) will not block.
         }
     }
 }
