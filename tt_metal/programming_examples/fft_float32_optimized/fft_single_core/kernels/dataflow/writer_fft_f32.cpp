@@ -139,13 +139,36 @@ void kernel_main() {
                 continue;
             }
 
-            // Base L1 read pointers (out0/out1 in CB 16-19)
+            // Snapshot L1 read pointers BEFORE popping (pointers remain
+            // valid until the next cb_reserve_back on the same CB).
             const uint32_t src0r = get_read_ptr(cb_out0_r);
             const uint32_t src0i = get_read_ptr(cb_out0_i);
             const uint32_t src1r = get_read_ptr(cb_out1_r);
             const uint32_t src1i = get_read_ptr(cb_out1_i);
 
-            // Reserve destination slots in CB 0-3
+            // FIX (deadlock): reserve CB 0-3 AFTER popping CB 16-19.
+            //
+            // Previous order: reserve CB 0-3 → pop CB 16-19
+            // This deadlocked because:
+            //   writer holds CB 16-19, waits for free slot in CB 0-3
+            //   compute holds CB 0-3,  waits for data in CB 16-19
+            //   → circular wait → neither can proceed.
+            //
+            // Correct order: pop CB 16-19 first (releases compute's
+            // dependency), then reserve CB 0-3 (now safe to block if
+            // needed since compute can run and will pop those slots).
+            //
+            // NOTE: src0r/src1r pointers captured above remain valid
+            // after the pop — the CB ring buffer does not overwrite
+            // freed pages until cb_reserve_back is called again, and
+            // we reserve CB 0-3 (different buffers) not CB 16-19.
+
+            cb_pop_front(cb_out0_r, num_tiles);
+            cb_pop_front(cb_out0_i, num_tiles);
+            cb_pop_front(cb_out1_r, num_tiles);
+            cb_pop_front(cb_out1_i, num_tiles);
+
+            // Now safe to wait for CB 0-3 slots — compute is unblocked.
             cb_reserve_back(cb_even_r, num_tiles);
             cb_reserve_back(cb_even_i, num_tiles);
             cb_reserve_back(cb_odd_r,  num_tiles);
@@ -228,12 +251,7 @@ void kernel_main() {
                 }
             }
             // No barrier needed — direct RISC-V writes are synchronous.
-
-            // Free compute's output slots
-            cb_pop_front(cb_out0_r, num_tiles);
-            cb_pop_front(cb_out0_i, num_tiles);
-            cb_pop_front(cb_out1_r, num_tiles);
-            cb_pop_front(cb_out1_i, num_tiles);
+            // CB 16-19 already popped above before the reserve.
 
             // Signal compute that next stage's inputs are ready
             cb_push_back(cb_even_r, num_tiles);
