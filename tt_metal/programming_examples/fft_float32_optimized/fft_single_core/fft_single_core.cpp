@@ -111,11 +111,21 @@ void prepare_stage0(const std::vector<float>& sr, const std::vector<float>& si,
 // Compact twiddle table: N/2 entries, direction-aware sign.
 std::pair<std::vector<uint32_t>,std::vector<uint32_t>>
 precompute_compact_twiddles(uint32_t N, uint32_t direction) {
-    uint32_t half_N = N/2;
-    float sign = (direction==1) ? 1.f : -1.f;
-    std::vector<uint32_t> tw_r(TILE_SIZE, 0), tw_i(TILE_SIZE, 0);
+    const uint32_t half_N = N / 2;
+    const float sign = (direction == 1) ? 1.f : -1.f;
+
+    // IMPORTANT:
+    // The compact DRAM buffers are allocated with exactly half_N float entries
+    // (compact_bytes = half_N * sizeof(float)). The host vectors written into
+    // those buffers must therefore also contain exactly half_N elements.
+    // Using TILE_SIZE elements here overruns the compact DRAM buffer and can
+    // corrupt device-side state, which is why the program appears to hang
+    // after launching the workload.
+    std::vector<uint32_t> tw_r(half_N, 0);
+    std::vector<uint32_t> tw_i(half_N, 0);
+
     for (uint32_t k = 0; k < half_N; k++) {
-        float angle = sign * 2.f*PI*(float)k/(float)N;
+        const float angle = sign * 2.f * PI * static_cast<float>(k) / static_cast<float>(N);
         tw_r[k] = f2u(std::cos(angle));
         tw_i[k] = f2u(std::sin(angle));
     }
