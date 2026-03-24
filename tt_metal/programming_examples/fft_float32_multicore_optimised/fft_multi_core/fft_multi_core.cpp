@@ -165,7 +165,6 @@ static std::vector<uint32_t> padCompactTwiddlesToTile(
     return padded;
 }
 
-
 CBHandle create_cb(Program& p, CoreCoord c, uint32_t id,
                    uint32_t ntiles, uint32_t bytes_per_tile) {
     CircularBufferConfig cfg =
@@ -390,99 +389,98 @@ int main(int argc, char** argv) {
     auto b_cmp_r = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
     auto b_cmp_i = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
 
-    // ── Circular buffers ──────────────────────────────────────────────
-    //
-    //  All scratch CBs use depth=1.  The compute kernel's session
-    //  structure guarantees at most 1 tile in flight per scratch CB
-    //  at any time — verified by dry-run in fft_compute_f32.cpp.
-    //
-    //  CB depth=1 uses the minimum L1 for scratch and prevents the
-    //  old depth-2 + illegal-CB-op-inside-session deadlock entirely.
-
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
-        create_cb(prog, cc,  0, tiles_per_row, TILE_BYTES);  // even_r
-        create_cb(prog, cc,  1, tiles_per_row, TILE_BYTES);  // even_i
-        create_cb(prog, cc,  2, tiles_per_row, TILE_BYTES);  // odd_r
-        create_cb(prog, cc,  3, tiles_per_row, TILE_BYTES);  // odd_i
-        create_cb(prog, cc,  4, tiles_per_row, TILE_BYTES);  // tw_r
-        create_cb(prog, cc,  5, tiles_per_row, TILE_BYTES);  // tw_i
-        create_cb(prog, cc, 16, tiles_per_row, TILE_BYTES);  // out0_r
-        create_cb(prog, cc, 17, tiles_per_row, TILE_BYTES);  // out0_i
-        create_cb(prog, cc, 18, tiles_per_row, TILE_BYTES);  // out1_r
-        create_cb(prog, cc, 19, tiles_per_row, TILE_BYTES);  // out1_i
-        create_cb(prog, cc, 20, 1,             TILE_BYTES);  // tmp0 depth=1
-        create_cb(prog, cc, 21, 1,             TILE_BYTES);  // tmp1 depth=1
-        create_cb(prog, cc, 22, 1,             TILE_BYTES);  // tmp2 depth=1 (t_r)
-        create_cb(prog, cc, 23, 1,             TILE_BYTES);  // tmp3 depth=1 (t_i)
-
-        create_cb(prog, cc, 10, 1, TILE_BYTES);  // compact_r
-        create_cb(prog, cc, 11, 1, TILE_BYTES);  // compact_i
+        create_cb(prog, cc,  0, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  1, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  2, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  3, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  4, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  5, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc, 16, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc, 17, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc, 18, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc, 19, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc, 20, 1,             TILE_BYTES);
+        create_cb(prog, cc, 21, 1,             TILE_BYTES);
+        create_cb(prog, cc, 22, 1,             TILE_BYTES);
+        create_cb(prog, cc, 23, 1,             TILE_BYTES);
+        create_cb(prog, cc, 10, 1,             TILE_BYTES);
+        create_cb(prog, cc, 11, 1,             TILE_BYTES);
     }
 
     constexpr const char* KERNEL_PATH =
         "tt_metal/programming_examples/fft_float32_multicore_optimised/"
         "fft_multi_core/kernels/";
 
-    KernelHandle reader_k = CreateKernel(prog,
+    KernelHandle reader_k = CreateKernel(
+        prog,
         std::string(KERNEL_PATH) + "dataflow/reader_fft_f32.cpp",
         core_range,
-        DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
-                           .noc       = NOC::RISCV_0_default});
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc       = NOC::RISCV_0_default
+        });
 
-    KernelHandle writer_k = CreateKernel(prog,
+    KernelHandle writer_k = CreateKernel(
+        prog,
         std::string(KERNEL_PATH) + "dataflow/writer_fft_f32.cpp",
         core_range,
-        DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
-                           .noc       = NOC::RISCV_1_default});
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc       = NOC::RISCV_1_default
+        });
 
-    KernelHandle compute_k = CreateKernel(prog,
+    KernelHandle compute_k = CreateKernel(
+        prog,
         std::string(KERNEL_PATH) + "compute/fft_compute_f32.cpp",
         core_range,
-        ComputeConfig{.math_fidelity    = MathFidelity::HiFi4,
-                      .fp32_dest_acc_en = true,
-                      .math_approx_mode = false});
+        ComputeConfig{
+            .math_fidelity    = MathFidelity::HiFi4,
+            .fp32_dest_acc_en = true,
+            .math_approx_mode = false
+        });
 
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord       cc         = {c, 0};
         const uint32_t tile_offset = c * tiles_per_core;
 
         SetRuntimeArgs(prog, reader_k, cc, std::vector<uint32_t>{
-            b_er->address(),     // [0]  even_r
-            b_ei->address(),     // [1]  even_i
-            b_or->address(),     // [2]  odd_r
-            b_oi->address(),     // [3]  odd_i
-            b_cmp_r->address(),  // [4]  compact twiddle real
-            b_cmp_i->address(),  // [5]  compact twiddle imag
-            tiles_per_row,       // [6]  tiles per row
-            tile_offset,         // [7]  first tile index
-            log2_row,            // [8]  num_stages
-            half_row,            // [9]  half_N
-            half_row,            // [10] local_half (ABI compat)
-            rows_per_core,       // [11] rows this core processes
+            b_er->address(),
+            b_ei->address(),
+            b_or->address(),
+            b_oi->address(),
+            b_cmp_r->address(),
+            b_cmp_i->address(),
+            tiles_per_row,
+            tile_offset,
+            log2_row,
+            half_row,
+            half_row,
+            rows_per_core,
         });
 
         SetRuntimeArgs(prog, compute_k, cc, std::vector<uint32_t>{
-            log2_row,            // [0]  num_stages
-            tiles_per_row,       // [1]  tiles_per_stage
-            rows_per_core,       // [2]  rows_per_core
+            log2_row,
+            tiles_per_row,
+            rows_per_core,
         });
 
         SetRuntimeArgs(prog, writer_k, cc, std::vector<uint32_t>{
-            b_o0r->address(),    // [0]  out0_r
-            b_o0i->address(),    // [1]  out0_i
-            b_o1r->address(),    // [2]  out1_r
-            b_o1i->address(),    // [3]  out1_i
-            tiles_per_row,       // [4]  tiles per row
-            log2_row,            // [5]  num_stages
-            half_row,            // [6]  local_half
-            half_row,            // [7]  half_N
-            1u,                  // [8]  num_cores
-            c,                   // [9]  core_id
-            0u,                  // [10] log2_cores
-            tile_offset,         // [11] tile_offset for DRAM writes
-            0u,                  // [12] core_elem_base
-            rows_per_core,       // [13] rows_per_core
+            b_o0r->address(),
+            b_o0i->address(),
+            b_o1r->address(),
+            b_o1i->address(),
+            tiles_per_row,
+            log2_row,
+            half_row,
+            half_row,
+            1u,
+            c,
+            0u,
+            tile_offset,
+            0u,
+            rows_per_core,
         });
     }
 
@@ -492,10 +490,10 @@ int main(int argc, char** argv) {
     wl.add_program(rng, std::move(prog));
 
     std::cout << "Writing inputs to DRAM...\n";
-    EnqueueWriteMeshBuffer(cq, b_er,    all_er,  false);
-    EnqueueWriteMeshBuffer(cq, b_ei,    all_ei,  false);
-    EnqueueWriteMeshBuffer(cq, b_or,    all_or,  false);
-    EnqueueWriteMeshBuffer(cq, b_oi,    all_oi,  false);
+    EnqueueWriteMeshBuffer(cq, b_er,    all_er, false);
+    EnqueueWriteMeshBuffer(cq, b_ei,    all_ei, false);
+    EnqueueWriteMeshBuffer(cq, b_or,    all_or, false);
+    EnqueueWriteMeshBuffer(cq, b_oi,    all_oi, false);
     EnqueueWriteMeshBuffer(cq, b_cmp_r, cmp_r_tile, false);
     EnqueueWriteMeshBuffer(cq, b_cmp_i, cmp_i_tile, false);
     Finish(cq);
@@ -524,6 +522,7 @@ int main(int argc, char** argv) {
             result_i[row * N_row + i + half_row] = u2f(o1i_raw[tile_base + i]);
         }
     }
+
     if (direction == 1) {
         const float inv_N = 1.f / static_cast<float>(N_row);
         for (uint32_t i = 0; i < total_N; i++) {
