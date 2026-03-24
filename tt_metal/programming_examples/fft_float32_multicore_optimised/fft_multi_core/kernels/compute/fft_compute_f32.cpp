@@ -29,6 +29,7 @@
 void kernel_main() {
     const uint32_t num_stages      = get_arg_val<uint32_t>(0);
     const uint32_t tiles_per_stage = get_arg_val<uint32_t>(1);
+    const uint32_t rows_per_core   = get_arg_val<uint32_t>(2);
 
     constexpr uint32_t cb_even_r   = 0;
     constexpr uint32_t cb_even_i   = 1;
@@ -45,10 +46,15 @@ void kernel_main() {
     constexpr uint32_t cb_tw_odd_r = 22;
     constexpr uint32_t cb_tw_odd_i = 23;
 
+    if (tiles_per_stage == 0 || num_stages == 0 || rows_per_core == 0) {
+        return;
+    }
+
     binary_op_init_common(cb_even_r, cb_odd_r, cb_tmp0);
 
-    for (uint32_t stage = 0; stage < num_stages; stage++) {
-        for (uint32_t t = 0; t < tiles_per_stage; t++) {
+    for (uint32_t row = 0; row < rows_per_core; row++) {
+        for (uint32_t stage = 0; stage < num_stages; stage++) {
+            for (uint32_t t = 0; t < tiles_per_stage; t++) {
 
             cb_wait_front(cb_tw_r,   1);
             cb_wait_front(cb_tw_i,   1);
@@ -160,6 +166,7 @@ void kernel_main() {
             cb_pop_front(cb_even_i,   1);
             cb_pop_front(cb_tw_odd_r, 1);
             cb_pop_front(cb_tw_odd_i, 1);
+            }
         }
     }
 }
