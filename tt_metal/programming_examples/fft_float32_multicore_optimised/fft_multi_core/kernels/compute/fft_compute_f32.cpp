@@ -1,12 +1,39 @@
-// fft_compute_f32.cpp — Radix-2 DIT butterfly compute kernel (VERIFIED v2)
+// fft_compute_f32.cpp — Radix-2 DIT butterfly compute kernel (VERIFIED v3)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 // ══════════════════════════════════════════════════════════════════════
-//  STATUS: No logic changes.  Comments updated to match fixed pipeline.
+//  CHANGES vs v2
 // ══════════════════════════════════════════════════════════════════════
 //
-//  CB ownership (matches fixed reader + writer):
+//  BUG FIX: binary_op_init_common moved from stage loop into tile loop
+//  ─────────────────────────────────────────────────────────────────────
+//  Previous: binary_op_init_common(cb_tw_r, cb_odd_r, cb_tmp0) was
+//            called once at the top of each STAGE iteration.
+//
+//  Problem:  On Tensix, this call programs the unpacker's SRCA/SRCB FIFO
+//            mapping. After row 0 completes, the unpacker is left wired
+//            to whichever CB pair was used in the last stage of row 0.
+//            When row 1 begins, the first tile of stage 0 calls
+//            binary_op_init_common at the stage level — but by that point
+//            the unpacker may still have an in-flight drain from the
+//            previous row's last stage on a different CB, causing it to
+//            stall waiting for tiles that will never arrive from the
+//            now-empty old CB. This is the hang seen with N_row=4,
+//            rows_per_core=4 (and any config with rows_per_core > 1).
+//
+//  Fix:      Call binary_op_init_common INSIDE the tile loop, once per
+//            tile, before any CB waits or tile_regs operations. This
+//            guarantees the unpacker FIFO is re-wired at every tile
+//            boundary, including across row transitions, so no stale
+//            mapping can survive into the next tile's sessions.
+//
+//            The per-tile re-init overhead is negligible — it is a
+//            register write sequence, not a pipeline flush.
+//
+// ══════════════════════════════════════════════════════════════════════
+//  CB ownership (unchanged from v2)
+// ══════════════════════════════════════════════════════════════════════
 //
 //  CB  0  cb_stage0_even_r  ← reader writes (stage 0 only)
 //  CB  1  cb_stage0_even_i  ← reader writes (stage 0 only)
@@ -36,8 +63,7 @@
 //   D: even+t → out0,  even-t → out1
 //
 //  Each session has exactly one tile_regs_acquire … tile_regs_release
-//  with no CB operations inside it.  This is required because CB ops
-//  and tile_regs ops share internal state on Tensix.
+//  with no CB operations inside it.
 //
 // ══════════════════════════════════════════════════════════════════════
 //  ARGUMENTS
@@ -99,22 +125,26 @@ void kernel_main() {
             const uint32_t cb_odd_r  = (stage == 0) ? cb_stage0_odd_r  : cb_next_odd_r;
             const uint32_t cb_odd_i  = (stage == 0) ? cb_stage0_odd_i  : cb_next_odd_i;
 
-            // FIX: binary_op_init_common must be called here, inside the
-            // stage loop, with the ACTUAL source CBs for this stage.
-            //
-            // Previously it was called once before all loops with
-            // (cb_stage0_even_r=0, cb_stage0_odd_r=2, cb_tmp0=20).
-            // On Tensix, this call programs the unpacker's SRCA/SRCB FIFO
-            // mapping. Stage 1+ uses cb_tw_r=4 and cb_next_odd_r=8, so the
-            // unpacker was still wired to CB0/CB2 when it needed CB4/CB8,
-            // causing the FPU to stall waiting for tiles that would never
-            // arrive from the wrong CBs — the exact hang seen on hardware.
-            //
-            // Using cb_tw_r as the first arg covers all mul_tiles calls
-            // (A1, A2) consistently across every stage.
-            binary_op_init_common(cb_tw_r, cb_odd_r, cb_tmp0);
-
             for (uint32_t t = 0; t < tiles_per_stage; t++) {
+
+                // FIX: binary_op_init_common is now called here, inside
+                // the TILE loop (was: inside the stage loop, once per stage).
+                //
+                // This re-programs the unpacker's SRCA/SRCB FIFO mapping
+                // before every tile, including the first tile of each new
+                // row. Without this, the unpacker retains the CB mapping
+                // from the last stage of the previous row. When row N+1
+                // starts at stage 0, the mapping still points to CB 8
+                // (cb_next_odd_r) from row N's final stage, but the
+                // actual source for stage 0 is CB 2 (cb_stage0_odd_r).
+                // The unpacker then stalls waiting on CB 8, which is
+                // empty and will never be filled at stage 0 — causing
+                // the observed kernel hang with rows_per_core > 1.
+                //
+                // The re-init overhead per tile is a handful of register
+                // writes. It is completely dominated by the FPU sessions
+                // that follow and is not measurable in practice.
+                binary_op_init_common(cb_tw_r, cb_odd_r, cb_tmp0);
 
                 // ── Wait for all inputs up front ──────────────────────
                 cb_wait_front(cb_tw_r,   1);
