@@ -266,7 +266,8 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
                   << " <direction:0|1> [N_row] [num_rows] [num_cores] [input_file]\n"
-                  << " Default: forward FFT, N_row=1024, num_rows=auto\n";
+                  << " Example: " << argv[0] << " 0 4 1 1 sample_input.txt\n"
+                  << " Default: forward FFT, N_row=4, num_rows=auto, num_cores=auto\n";
         return 1;
     }
 
@@ -277,22 +278,59 @@ int main(int argc, char** argv) {
     const uint32_t rows_per_core_target = 4;
     std::string    in_file              = "";
 
-    for (int i = 2; i < argc; i++) {
-        if (!is_uint_str(argv[i])) { in_file = argv[i]; continue; }
-        const uint32_t v = static_cast<uint32_t>(std::stoul(argv[i]));
-        if      (v >= 2 && v <= 64 && (v & (v-1)) == 0) user_cores = v;
-        else if (v > 64  && v <= 1024 && (v & (v-1)) == 0) N_row    = v;
-        else if (v > 1024 && (v & (v-1)) == 0)             num_rows  = v;
-        else if (v >= 2)                                    num_rows  = v;
+    if (argc >= 3) {
+        if (!is_uint_str(argv[2])) {
+            std::cerr << "N_row must be an integer\n";
+            return 1;
+        }
+        N_row = static_cast<uint32_t>(std::stoul(argv[2]));
+    }
+
+    if (argc >= 4) {
+        if (!is_uint_str(argv[3])) {
+            std::cerr << "num_rows must be an integer\n";
+            return 1;
+        }
+        num_rows = static_cast<uint32_t>(std::stoul(argv[3]));
+    }
+
+    if (argc >= 5) {
+        if (!is_uint_str(argv[4])) {
+            std::cerr << "num_cores must be an integer\n";
+            return 1;
+        }
+        user_cores = static_cast<uint32_t>(std::stoul(argv[4]));
+    }
+
+    if (argc >= 6) {
+        in_file = argv[5];
+    }
+
+    if (direction > 1) {
+        std::cerr << "direction must be 0 (forward) or 1 (inverse)\n";
+        return 1;
     }
     if (N_row < 2 || (N_row & (N_row - 1))) {
-        std::cerr << "N_row must be a power of 2\n"; return 1;
+        std::cerr << "N_row must be a power of 2\n";
+        return 1;
+    }
+    if (argc >= 4 && num_rows == 0) {
+        std::cerr << "num_rows must be >= 1\n";
+        return 1;
+    }
+    if (argc >= 5 && user_cores == 0) {
+        std::cerr << "num_cores must be >= 1\n";
+        return 1;
     }
 
     const int dev_id = 0;
     auto mesh   = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(dev_id);
     auto& cq    = mesh->mesh_command_queue();
     IDevice* device = mesh->get_devices().at(0);
+
+    std::cout << " Requested N_row   : " << N_row << "\n"
+              << " Requested rows    : " << (num_rows ? std::to_string(num_rows) : std::string("auto")) << "\n"
+              << " Requested cores   : " << (user_cores ? std::to_string(user_cores) : std::string("auto")) << "\n";
 
     const uint32_t max_req   = user_cores > 0 ? user_cores : 64u;
     const uint32_t num_cores = detect_available_cores(device, max_req, num_rows);
@@ -309,7 +347,7 @@ int main(int argc, char** argv) {
     const uint32_t total_N       = N_row * num_rows;
 
     std::cout << "════════════════════════════════════════════════\n";
-    std::cout << " TT-Metal MULTICORE FFT (row decomposition ok ok)\n";
+    std::cout << " TT-Metal MULTICORE FFT (row decomposition....)\n";
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << " N_row        : " << N_row         << "\n";
     std::cout << " num_rows     : " << num_rows      << "\n";
