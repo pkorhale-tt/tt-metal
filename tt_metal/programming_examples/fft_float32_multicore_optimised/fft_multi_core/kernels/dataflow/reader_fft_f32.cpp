@@ -56,10 +56,10 @@ void kernel_main() {
     // arg[10] local_half — ABI compat, not used in scatter loop
     const uint32_t rows_per_core  = get_arg_val<uint32_t>(11);
 
-    constexpr uint32_t cb_even_r    = 0;
-    constexpr uint32_t cb_even_i    = 1;
-    constexpr uint32_t cb_odd_r     = 2;
-    constexpr uint32_t cb_odd_i     = 3;
+    constexpr uint32_t cb_even_r    = 6;
+    constexpr uint32_t cb_even_i    = 7;
+    constexpr uint32_t cb_odd_r     = 8;
+    constexpr uint32_t cb_odd_i     = 9;
     constexpr uint32_t cb_tw_r      = 4;
     constexpr uint32_t cb_tw_i      = 5;
     constexpr uint32_t cb_compact_r = 10;

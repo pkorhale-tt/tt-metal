@@ -13,10 +13,17 @@ void kernel_main() {
     const uint32_t rows_per_core   = get_arg_val<uint32_t>(2);
 
     // ── CB indices ────────────────────────────────────────────────────
-    constexpr uint32_t cb_even_r = 0;
-    constexpr uint32_t cb_even_i = 1;
-    constexpr uint32_t cb_odd_r  = 2;
-    constexpr uint32_t cb_odd_i  = 3;
+    constexpr uint32_t cb_stage0_even_r = 0;
+    constexpr uint32_t cb_stage0_even_i = 1;
+    constexpr uint32_t cb_stage0_odd_r  = 2;
+    constexpr uint32_t cb_stage0_odd_i  = 3;
+
+    constexpr uint32_t cb_next_even_r   = 6;
+    constexpr uint32_t cb_next_even_i   = 7;
+    constexpr uint32_t cb_next_odd_r    = 8;
+    constexpr uint32_t cb_next_odd_i    = 9;
+
+
     constexpr uint32_t cb_tw_r   = 4;
     constexpr uint32_t cb_tw_i   = 5;
 
@@ -36,10 +43,14 @@ void kernel_main() {
     }
 
     // Sticky FPU config — valid for the lifetime of this kernel.
-    binary_op_init_common(cb_even_r, cb_odd_r, cb_tmp0);
+    binary_op_init_common(cb_stage0_even_r, cb_stage0_odd_r, cb_tmp0);
 
     for (uint32_t row = 0; row < rows_per_core; row++) {
         for (uint32_t stage = 0; stage < num_stages; stage++) {
+            const uint32_t cb_even_r = (stage == 0) ? cb_stage0_even_r : cb_next_even_r;
+            const uint32_t cb_even_i = (stage == 0) ? cb_stage0_even_i : cb_next_even_i;
+            const uint32_t cb_odd_r  = (stage == 0) ? cb_stage0_odd_r  : cb_next_odd_r;
+            const uint32_t cb_odd_i  = (stage == 0) ? cb_stage0_odd_i  : cb_next_odd_i;
             for (uint32_t t = 0; t < tiles_per_stage; t++) {
 
                 // ── Wait for all inputs up front ──────────────────────
