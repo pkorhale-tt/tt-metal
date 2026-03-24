@@ -1,33 +1,39 @@
-// writer_fft_f32.cpp — FIXED v4
+// writer_fft_f32.cpp — FIXED v5
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 // ══════════════════════════════════════════════════════════════════════
-//  ROOT CAUSE OF PREVIOUS DEADLOCK
+//  ROOT CAUSE OF HANG (N=2 / any small N)
 // ══════════════════════════════════════════════════════════════════════
 //
-//  In the original code, for any stage s < num_stages-1 the writer did:
+//  v4 allocated the inter-stage shuffle buffer on the RISC-V stack:
+//    uint32_t scratch_er[elems_per_batch];   // 1024 uint32_t = 4 KB
+//    uint32_t scratch_ei[...];               // × 4 arrays = 16 KB
+//    uint32_t scratch_or[...];
+//    uint32_t scratch_oi[...];
 //
-//    cb_wait_front(cb_out0_r, num_tiles)   ← blocks until compute pushes
-//    cb_reserve_back(cb_next_even_r, ...)  ← blocks until compute DRAINS
-//                                             CB 6-9 (it hasn't yet!)
+//  The RISC-V dataflow processor has ~4 KB of usable stack.
+//  Allocating 16 KB silently overwrites adjacent memory and hangs.
 //
-//  Compute meanwhile was doing:
-//    cb_wait_front(cb_next_even_r, 1)      ← blocks until writer pushes
+//  FIX: replace stack VLAs with four dedicated depth-1 L1 scratch CBs
+//  (indices 12-15).  Their write pointers are used as flat byte arrays.
+//  No push/pop — purely memory-mapped L1 access.
 //
-//  Both sides blocked on each other → deadlock.
+//  HOST CHANGE REQUIRED (add to the per-core CB setup):
+//    create_cb(prog, cc, 12, 1, TILE_BYTES);  // scr even-r
+//    create_cb(prog, cc, 13, 1, TILE_BYTES);  // scr even-i
+//    create_cb(prog, cc, 14, 1, TILE_BYTES);  // scr odd-r
+//    create_cb(prog, cc, 15, 1, TILE_BYTES);  // scr odd-i
 //
-//  FIX: For intermediate stages the writer performs two passes:
+// ══════════════════════════════════════════════════════════════════════
+//  DEADLOCK-FREE PROTOCOL (two-pass, same as v4)
+// ══════════════════════════════════════════════════════════════════════
 //
-//    Pass 1 — "Drain":  wait for all output tiles from compute, copy the
-//             shuffle data into local L1 scratch, then immediately pop the
-//             output CBs.  This unblocks compute for the next stage.
+//  Intermediate stages only:
+//    Pass 1 (drain):  wait CB 16-19, shuffle into L1 scratch, pop CB 16-19.
+//    Pass 2 (fill):   reserve CB 6-9, copy from scratch, push.
 //
-//    Pass 2 — "Fill":   reserve space in CB 6-9, copy the shuffled data
-//             in, push.  Compute can now proceed with stage s+1.
-//
-//  Because Pass 1 pops CB 16-19 before Pass 2 reserves CB 6-9, compute
-//  is never waiting on the writer while the writer is waiting on compute.
+//  Popping CB 16-19 before reserving CB 6-9 breaks the circular deadlock.
 //
 // ══════════════════════════════════════════════════════════════════════
 //  ARGUMENT MAP
@@ -40,12 +46,9 @@
 //  [4]  num_tiles      (= tiles_per_row)
 //  [5]  num_stages
 //  [6]  half_N
-//  [7]  (padding)
-//  [8]  (padding)
-//  [9]  (padding / core index)
-//  [10] (padding)
+//  [7-10] padding
 //  [11] tile_offset
-//  [12] (padding)
+//  [12] padding
 //  [13] rows_per_core
 //
 // ══════════════════════════════════════════════════════════════════════
@@ -61,29 +64,32 @@ void kernel_main() {
     const uint32_t num_tiles     = get_arg_val<uint32_t>(4);
     const uint32_t num_stages    = get_arg_val<uint32_t>(5);
     const uint32_t half_N        = get_arg_val<uint32_t>(6);
-    // args [7-10]: padding
     const uint32_t tile_offset   = get_arg_val<uint32_t>(11);
-    // arg [12]:    padding
     const uint32_t rows_per_core = get_arg_val<uint32_t>(13);
 
-    // ── CB indices ────────────────────────────────────────────────────
     constexpr uint32_t cb_out0_r      = 16;
     constexpr uint32_t cb_out0_i      = 17;
     constexpr uint32_t cb_out1_r      = 18;
     constexpr uint32_t cb_out1_i      = 19;
 
-    // Next-stage even/odd: writer fills these after shuffling, compute reads.
     constexpr uint32_t cb_next_even_r = 6;
     constexpr uint32_t cb_next_even_i = 7;
     constexpr uint32_t cb_next_odd_r  = 8;
     constexpr uint32_t cb_next_odd_i  = 9;
 
+    // L1 scratch CBs — used as plain memory, never pushed/popped.
+    // Must be created in the host with depth=1.
+    constexpr uint32_t cb_scratch_er  = 12;
+    constexpr uint32_t cb_scratch_ei  = 13;
+    constexpr uint32_t cb_scratch_or  = 14;
+    constexpr uint32_t cb_scratch_oi  = 15;
+
     if (num_tiles == 0 || num_stages == 0 || rows_per_core == 0) return;
 
-    const uint32_t tile_bytes    = get_tile_size(cb_out0_r);
-    const DataFormat data_format = get_dataformat(cb_out0_r);
-    constexpr uint32_t ELEM      = sizeof(float);
-    const uint32_t elems_per_tile_batch = num_tiles * (tile_bytes / ELEM);
+    const uint32_t tile_bytes      = get_tile_size(cb_out0_r);
+    const DataFormat data_format   = get_dataformat(cb_out0_r);
+    constexpr uint32_t ELEM        = sizeof(float);
+    const uint32_t elems_per_batch = num_tiles * (tile_bytes / ELEM);
 
     const InterleavedAddrGenFast<true> out0_r_gen = {
         .bank_base_address = out0_r_addr,
@@ -105,29 +111,12 @@ void kernel_main() {
         *reinterpret_cast<volatile uint32_t*>(addr) = v;
     };
 
-    // Temporary L1 scratch for the inter-stage shuffle.
-    // Allocated once; reused every stage.  Size = 4 component arrays ×
-    // elems_per_tile_batch floats.
-    //
-    // We use a flat uint32_t array.  The host kernel linker places L1
-    // data in the local data segment, so a stack VLA is fine for small
-    // sizes (tiles_per_row is typically 1-4).
-    const uint32_t scratch_elems = elems_per_tile_batch;
-    // Four scratch arrays laid out as local variables:
-    //   scratch_er[0..scratch_elems-1]
-    //   scratch_ei[0..scratch_elems-1]
-    //   scratch_or[0..scratch_elems-1]
-    //   scratch_oi[0..scratch_elems-1]
-    //
-    // Using __attribute__((aligned(4))) to be safe, but alignment should
-    // already be 4 on RISC-V with uint32_t arrays.
-    //
-    // NOTE: If tiles_per_row is large (e.g. 8+) consider moving scratch
-    //       to a dedicated L1 CB instead of the stack.
-    uint32_t scratch_er[scratch_elems];
-    uint32_t scratch_ei[scratch_elems];
-    uint32_t scratch_or[scratch_elems];
-    uint32_t scratch_oi[scratch_elems];
+    // Stable L1 scratch pointers — write pointers of depth-1 CBs.
+    // These never change because we never push/pop the scratch CBs.
+    const uint32_t scr_er = get_write_ptr(cb_scratch_er);
+    const uint32_t scr_ei = get_write_ptr(cb_scratch_ei);
+    const uint32_t scr_or = get_write_ptr(cb_scratch_or);
+    const uint32_t scr_oi = get_write_ptr(cb_scratch_oi);
 
     for (uint32_t row = 0; row < rows_per_core; ++row) {
         const uint32_t row_tile_base = tile_offset + row * num_tiles;
@@ -135,14 +124,13 @@ void kernel_main() {
         for (uint32_t stage = 0; stage < num_stages; ++stage) {
             const bool is_last = (stage == num_stages - 1);
 
-            // ── Wait for compute to finish this stage ─────────────────
             cb_wait_front(cb_out0_r, num_tiles);
             cb_wait_front(cb_out0_i, num_tiles);
             cb_wait_front(cb_out1_r, num_tiles);
             cb_wait_front(cb_out1_i, num_tiles);
 
             if (is_last) {
-                // ── Final stage: write results to DRAM ────────────────
+                // ── Final stage: write to DRAM ────────────────────────
                 const uint32_t src0r = get_read_ptr(cb_out0_r);
                 const uint32_t src0i = get_read_ptr(cb_out0_i);
                 const uint32_t src1r = get_read_ptr(cb_out1_r);
@@ -150,13 +138,13 @@ void kernel_main() {
 
                 for (uint32_t t = 0; t < num_tiles; ++t) {
                     noc_async_write_tile(row_tile_base + t, out0_r_gen,
-                        src0r + t * tile_bytes);
+                                         src0r + t * tile_bytes);
                     noc_async_write_tile(row_tile_base + t, out0_i_gen,
-                        src0i + t * tile_bytes);
+                                         src0i + t * tile_bytes);
                     noc_async_write_tile(row_tile_base + t, out1_r_gen,
-                        src1r + t * tile_bytes);
+                                         src1r + t * tile_bytes);
                     noc_async_write_tile(row_tile_base + t, out1_i_gen,
-                        src1i + t * tile_bytes);
+                                         src1i + t * tile_bytes);
                 }
                 noc_async_write_barrier();
 
@@ -166,23 +154,11 @@ void kernel_main() {
                 cb_pop_front(cb_out1_i, num_tiles);
 
             } else {
-                // ── Intermediate stage: shuffle then feed next stage ──
+                // ── Intermediate stage: shuffle → CB 6-9 ─────────────
                 //
-                // DEADLOCK-FREE PROTOCOL:
+                // Pass 1 — drain: shuffle compute outputs into L1 scratch,
+                //   then pop CB 16-19 BEFORE reserving CB 6-9.
                 //
-                //   Pass 1: Read compute outputs, compute shuffle, store
-                //           results in local scratch, then POP the output
-                //           CBs immediately.  This frees compute to start
-                //           working on stage s+1 twiddle tiles right away.
-                //
-                //   Pass 2: Reserve space in CB 6-9, copy from scratch,
-                //           push.  Compute can now consume stage s+1.
-                //
-                // Because Pass 1 always happens before Pass 2, compute
-                // is never blocked waiting for CB 6-9 while the writer
-                // is blocked waiting for CB 16-19.
-
-                // ── Pass 1: drain compute outputs, compute shuffle ─────
                 const uint32_t m       = 1u << (stage + 1);
                 const uint32_t half_m  = m >> 1;
                 const uint32_t m2      = m << 1;
@@ -195,12 +171,13 @@ void kernel_main() {
                 const uint32_t src1r = get_read_ptr(cb_out1_r);
                 const uint32_t src1i = get_read_ptr(cb_out1_i);
 
-                // Zero-initialise scratch so unused elements are 0.
-                for (uint32_t lp = 0; lp < scratch_elems; ++lp) {
-                    scratch_er[lp] = 0u;
-                    scratch_ei[lp] = 0u;
-                    scratch_or[lp] = 0u;
-                    scratch_oi[lp] = 0u;
+                // Zero-fill scratch (clears unused tile tail).
+                for (uint32_t lp = 0; lp < elems_per_batch; ++lp) {
+                    const uint32_t off = lp * ELEM;
+                    wr32(scr_er + off, 0u);
+                    wr32(scr_ei + off, 0u);
+                    wr32(scr_or + off, 0u);
+                    wr32(scr_oi + off, 0u);
                 }
 
                 if (G2 != 0) {
@@ -213,7 +190,7 @@ void kernel_main() {
                         const uint32_t base_o = base_e + half_m2;
 
                         for (uint32_t j2 = 0; j2 < half_m2; ++j2) {
-                            // Even output element
+                            // Even element
                             {
                                 const uint32_t f      = base_e + j2;
                                 const uint32_t g_old  = f >> log2m;
@@ -226,10 +203,10 @@ void kernel_main() {
                                     idx  = g_old * half_m + (offset - half_m);
                                     srcr = src1r; srci = src1i;
                                 }
-                                scratch_er[dst] = rd32(srcr + idx * ELEM);
-                                scratch_ei[dst] = rd32(srci + idx * ELEM);
+                                wr32(scr_er + dst * ELEM, rd32(srcr + idx * ELEM));
+                                wr32(scr_ei + dst * ELEM, rd32(srci + idx * ELEM));
                             }
-                            // Odd output element
+                            // Odd element
                             {
                                 const uint32_t f      = base_o + j2;
                                 const uint32_t g_old  = f >> log2m;
@@ -242,29 +219,22 @@ void kernel_main() {
                                     idx  = g_old * half_m + (offset - half_m);
                                     srcr = src1r; srci = src1i;
                                 }
-                                scratch_or[dst] = rd32(srcr + idx * ELEM);
-                                scratch_oi[dst] = rd32(srci + idx * ELEM);
+                                wr32(scr_or + dst * ELEM, rd32(srcr + idx * ELEM));
+                                wr32(scr_oi + dst * ELEM, rd32(srci + idx * ELEM));
                             }
                             ++dst;
                         }
                     }
                 }
 
-                // Pop compute outputs NOW — before reserving CB 6-9.
-                // This is the key step that breaks the circular dependency.
+                // Pop CB 16-19 NOW — before reserving CB 6-9.
+                // This is what prevents the circular deadlock.
                 cb_pop_front(cb_out0_r, num_tiles);
                 cb_pop_front(cb_out0_i, num_tiles);
                 cb_pop_front(cb_out1_r, num_tiles);
                 cb_pop_front(cb_out1_i, num_tiles);
 
-                // ── Pass 2: push shuffled data into CB 6-9 ────────────
-                //
-                // cb_reserve_back may block if compute has not yet
-                // consumed the previous push into CB 6-9, but that is
-                // only possible at stage s >= 2 and only if compute is
-                // behind — which is fine because compute is now free
-                // to drain CB 6-9 (we already popped its inputs above).
-                //
+                // Pass 2 — fill: copy from L1 scratch into CB 6-9.
                 cb_reserve_back(cb_next_even_r, num_tiles);
                 cb_reserve_back(cb_next_even_i, num_tiles);
                 cb_reserve_back(cb_next_odd_r,  num_tiles);
@@ -275,12 +245,12 @@ void kernel_main() {
                 const uint32_t dst_or = get_write_ptr(cb_next_odd_r);
                 const uint32_t dst_oi = get_write_ptr(cb_next_odd_i);
 
-                for (uint32_t lp = 0; lp < scratch_elems; ++lp) {
+                for (uint32_t lp = 0; lp < elems_per_batch; ++lp) {
                     const uint32_t off = lp * ELEM;
-                    wr32(dst_er + off, scratch_er[lp]);
-                    wr32(dst_ei + off, scratch_ei[lp]);
-                    wr32(dst_or + off, scratch_or[lp]);
-                    wr32(dst_oi + off, scratch_oi[lp]);
+                    wr32(dst_er + off, rd32(scr_er + off));
+                    wr32(dst_ei + off, rd32(scr_ei + off));
+                    wr32(dst_or + off, rd32(scr_or + off));
+                    wr32(dst_oi + off, rd32(scr_oi + off));
                 }
 
                 cb_push_back(cb_next_even_r, num_tiles);

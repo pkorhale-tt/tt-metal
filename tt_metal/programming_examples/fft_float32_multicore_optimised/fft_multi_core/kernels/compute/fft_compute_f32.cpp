@@ -91,6 +91,7 @@ void kernel_main() {
     constexpr uint32_t cb_out1_i        = 19;
 
     // Depth-1 scratch tiles — must be fully consumed before reuse.
+    // CB 12-15 are used by the writer as L1 scratch memory (no push/pop).
     constexpr uint32_t cb_tmp0          = 20;
     constexpr uint32_t cb_tmp1          = 21;
     constexpr uint32_t cb_tmp2          = 22;
