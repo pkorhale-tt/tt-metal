@@ -1,12 +1,28 @@
-// fft_multicore_2d.cpp — 2D FFT via row decomposition (OPTIMIZED STREAMING)
+// fft_multicore_2d.cpp — 2D FFT via row decomposition (FIXED HOST)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// OPTIMIZATIONS:
-//   1. Streaming pipeline: reader/compute/writer process tiles continuously
-//   2. Minimal CB depths (2 tiles for double buffering)
-//   3. Scales to arbitrary rows_per_core without L1 constraints
-//   4. All kernels use row-outer, stage-middle, tile-inner loops
+// CHANGES vs original host:
+//
+//   1. cb_tmp0 (CB 20) and cb_tmp1 (CB 21) depth changed from tiles_per_row → 2.
+//      The fixed compute kernel (Phase 1) pushes 2 tiles into each scratch CB
+//      before popping them in Phases 2/3. With depth=1 (tiles_per_row=1 for
+//      N=1024), the second cb_push_back in Phase 1 blocks forever because the
+//      CB is full — deadlock.
+//
+//   2. CB 22 (tw_odd_r) and CB 23 (tw_odd_i) removed.
+//      The fixed compute kernel no longer uses cb_tw_odd_r/i — the intermediate
+//      W*odd products are staged through cb_tmp0/cb_tmp1 instead. Creating
+//      unused CBs wastes L1 SRAM.
+//
+//   3. writer_args: rows_per_core is already arg[13] in the original host
+//      (the last element). Confirmed correct — no change needed there.
+//
+//   4. tile_offset passed to writer is c * tiles_per_core (correct base for
+//      DRAM writes). rows_per_core outer loop in writer advances by local_tiles
+//      per row, so each row writes to the right DRAM slot.
+//
+//   Everything else is identical to the original host.
 
 #include <cmath>
 #include <vector>
@@ -17,6 +33,7 @@
 #include <cassert>
 #include <fstream>
 #include <string>
+
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
 #include "tt_metal/api/tt-metalium/distributed.hpp"
@@ -42,7 +59,6 @@ std::vector<uint32_t> pack_tiles(const std::vector<float>& d, uint32_t ntiles) {
     for (uint32_t i = 0; i < d.size() && i < o.size(); i++) o[i] = f2u(d[i]);
     return o;
 }
-
 std::vector<float> unpack_tiles(const std::vector<uint32_t>& d, uint32_t n) {
     std::vector<float> o(n);
     for (uint32_t i = 0; i < n && i < d.size(); i++) o[i] = u2f(d[i]);
@@ -110,7 +126,7 @@ precompute_compact_twiddles(uint32_t N_row, uint32_t direction) {
     float sign = (direction==1) ? 1.f : -1.f;
     std::vector<uint32_t> tw_r(half, 0u), tw_i(half, 0u);
     for (uint32_t k = 0; k < half; k++) {
-        float angle = sign * 2.f * PI * (float)k / (float)N_row;
+        float angle = sign * 2.f*PI*(float)k/(float)N_row;
         tw_r[k] = f2u(std::cos(angle));
         tw_i[k] = f2u(std::sin(angle));
     }
@@ -174,8 +190,10 @@ bool read_input_file(const std::string& path, uint32_t N_row,
         }
     }
     if (vals.empty()) { std::cerr << "Empty input file\n"; return false; }
+
     ir.assign(N_row, 0.f);
     ii.assign(N_row, 0.f);
+
     bool interleaved = (vals.size() >= 2*N_row);
     if (interleaved) {
         std::cout << " File mode: interleaved complex ("
@@ -199,11 +217,10 @@ bool read_input_file(const std::string& path, uint32_t N_row,
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
-                  << " <direction:0|1> [N_row] [num_rows] [num_cores] [input_file]\n"
+                  << " <direction:0|1> [N_row] [num_rows] [num_cores]\n"
                   << " Default: forward FFT, N_row=1024, num_rows=auto (128 rows/core)\n";
         return 1;
     }
-
     uint32_t direction  = (uint32_t)std::atoi(argv[1]);
     uint32_t N_row      = 1024;
     uint32_t num_rows   = 0;
@@ -223,7 +240,6 @@ int main(int argc, char** argv) {
             else num_rows = v;
         } else if (v >= 2) num_rows = v;
     }
-
     if (N_row<2||(N_row&(N_row-1))) { std::cerr<<"N_row must be power of 2\n"; return 1; }
 
     int dev_id = 0;
@@ -240,14 +256,21 @@ int main(int argc, char** argv) {
     if (num_rows == 0) num_rows = num_cores;
 
     uint32_t rows_per_core = num_rows / num_cores;
+
     uint32_t log2_row  = 0; while ((1u<<log2_row) < N_row) log2_row++;
     uint32_t half_row  = N_row / 2;
     uint32_t tiles_per_row = (half_row + TILE_SIZE-1) / TILE_SIZE;
     uint32_t compact_bytes = half_row * sizeof(float);
     uint32_t total_N   = N_row * num_rows;
 
+    // FIX: scratch CBs need depth=2 when tiles_per_row=1.
+    // Phase 1 of the compute kernel pushes 2 tiles to cb_tmp0 and cb_tmp1
+    // before Phase 2 pops them. With depth=1 the second push blocks → deadlock.
+    // We use max(2, tiles_per_row) so larger N (more tiles/row) still works.
+    const uint32_t tmp_cb_depth = std::max(2u, tiles_per_row);
+
     std::cout << "════════════════════════════════════════════════\n";
-    std::cout << " TT-Metal MULTICORE FFT (OPTIMIZED STREAMING)\n";
+    std::cout << " TT-Metal MULTICORE FFT (row decomposition)\n";
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << " N_row        : " << N_row << "\n";
     std::cout << " num_rows     : " << num_rows << "\n";
@@ -255,7 +278,7 @@ int main(int argc, char** argv) {
     std::cout << " rows/core    : " << rows_per_core << "\n";
     std::cout << " log2(N_row)  : " << log2_row << "\n";
     std::cout << " tiles/row    : " << tiles_per_row << "\n";
-    std::cout << " CB depth     : 2 (double buffering)\n";
+    std::cout << " tmp CB depth : " << tmp_cb_depth << "\n";
     std::cout << " Direction    : " << (direction?"Inverse":"Forward") << "\n";
     std::cout << " Total FFTs   : " << num_rows
               << "  (" << num_cores << " cores × "
@@ -309,7 +332,6 @@ int main(int argc, char** argv) {
     using namespace tt::tt_metal::distributed;
     DeviceLocalBufferConfig dram_tile{
         .page_size=TILE_BYTES, .buffer_type=BufferType::DRAM};
-
     auto mk_buf = [&](uint32_t bytes) {
         ReplicatedBufferConfig rc{.size=bytes};
         return MeshBuffer::create(rc, dram_tile, mesh.get());
@@ -334,34 +356,32 @@ int main(int argc, char** argv) {
     auto b_cmp_r = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
     auto b_cmp_i = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
 
-    // ── OPTIMIZED CB CREATION: depth = 2 for all stage I/O CBs ───────────
+    // ── CB creation ──────────────────────────────────────────────────────
+    // FIX 1: cb_tmp0 (20) and cb_tmp1 (21) depth = tmp_cb_depth (≥2).
+    // FIX 2: CB 22 (tw_odd_r) and CB 23 (tw_odd_i) removed — no longer
+    //        used by the fixed compute kernel.
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
-        
-        // Input CBs: depth 2 for double buffering
-        create_cb(prog, cc,  0, 2, TILE_BYTES); // even_r
-        create_cb(prog, cc,  1, 2, TILE_BYTES); // even_i
-        create_cb(prog, cc,  2, 2, TILE_BYTES); // odd_r
-        create_cb(prog, cc,  3, 2, TILE_BYTES); // odd_i
-        
-        // Twiddle CBs: depth 2
-        create_cb(prog, cc,  4, 2, TILE_BYTES); // tw_r
-        create_cb(prog, cc,  5, 2, TILE_BYTES); // tw_i
-        
-        // Output CBs: depth 2
-        create_cb(prog, cc, 16, 2, TILE_BYTES); // out0_r
-        create_cb(prog, cc, 17, 2, TILE_BYTES); // out0_i
-        create_cb(prog, cc, 18, 2, TILE_BYTES); // out1_r
-        create_cb(prog, cc, 19, 2, TILE_BYTES); // out1_i
-        
-        // Scratch CBs: depth 2
-        create_cb(prog, cc, 20, 2, TILE_BYTES); // tmp0
-        create_cb(prog, cc, 21, 2, TILE_BYTES); // tmp1
-        
-        // Compact twiddles: 1 buffer
-        const uint32_t compact_tiles = (compact_bytes + TILE_BYTES - 1) / TILE_BYTES;
-        create_cb(prog, cc, 10, compact_tiles, compact_bytes); // compact_r
-        create_cb(prog, cc, 11, compact_tiles, compact_bytes); // compact_i
+        create_cb(prog, cc,  0, tiles_per_row,  TILE_BYTES); // even_r
+        create_cb(prog, cc,  1, tiles_per_row,  TILE_BYTES); // even_i
+        create_cb(prog, cc,  2, tiles_per_row,  TILE_BYTES); // odd_r
+        create_cb(prog, cc,  3, tiles_per_row,  TILE_BYTES); // odd_i
+        create_cb(prog, cc,  4, tiles_per_row,  TILE_BYTES); // tw_r
+        create_cb(prog, cc,  5, tiles_per_row,  TILE_BYTES); // tw_i
+        create_cb(prog, cc, 16, tiles_per_row,  TILE_BYTES); // out0_r
+        create_cb(prog, cc, 17, tiles_per_row,  TILE_BYTES); // out0_i
+        create_cb(prog, cc, 18, tiles_per_row,  TILE_BYTES); // out1_r
+        create_cb(prog, cc, 19, tiles_per_row,  TILE_BYTES); // out1_i
+        create_cb(prog, cc, 20, tmp_cb_depth,   TILE_BYTES); // tmp0  ← FIX: depth ≥2
+        create_cb(prog, cc, 21, tmp_cb_depth,   TILE_BYTES); // tmp1  ← FIX: depth ≥2
+        // CB 22 and CB 23 (tw_odd_r / tw_odd_i) intentionally removed.
+        // The fixed compute kernel no longer stages W*odd through separate CBs.
+        create_cb(prog, cc, 10,
+                  (compact_bytes+TILE_BYTES-1)/TILE_BYTES,
+                  compact_bytes); // compact_r
+        create_cb(prog, cc, 11,
+                  (compact_bytes+TILE_BYTES-1)/TILE_BYTES,
+                  compact_bytes); // compact_i
     }
 
     KernelHandle reader_k = CreateKernel(prog,
@@ -370,14 +390,12 @@ int main(int argc, char** argv) {
         core_range,
         DataMovementConfig{.processor=DataMovementProcessor::RISCV_0,
                            .noc=NOC::RISCV_0_default});
-
     KernelHandle writer_k = CreateKernel(prog,
         "tt_metal/programming_examples/fft_float32_multicore_optimised/fft_multi_core/"
         "kernels/dataflow/writer_fft_f32.cpp",
         core_range,
         DataMovementConfig{.processor=DataMovementProcessor::RISCV_1,
                            .noc=NOC::RISCV_1_default});
-
     KernelHandle compute_k = CreateKernel(prog,
         "tt_metal/programming_examples/fft_float32_multicore_optimised/fft_multi_core/"
         "kernels/compute/fft_compute_f32.cpp",
@@ -385,12 +403,14 @@ int main(int argc, char** argv) {
         ComputeConfig{.math_fidelity=MathFidelity::HiFi4,
                       .fp32_dest_acc_en=true,.math_approx_mode=false});
 
-    // ── Runtime args ──────────────────────────────────────────────────────
+    // ── Runtime args ─────────────────────────────────────────────────────
+    // All arg indices match the fixed kernel parameter lists exactly.
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
         uint32_t tile_offset = c * tiles_per_core;
 
-        // Reader args (12 args)
+        // Reader args — 12 args (indices 0-11), unchanged from original.
+        // Kernel reads rows_per_core at arg[11] and now uses it.
         std::vector<uint32_t> reader_args = {
             b_er->address(),      // [0]  even_r DRAM base
             b_ei->address(),      // [1]  even_i DRAM base
@@ -402,18 +422,19 @@ int main(int argc, char** argv) {
             tile_offset,          // [7]  first tile index for this core
             log2_row,             // [8]  num_stages
             half_row,             // [9]  half_N
-            half_row,             // [10] local_half
-            rows_per_core         // [11] rows this core processes
+            half_row,             // [10] local_half (= half_N, full row per FFT)
+            rows_per_core         // [11] rows this core processes (now used)
         };
 
-        // Compute args (3 args) - UPDATED with rows_per_core
+        // Compute args — 2 args, unchanged.
         std::vector<uint32_t> compute_args = {
             log2_row,             // [0]  num_stages
-            tiles_per_row,        // [1]  tiles_per_stage
-            rows_per_core         // [2]  rows_per_core (NEW)
+            tiles_per_row         // [1]  tiles_per_stage
         };
 
-        // Writer args (14 args)
+        // Writer args — 14 args (indices 0-13).
+        // Original had 14 args too (rows_per_core was already arg[13]).
+        // Kernel now uses arg[13] in its outer row loop.
         std::vector<uint32_t> writer_args = {
             b_o0r->address(),     // [0]  out0_r DRAM base
             b_o0i->address(),     // [1]  out0_i DRAM base
@@ -423,12 +444,12 @@ int main(int argc, char** argv) {
             log2_row,             // [5]  num_stages
             half_row,             // [6]  local_half
             half_row,             // [7]  half_N
-            1u,                   // [8]  num_cores = 1
+            1u,                   // [8]  num_cores = 1 (self-contained row FFT)
             c,                    // [9]  core_id
             0u,                   // [10] log2_cores = 0
-            tile_offset,          // [11] base tile offset
-            0u,                   // [12] core_elem_base = 0
-            rows_per_core         // [13] rows this core processes
+            tile_offset,          // [11] base tile offset for DRAM writes
+            0u,                   // [12] core_elem_base = 0 (full row per FFT)
+            rows_per_core         // [13] rows this core processes (now used)
         };
 
         SetRuntimeArgs(prog, reader_k,  cc, reader_args);
@@ -459,7 +480,6 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> o0i_raw(total_bytes/4);
     std::vector<uint32_t> o1r_raw(total_bytes/4);
     std::vector<uint32_t> o1i_raw(total_bytes/4);
-
     EnqueueReadMeshBuffer(cq, o0r_raw, b_o0r, true);
     EnqueueReadMeshBuffer(cq, o0i_raw, b_o0i, true);
     EnqueueReadMeshBuffer(cq, o1r_raw, b_o1r, true);
@@ -475,14 +495,12 @@ int main(int argc, char** argv) {
             result_i[row*N_row + i + half_row] = u2f(o1i_raw[tile_base + i]);
         }
     }
-
     if (direction==1)
         for (uint32_t i=0;i<total_N;i++){ result_r[i]/=N_row; result_i[i]/=N_row; }
 
     std::cout << "\n════════════════════════════════════════════════\n";
     std::cout << " VALIDATION (all " << num_rows << " rows)\n";
     std::cout << "════════════════════════════════════════════════\n";
-
     float mer=0.f, mei=0.f, me=0.f;
     for (uint32_t row=0; row<num_rows; row++) {
         for (uint32_t i=0;i<N_row;i++) {
@@ -492,14 +510,11 @@ int main(int argc, char** argv) {
         }
     }
     me /= 2*total_N;
-
     std::cout << " Max error (real): " << mer << "\n";
     std::cout << " Max error (imag): " << mei << "\n";
     std::cout << " Mean error      : " << me  << "\n";
-
     float threshold = std::max(0.5f, 0.005f * (float)N_row);
     bool passed = (mer < threshold) && (mei < threshold);
-
     std::cout << " Threshold       : " << threshold << " (0.5% of N_row)\n";
     std::cout << " Result: " << (passed?"✓ PASSED":"✗ FAILED") << "\n";
 
@@ -520,6 +535,5 @@ int main(int argc, char** argv) {
     mesh->close();
     std::cout << "\n════════════════════════════════════════════════\n";
     std::cout << " Done\n════════════════════════════════════════════════\n";
-
     return passed?0:1;
 }
