@@ -1,27 +1,27 @@
-// reader_fft_f32_mc.cpp — MULTICORE reader (FIXED v3)
+// reader_fft_f32_mc.cpp — MULTICORE reader (FIXED v4)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 // ══════════════════════════════════════════════════════════════════════
-//  CHANGES vs v2
+//  KEY INVARIANTS THIS KERNEL MUST SATISFY
 // ══════════════════════════════════════════════════════════════════════
 //
-//  BUG FIX (CB index mismatch — stage-0 even/odd)
-//  ─────────────────────────────────────────────────────────────────────
-//  Previous: reader pushed stage-0 even/odd data into CB 6-9
-//            (cb_even_r=6, cb_even_i=7, cb_odd_r=8, cb_odd_i=9)
+//  1. Stage-0 even/odd → CB 0-3  (compute reads them only at stage 0)
+//  2. Twiddles         → CB 4-5  (all stages; depth = tiles_per_row)
+//  3. Compact twiddle table lives in CB 10-11 for the lifetime of the
+//     kernel — popped only at the very end.
 //
-//  Problem:  the compute kernel reads stage-0 inputs from CB 0-3
-//            (cb_stage0_even_r=0, cb_stage0_even_i=1,
-//             cb_stage0_odd_r=2,  cb_stage0_odd_i=3)
-//            so compute would stall forever at stage 0 waiting on CB 0-3
-//            while reader was filling CB 6-9 instead.
+//  PIPELINE FLOW (per row):
+//  ────────────────────────
+//  reader pushes CB 0-3  (stage-0 even/odd)
+//  reader pushes CB 4-5  (stage-0 twiddles)    ← compute starts stage 0
+//  [writer drains CB 16-19 and shuffles into CB 6-9]
+//  reader pushes CB 4-5  (stage-1 twiddles)    ← compute starts stage 1
+//  ...
 //
-//  Fix:      reader now pushes stage-0 even/odd into CB 0-3, matching
-//            the compute kernel's cb_stage0_* indices.
-//
-//  No other logic changes.  The twiddle path (CB 4,5) and compact path
-//  (CB 10,11) were already correct and are unchanged.
+//  The cb_reserve_back(cb_tw_r/i, tiles_per_row) at the top of each
+//  stage iteration naturally rate-limits the reader to one stage ahead:
+//  it blocks until compute has drained the previous twiddle batch.
 //
 // ══════════════════════════════════════════════════════════════════════
 //  ARGUMENT MAP
@@ -37,7 +37,7 @@
 //  [7]  tile_offset
 //  [8]  num_stages
 //  [9]  half_N
-//  [10] local_half (ABI compatibility, unused in scatter loop)
+//  [10] local_half  (ABI padding, unused)
 //  [11] rows_per_core
 //
 // ══════════════════════════════════════════════════════════════════════
@@ -56,33 +56,27 @@ void kernel_main() {
     const uint32_t tile_offset    = get_arg_val<uint32_t>(7);
     const uint32_t num_stages     = get_arg_val<uint32_t>(8);
     const uint32_t half_N         = get_arg_val<uint32_t>(9);
-    // arg[10] local_half — ABI compat, not used in scatter loop
+    // arg[10] — ABI padding, not used
     const uint32_t rows_per_core  = get_arg_val<uint32_t>(11);
 
     // ── CB indices ────────────────────────────────────────────────────
-    //
-    // FIX: stage-0 even/odd must land in CB 0-3 so the compute kernel
-    //      (cb_stage0_even_r=0 … cb_stage0_odd_i=3) can consume them.
-    //      Previously these were 6-9, causing compute to stall on stage 0.
-    //
-    constexpr uint32_t cb_even_r    = 0;   // FIX: was 6
-    constexpr uint32_t cb_even_i    = 1;   // FIX: was 7
-    constexpr uint32_t cb_odd_r     = 2;   // FIX: was 8
-    constexpr uint32_t cb_odd_i     = 3;   // FIX: was 9
-    constexpr uint32_t cb_tw_r      = 4;   // unchanged
-    constexpr uint32_t cb_tw_i      = 5;   // unchanged
-    constexpr uint32_t cb_compact_r = 10;  // unchanged
-    constexpr uint32_t cb_compact_i = 11;  // unchanged
+    constexpr uint32_t cb_even_r    = 0;   // stage-0 even real
+    constexpr uint32_t cb_even_i    = 1;   // stage-0 even imag
+    constexpr uint32_t cb_odd_r     = 2;   // stage-0 odd  real
+    constexpr uint32_t cb_odd_i     = 3;   // stage-0 odd  imag
+    constexpr uint32_t cb_tw_r      = 4;   // twiddle real  (all stages)
+    constexpr uint32_t cb_tw_i      = 5;   // twiddle imag  (all stages)
+    constexpr uint32_t cb_compact_r = 10;  // compact twiddle table real
+    constexpr uint32_t cb_compact_i = 11;  // compact twiddle table imag
+
+    if (tiles_per_row == 0 || num_stages == 0 || rows_per_core == 0) return;
 
     const uint32_t tile_bytes    = get_tile_size(cb_even_r);
     const DataFormat data_format = get_dataformat(cb_even_r);
-    const uint32_t compact_bytes = half_N * sizeof(float);   // kept for reference
-
     constexpr uint32_t ELEM      = sizeof(float);
-    // Total float elements per twiddle CB push = all slots in tiles_per_row tiles.
-    const uint32_t elems_per_row = (tile_bytes / ELEM) * tiles_per_row;
 
-    if (tiles_per_row == 0 || num_stages == 0 || rows_per_core == 0) return;
+    // Total float elements that fill tiles_per_row tiles.
+    const uint32_t elems_per_row = (tile_bytes / ELEM) * tiles_per_row;
 
     // ── Address generators ────────────────────────────────────────────
     const InterleavedAddrGenFast<true> even_r_gen = {
@@ -111,7 +105,7 @@ void kernel_main() {
         *reinterpret_cast<volatile uint32_t*>(addr) = v;
     };
 
-    // ── Load compact twiddle table once (shared across all rows) ─────
+    // ── Load compact twiddle table once (shared across all rows/stages) ─
     cb_reserve_back(cb_compact_r, 1);
     cb_reserve_back(cb_compact_i, 1);
     noc_async_read_tile(0, cmp_r_gen, get_write_ptr(cb_compact_r));
@@ -126,21 +120,20 @@ void kernel_main() {
     const uint32_t cmp_i_base = get_read_ptr(cb_compact_i);
 
     // ── Outer row loop ────────────────────────────────────────────────
-    for (uint32_t row = 0; row < rows_per_core; row++) {
+    for (uint32_t row = 0; row < rows_per_core; ++row) {
         const uint32_t row_tile_base = tile_offset + row * tiles_per_row;
         const uint32_t row_elem_base = row_tile_base * (tile_bytes / ELEM);
 
-        // ── Stage 0: load even/odd from DRAM into CB 0-3 ─────────────
+        // ── Stage 0: DMA even/odd inputs from DRAM into CB 0-3 ───────
         //
-        // Issue all four NOC reads before the barrier so they run in
-        // parallel on the NoC fabric.
+        // Issue all four reads before the barrier so NoC can pipeline them.
         //
         cb_reserve_back(cb_even_r, tiles_per_row);
         cb_reserve_back(cb_even_i, tiles_per_row);
         cb_reserve_back(cb_odd_r,  tiles_per_row);
         cb_reserve_back(cb_odd_i,  tiles_per_row);
 
-        for (uint32_t t = 0; t < tiles_per_row; t++) {
+        for (uint32_t t = 0; t < tiles_per_row; ++t) {
             const uint32_t gt = row_tile_base + t;
             noc_async_read_tile(gt, even_r_gen,
                 get_write_ptr(cb_even_r) + t * tile_bytes);
@@ -158,16 +151,13 @@ void kernel_main() {
         cb_push_back(cb_odd_r,  tiles_per_row);
         cb_push_back(cb_odd_i,  tiles_per_row);
 
-        // ── All stages: scatter twiddle factors into CB 4,5 ──────────
+        // ── All stages: scatter twiddle factors into CB 4-5 ──────────
         //
-        // cb_tw_r/i have depth=tiles_per_row.  The cb_reserve_back at
-        // stage N+1 blocks until compute drains stage N's twiddle tiles,
-        // creating a natural one-stage-ahead limit on the reader.
+        // cb_reserve_back blocks until compute has drained the previous
+        // stage's twiddle tiles — this is the natural backpressure that
+        // keeps the reader at most one stage ahead of compute.
         //
-        // elems_per_row fills ALL float slots in the tiles_per_row tiles
-        // so no element is left uninitialised (BUG 4 fix retained).
-
-        for (uint32_t stage = 0; stage < num_stages; stage++) {
+        for (uint32_t stage = 0; stage < num_stages; ++stage) {
             const uint32_t half_m      = 1u << stage;
             const uint32_t N_over_m    = half_N >> stage;
             const uint32_t half_m_mask = half_m - 1u;
@@ -177,7 +167,9 @@ void kernel_main() {
             const uint32_t dst_r = get_write_ptr(cb_tw_r);
             const uint32_t dst_i = get_write_ptr(cb_tw_i);
 
-            for (uint32_t lp = 0; lp < elems_per_row; lp++) {
+            // Scatter: element p maps to compact twiddle index
+            // (p & half_m_mask) * N_over_m
+            for (uint32_t lp = 0; lp < elems_per_row; ++lp) {
                 const uint32_t p   = row_elem_base + lp;
                 const uint32_t idx = (p & half_m_mask) * N_over_m;
                 wr32(dst_r + lp * ELEM, rd32(cmp_r_base + idx * ELEM));
@@ -187,8 +179,8 @@ void kernel_main() {
             cb_push_back(cb_tw_r, tiles_per_row);
             cb_push_back(cb_tw_i, tiles_per_row);
         }
-        // Reader's job for this row is done.
-        // Compute+writer pipeline drains the remaining CBs independently.
+        // Reader is done for this row.  Compute and writer drain the
+        // remaining CBs (out0/out1 and the inter-stage shuffle) on their own.
     }
 
     cb_pop_front(cb_compact_r, 1);
