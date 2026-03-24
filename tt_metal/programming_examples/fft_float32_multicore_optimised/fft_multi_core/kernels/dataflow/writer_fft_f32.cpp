@@ -1,28 +1,26 @@
-// writer_fft_f32_mc.cpp — MULTICORE writer (FIXED)
+// writer_fft_f32_mc.cpp — MULTICORE writer (FIXED: no ThCon in dataflow)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// BUG FIX vs previous version:
+// REMOVED: All TT_SETDMAREG / TT_LOADIND / TT_STOREIND / p_ind / LOWER_HALFWORD
+//          / UPPER_HALFWORD / LO_16 / HI_16 / copy128 / copy_floats (128-bit path).
 //
-//   Bug: rows_per_core argument was accepted but the stage loop was not
-//   wrapped in an outer row loop. The writer processed local_tiles tiles
-//   for num_stages stages once — corresponding to exactly one FFT row.
-//   For rows_per_core=128, rows 1-127 were never written to DRAM, and
-//   the compute kernel stalled after row 0 because output CBs were never
-//   drained.
+//   ThCon intrinsics are compute-core (TRISC) only. NCRISC (this file) compiles
+//   without llk_defs.h and has no access to the ThCon register file.
 //
-//   Fix: Added outer loop `for (row = 0; row < rows_per_core; row++)`.
-//   Each iteration processes one complete FFT row (all stages).
-//   tile_offset for DRAM writes advances by local_tiles each row.
-//   The shuffle (inter-stage reorder) uses row_elem_base derived from
-//   the row's tile offset for correct twiddle index computation.
+//   Replacement: copy_floats() is now a plain scalar loop using volatile
+//   uint32_t* reads and writes — the correct and only available L1 copy
+//   primitive in BRISC/NCRISC dataflow kernels.
 //
-//   Also fixed: safe_local_src() underflow guard on unsigned subtraction.
+// WHAT IS KEPT:
+//   - Outer rows_per_core loop
+//   - Per-stage shuffle (G2 normal path + G2=0 passthrough)
+//   - Last-stage DRAM write via noc_async_write_tile
+//   - safe_local_src() underflow guard
+//   - All CB push/pop/wait/reserve protocol
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
-#include "llk_io.h"
-#include "llk_defs.h"
 
 void kernel_main() {
     const uint32_t out0_r_addr    = get_arg_val<uint32_t>(0);
@@ -36,9 +34,9 @@ void kernel_main() {
     const uint32_t num_cores      = get_arg_val<uint32_t>(8);
     const uint32_t core_id        = get_arg_val<uint32_t>(9);
     const uint32_t log2_cores     = get_arg_val<uint32_t>(10);
-    const uint32_t tile_offset    = get_arg_val<uint32_t>(11);  // base tile index for this core
-    const uint32_t core_elem_base = get_arg_val<uint32_t>(12);  // base elem index for this core
-    const uint32_t rows_per_core  = get_arg_val<uint32_t>(13);  // FIX: was ignored before
+    const uint32_t tile_offset    = get_arg_val<uint32_t>(11);
+    const uint32_t core_elem_base = get_arg_val<uint32_t>(12);
+    const uint32_t rows_per_core  = get_arg_val<uint32_t>(13);
 
     constexpr uint32_t cb_out0_r = 16;
     constexpr uint32_t cb_out0_i = 17;
@@ -67,9 +65,10 @@ void kernel_main() {
 
     if (local_tiles == 0 || rows_per_core == 0) return;
 
-    constexpr uint32_t ELEM    = sizeof(float);
-    constexpr uint32_t ELEM128 = 4 * sizeof(float);
+    constexpr uint32_t ELEM = sizeof(float);
 
+    // Plain scalar L1 copy — no ThCon, no LLK intrinsics.
+    // Dataflow kernels (BRISC/NCRISC) only have access to scalar memory ops.
     auto rd32 = [](uint32_t addr) -> uint32_t {
         return *reinterpret_cast<volatile uint32_t*>(addr);
     };
@@ -77,47 +76,22 @@ void kernel_main() {
         *reinterpret_cast<volatile uint32_t*>(addr) = v;
     };
 
-    auto copy128 = [](uint32_t dst, uint32_t src) {
-        uint32_t base   = src >> 4, offset = src & 0xFu;
-        TT_SETDMAREG(0, LOWER_HALFWORD(offset), 0, LO_16(0));
-        TT_SETDMAREG(0, UPPER_HALFWORD(offset), 0, HI_16(0));
-        TT_SETDMAREG(0, LOWER_HALFWORD(base),   0, LO_16(1));
-        TT_SETDMAREG(0, UPPER_HALFWORD(base),   0, HI_16(1));
-        TT_LOADIND(p_ind::LD_128bit, LO_16(0), p_ind::INC_NONE, 4, 1);
-        uint32_t dbase = dst >> 4, doffset = dst & 0xFu;
-        TT_SETDMAREG(0, LOWER_HALFWORD(doffset), 0, LO_16(2));
-        TT_SETDMAREG(0, UPPER_HALFWORD(doffset), 0, HI_16(2));
-        TT_SETDMAREG(0, LOWER_HALFWORD(dbase),   0, LO_16(3));
-        TT_SETDMAREG(0, UPPER_HALFWORD(dbase),   0, HI_16(3));
-        TT_STOREIND(p_ind::ST_128bit, LO_16(2), p_ind::INC_NONE, 4, 3);
-    };
-
+    // Scalar block copy of `count` floats from src to dst.
     auto copy_floats = [&](uint32_t dst, uint32_t src, uint32_t count) {
-        while (count > 0 && (dst & 0xFu) != 0) {
-            wr32(dst, rd32(src)); dst += ELEM; src += ELEM; count--;
-        }
-        while (count >= 4) {
-            copy128(dst, src); dst += ELEM128; src += ELEM128; count -= 4;
-        }
-        while (count > 0) {
-            wr32(dst, rd32(src)); dst += ELEM; src += ELEM; count--;
+        for (uint32_t i = 0; i < count; i++) {
+            wr32(dst + i * ELEM, rd32(src + i * ELEM));
         }
     };
 
-    // FIX: safe unsigned subtraction with underflow guard.
+    // Underflow guard for unsigned subtraction in shuffle index math.
     auto safe_local_src = [](uint32_t src_start, uint32_t base) -> uint32_t {
-        if (src_start < base) return UINT32_MAX; // partitioning invariant violated
+        if (src_start < base) return UINT32_MAX;
         return src_start - base;
     };
 
-    // ── FIX: outer loop over rows ─────────────────────────────────────────
-    // Each iteration processes one complete FFT row through all stages.
-    // row_tile_offset: DRAM tile base for this row's output.
-    // row_elem_base:   element index base for this row's shuffle computation.
-
     for (uint32_t row = 0; row < rows_per_core; row++) {
-        const uint32_t row_tile_offset = tile_offset + row * local_tiles;
-        const uint32_t row_elem_base   = row_tile_offset * (tile_bytes / ELEM);
+        const uint32_t row_tile_base = tile_offset + row * local_tiles;
+        const uint32_t row_elem_base = row_tile_base * (tile_bytes / ELEM);
 
         for (uint32_t stage = 0; stage < num_stages; stage++) {
             const bool is_last = (stage == num_stages - 1);
@@ -133,9 +107,9 @@ void kernel_main() {
             const uint32_t src1i = get_read_ptr(cb_out1_i);
 
             if (is_last) {
-                // DRAM write: all 4 arrays, tight loop for NOC pipeline depth
+                // Write final results to DRAM.
                 for (uint32_t t = 0; t < local_tiles; t++) {
-                    const uint32_t gt = row_tile_offset + t;
+                    const uint32_t gt = row_tile_base + t;
                     noc_async_write_tile(gt, out0_r_gen, src0r + t * tile_bytes);
                     noc_async_write_tile(gt, out0_i_gen, src0i + t * tile_bytes);
                     noc_async_write_tile(gt, out1_r_gen, src1r + t * tile_bytes);
@@ -149,7 +123,7 @@ void kernel_main() {
                 cb_pop_front(cb_out1_i, local_tiles);
 
             } else {
-                // Shuffle: reorder out0/out1 → even/odd for next stage
+                // Shuffle: reorder out0/out1 into even/odd for next stage.
                 const uint32_t m       = 1u << (stage + 1);
                 const uint32_t half_m  = m >> 1;
                 const uint32_t m2      = m << 1;
@@ -178,7 +152,7 @@ void kernel_main() {
 
                         // Block A: new_even[0..half_m) ← out0
                         {
-                            uint32_t f0  = row_elem_base + lb_e;
+                            uint32_t f0    = row_elem_base + lb_e;
                             uint32_t g_old = f0 >> log2m;
                             uint32_t off   = f0 & m_mask;
                             uint32_t ss    = g_old * half_m + off;
@@ -190,7 +164,7 @@ void kernel_main() {
                         }
                         // Block B: new_even[half_m..m) ← out1
                         {
-                            uint32_t f0  = row_elem_base + lb_e + half_m;
+                            uint32_t f0    = row_elem_base + lb_e + half_m;
                             uint32_t g_old = f0 >> log2m;
                             uint32_t off   = f0 & m_mask;
                             uint32_t ss    = g_old * half_m + (off - half_m);
@@ -202,7 +176,7 @@ void kernel_main() {
                         }
                         // Block C: new_odd[0..half_m) ← out0
                         {
-                            uint32_t f0  = row_elem_base + lb_o;
+                            uint32_t f0    = row_elem_base + lb_o;
                             uint32_t g_old = f0 >> log2m;
                             uint32_t off   = f0 & m_mask;
                             uint32_t ss    = g_old * half_m + off;
@@ -214,7 +188,7 @@ void kernel_main() {
                         }
                         // Block D: new_odd[half_m..m) ← out1
                         {
-                            uint32_t f0  = row_elem_base + lb_o + half_m;
+                            uint32_t f0    = row_elem_base + lb_o + half_m;
                             uint32_t g_old = f0 >> log2m;
                             uint32_t off   = f0 & m_mask;
                             uint32_t ss    = g_old * half_m + (off - half_m);
@@ -228,7 +202,7 @@ void kernel_main() {
                         dst += half_m2;
                     }
                 } else {
-                    // G2=0: direct passthrough, fully contiguous
+                    // G2=0: direct passthrough, fully contiguous.
                     copy_floats(dst_er, src0r, local_half);
                     copy_floats(dst_ei, src0i, local_half);
                     copy_floats(dst_or, src1r, local_half);
@@ -246,6 +220,5 @@ void kernel_main() {
                 cb_push_back(cb_odd_i,  local_tiles);
             }
         }
-        // End of row — all stages complete, DRAM write done for this row.
     }
 }
