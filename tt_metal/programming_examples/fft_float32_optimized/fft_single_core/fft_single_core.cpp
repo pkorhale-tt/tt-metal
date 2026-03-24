@@ -251,11 +251,18 @@ int main(int argc, char** argv) {
     //   If L1 is tight, depth=1 is also safe with the reader fix — it just
     //   means reader and compute alternate one tile at a time.
 
-    // Input CBs 0-3: depth = num_tiles
-    create_cb(prog,core, 0, tiles, TILE_BYTES);   // even_r
-    create_cb(prog,core, 1, tiles, TILE_BYTES);   // even_i
-    create_cb(prog,core, 2, tiles, TILE_BYTES);   // odd_r
-    create_cb(prog,core, 3, tiles, TILE_BYTES);   // odd_i
+    // Input CBs 0-3: depth = tiles+1
+    // DEADLOCK FIX: compute waits for CB4-5 (twiddles) BEFORE CB0-3 (even/odd).
+    // At stage S+1: writer needs a free slot in CB0-3 to deposit next inputs,
+    // but compute holds the current CB0-3 slot while blocked waiting for
+    // CB4-5 twiddles. With depth=tiles there is no free slot, so writer blocks,
+    // compute never gets twiddles, and neither can proceed: circular deadlock.
+    // depth=tiles+1 provides one extra slot so writer never needs to wait for
+    // compute to pop CB0-3 before reserving the next stage slot.
+    create_cb(prog,core, 0, tiles+1, TILE_BYTES);   // even_r  (depth=tiles+1, see deadlock fix comment)
+    create_cb(prog,core, 1, tiles+1, TILE_BYTES);   // even_i
+    create_cb(prog,core, 2, tiles+1, TILE_BYTES);   // odd_r
+    create_cb(prog,core, 3, tiles+1, TILE_BYTES);   // odd_i
     // Twiddle CBs 4-5: depth = num_tiles (pipeline reader ↔ compute)
     create_cb(prog,core, 4, tiles, TILE_BYTES);   // tw_r
     create_cb(prog,core, 5, tiles, TILE_BYTES);   // tw_i
