@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
     }
 
     const uint32_t direction            = static_cast<uint32_t>(std::atoi(argv[1]));
-    uint32_t       N_row                = 1024;
+    uint32_t       N_row                = 64;
     uint32_t       num_rows             = 0;
     uint32_t       user_cores           = 0;
     const uint32_t rows_per_core_target = 128;
