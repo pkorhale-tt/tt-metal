@@ -1,6 +1,50 @@
-// writer_fft_f32.cpp — MULTICORE row-aware writer
+// writer_fft_f32.cpp — MULTICORE row-aware writer (FIXED v2)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// ══════════════════════════════════════════════════════════════════════
+//  CHANGES vs previous version
+// ══════════════════════════════════════════════════════════════════════
+//
+//  BUG FIX (CB index mismatch — inter-stage shuffle destination)
+//  ─────────────────────────────────────────────────────────────────────
+//  Previous: writer shuffled butterfly output into CB 0-3
+//            (cb_even_r=0, cb_even_i=1, cb_odd_r=2, cb_odd_i=3)
+//
+//  Problem:  the compute kernel reads stage>=1 inputs from CB 6-9
+//            (cb_next_even_r=6, cb_next_even_i=7,
+//             cb_next_odd_r=8,  cb_next_odd_i=9)
+//            so compute would stall forever at stage 1+ waiting on CB 6-9
+//            while writer was filling CB 0-3 instead.
+//            This was THE deadlock — CB 6-9 was never written after stage 0.
+//
+//  Fix:      writer now pushes shuffle data into CB 6-9, matching the
+//            compute kernel's cb_next_* indices.
+//
+//  Note:     CB 0-3 is now exclusively owned by the reader (stage-0 input)
+//            and the compute kernel (stage-0 read).  The writer never
+//            touches CB 0-3.
+//
+// ══════════════════════════════════════════════════════════════════════
+//  ARGUMENT MAP (unchanged)
+// ══════════════════════════════════════════════════════════════════════
+//
+//  [0]  out0_r_addr
+//  [1]  out0_i_addr
+//  [2]  out1_r_addr
+//  [3]  out1_i_addr
+//  [4]  num_tiles      (tiles_per_row)
+//  [5]  num_stages     (log2_row)
+//  [6]  half_N         (N_row/2)
+//  [7]  (unused padding)
+//  [8]  (unused padding)
+//  [9]  (unused padding)
+//  [10] (unused padding)
+//  [11] tile_offset    (starting tile index for this core)
+//  [12] (unused padding)
+//  [13] rows_per_core
+//
+// ══════════════════════════════════════════════════════════════════════
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -16,15 +60,25 @@ void kernel_main() {
     const uint32_t tile_offset   = get_arg_val<uint32_t>(11);  // starting tile for this core
     const uint32_t rows_per_core = get_arg_val<uint32_t>(13);  // rows handled by this core
 
+    // ── CB indices ────────────────────────────────────────────────────
+    //
+    // Output CBs: compute produces here, writer consumes.
+    //
     constexpr uint32_t cb_out0_r = 16;
     constexpr uint32_t cb_out0_i = 17;
     constexpr uint32_t cb_out1_r = 18;
     constexpr uint32_t cb_out1_i = 19;
 
-    constexpr uint32_t cb_even_r = 0;
-    constexpr uint32_t cb_even_i = 1;
-    constexpr uint32_t cb_odd_r  = 2;
-    constexpr uint32_t cb_odd_i  = 3;
+    // Shuffle destination CBs: writer produces here, compute consumes
+    // on the next stage (cb_next_even_r=6 … cb_next_odd_i=9).
+    //
+    // FIX: was 0,1,2,3 — must be 6,7,8,9 to match compute's
+    //      cb_next_even_r/i and cb_next_odd_r/i.
+    //
+    constexpr uint32_t cb_next_even_r = 6;   // FIX: was 0
+    constexpr uint32_t cb_next_even_i = 7;   // FIX: was 1
+    constexpr uint32_t cb_next_odd_r  = 8;   // FIX: was 2
+    constexpr uint32_t cb_next_odd_i  = 9;   // FIX: was 3
 
     const uint32_t tile_bytes    = get_tile_size(cb_out0_r);
     const DataFormat data_format = get_dataformat(cb_out0_r);
@@ -60,6 +114,7 @@ void kernel_main() {
             cb_wait_front(cb_out1_i, num_tiles);
 
             if (is_last) {
+                // ── Final stage: write butterfly outputs to DRAM ─────
                 for (uint32_t t = 0; t < num_tiles; t++) {
                     noc_async_write_tile(row_tile_base + t, out0_r_gen,
                         get_read_ptr(cb_out0_r) + t * tile_bytes);
@@ -78,6 +133,11 @@ void kernel_main() {
                 cb_pop_front(cb_out1_i, num_tiles);
 
             } else {
+                // ── Intermediate stage: shuffle butterfly outputs into
+                //    CB 6-9 (cb_next_even/odd r/i) for the next compute
+                //    stage.
+                // ────────────────────────────────────────────────────
+
                 const uint32_t m       = 1u << (stage + 1);
                 const uint32_t half_m  = m >> 1;
                 const uint32_t m2      = m << 1;
@@ -92,25 +152,35 @@ void kernel_main() {
                     continue;
                 }
 
+                // Capture source pointers before popping (popping only
+                // moves the read-pointer; the data remains valid until
+                // the next reserve overwrites it, but getting the pointer
+                // first is the safe pattern).
                 const uint32_t src0r = get_read_ptr(cb_out0_r);
                 const uint32_t src0i = get_read_ptr(cb_out0_i);
                 const uint32_t src1r = get_read_ptr(cb_out1_r);
                 const uint32_t src1i = get_read_ptr(cb_out1_i);
 
+                // Free the output CBs FIRST so compute is unblocked and
+                // can start producing the next stage's output immediately
+                // while we fill the shuffle destination below.
                 cb_pop_front(cb_out0_r, num_tiles);
                 cb_pop_front(cb_out0_i, num_tiles);
                 cb_pop_front(cb_out1_r, num_tiles);
                 cb_pop_front(cb_out1_i, num_tiles);
 
-                cb_reserve_back(cb_even_r, num_tiles);
-                cb_reserve_back(cb_even_i, num_tiles);
-                cb_reserve_back(cb_odd_r,  num_tiles);
-                cb_reserve_back(cb_odd_i,  num_tiles);
+                // Now claim space in the next-stage input CBs (6-9).
+                // This may block if compute hasn't yet drained them from
+                // a previous iteration, which is the correct back-pressure.
+                cb_reserve_back(cb_next_even_r, num_tiles);
+                cb_reserve_back(cb_next_even_i, num_tiles);
+                cb_reserve_back(cb_next_odd_r,  num_tiles);
+                cb_reserve_back(cb_next_odd_i,  num_tiles);
 
-                const uint32_t dst_er = get_write_ptr(cb_even_r);
-                const uint32_t dst_ei = get_write_ptr(cb_even_i);
-                const uint32_t dst_or = get_write_ptr(cb_odd_r);
-                const uint32_t dst_oi = get_write_ptr(cb_odd_i);
+                const uint32_t dst_er = get_write_ptr(cb_next_even_r);
+                const uint32_t dst_ei = get_write_ptr(cb_next_even_i);
+                const uint32_t dst_or = get_write_ptr(cb_next_odd_r);
+                const uint32_t dst_oi = get_write_ptr(cb_next_odd_i);
 
                 auto rd = [](uint32_t addr) -> float {
                     uint32_t raw = *reinterpret_cast<volatile uint32_t*>(addr);
@@ -132,6 +202,7 @@ void kernel_main() {
                     const uint32_t base_e = g2 * m2;
                     const uint32_t base_o = base_e + half_m2;
                     for (uint32_t j2 = 0; j2 < half_m2; j2++) {
+                        // Even butterfly output element
                         {
                             uint32_t f      = base_e + j2;
                             uint32_t g_old  = f >> log2m;
@@ -148,6 +219,7 @@ void kernel_main() {
                             wr(dst_ei + dst * ELEM, rd(srci + idx * ELEM));
                         }
 
+                        // Odd butterfly output element
                         {
                             uint32_t f      = base_o + j2;
                             uint32_t g_old  = f >> log2m;
@@ -168,10 +240,10 @@ void kernel_main() {
                     }
                 }
 
-                cb_push_back(cb_even_r, num_tiles);
-                cb_push_back(cb_even_i, num_tiles);
-                cb_push_back(cb_odd_r,  num_tiles);
-                cb_push_back(cb_odd_i,  num_tiles);
+                cb_push_back(cb_next_even_r, num_tiles);
+                cb_push_back(cb_next_even_i, num_tiles);
+                cb_push_back(cb_next_odd_r,  num_tiles);
+                cb_push_back(cb_next_odd_i,  num_tiles);
             }
         }
     }

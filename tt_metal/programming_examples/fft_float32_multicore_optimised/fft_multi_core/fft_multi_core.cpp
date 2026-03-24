@@ -1,33 +1,48 @@
-// fft_multicore_2d.cpp — 2D FFT host (FIXED v2)
+// fft_multicore_2d.cpp — 2D FFT host (FIXED v3)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 // ══════════════════════════════════════════════════════════════════════
-//  CHANGES vs previous version
+//  CHANGES vs v2
 // ══════════════════════════════════════════════════════════════════════
 //
-//  HOST CHANGE 1 — CB layout update (matches compute kernel v2)
-//  ─────────────────────────────────────────────────────────────────────
-//  Old: cb_tmp0 [20] depth=max(2,tiles_per_row)
-//       cb_tmp1 [21] depth=max(2,tiles_per_row)
+//  No CB layout changes in the host — the host was already creating the
+//  correct set of CBs.  Comments updated to document the fixed pipeline.
 //
-//  New: cb_tmp0 [20] depth=1   tw_r*odd_r  /  tw_r*odd_i  (one at a time)
-//       cb_tmp1 [21] depth=1   tw_i*odd_i  /  tw_i*odd_r  (one at a time)
-//       cb_tmp2 [22] depth=1   t_r  (= tw_r*odd_r − tw_i*odd_i)
-//       cb_tmp3 [23] depth=1   t_i  (= tw_r*odd_i + tw_i*odd_r)
+//  CB ownership summary (post-fix):
+//  ──────────────────────────────────────────────────────────────────
+//  CB  0-3  Stage-0 input even/odd r/i
+//           Producer: reader kernel (RISCV_0)
+//           Consumer: compute kernel (stage 0 only)
 //
-//  The compute kernel was restructured into 5 sessions (A1, B, A2, C, D)
-//  so that no CB operation ever occurs inside a tile_regs session.
-//  Each scratch CB is used by at most one producer and one consumer at
-//  any point, so depth=1 is sufficient and saves L1.
+//  CB  4-5  Twiddle factors tw_r / tw_i
+//           Producer: reader kernel (all stages)
+//           Consumer: compute kernel (all stages)
 //
-//  HOST CHANGE 2 — tmp_cb_depth variable removed
-//  ─────────────────────────────────────────────────────────────────────
-//  The old max(2, tiles_per_row) logic is gone.  All four scratch CBs
-//  are created with depth=1.
+//  CB  6-9  Next-stage input even/odd r/i
+//           Producer: writer kernel (inter-stage shuffle, stages 0..N-2)
+//           Consumer: compute kernel (stages 1..N-1)
 //
-//  All other logic (input packing, twiddle precomputation, validation,
-//  DRAM buffer allocation, runtime args) is unchanged.
+//  CB 16-19 Butterfly outputs out0/out1 r/i
+//           Producer: compute kernel (all stages)
+//           Consumer: writer kernel (all stages)
+//
+//  CB 20-23 Compute scratch tmp0..tmp3 (depth=1 each)
+//           Internal to compute kernel only
+//
+//  CB 10-11 Compact twiddle table (depth=1)
+//           Producer: reader kernel (loaded once from DRAM)
+//           Consumer: reader kernel (read pointer held for all stages)
+//
+//  KEY FIXES IN KERNELS (not host):
+//  ──────────────────────────────────────────────────────────────────
+//  reader_fft_f32_mc.cpp:
+//    - Stage-0 even/odd now pushed into CB 0-3 (was incorrectly 6-9)
+//
+//  writer_fft_f32.cpp:
+//    - Inter-stage shuffle now writes to CB 6-9 (was incorrectly 0-3)
+//    - Variable rename: cb_even_r/i, cb_odd_r/i → cb_next_even_r/i,
+//      cb_next_odd_r/i to make intent explicit
 //
 // ══════════════════════════════════════════════════════════════════════
 
@@ -389,24 +404,43 @@ int main(int argc, char** argv) {
     auto b_cmp_r = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
     auto b_cmp_i = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
 
+    // ── CB creation ───────────────────────────────────────────────────
+    //
+    // CB  0-3  Stage-0 even/odd input (reader → compute)
+    // CB  4-5  Twiddle factors        (reader → compute)
+    // CB  6-9  Next-stage even/odd    (writer → compute, stages 1..N-1)
+    // CB 16-19 Butterfly outputs      (compute → writer)
+    // CB 20-23 Compute scratch        (internal, depth=1)
+    // CB 10-11 Compact twiddle table  (reader internal, depth=1)
+    //
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
-        create_cb(prog, cc,  0, tiles_per_row , TILE_BYTES);
-        create_cb(prog, cc,  1, tiles_per_row , TILE_BYTES);
-        create_cb(prog, cc,  2, tiles_per_row , TILE_BYTES);
-        create_cb(prog, cc,  3, tiles_per_row , TILE_BYTES);
+        // Stage-0 inputs: reader writes, compute reads (stage 0)
+        create_cb(prog, cc,  0, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  1, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  2, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  3, tiles_per_row, TILE_BYTES);
+        // Twiddle factors: reader writes, compute reads (all stages)
         create_cb(prog, cc,  4, tiles_per_row, TILE_BYTES);
         create_cb(prog, cc,  5, tiles_per_row, TILE_BYTES);
+        // Next-stage inputs: writer writes (shuffle), compute reads (stage 1+)
+        create_cb(prog, cc,  6, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  7, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  8, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  9, tiles_per_row, TILE_BYTES);
+        // Butterfly outputs: compute writes, writer reads
         create_cb(prog, cc, 16, tiles_per_row, TILE_BYTES);
         create_cb(prog, cc, 17, tiles_per_row, TILE_BYTES);
         create_cb(prog, cc, 18, tiles_per_row, TILE_BYTES);
         create_cb(prog, cc, 19, tiles_per_row, TILE_BYTES);
-        create_cb(prog, cc, 20, 1,             TILE_BYTES);
-        create_cb(prog, cc, 21, 1,             TILE_BYTES);
-        create_cb(prog, cc, 22, 1,             TILE_BYTES);
-        create_cb(prog, cc, 23, 1,             TILE_BYTES);
-        create_cb(prog, cc, 10, 1,             TILE_BYTES);
-        create_cb(prog, cc, 11, 1,             TILE_BYTES);
+        // Compute scratch (depth=1): used internally by compute kernel
+        create_cb(prog, cc, 20, 1, TILE_BYTES);
+        create_cb(prog, cc, 21, 1, TILE_BYTES);
+        create_cb(prog, cc, 22, 1, TILE_BYTES);
+        create_cb(prog, cc, 23, 1, TILE_BYTES);
+        // Compact twiddle table (depth=1): loaded once by reader
+        create_cb(prog, cc, 10, 1, TILE_BYTES);
+        create_cb(prog, cc, 11, 1, TILE_BYTES);
     }
 
     constexpr const char* KERNEL_PATH =
@@ -446,41 +480,41 @@ int main(int argc, char** argv) {
         const uint32_t tile_offset = c * tiles_per_core;
 
         SetRuntimeArgs(prog, reader_k, cc, std::vector<uint32_t>{
-            b_er->address(),
-            b_ei->address(),
-            b_or->address(),
-            b_oi->address(),
-            b_cmp_r->address(),
-            b_cmp_i->address(),
-            tiles_per_row,
-            tile_offset,
-            log2_row,
-            half_row,
-            half_row,
-            rows_per_core,
+            b_er->address(),       // [0]  even_r_addr
+            b_ei->address(),       // [1]  even_i_addr
+            b_or->address(),       // [2]  odd_r_addr
+            b_oi->address(),       // [3]  odd_i_addr
+            b_cmp_r->address(),    // [4]  compact_r_addr
+            b_cmp_i->address(),    // [5]  compact_i_addr
+            tiles_per_row,         // [6]  tiles_per_row
+            tile_offset,           // [7]  tile_offset
+            log2_row,              // [8]  num_stages
+            half_row,              // [9]  half_N
+            half_row,              // [10] local_half (ABI compat)
+            rows_per_core,         // [11] rows_per_core
         });
 
         SetRuntimeArgs(prog, compute_k, cc, std::vector<uint32_t>{
-            log2_row,
-            tiles_per_row,
-            rows_per_core,
+            log2_row,              // [0] num_stages
+            tiles_per_row,         // [1] tiles_per_stage
+            rows_per_core,         // [2] rows_per_core
         });
 
         SetRuntimeArgs(prog, writer_k, cc, std::vector<uint32_t>{
-            b_o0r->address(),
-            b_o0i->address(),
-            b_o1r->address(),
-            b_o1i->address(),
-            tiles_per_row,
-            log2_row,
-            half_row,
-            half_row,
-            1u,
-            c,
-            0u,
-            tile_offset,
-            0u,
-            rows_per_core,
+            b_o0r->address(),      // [0]  out0_r_addr
+            b_o0i->address(),      // [1]  out0_i_addr
+            b_o1r->address(),      // [2]  out1_r_addr
+            b_o1i->address(),      // [3]  out1_i_addr
+            tiles_per_row,         // [4]  num_tiles (tiles_per_row)
+            log2_row,              // [5]  num_stages
+            half_row,              // [6]  half_N
+            half_row,              // [7]  (padding)
+            1u,                    // [8]  (padding)
+            c,                     // [9]  (padding / core index, unused in kernel)
+            0u,                    // [10] (padding)
+            tile_offset,           // [11] tile_offset
+            0u,                    // [12] (padding)
+            rows_per_core,         // [13] rows_per_core
         });
     }
 

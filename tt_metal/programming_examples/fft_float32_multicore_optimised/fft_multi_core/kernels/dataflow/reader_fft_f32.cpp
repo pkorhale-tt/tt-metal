@@ -1,24 +1,27 @@
-// reader_fft_f32_mc.cpp — MULTICORE reader (FIXED v2)
+// reader_fft_f32_mc.cpp — MULTICORE reader (FIXED v3)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 // ══════════════════════════════════════════════════════════════════════
-//  CHANGES vs previous version
+//  CHANGES vs v2
 // ══════════════════════════════════════════════════════════════════════
 //
-//  No logic changes in this file.  The reader is correct as written.
-//  Updated comments only:
-//    - CB 22 (tmp2) and CB 23 (tmp3) are now used by the compute kernel
-//      as t_r and t_i scratch buffers.  The reader does not touch them.
-//    - Clarified that the twiddle loop blocking at each depth-1 stage is
-//      intentional and correct: the reader blocks at stage N+1 reserve
-//      until compute drains stage N, serialising naturally.
+//  BUG FIX (CB index mismatch — stage-0 even/odd)
+//  ─────────────────────────────────────────────────────────────────────
+//  Previous: reader pushed stage-0 even/odd data into CB 6-9
+//            (cb_even_r=6, cb_even_i=7, cb_odd_r=8, cb_odd_i=9)
 //
-//  BUG 4 FIX (retained): twiddle scatter fills elems_per_row elements,
-//  not local_half, ensuring all tile slots are initialised.
+//  Problem:  the compute kernel reads stage-0 inputs from CB 0-3
+//            (cb_stage0_even_r=0, cb_stage0_even_i=1,
+//             cb_stage0_odd_r=2,  cb_stage0_odd_i=3)
+//            so compute would stall forever at stage 0 waiting on CB 0-3
+//            while reader was filling CB 6-9 instead.
 //
-//  BUG 5 FIX (retained): reader fills even/odd from DRAM exactly once
-//  per row (stage 0 only); writer handles subsequent stages via shuffle.
+//  Fix:      reader now pushes stage-0 even/odd into CB 0-3, matching
+//            the compute kernel's cb_stage0_* indices.
+//
+//  No other logic changes.  The twiddle path (CB 4,5) and compact path
+//  (CB 10,11) were already correct and are unchanged.
 //
 // ══════════════════════════════════════════════════════════════════════
 //  ARGUMENT MAP
@@ -34,7 +37,7 @@
 //  [7]  tile_offset
 //  [8]  num_stages
 //  [9]  half_N
-//  [10] local_half (kept for ABI compatibility, not used in scatter loop)
+//  [10] local_half (ABI compatibility, unused in scatter loop)
 //  [11] rows_per_core
 //
 // ══════════════════════════════════════════════════════════════════════
@@ -56,20 +59,24 @@ void kernel_main() {
     // arg[10] local_half — ABI compat, not used in scatter loop
     const uint32_t rows_per_core  = get_arg_val<uint32_t>(11);
 
-    constexpr uint32_t cb_even_r    = 6;
-    constexpr uint32_t cb_even_i    = 7;
-    constexpr uint32_t cb_odd_r     = 8;
-    constexpr uint32_t cb_odd_i     = 9;
-    constexpr uint32_t cb_tw_r      = 4;
-    constexpr uint32_t cb_tw_i      = 5;
-    constexpr uint32_t cb_compact_r = 10;
-    constexpr uint32_t cb_compact_i = 11;
+    // ── CB indices ────────────────────────────────────────────────────
+    //
+    // FIX: stage-0 even/odd must land in CB 0-3 so the compute kernel
+    //      (cb_stage0_even_r=0 … cb_stage0_odd_i=3) can consume them.
+    //      Previously these were 6-9, causing compute to stall on stage 0.
+    //
+    constexpr uint32_t cb_even_r    = 0;   // FIX: was 6
+    constexpr uint32_t cb_even_i    = 1;   // FIX: was 7
+    constexpr uint32_t cb_odd_r     = 2;   // FIX: was 8
+    constexpr uint32_t cb_odd_i     = 3;   // FIX: was 9
+    constexpr uint32_t cb_tw_r      = 4;   // unchanged
+    constexpr uint32_t cb_tw_i      = 5;   // unchanged
+    constexpr uint32_t cb_compact_r = 10;  // unchanged
+    constexpr uint32_t cb_compact_i = 11;  // unchanged
 
     const uint32_t tile_bytes    = get_tile_size(cb_even_r);
     const DataFormat data_format = get_dataformat(cb_even_r);
-    // Only the first half_N floats are valid; host stores this table in one
-    // full tile page because it is fetched with noc_async_read_tile().
-    const uint32_t compact_bytes = half_N * sizeof(float);
+    const uint32_t compact_bytes = half_N * sizeof(float);   // kept for reference
 
     constexpr uint32_t ELEM      = sizeof(float);
     // Total float elements per twiddle CB push = all slots in tiles_per_row tiles.
@@ -123,8 +130,11 @@ void kernel_main() {
         const uint32_t row_tile_base = tile_offset + row * tiles_per_row;
         const uint32_t row_elem_base = row_tile_base * (tile_bytes / ELEM);
 
-        // ── Stage 0: load even/odd from DRAM ─────────────────────────
-        // Issue all four NOC reads before the barrier.
+        // ── Stage 0: load even/odd from DRAM into CB 0-3 ─────────────
+        //
+        // Issue all four NOC reads before the barrier so they run in
+        // parallel on the NoC fabric.
+        //
         cb_reserve_back(cb_even_r, tiles_per_row);
         cb_reserve_back(cb_even_i, tiles_per_row);
         cb_reserve_back(cb_odd_r,  tiles_per_row);
@@ -148,15 +158,14 @@ void kernel_main() {
         cb_push_back(cb_odd_r,  tiles_per_row);
         cb_push_back(cb_odd_i,  tiles_per_row);
 
-        // ── All stages: scatter twiddle factors ───────────────────────
+        // ── All stages: scatter twiddle factors into CB 4,5 ──────────
         //
-        // The cb_tw_r/i CBs have depth=1.  The reserve at stage N+1
-        // blocks until compute pops stage N's twiddle tile.  This
-        // creates a natural stage-by-stage synchronisation: the reader
-        // cannot get more than one stage ahead of compute.
+        // cb_tw_r/i have depth=tiles_per_row.  The cb_reserve_back at
+        // stage N+1 blocks until compute drains stage N's twiddle tiles,
+        // creating a natural one-stage-ahead limit on the reader.
         //
         // elems_per_row fills ALL float slots in the tiles_per_row tiles
-        // so no element is left uninitialised (BUG 4 fix).
+        // so no element is left uninitialised (BUG 4 fix retained).
 
         for (uint32_t stage = 0; stage < num_stages; stage++) {
             const uint32_t half_m      = 1u << stage;
