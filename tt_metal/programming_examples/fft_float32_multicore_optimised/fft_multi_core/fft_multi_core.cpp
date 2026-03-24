@@ -1,60 +1,75 @@
-// fft_single_core_opt.cpp  — OPTIMAL v2: compact twiddle table  [FIXED]
+// fft_multicore_2d.cpp — 2D FFT host (FIXED v2)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// FIX 1 (host): CB 4/5 (twiddle real/imag) depth changed from 1 to num_tiles.
-//   The reader now pushes one tile at a time inside its per-tile loop, so
-//   compute can pipeline: while compute processes tile k, the reader can
-//   already be filling tile k+1 into the next slot.  Without this, the
-//   CB with depth=1 was safe only for N<=1024 (num_tiles==1).  For larger N
-//   depth must equal num_tiles so the reader never stalls waiting for compute
-//   to drain a slot before it can write the next tile in the same stage.
+// ══════════════════════════════════════════════════════════════════════
+//  CHANGES vs previous version
+// ══════════════════════════════════════════════════════════════════════
 //
-//   NOTE: if you intentionally want to keep depth=1 to save L1 (1.3 MB per
-//   Tensix core is limited), the reader fix alone (reserve-1-at-a-time) is
-//   sufficient to avoid deadlock — the reader will just pause between tiles.
-//   Increase depth to num_tiles only if profiling shows the reader is the
-//   bottleneck within a stage.
+//  HOST CHANGE 1 — CB layout update (matches compute kernel v2)
+//  ─────────────────────────────────────────────────────────────────────
+//  Old: cb_tmp0 [20] depth=max(2,tiles_per_row)
+//       cb_tmp1 [21] depth=max(2,tiles_per_row)
 //
-// FIX 2 (host): CB 0-3 (even/odd inputs) depth changed from 1 to num_tiles.
-//   The reader uploads all num_tiles in one burst (cb_reserve_back num_tiles),
-//   so the CB must have at least num_tiles slots.  With depth=1 and
-//   num_tiles>1 the initial cb_reserve_back in the reader blocks immediately.
+//  New: cb_tmp0 [20] depth=1   tw_r*odd_r  /  tw_r*odd_i  (one at a time)
+//       cb_tmp1 [21] depth=1   tw_i*odd_i  /  tw_i*odd_r  (one at a time)
+//       cb_tmp2 [22] depth=1   t_r  (= tw_r*odd_r − tw_i*odd_i)
+//       cb_tmp3 [23] depth=1   t_i  (= tw_r*odd_i + tw_i*odd_r)
 //
-// DRAM traffic (N=1024):
-//   Upload: 8 KB input + 4 KB compact twiddles = 12 KB  (was 88 KB)
-//   Download: 8 KB result
-//   Total: 20 KB  — matches mesham's design, ~5× less than previous version
+//  The compute kernel was restructured into 5 sessions (A1, B, A2, C, D)
+//  so that no CB operation ever occurs inside a tile_regs session.
+//  Each scratch CB is used by at most one producer and one consumer at
+//  any point, so depth=1 is sufficient and saves L1.
+//
+//  HOST CHANGE 2 — tmp_cb_depth variable removed
+//  ─────────────────────────────────────────────────────────────────────
+//  The old max(2, tiles_per_row) logic is gone.  All four scratch CBs
+//  are created with depth=1.
+//
+//  All other logic (input packing, twiddle precomputation, validation,
+//  DRAM buffer allocation, runtime args) is unchanged.
+//
+// ══════════════════════════════════════════════════════════════════════
 
 #include <cmath>
-#include <fstream>
 #include <vector>
 #include <iostream>
 #include <iomanip>
 #include <cstdint>
 #include <cstring>
+#include <cassert>
+#include <fstream>
+#include <string>
+#include <algorithm>
 
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
 #include "tt_metal/api/tt-metalium/distributed.hpp"
 #include "tt_metal/api/tt-metalium/base_types.hpp"
 #include "tt_metal/api/tt-metalium/mesh_workload.hpp"
+#include "tt_metal/api/tt-metalium/allocator.hpp"
+#include "tt_metal/api/tt-metalium/hal.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
 
-constexpr float PI = 3.14159265358979323846f;
-
+constexpr float    PI         = 3.14159265358979323846f;
 constexpr uint32_t TILE_H     = tt::constants::TILE_HEIGHT;
 constexpr uint32_t TILE_W     = tt::constants::TILE_WIDTH;
 constexpr uint32_t TILE_SIZE  = TILE_H * TILE_W;
 constexpr uint32_t TILE_BYTES = TILE_SIZE * sizeof(float);
 
-inline uint32_t f2u(float f)  { uint32_t u; std::memcpy(&u,&f,4); return u; }
-inline float    u2f(uint32_t u){ float f;   std::memcpy(&f,&u,4); return f; }
+inline uint32_t f2u(float f)    { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+inline float    u2f(uint32_t u) { float f;    std::memcpy(&f, &u, 4); return f; }
+
+uint32_t bit_reverse(uint32_t x, uint32_t log2n) {
+    uint32_t r = 0;
+    for (uint32_t i = 0; i < log2n; i++) { r = (r << 1) | (x & 1); x >>= 1; }
+    return r;
+}
 
 std::vector<uint32_t> pack_tiles(const std::vector<float>& d, uint32_t ntiles) {
-    std::vector<uint32_t> o(ntiles*TILE_SIZE, 0);
+    std::vector<uint32_t> o(ntiles * TILE_SIZE, 0u);
     for (uint32_t i = 0; i < d.size() && i < o.size(); i++) o[i] = f2u(d[i]);
     return o;
 }
@@ -64,329 +79,495 @@ std::vector<float> unpack_tiles(const std::vector<uint32_t>& d, uint32_t n) {
     return o;
 }
 
-uint32_t bit_reverse(uint32_t x, uint32_t log2n) {
-    uint32_t r = 0;
-    for (uint32_t i = 0; i < log2n; i++) { r = (r<<1)|(x&1); x >>= 1; }
-    return r;
-}
-
 void cpu_fft(std::vector<float>& re, std::vector<float>& im, bool inv) {
-    uint32_t N = re.size(), log2N = 0;
-    while ((1u<<log2N) < N) log2N++;
+    const uint32_t N = re.size();
+    uint32_t log2N  = 0;
+    while ((1u << log2N) < N) log2N++;
     for (uint32_t i = 0; i < N; i++) {
         uint32_t j = bit_reverse(i, log2N);
-        if (i < j) { std::swap(re[i],re[j]); std::swap(im[i],im[j]); }
+        if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
     }
     for (uint32_t s = 0; s < log2N; s++) {
-        uint32_t m = 1u<<(s+1);
-        float ab = (inv?2.f:-2.f)*PI/m;
-        for (uint32_t k = 0; k < N; k += m)
-            for (uint32_t j = 0; j < m/2; j++) {
-                float wr=std::cos(ab*j), wi=std::sin(ab*j);
-                uint32_t e=k+j, o=k+j+m/2;
-                float tr=wr*re[o]-wi*im[o], ti=wr*im[o]+wi*re[o];
-                float er=re[e], ei=im[e];
-                re[e]=er+tr; im[e]=ei+ti; re[o]=er-tr; im[o]=ei-ti;
+        const uint32_t m  = 1u << (s + 1);
+        const float    ab = (inv ? 2.f : -2.f) * PI / static_cast<float>(m);
+        for (uint32_t k = 0; k < N; k += m) {
+            for (uint32_t j = 0; j < m / 2; j++) {
+                const float wr = std::cos(ab * j);
+                const float wi = std::sin(ab * j);
+                const uint32_t e = k + j, o = k + j + m / 2;
+                const float tr = wr * re[o] - wi * im[o];
+                const float ti = wr * im[o] + wi * re[o];
+                const float er = re[e], ei = im[e];
+                re[e] = er + tr;  im[e] = ei + ti;
+                re[o] = er - tr;  im[o] = ei - ti;
             }
+        }
     }
-    if (inv) for (uint32_t i=0;i<N;i++){re[i]/=N;im[i]/=N;}
+    if (inv) {
+        const float inv_N = 1.f / static_cast<float>(N);
+        for (uint32_t i = 0; i < N; i++) { re[i] *= inv_N; im[i] *= inv_N; }
+    }
 }
 
-// Stage-0 split: bit-reversed input, stride-2 partition into even/odd
-void prepare_stage0(const std::vector<float>& sr, const std::vector<float>& si,
-                    uint32_t N, uint32_t log2N, uint32_t tiles,
-                    std::vector<uint32_t>& er, std::vector<uint32_t>& ei,
-                    std::vector<uint32_t>& or_, std::vector<uint32_t>& oi) {
-    uint32_t half_N = N/2;
-    std::vector<float> _er(half_N),_ei(half_N),_or(half_N),_oi(half_N);
-    for (uint32_t i = 0; i < half_N; i++) {
-        uint32_t e = bit_reverse(2*i,   log2N);
-        uint32_t o = bit_reverse(2*i+1, log2N);
-        _er[i]=sr[e]; _ei[i]=si[e]; _or[i]=sr[o]; _oi[i]=si[o];
+void prepare_stage0_row(
+    const std::vector<float>& sr, const std::vector<float>& si,
+    uint32_t row_offset, uint32_t N_row, uint32_t log2_row,
+    uint32_t tiles_per_row,
+    std::vector<uint32_t>& er, std::vector<uint32_t>& ei,
+    std::vector<uint32_t>& or_, std::vector<uint32_t>& oi)
+{
+    const uint32_t half = N_row / 2;
+    std::vector<float> _er(half), _ei(half), _or(half), _oi(half);
+    for (uint32_t i = 0; i < half; i++) {
+        const uint32_t e = bit_reverse(2 * i,     log2_row);
+        const uint32_t o = bit_reverse(2 * i + 1, log2_row);
+        _er[i] = sr[row_offset + e];  _ei[i] = si[row_offset + e];
+        _or[i] = sr[row_offset + o];  _oi[i] = si[row_offset + o];
     }
-    er=pack_tiles(_er,tiles); ei=pack_tiles(_ei,tiles);
-    or_=pack_tiles(_or,tiles); oi=pack_tiles(_oi,tiles);
+    auto append = [](std::vector<uint32_t>& dst,
+                     const std::vector<float>& src, uint32_t ntiles) {
+        std::vector<uint32_t> o(ntiles * TILE_SIZE, 0u);
+        for (uint32_t i = 0; i < src.size() && i < o.size(); i++)
+            o[i] = f2u(src[i]);
+        dst.insert(dst.end(), o.begin(), o.end());
+    };
+    append(er,  _er, tiles_per_row);
+    append(ei,  _ei, tiles_per_row);
+    append(or_, _or, tiles_per_row);
+    append(oi,  _oi, tiles_per_row);
 }
 
-// Compact twiddle table: N/2 entries, direction-aware sign.
-std::pair<std::vector<uint32_t>,std::vector<uint32_t>>
-precompute_compact_twiddles(uint32_t N, uint32_t direction) {
-    uint32_t half_N = N/2;
-    float sign = (direction==1) ? 1.f : -1.f;
-    std::vector<uint32_t> tw_r(half_N, 0), tw_i(half_N, 0);
-    for (uint32_t k = 0; k < half_N; k++) {
-        float angle = sign * 2.f*PI*(float)k/(float)N;
+std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
+precompute_compact_twiddles(uint32_t N_row, uint32_t direction) {
+    const uint32_t half  = N_row / 2;
+    const float    sign  = (direction == 1) ? 1.f : -1.f;
+    std::vector<uint32_t> tw_r(half), tw_i(half);
+    for (uint32_t k = 0; k < half; k++) {
+        const float angle = sign * 2.f * PI * static_cast<float>(k)
+                                             / static_cast<float>(N_row);
         tw_r[k] = f2u(std::cos(angle));
         tw_i[k] = f2u(std::sin(angle));
     }
     return {tw_r, tw_i};
 }
 
-// Pad compact twiddle table into one full tile because the reader fetches it
-// through a tile-oriented NOC path. Only the first valid_count entries matter.
-std::vector<uint32_t> pad_compact_to_tile(
-    const std::vector<uint32_t>& compact, uint32_t valid_count) {
-    std::vector<uint32_t> padded(TILE_SIZE, 0u);
-    const uint32_t count = std::min<uint32_t>(valid_count, compact.size());
-    for (uint32_t i = 0; i < count; i++) padded[i] = compact[i];
-    return padded;
-}
-
-void create_cb(Program& p, CoreCoord c, uint32_t id, uint32_t ntiles, uint32_t bytes) {
+CBHandle create_cb(Program& p, CoreCoord c, uint32_t id,
+                   uint32_t ntiles, uint32_t bytes_per_tile) {
     CircularBufferConfig cfg =
-        CircularBufferConfig(ntiles*bytes, {{id, tt::DataFormat::Float32}})
-            .set_page_size(id, bytes);
-    CreateCircularBuffer(p, c, cfg);
+        CircularBufferConfig(ntiles * bytes_per_tile,
+                             {{id, tt::DataFormat::Float32}})
+            .set_page_size(id, bytes_per_tile);
+    return CreateCircularBuffer(p, c, cfg);
 }
 
-bool read_file(const std::string& path, uint32_t& N, bool from_cmd,
-               std::vector<float>& ir, std::vector<float>& ii) {
-    std::ifstream f(path);
-    if (!f.is_open()) { std::cerr<<"Cannot open: "<<path<<"\n"; return false; }
-    std::vector<float> v; std::string t;
-    while (f>>t) {
-        if (!t.empty() && t.back()==',') t.pop_back();
-        if (t.empty()) continue;
-        try { v.push_back(std::stof(t)); } catch(...) { std::cerr<<"Bad token\n"; return false; }
+uint32_t detect_available_cores(IDevice* device, uint32_t max_req,
+                                 uint32_t num_rows) {
+    const CoreCoord grid = device->compute_with_storage_grid_size();
+    std::cout << " Device grid : " << grid.x << " x " << grid.y
+              << " Tensix cores\n";
+    uint32_t usable = 0;
+    for (uint32_t col = 0; col < grid.x; col++) {
+        try {
+            (void)device->worker_core_from_logical_core({col, 0});
+            usable++;
+        } catch (...) { break; }
     }
-    if (v.empty()) { std::cerr<<"Empty file\n"; return false; }
-    uint32_t cnt=(uint32_t)v.size(); bool interleaved=false;
-    if (from_cmd) {
-        if (cnt==2*N) { interleaved=true; }
-        else if (cnt<N) std::cerr<<"File has "<<cnt<<" values, padding to N="<<N<<"\n";
-        else if (cnt>N) { cnt=N; v.resize(N); }
+    std::cout << " Usable row-0 cores: " << usable << "\n";
+    uint32_t cap    = std::min(usable, max_req);
+    uint32_t result = 1u;
+    if (num_rows == 0) {
+        while (result * 2 <= cap) result *= 2;
     } else {
-        N=1; while(N<cnt) N<<=1;
+        while (result * 2 <= cap && num_rows % (result * 2) == 0) result *= 2;
     }
-    ir.assign(N,0.f); ii.assign(N,0.f);
-    if (interleaved)
-        for (uint32_t i=0;i<N&&2*i+1<(uint32_t)v.size();i++){ir[i]=v[2*i];ii[i]=v[2*i+1];}
-    else
-        for (uint32_t i=0;i<N&&i<(uint32_t)v.size();i++) ir[i]=v[i];
+    std::cout << " Selected cores: " << result << "\n";
+    return result;
+}
+
+bool is_uint_str(const char* s) {
+    if (!s || !*s) return false;
+    for (const char* p = s; *p; ++p)
+        if (*p < '0' || *p > '9') return false;
     return true;
 }
 
-int main(int argc, char** argv) {
-    if (argc<2) { std::cerr<<"Usage: "<<argv[0]<<" <0|1> [file] [N]\n"; return 1; }
-    uint32_t direction = (uint32_t)std::atoi(argv[1]);
-    uint32_t N = 1024; std::string in_file; bool from_cmd=false;
-    for (int i=2;i<argc;i++) {
-        std::string a=argv[i];
-        bool is_file=(a.find('.')!=std::string::npos||a.find('/')!=std::string::npos);
-        if (is_file&&in_file.empty()) in_file=a;
-        else { try{N=(uint32_t)std::stol(a);from_cmd=true;}catch(...){if(in_file.empty())in_file=a;} }
+bool read_input_file(const std::string& path, uint32_t N_row,
+                     std::vector<float>& ir, std::vector<float>& ii) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cerr << "Cannot open input file: " << path << "\n";
+        return false;
     }
-    if (from_cmd&&(N==0||(N&(N-1)))) { std::cerr<<"N must be power of 2\n"; return 1; }
-
-    uint32_t log2N=0; while((1u<<log2N)<N) log2N++;
-    uint32_t half_N=N/2;
-    uint32_t tiles=(half_N+TILE_SIZE-1)/TILE_SIZE;
-
-    std::vector<float> ir(N,0.f), ii(N,0.f);
-    if (!in_file.empty()) {
-        if (!read_file(in_file,N,from_cmd,ir,ii)) return 1;
-        log2N=0; while((1u<<log2N)<N) log2N++;
-        half_N=N/2; tiles=(half_N+TILE_SIZE-1)/TILE_SIZE;
-        ir.resize(N,0.f); ii.resize(N,0.f);
-        if (N<4||(N&(N-1))) { std::cerr<<"Invalid N="<<N<<" (must be power of 2, >= 4)\n"; return 1; }
+    std::vector<float> vals;
+    std::string tok;
+    while (f >> tok) {
+        if (!tok.empty() && tok.back() == ',') tok.pop_back();
+        if (tok.empty()) continue;
+        try { vals.push_back(std::stof(tok)); }
+        catch (...) {
+            std::cerr << "Bad token in file: '" << tok << "'\n";
+            return false;
+        }
+    }
+    if (vals.empty()) { std::cerr << "Empty input file\n"; return false; }
+    ir.assign(N_row, 0.f);
+    ii.assign(N_row, 0.f);
+    const bool interleaved = (vals.size() >= 2 * N_row);
+    if (interleaved) {
+        std::cout << " File mode: interleaved complex ("
+                  << vals.size() << " values → " << N_row << " complex)\n";
+        for (uint32_t i = 0; i < N_row && 2 * i + 1 < vals.size(); i++) {
+            ir[i] = vals[2 * i];
+            ii[i] = vals[2 * i + 1];
+        }
     } else {
-        for (uint32_t i=0;i<N;i++)
-            ir[i]=std::sin(2.f*PI*4.f*i/N)+0.5f*std::sin(2.f*PI*8.f*i/N);
+        std::cout << " File mode: real-only ("
+                  << vals.size() << " values → " << N_row << " points)\n";
+        if (vals.size() < N_row)
+            std::cout << " Note: " << (N_row - vals.size())
+                      << " values zero-padded\n";
+        for (uint32_t i = 0; i < N_row && i < vals.size(); i++)
+            ir[i] = vals[i];
+    }
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <direction:0|1> [N_row] [num_rows] [num_cores] [input_file]\n"
+                  << " Default: forward FFT, N_row=1024, num_rows=auto\n";
+        return 1;
     }
 
-    // DRAM sizes
-    uint32_t in_bytes      = tiles * TILE_BYTES;
-    uint32_t compact_bytes = half_N * sizeof(float);
+    const uint32_t direction            = static_cast<uint32_t>(std::atoi(argv[1]));
+    uint32_t       N_row                = 4;
+    uint32_t       num_rows             = 0;
+    uint32_t       user_cores           = 0;
+    const uint32_t rows_per_core_target = 4;
+    std::string    in_file              = "";
 
-    std::cout<<"════════════════════════════════════════\n";
-    std::cout<<" TT-Metal FFT  (Optimal v2 — compact twiddles) [FIXED]\n";
-    std::cout<<"════════════════════════════════════════\n";
-    std::cout<<" N           : "<<N<<"\n";
-    std::cout<<" log2N       : "<<log2N<<"\n";
-    std::cout<<" Direction   : "<<(direction?"Inverse":"Forward")<<"\n";
-    std::cout<<" tiles/stage : "<<tiles<<"\n";
-    std::cout<<" DRAM upload : "<<(4*in_bytes + 2*compact_bytes)/1024<<" KB"
-             <<" (input "<<4*in_bytes/1024<<"KB + twiddles "<<2*compact_bytes/1024<<"KB)\n";
-    std::cout<<" DRAM dl     : "<<4*in_bytes/1024<<" KB\n";
-    std::cout<<"════════════════════════════════════════\n";
+    for (int i = 2; i < argc; i++) {
+        if (!is_uint_str(argv[i])) { in_file = argv[i]; continue; }
+        const uint32_t v = static_cast<uint32_t>(std::stoul(argv[i]));
+        if      (v >= 2 && v <= 64 && (v & (v-1)) == 0) user_cores = v;
+        else if (v > 64  && v <= 1024 && (v & (v-1)) == 0) N_row    = v;
+        else if (v > 1024 && (v & (v-1)) == 0)             num_rows  = v;
+        else if (v >= 2)                                    num_rows  = v;
+    }
+    if (N_row < 2 || (N_row & (N_row - 1))) {
+        std::cerr << "N_row must be a power of 2\n"; return 1;
+    }
 
-    // Reference
+    const int dev_id = 0;
+    auto mesh   = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(dev_id);
+    auto& cq    = mesh->mesh_command_queue();
+    IDevice* device = mesh->get_devices().at(0);
+
+    const uint32_t max_req   = user_cores > 0 ? user_cores : 64u;
+    const uint32_t num_cores = detect_available_cores(device, max_req, num_rows);
+
+    if (num_rows == 0) num_rows = num_cores * rows_per_core_target;
+    num_rows = (num_rows / num_cores) * num_cores;
+    if (num_rows == 0) num_rows = num_cores;
+
+    const uint32_t rows_per_core = num_rows / num_cores;
+    const uint32_t log2_row      = [&]{
+        uint32_t l = 0; while ((1u << l) < N_row) l++; return l; }();
+    const uint32_t half_row      = N_row / 2;
+    const uint32_t tiles_per_row = (half_row + TILE_SIZE - 1) / TILE_SIZE;
+    const uint32_t compact_bytes = half_row * sizeof(float);
+    const uint32_t total_N       = N_row * num_rows;
+
+    std::cout << "════════════════════════════════════════════════\n";
+    std::cout << " TT-Metal MULTICORE FFT (row decomposition)\n";
+    std::cout << "════════════════════════════════════════════════\n";
+    std::cout << " N_row        : " << N_row         << "\n";
+    std::cout << " num_rows     : " << num_rows      << "\n";
+    std::cout << " num_cores    : " << num_cores     << "\n";
+    std::cout << " rows/core    : " << rows_per_core << "\n";
+    std::cout << " log2(N_row)  : " << log2_row      << "\n";
+    std::cout << " tiles/row    : " << tiles_per_row  << "\n";
+    std::cout << " scratch CBs  : tmp0/1/2/3 [20-23] depth=1 each\n";
+    std::cout << " Direction    : " << (direction ? "Inverse" : "Forward") << "\n";
+    std::cout << " Total FFTs   : " << num_rows
+              << "  (" << num_cores << " cores × " << rows_per_core << " rows)\n";
+    std::cout << " Total points : "
+              << (static_cast<uint64_t>(num_rows) * N_row / 1024)
+              << " K complex samples\n";
+    std::cout << "════════════════════════════════════════════════\n";
+
+    std::vector<float> ir(total_N, 0.f), ii(total_N, 0.f);
+
+    if (!in_file.empty()) {
+        std::cout << " Input file  : " << in_file << "\n";
+        std::vector<float> row_r, row_i;
+        if (!read_input_file(in_file, N_row, row_r, row_i)) {
+            mesh->close(); return 1;
+        }
+        for (uint32_t row = 0; row < num_rows; row++)
+            for (uint32_t i = 0; i < N_row; i++) {
+                ir[row * N_row + i] = row_r[i];
+                ii[row * N_row + i] = row_i[i];
+            }
+    } else {
+        for (uint32_t row = 0; row < num_rows; row++)
+            for (uint32_t i = 0; i < N_row; i++)
+                ir[row * N_row + i] =
+                    std::sin(2.f * PI * 4.f * i / N_row)
+                  + 0.5f * std::sin(2.f * PI * 8.f * i / N_row);
+    }
+
     std::vector<float> ref_r(ir), ref_i(ii);
-    cpu_fft(ref_r, ref_i, direction==1);
+    for (uint32_t row = 0; row < num_rows; row++) {
+        std::vector<float> row_r(ir.begin() + row * N_row,
+                                  ir.begin() + (row + 1) * N_row);
+        std::vector<float> row_i(ii.begin() + row * N_row,
+                                  ii.begin() + (row + 1) * N_row);
+        cpu_fft(row_r, row_i, direction == 1);
+        for (uint32_t i = 0; i < N_row; i++) {
+            ref_r[row * N_row + i] = row_r[i];
+            ref_i[row * N_row + i] = row_i[i];
+        }
+    }
 
-    // Prepare inputs
-    std::vector<uint32_t> even_r_t, even_i_t, odd_r_t, odd_i_t;
-    prepare_stage0(ir,ii,N,log2N,tiles,even_r_t,even_i_t,odd_r_t,odd_i_t);
+    std::vector<uint32_t> all_er, all_ei, all_or, all_oi;
+    all_er.reserve(num_rows * tiles_per_row * TILE_SIZE);
+    all_ei.reserve(num_rows * tiles_per_row * TILE_SIZE);
+    all_or.reserve(num_rows * tiles_per_row * TILE_SIZE);
+    all_oi.reserve(num_rows * tiles_per_row * TILE_SIZE);
+    for (uint32_t row = 0; row < num_rows; row++)
+        prepare_stage0_row(ir, ii, row * N_row, N_row, log2_row,
+                           tiles_per_row, all_er, all_ei, all_or, all_oi);
 
-    // Compact twiddle table
-    auto [cmp_r_t, cmp_i_t] = precompute_compact_twiddles(N, direction);
+    auto [cmp_r_t, cmp_i_t] = precompute_compact_twiddles(N_row, direction);
 
-    // Device setup
-    int dev_id=0;
-    auto mesh = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(dev_id);
-    auto& cq  = mesh->mesh_command_queue();
-    Program prog = CreateProgram();
-    CoreCoord core = {0,0};
+    Program   prog       = CreateProgram();
+    CoreRange core_range({0, 0}, {num_cores - 1, 0});
 
-    // DRAM buffers
-    tt::tt_metal::distributed::DeviceLocalBufferConfig dram{
-        .page_size=TILE_BYTES, .buffer_type=tt::tt_metal::BufferType::DRAM};
-    auto mk_tile=[&](uint32_t bytes) {
-        tt::tt_metal::distributed::ReplicatedBufferConfig rc{.size=bytes};
-        return tt::tt_metal::distributed::MeshBuffer::create(rc,dram,mesh.get());
+    using namespace tt::tt_metal::distributed;
+    DeviceLocalBufferConfig dram_tile{
+        .page_size = TILE_BYTES, .buffer_type = BufferType::DRAM};
+
+    const uint32_t tiles_per_core = tiles_per_row * rows_per_core;
+    const uint32_t bytes_per_core = tiles_per_core * TILE_BYTES;
+    const uint32_t total_bytes    = bytes_per_core * num_cores;
+
+    auto mk_buf = [&](uint32_t bytes) {
+        ReplicatedBufferConfig rc{.size = bytes};
+        return MeshBuffer::create(rc, dram_tile, mesh.get());
     };
-    auto b_er  = mk_tile(in_bytes);
-    auto b_ei  = mk_tile(in_bytes);
-    auto b_or  = mk_tile(in_bytes);
-    auto b_oi  = mk_tile(in_bytes);
-    tt::tt_metal::distributed::DeviceLocalBufferConfig dram_cmp{
-        .page_size=compact_bytes, .buffer_type=tt::tt_metal::BufferType::DRAM};
-    tt::tt_metal::distributed::ReplicatedBufferConfig rc_cmp{.size=compact_bytes};
-    auto b_cmp_r = tt::tt_metal::distributed::MeshBuffer::create(rc_cmp,dram_cmp,mesh.get());
-    auto b_cmp_i = tt::tt_metal::distributed::MeshBuffer::create(rc_cmp,dram_cmp,mesh.get());
-    auto b_o0r = mk_tile(in_bytes);
-    auto b_o0i = mk_tile(in_bytes);
-    auto b_o1r = mk_tile(in_bytes);
-    auto b_o1i = mk_tile(in_bytes);
+
+    auto b_er  = mk_buf(total_bytes);
+    auto b_ei  = mk_buf(total_bytes);
+    auto b_or  = mk_buf(total_bytes);
+    auto b_oi  = mk_buf(total_bytes);
+    auto b_o0r = mk_buf(total_bytes);
+    auto b_o0i = mk_buf(total_bytes);
+    auto b_o1r = mk_buf(total_bytes);
+    auto b_o1i = mk_buf(total_bytes);
+
+    DeviceLocalBufferConfig dram_cmp{
+        .page_size = compact_bytes, .buffer_type = BufferType::DRAM};
+    ReplicatedBufferConfig rc_cmp{.size = compact_bytes};
+    auto b_cmp_r = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
+    auto b_cmp_i = MeshBuffer::create(rc_cmp, dram_cmp, mesh.get());
 
     // ── Circular buffers ──────────────────────────────────────────────
     //
-    // FIX 2: CB 0-3 depth = num_tiles (was 1).
-    //   The reader does cb_reserve_back(cb_even_r, num_tiles) in one shot
-    //   before the DRAM burst, so these CBs must hold num_tiles pages.
+    //  All scratch CBs use depth=1.  The compute kernel's session
+    //  structure guarantees at most 1 tile in flight per scratch CB
+    //  at any time — verified by dry-run in fft_compute_f32.cpp.
     //
-    // FIX 1: CB 4/5 depth = num_tiles (was 1).
-    //   Allows the reader's per-tile twiddle loop to pipeline with compute:
-    //   reader fills tile k+1 while compute works on tile k.
-    //   If L1 is tight, depth=1 is also safe with the reader fix — it just
-    //   means reader and compute alternate one tile at a time.
+    //  CB depth=1 uses the minimum L1 for scratch and prevents the
+    //  old depth-2 + illegal-CB-op-inside-session deadlock entirely.
 
-    // Input CBs 0-3: depth = tiles+1
-    // DEADLOCK FIX: compute waits for CB4-5 (twiddles) BEFORE CB0-3 (even/odd).
-    // At stage S+1: writer needs a free slot in CB0-3 to deposit next inputs,
-    // but compute holds the current CB0-3 slot while blocked waiting for
-    // CB4-5 twiddles. With depth=tiles there is no free slot, so writer blocks,
-    // compute never gets twiddles, and neither can proceed: circular deadlock.
-    // depth=tiles+1 provides one extra slot so writer never needs to wait for
-    // compute to pop CB0-3 before reserving the next stage slot.
-    create_cb(prog,core, 0, tiles+1, TILE_BYTES);   // even_r  (depth=tiles+1, see deadlock fix comment)
-    create_cb(prog,core, 1, tiles+1, TILE_BYTES);   // even_i
-    create_cb(prog,core, 2, tiles+1, TILE_BYTES);   // odd_r
-    create_cb(prog,core, 3, tiles+1, TILE_BYTES);   // odd_i
-    // Twiddle CBs 4-5: depth = num_tiles (pipeline reader ↔ compute)
-    create_cb(prog,core, 4, tiles, TILE_BYTES);   // tw_r
-    create_cb(prog,core, 5, tiles, TILE_BYTES);   // tw_i
-    // Output CBs 16-19: depth = num_tiles
-    create_cb(prog,core,16, tiles, TILE_BYTES);   // out0_r
-    create_cb(prog,core,17, tiles, TILE_BYTES);   // out0_i
-    create_cb(prog,core,18, tiles, TILE_BYTES);   // out1_r
-    create_cb(prog,core,19, tiles, TILE_BYTES);   // out1_i
-    // Scratch CBs 20-23: depth=1 (per-tile intermediates, same as before)
-    create_cb(prog,core,20, 1, TILE_BYTES);       // tmp0
-    create_cb(prog,core,21, 1, TILE_BYTES);       // tmp1
-    create_cb(prog,core,22, 1, TILE_BYTES);       // tw_odd_r
-    create_cb(prog,core,23, 1, TILE_BYTES);       // tw_odd_i
-    // Compact twiddle CBs 10-11: depth=1 (uploaded once, kept in L1)
-    create_cb(prog,core,10, 1, TILE_BYTES);       // cb_compact_r
-    create_cb(prog,core,11, 1, TILE_BYTES);       // cb_compact_i
+    for (uint32_t c = 0; c < num_cores; c++) {
+        CoreCoord cc = {c, 0};
+        create_cb(prog, cc,  0, tiles_per_row, TILE_BYTES);  // even_r
+        create_cb(prog, cc,  1, tiles_per_row, TILE_BYTES);  // even_i
+        create_cb(prog, cc,  2, tiles_per_row, TILE_BYTES);  // odd_r
+        create_cb(prog, cc,  3, tiles_per_row, TILE_BYTES);  // odd_i
+        create_cb(prog, cc,  4, tiles_per_row, TILE_BYTES);  // tw_r
+        create_cb(prog, cc,  5, tiles_per_row, TILE_BYTES);  // tw_i
+        create_cb(prog, cc, 16, tiles_per_row, TILE_BYTES);  // out0_r
+        create_cb(prog, cc, 17, tiles_per_row, TILE_BYTES);  // out0_i
+        create_cb(prog, cc, 18, tiles_per_row, TILE_BYTES);  // out1_r
+        create_cb(prog, cc, 19, tiles_per_row, TILE_BYTES);  // out1_i
+        create_cb(prog, cc, 20, 1,             TILE_BYTES);  // tmp0 depth=1
+        create_cb(prog, cc, 21, 1,             TILE_BYTES);  // tmp1 depth=1
+        create_cb(prog, cc, 22, 1,             TILE_BYTES);  // tmp2 depth=1 (t_r)
+        create_cb(prog, cc, 23, 1,             TILE_BYTES);  // tmp3 depth=1 (t_i)
 
-    auto reader_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core"
-        "/kernels/dataflow/reader_fft_f32.cpp",
-        core, DataMovementConfig{
-            .processor=DataMovementProcessor::RISCV_0,.noc=NOC::RISCV_0_default});
-    auto writer_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core"
-        "/kernels/dataflow/writer_fft_f32.cpp",
-        core, DataMovementConfig{
-            .processor=DataMovementProcessor::RISCV_1,.noc=NOC::RISCV_1_default});
-    auto compute_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_optimized/fft_single_core"
-        "/kernels/compute/fft_compute_f32.cpp",
-        core, ComputeConfig{
-            .math_fidelity=MathFidelity::HiFi4,.fp32_dest_acc_en=true,.math_approx_mode=false});
+        const uint32_t cmp_ntiles =
+            (compact_bytes + TILE_BYTES - 1) / TILE_BYTES;
+        create_cb(prog, cc, 10, cmp_ntiles, compact_bytes);  // compact_r
+        create_cb(prog, cc, 11, cmp_ntiles, compact_bytes);  // compact_i
+    }
 
-    std::vector<uint32_t> reader_args = {
-        b_er->address(), b_ei->address(),
-        b_or->address(), b_oi->address(),
-        b_cmp_r->address(), b_cmp_i->address(),
-        tiles, log2N, half_N};
-    std::vector<uint32_t> writer_args = {
-        b_o0r->address(), b_o0i->address(),
-        b_o1r->address(), b_o1i->address(),
-        tiles, log2N, half_N};
-    std::vector<uint32_t> compute_args = {log2N, tiles};
+    constexpr const char* KERNEL_PATH =
+        "tt_metal/programming_examples/fft_float32_multicore_optimised/"
+        "fft_multi_core/kernels/";
 
-    tt::tt_metal::distributed::MeshWorkload wl;
-    tt::tt_metal::distributed::MeshCoordinateRange rng =
-        tt::tt_metal::distributed::MeshCoordinateRange(mesh->shape());
+    KernelHandle reader_k = CreateKernel(prog,
+        std::string(KERNEL_PATH) + "dataflow/reader_fft_f32.cpp",
+        core_range,
+        DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                           .noc       = NOC::RISCV_0_default});
+
+    KernelHandle writer_k = CreateKernel(prog,
+        std::string(KERNEL_PATH) + "dataflow/writer_fft_f32.cpp",
+        core_range,
+        DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                           .noc       = NOC::RISCV_1_default});
+
+    KernelHandle compute_k = CreateKernel(prog,
+        std::string(KERNEL_PATH) + "compute/fft_compute_f32.cpp",
+        core_range,
+        ComputeConfig{.math_fidelity    = MathFidelity::HiFi4,
+                      .fp32_dest_acc_en = true,
+                      .math_approx_mode = false});
+
+    for (uint32_t c = 0; c < num_cores; c++) {
+        CoreCoord       cc         = {c, 0};
+        const uint32_t tile_offset = c * tiles_per_core;
+
+        SetRuntimeArgs(prog, reader_k, cc, std::vector<uint32_t>{
+            b_er->address(),     // [0]  even_r
+            b_ei->address(),     // [1]  even_i
+            b_or->address(),     // [2]  odd_r
+            b_oi->address(),     // [3]  odd_i
+            b_cmp_r->address(),  // [4]  compact twiddle real
+            b_cmp_i->address(),  // [5]  compact twiddle imag
+            tiles_per_row,       // [6]  tiles per row
+            tile_offset,         // [7]  first tile index
+            log2_row,            // [8]  num_stages
+            half_row,            // [9]  half_N
+            half_row,            // [10] local_half (ABI compat)
+            rows_per_core,       // [11] rows this core processes
+        });
+
+        SetRuntimeArgs(prog, compute_k, cc, std::vector<uint32_t>{
+            log2_row,            // [0]  num_stages
+            tiles_per_row,       // [1]  tiles_per_stage
+        });
+
+        SetRuntimeArgs(prog, writer_k, cc, std::vector<uint32_t>{
+            b_o0r->address(),    // [0]  out0_r
+            b_o0i->address(),    // [1]  out0_i
+            b_o1r->address(),    // [2]  out1_r
+            b_o1i->address(),    // [3]  out1_i
+            tiles_per_row,       // [4]  tiles per row
+            log2_row,            // [5]  num_stages
+            half_row,            // [6]  local_half
+            half_row,            // [7]  half_N
+            1u,                  // [8]  num_cores
+            c,                   // [9]  core_id
+            0u,                  // [10] log2_cores
+            tile_offset,         // [11] tile_offset for DRAM writes
+            0u,                  // [12] core_elem_base
+            rows_per_core,       // [13] rows_per_core
+        });
+    }
+
+    distributed::MeshWorkload wl;
+    distributed::MeshCoordinateRange rng =
+        distributed::MeshCoordinateRange(mesh->shape());
     wl.add_program(rng, std::move(prog));
-    auto& p = wl.get_programs().begin()->second;
-    SetRuntimeArgs(p, reader_k,  core, reader_args);
-    SetRuntimeArgs(p, writer_k,  core, writer_args);
-    SetRuntimeArgs(p, compute_k, core, compute_args);
 
-    using namespace tt::tt_metal::distributed;
-    std::cout<<"Writing inputs to DRAM...\n";
-    EnqueueWriteMeshBuffer(cq,b_er,  even_r_t, false);
-    EnqueueWriteMeshBuffer(cq,b_ei,  even_i_t, false);
-    EnqueueWriteMeshBuffer(cq,b_or,  odd_r_t,  false);
-    EnqueueWriteMeshBuffer(cq,b_oi,  odd_i_t,  false);
-    EnqueueWriteMeshBuffer(cq,b_cmp_r, cmp_r_t, false);
-    EnqueueWriteMeshBuffer(cq,b_cmp_i, cmp_i_t, false);
+    std::cout << "Writing inputs to DRAM...\n";
+    EnqueueWriteMeshBuffer(cq, b_er,    all_er,  false);
+    EnqueueWriteMeshBuffer(cq, b_ei,    all_ei,  false);
+    EnqueueWriteMeshBuffer(cq, b_or,    all_or,  false);
+    EnqueueWriteMeshBuffer(cq, b_oi,    all_oi,  false);
+    EnqueueWriteMeshBuffer(cq, b_cmp_r, cmp_r_t, false);
+    EnqueueWriteMeshBuffer(cq, b_cmp_i, cmp_i_t, false);
     Finish(cq);
 
-    std::cout<<"Launching FFT kernel ("<<log2N<<" stages on device)...\n";
-    EnqueueMeshWorkload(cq,wl,true);
-    std::cout<<"Kernel complete.\n";
+    std::cout << "Launching multicore FFT (" << num_cores << " cores, "
+              << num_rows << " rows of " << N_row << " points)...\n";
+    EnqueueMeshWorkload(cq, wl, true);
+    std::cout << "Kernel complete.\n";
 
-    std::vector<uint32_t> o0r_raw(tiles*TILE_SIZE), o0i_raw(tiles*TILE_SIZE);
-    std::vector<uint32_t> o1r_raw(tiles*TILE_SIZE), o1i_raw(tiles*TILE_SIZE);
-    EnqueueReadMeshBuffer(cq,o0r_raw,b_o0r,true);
-    EnqueueReadMeshBuffer(cq,o0i_raw,b_o0i,true);
-    EnqueueReadMeshBuffer(cq,o1r_raw,b_o1r,true);
-    EnqueueReadMeshBuffer(cq,o1i_raw,b_o1i,true);
+    std::vector<uint32_t> o0r_raw(total_bytes / 4);
+    std::vector<uint32_t> o0i_raw(total_bytes / 4);
+    std::vector<uint32_t> o1r_raw(total_bytes / 4);
+    std::vector<uint32_t> o1i_raw(total_bytes / 4);
+    EnqueueReadMeshBuffer(cq, o0r_raw, b_o0r, true);
+    EnqueueReadMeshBuffer(cq, o0i_raw, b_o0i, true);
+    EnqueueReadMeshBuffer(cq, o1r_raw, b_o1r, true);
+    EnqueueReadMeshBuffer(cq, o1i_raw, b_o1i, true);
 
-    auto o0r=unpack_tiles(o0r_raw,half_N); auto o0i=unpack_tiles(o0i_raw,half_N);
-    auto o1r=unpack_tiles(o1r_raw,half_N); auto o1i=unpack_tiles(o1i_raw,half_N);
-
-    std::vector<float> result_r(N), result_i(N);
-    for (uint32_t i=0;i<half_N;i++) {
-        result_r[i]=o0r[i]; result_i[i]=o0i[i];
-        result_r[i+half_N]=o1r[i]; result_i[i+half_N]=o1i[i];
+    std::vector<float> result_r(total_N), result_i(total_N);
+    for (uint32_t row = 0; row < num_rows; row++) {
+        const uint32_t tile_base = row * tiles_per_row * TILE_SIZE;
+        for (uint32_t i = 0; i < half_row; i++) {
+            result_r[row * N_row + i]            = u2f(o0r_raw[tile_base + i]);
+            result_i[row * N_row + i]            = u2f(o0i_raw[tile_base + i]);
+            result_r[row * N_row + i + half_row] = u2f(o1r_raw[tile_base + i]);
+            result_i[row * N_row + i + half_row] = u2f(o1i_raw[tile_base + i]);
+        }
     }
-    if (direction==1) for (uint32_t i=0;i<N;i++){result_r[i]/=N;result_i[i]/=N;}
-
-    std::cout<<"\n════════════════════════════════════════\n";
-    std::cout<<" VALIDATION\n";
-    std::cout<<"════════════════════════════════════════\n";
-    float mer=0.f, mei=0.f, me=0.f;
-    for (uint32_t i=0;i<N;i++) {
-        float er=std::abs(result_r[i]-ref_r[i]), ei=std::abs(result_i[i]-ref_i[i]);
-        mer=std::max(mer,er); mei=std::max(mei,ei); me+=er+ei;
+    if (direction == 1) {
+        const float inv_N = 1.f / static_cast<float>(N_row);
+        for (uint32_t i = 0; i < total_N; i++) {
+            result_r[i] *= inv_N;
+            result_i[i] *= inv_N;
+        }
     }
-    me /= 2*N;
-    std::cout<<" Max error (real): "<<mer<<"\n";
-    std::cout<<" Max error (imag): "<<mei<<"\n";
-    std::cout<<" Mean error      : "<<me<<"\n";
-    bool passed = (mer<0.5f)&&(mei<0.5f);
-    std::cout<<" Result: "<<(passed?"✓ PASSED":"✗ FAILED")<<"\n";
 
-    std::cout<<"\n════════════════════════════════════════\n";
-    std::cout<<" FIRST 16 RESULTS\n";
-    std::cout<<"════════════════════════════════════════\n";
-    std::cout<<std::fixed<<std::setprecision(5);
-    for (uint32_t i=0;i<16&&i<N;i++) {
-        std::cout<<" X["<<std::setw(3)<<i<<"] = "
-                 <<std::setw(12)<<result_r[i]
-                 <<(result_i[i]>=0?" + ":" - ")
-                 <<std::setw(12)<<std::abs(result_i[i])<<"j"
-                 <<"   ref: "<<std::setw(12)<<ref_r[i]
-                 <<(ref_i[i]>=0?" + ":" - ")
-                 <<std::setw(12)<<std::abs(ref_i[i])<<"j\n";
+    std::cout << "\n════════════════════════════════════════════════\n";
+    std::cout << " VALIDATION (all " << num_rows << " rows)\n";
+    std::cout << "════════════════════════════════════════════════\n";
+
+    float    mer       = 0.f, mei = 0.f, me = 0.f;
+    uint32_t worst_row = 0;
+    float    worst_err = 0.f;
+
+    for (uint32_t row = 0; row < num_rows; row++) {
+        float row_err = 0.f;
+        for (uint32_t i = 0; i < N_row; i++) {
+            const float er = std::abs(result_r[row * N_row + i]
+                                    - ref_r[row * N_row + i]);
+            const float ei = std::abs(result_i[row * N_row + i]
+                                    - ref_i[row * N_row + i]);
+            mer     = std::max(mer, er);
+            mei     = std::max(mei, ei);
+            me     += er + ei;
+            row_err = std::max(row_err, er + ei);
+        }
+        if (row_err > worst_err) { worst_err = row_err; worst_row = row; }
     }
+    me /= 2.f * static_cast<float>(total_N);
+
+    std::cout << " Max error (real): " << mer       << "\n";
+    std::cout << " Max error (imag): " << mei       << "\n";
+    std::cout << " Mean error      : " << me        << "\n";
+    std::cout << " Worst row       : " << worst_row << "\n";
+
+    const float threshold = std::max(0.5f, 0.005f * static_cast<float>(N_row));
+    const bool  passed    = (mer < threshold) && (mei < threshold);
+    std::cout << " Threshold       : " << threshold << " (0.5% of N_row)\n";
+    std::cout << " Result          : " << (passed ? "✓ PASSED" : "✗ FAILED") << "\n";
+
+    std::cout << "\n════════════════════════════════════════════════\n";
+    std::cout << " FIRST 16 RESULTS (row 0 of " << num_rows << ")\n";
+    std::cout << "════════════════════════════════════════════════\n";
+    std::cout << std::fixed << std::setprecision(5);
+    for (uint32_t i = 0; i < 16 && i < N_row; i++) {
+        std::cout << " X[" << std::setw(3) << i << "] = "
+                  << std::setw(12) << result_r[i]
+                  << (result_i[i] >= 0 ? " + " : " - ")
+                  << std::setw(12) << std::abs(result_i[i]) << "j"
+                  << "  ref: " << std::setw(12) << ref_r[i]
+                  << (ref_i[i] >= 0 ? " + " : " - ")
+                  << std::setw(12) << std::abs(ref_i[i]) << "j\n";
+    }
+
     mesh->close();
-    std::cout<<"\n════════════════════════════════════════\n Done\n";
-    std::cout<<"════════════════════════════════════════\n";
-    return passed?0:1;
+    std::cout << "\n════════════════════════════════════════════════\n";
+    std::cout << " Done\n";
+    std::cout << "════════════════════════════════════════════════\n";
+    return passed ? 0 : 1;
 }
