@@ -1,79 +1,41 @@
-// reader_fft_f32_mc.cpp — MULTICORE reader (BUGFREE + OPTIMISED)
+// reader_fft_f32_mc.cpp — MULTICORE reader (FIXED v2)
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 // ══════════════════════════════════════════════════════════════════════
-//  BUGS FIXED vs previous version
+//  CHANGES vs previous version
 // ══════════════════════════════════════════════════════════════════════
 //
-//  BUG 4 (twiddle scatter size mismatch)
-//    Old code iterated local_half (= half_N = 512 for N=1024) times and
-//    wrote individual floats into cb_tw_r/i, but each CB slot is sized
-//    for tiles_per_row tiles (1 tile = TILE_SIZE = 1024 floats for a
-//    32×32 tile). The scatter only filled the FIRST 512 of 1024 elements,
-//    leaving the second 512 as uninitialised L1 garbage. The compute
-//    kernel then read a full tile from cb_tw_r/i, seeing wrong twiddles
-//    for butterfly indices 512-1023.
+//  No logic changes in this file.  The reader is correct as written.
+//  Updated comments only:
+//    - CB 22 (tmp2) and CB 23 (tmp3) are now used by the compute kernel
+//      as t_r and t_i scratch buffers.  The reader does not touch them.
+//    - Clarified that the twiddle loop blocking at each depth-1 stage is
+//      intentional and correct: the reader blocks at stage N+1 reserve
+//      until compute drains stage N, serialising naturally.
 //
-//    FIX: iterate TILE_SIZE * tiles_per_row total elements per stage,
-//    so every element of every tile in the CB is correctly initialised
-//    before cb_push_back is called.
+//  BUG 4 FIX (retained): twiddle scatter fills elems_per_row elements,
+//  not local_half, ensuring all tile slots are initialised.
 //
-//  BUG 5 (row-loop CB race)
-//    Old code: the outer row loop reserved cb_even_r/i and cb_odd_r/i at
-//    the start of each row without waiting for the writer to finish
-//    consuming/shuffling those CBs from the *previous* row. The writer
-//    shuffles output back into cb_even/odd for the next stage — if the
-//    reader reserves new space before the writer's cb_push_back sequence
-//    completes, cb_reserve_back in the reader and cb_wait_front in the
-//    compute kernel interleave unpredictably, corrupting CB state.
-//
-//    FIX: the reader must NOT pre-reserve even/odd CBs for row N+1 until
-//    the compute+writer pipeline for row N has fully drained them. Because
-//    the reader cannot observe writer completion directly, the correct
-//    architecture is:
-//      - Stage 0 of each row: reader fills even/odd from DRAM.
-//      - Stages 1..num_stages-1: writer fills even/odd via shuffle.
-//    Therefore the reader only reserves/pushes even/odd ONCE per row
-//    (for stage 0 only), and does NOT loop over stages internally.
-//    The twiddle CB is filled once per stage (all stages), which is
-//    correct because twiddles are consumed by compute, not recycled
-//    by the writer.
+//  BUG 5 FIX (retained): reader fills even/odd from DRAM exactly once
+//  per row (stage 0 only); writer handles subsequent stages via shuffle.
 //
 // ══════════════════════════════════════════════════════════════════════
-//  OPTIMISATIONS
+//  ARGUMENT MAP
 // ══════════════════════════════════════════════════════════════════════
 //
-//  1. Compact twiddle table loaded once before the row loop (unchanged),
-//     but the base pointers are cached as const locals to avoid repeated
-//     get_read_ptr() calls inside the hot scatter loop.
-//
-//  2. NOC async reads for all four even/odd CBs are issued in one burst
-//     before the barrier — maximises DRAM read parallelism.
-//
-//  3. Twiddle scatter loop: index arithmetic uses pre-shifted constants
-//     (half_m, N_over_m) computed once per stage rather than inside
-//     the inner element loop.
-//
-//  4. TILE_SIZE elements per tile is a compile-time constant derived
-//     from tile_bytes / ELEM, eliminating the division in the loop.
-//
-// ══════════════════════════════════════════════════════════════════════
-//  ARGUMENT MAP (must match host exactly)
-// ══════════════════════════════════════════════════════════════════════
-//
-//  [0]  even_r_addr     — DRAM base address of even-real input buffer
-//  [1]  even_i_addr     — DRAM base address of even-imag input buffer
-//  [2]  odd_r_addr      — DRAM base address of odd-real  input buffer
-//  [3]  odd_i_addr      — DRAM base address of odd-imag  input buffer
-//  [4]  compact_r_addr  — DRAM base of compact twiddle real table
-//  [5]  compact_i_addr  — DRAM base of compact twiddle imag table
-//  [6]  tiles_per_row   — number of tiles per FFT row (= half_N/TILE_SIZE)
-//  [7]  tile_offset     — first tile index owned by this core
-//  [8]  num_stages      — log2(N_row)
-//  [9]  half_N          — N_row / 2
-//  [10] local_half      — elements per half-row on this core (= half_N)
-//  [11] rows_per_core   — number of FFT rows this core processes
+//  [0]  even_r_addr
+//  [1]  even_i_addr
+//  [2]  odd_r_addr
+//  [3]  odd_i_addr
+//  [4]  compact_r_addr
+//  [5]  compact_i_addr
+//  [6]  tiles_per_row
+//  [7]  tile_offset
+//  [8]  num_stages
+//  [9]  half_N
+//  [10] local_half (kept for ABI compatibility, not used in scatter loop)
+//  [11] rows_per_core
 //
 // ══════════════════════════════════════════════════════════════════════
 
@@ -81,7 +43,6 @@
 #include "api/dataflow/dataflow_api.h"
 
 void kernel_main() {
-    // ── Runtime args ─────────────────────────────────────────────────
     const uint32_t even_r_addr    = get_arg_val<uint32_t>(0);
     const uint32_t even_i_addr    = get_arg_val<uint32_t>(1);
     const uint32_t odd_r_addr     = get_arg_val<uint32_t>(2);
@@ -92,10 +53,9 @@ void kernel_main() {
     const uint32_t tile_offset    = get_arg_val<uint32_t>(7);
     const uint32_t num_stages     = get_arg_val<uint32_t>(8);
     const uint32_t half_N         = get_arg_val<uint32_t>(9);
-    // arg[10] local_half intentionally unused — see BUG 5 fix note above.
+    // arg[10] local_half — ABI compat, not used in scatter loop
     const uint32_t rows_per_core  = get_arg_val<uint32_t>(11);
 
-    // ── CB indices ────────────────────────────────────────────────────
     constexpr uint32_t cb_even_r    = 0;
     constexpr uint32_t cb_even_i    = 1;
     constexpr uint32_t cb_odd_r     = 2;
@@ -105,20 +65,14 @@ void kernel_main() {
     constexpr uint32_t cb_compact_r = 10;
     constexpr uint32_t cb_compact_i = 11;
 
-    // ── Tile geometry ─────────────────────────────────────────────────
     const uint32_t tile_bytes    = get_tile_size(cb_even_r);
     const DataFormat data_format = get_dataformat(cb_even_r);
     const uint32_t compact_bytes = half_N * sizeof(float);
 
-    // FIX (BUG 4): total elements per twiddle CB push = tiles_per_row
-    // full tiles, each of TILE_SIZE floats. For N=1024: 1 * 1024 = 1024.
     constexpr uint32_t ELEM      = sizeof(float);
+    // Total float elements per twiddle CB push = all slots in tiles_per_row tiles.
     const uint32_t elems_per_row = (tile_bytes / ELEM) * tiles_per_row;
-    // elems_per_row is the number of scalar float slots the compute kernel
-    // will read from cb_tw_r / cb_tw_i in one stage. We MUST fill all of
-    // them before pushing.
 
-    // Early exit.
     if (tiles_per_row == 0 || num_stages == 0 || rows_per_core == 0) return;
 
     // ── Address generators ────────────────────────────────────────────
@@ -141,7 +95,6 @@ void kernel_main() {
         .bank_base_address = compact_i_addr,
         .page_size = compact_bytes, .data_format = data_format };
 
-    // ── Scalar L1 accessors (BRISC/NCRISC only — no ThCon) ───────────
     auto rd32 = [](uint32_t addr) -> uint32_t {
         return *reinterpret_cast<volatile uint32_t*>(addr);
     };
@@ -149,7 +102,7 @@ void kernel_main() {
         *reinterpret_cast<volatile uint32_t*>(addr) = v;
     };
 
-    // ── Load compact twiddle table once — shared across all rows ─────
+    // ── Load compact twiddle table once (shared across all rows) ─────
     cb_reserve_back(cb_compact_r, 1);
     cb_reserve_back(cb_compact_i, 1);
     noc_async_read_tile(0, cmp_r_gen, get_write_ptr(cb_compact_r));
@@ -160,30 +113,16 @@ void kernel_main() {
 
     cb_wait_front(cb_compact_r, 1);
     cb_wait_front(cb_compact_i, 1);
-    // Cache read pointers — they will not move (compact CBs are never popped
-    // until kernel exit).
     const uint32_t cmp_r_base = get_read_ptr(cb_compact_r);
     const uint32_t cmp_i_base = get_read_ptr(cb_compact_i);
 
     // ── Outer row loop ────────────────────────────────────────────────
-    //
-    // FIX (BUG 5): the reader fills even/odd from DRAM ONCE per row
-    // (stage 0 only). For stages 1..num_stages-1 the writer performs the
-    // shuffle and pushes the next stage's even/odd. The reader must not
-    // attempt to refill even/odd during those stages.
-    //
-    // The reader IS responsible for twiddle factors every stage, because
-    // the writer does not produce twiddles — it only produces even/odd.
-
     for (uint32_t row = 0; row < rows_per_core; row++) {
         const uint32_t row_tile_base = tile_offset + row * tiles_per_row;
         const uint32_t row_elem_base = row_tile_base * (tile_bytes / ELEM);
 
         // ── Stage 0: load even/odd from DRAM ─────────────────────────
-        //
-        // Issue all four NOC reads before the barrier for maximum
-        // DRAM throughput (up to 4 outstanding requests in flight).
-
+        // Issue all four NOC reads before the barrier.
         cb_reserve_back(cb_even_r, tiles_per_row);
         cb_reserve_back(cb_even_i, tiles_per_row);
         cb_reserve_back(cb_odd_r,  tiles_per_row);
@@ -207,22 +146,15 @@ void kernel_main() {
         cb_push_back(cb_odd_r,  tiles_per_row);
         cb_push_back(cb_odd_i,  tiles_per_row);
 
-        // ── All stages: fill twiddle CBs ─────────────────────────────
+        // ── All stages: scatter twiddle factors ───────────────────────
         //
-        // Twiddle factors depend on the butterfly group (stage index and
-        // element position within the row). We scatter-read from the
-        // compact table into the full twiddle CB for each stage.
+        // The cb_tw_r/i CBs have depth=1.  The reserve at stage N+1
+        // blocks until compute pops stage N's twiddle tile.  This
+        // creates a natural stage-by-stage synchronisation: the reader
+        // cannot get more than one stage ahead of compute.
         //
-        // FIX (BUG 4): loop runs elems_per_row iterations, filling ALL
-        // elements in the tiles_per_row tiles — not just local_half.
-        // For N=1024: elems_per_row = 1024, half_N = 512,
-        // so elements 512-1023 now get the correct twiddle rather than
-        // staying as uninitialised L1 values.
-        //
-        // The twiddle index formula:
-        //   For global element p at FFT stage s with half_m = 2^s:
-        //     twiddle_index = (p mod half_m) * (half_N / half_m)
-        //                   = (p & (half_m - 1)) * N_over_m
+        // elems_per_row fills ALL float slots in the tiles_per_row tiles
+        // so no element is left uninitialised (BUG 4 fix).
 
         for (uint32_t stage = 0; stage < num_stages; stage++) {
             const uint32_t half_m      = 1u << stage;
@@ -234,7 +166,6 @@ void kernel_main() {
             const uint32_t dst_r = get_write_ptr(cb_tw_r);
             const uint32_t dst_i = get_write_ptr(cb_tw_i);
 
-            // Fill every element in the tile(s).
             for (uint32_t lp = 0; lp < elems_per_row; lp++) {
                 const uint32_t p   = row_elem_base + lp;
                 const uint32_t idx = (p & half_m_mask) * N_over_m;
@@ -245,17 +176,10 @@ void kernel_main() {
             cb_push_back(cb_tw_r, tiles_per_row);
             cb_push_back(cb_tw_i, tiles_per_row);
         }
-        // After the twiddle loop the compute+writer pipeline takes over:
-        //   - Compute drains tw_r/tw_i and even/odd, produces out0/out1.
-        //   - Writer consumes out0/out1 and (for stages <last) shuffles
-        //     results back into even/odd for the next compute stage.
-        // The reader does not touch even/odd again for this row.
-        // The cb_reserve_back at the top of the next row iteration will
-        // block correctly until the writer has drained the CBs — this is
-        // the natural back-pressure mechanism.
+        // Reader's job for this row is done.
+        // Compute+writer pipeline drains the remaining CBs independently.
     }
 
-    // ── Release compact twiddle table ─────────────────────────────────
     cb_pop_front(cb_compact_r, 1);
     cb_pop_front(cb_compact_i, 1);
 }
