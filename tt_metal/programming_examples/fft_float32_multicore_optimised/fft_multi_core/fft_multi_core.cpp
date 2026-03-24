@@ -391,10 +391,10 @@ int main(int argc, char** argv) {
 
     for (uint32_t c = 0; c < num_cores; c++) {
         CoreCoord cc = {c, 0};
-        create_cb(prog, cc,  0, tiles_per_row, TILE_BYTES);
-        create_cb(prog, cc,  1, tiles_per_row, TILE_BYTES);
-        create_cb(prog, cc,  2, tiles_per_row, TILE_BYTES);
-        create_cb(prog, cc,  3, tiles_per_row, TILE_BYTES);
+        create_cb(prog, cc,  0, tiles_per_row + 1, TILE_BYTES);
+        create_cb(prog, cc,  1, tiles_per_row + 1, TILE_BYTES);
+        create_cb(prog, cc,  2, tiles_per_row + 1, TILE_BYTES);
+        create_cb(prog, cc,  3, tiles_per_row + 1, TILE_BYTES);
         create_cb(prog, cc,  4, tiles_per_row, TILE_BYTES);
         create_cb(prog, cc,  5, tiles_per_row, TILE_BYTES);
         create_cb(prog, cc, 16, tiles_per_row, TILE_BYTES);
