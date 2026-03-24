@@ -309,7 +309,7 @@ int main(int argc, char** argv) {
     const uint32_t total_N       = N_row * num_rows;
 
     std::cout << "════════════════════════════════════════════════\n";
-    std::cout << " TT-Metal MULTICORE FFT (row decomposition....)\n";
+    std::cout << " TT-Metal MULTICORE FFT (row decomposition ok ok)\n";
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << " N_row        : " << N_row         << "\n";
     std::cout << " num_rows     : " << num_rows      << "\n";
