@@ -151,6 +151,21 @@ precompute_compact_twiddles(uint32_t N_row, uint32_t direction) {
     return {tw_r, tw_i};
 }
 
+// Compact twiddles are fetched in the reader with noc_async_read_tile().
+// Store them in DRAM as one full tile page and zero-pad the unused tail.
+static std::vector<uint32_t> padCompactTwiddlesToTile(
+    const std::vector<uint32_t>& compactTwiddles,
+    uint32_t validCount
+) {
+    std::vector<uint32_t> padded(TILE_SIZE, 0);
+    const uint32_t count = std::min<uint32_t>(validCount, static_cast<uint32_t>(compactTwiddles.size()));
+    for (uint32_t i = 0; i < count; ++i) {
+        padded[i] = compactTwiddles[i];
+    }
+    return padded;
+}
+
+
 CBHandle create_cb(Program& p, CoreCoord c, uint32_t id,
                    uint32_t ntiles, uint32_t bytes_per_tile) {
     CircularBufferConfig cfg =
