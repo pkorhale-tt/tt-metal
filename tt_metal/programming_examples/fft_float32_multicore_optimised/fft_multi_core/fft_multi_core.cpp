@@ -638,7 +638,7 @@ int main(int argc, char** argv) {
     std::cout << " Result          : " << (passed ? "✓ PASSED" : "✗ FAILED") << "\n";
 
     std::cout << "\n════════════════════════════════════════════════\n";
-    std::cout << " FIRST 16 RESULTS (row 0 of " << num_rows << ")\n";
+    std::cout << " FIRST 16 RESULTS .(row 0 of " << num_rows << ")\n";
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << std::fixed << std::setprecision(5);
     for (uint32_t i = 0; i < 16 && i < N_row; i++) {
