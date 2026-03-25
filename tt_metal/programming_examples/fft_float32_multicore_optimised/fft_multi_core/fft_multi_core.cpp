@@ -595,7 +595,7 @@ int main(int argc, char** argv) {
               << " Result           : " << (passed ? "PASS" : "FAIL") << "\n";
 
     std::cout << "\n══════════════════════════════════════\n"
-              << " FIRST 16 BINS (row 0)\n"
+              << " FIRST 16 BINS (row 0) okok\n"
               << "══════════════════════════════════════\n"
               << std::fixed << std::setprecision(4);
     for (uint32_t i = 0; i < 16 && i < N; ++i) {
