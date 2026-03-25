@@ -372,7 +372,7 @@ int main(int argc, char** argv) {
     CoreRange core_range({0, 0}, {num_cores - 1, 0});
 
     constexpr const char* KPATH =
-        "tt_metal/programming_examples/fft1d_wormhole/kernels/";
+    "tt_metal/programming_examples/fft_float32_multicore_optimised/fft_multi_core/kernels/";
 
     KernelHandle reader_k = CreateKernel(
         prog,
