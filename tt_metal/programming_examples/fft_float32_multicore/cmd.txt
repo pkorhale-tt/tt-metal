@@ -1,3 +1,7 @@
-cmake --build build --target metal_example_fft_float32_optimized_single_core -j
+cmake --build build --target metal_example_fft_float32_multi_core -j
 
-ARCH_NAME=wormhole_b0 ./build/programming_examples/fft_float32_optimized/metal_example_fft_float32_optimized_single_core 0 tt_metal/programming_examples/fft_float32_optimized/fft_single_core/sample_input.txt
+# Run synthetic data test (default 1024 points, 8 rows, auto cores)
+ARCH_NAME=wormhole_b0 ./build/programming_examples/fft_float32_multicore/metal_example_fft_float32_multi_core 0
+
+# Run with sample input file (N=4 points, 1 row, 1 core)
+ARCH_NAME=wormhole_b0 ./build/programming_examples/fft_float32_multicore/metal_example_fft_float32_multi_core 0 4 1 1 tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/sample_input.txt
