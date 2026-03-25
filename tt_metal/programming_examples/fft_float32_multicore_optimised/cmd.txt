@@ -1,3 +1,10 @@
 cmake --build build --target metal_example_fft_float32_multi_core_optimised -j
 
 ARCH_NAME=wormhole_b0 ./build/programming_examples/fft_float32_multicore_optimised/metal_example_fft_float32_multi_core_optimised 0 tt_metal/programming_examples/fft_float32_multicore_optimised/fft_multi_core/sample_input.txt
+
+
+============================
+
+
+cmake --build build --target metal_example_fft_float32_multi_core_optimised
+ARCH_NAME=wormhole_b0 ./build/programming_examples/fft_float32_multicore_optimised/metal_example_fft_float32_multi_core_optimised 0 8 1 8 tt_metal/programming_examples/fft_float32_multicore_optimised/fft_multi_core/sample_input.txt
