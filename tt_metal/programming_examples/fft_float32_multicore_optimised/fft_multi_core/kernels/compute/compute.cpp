@@ -27,6 +27,8 @@
 #include <cstdint>
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
 
 // ---------------------------------------------------------------------------
 // Helpers: compute and pack into dst_cb.  Inputs not popped — caller manages.
