@@ -141,37 +141,36 @@ static bool read_input(const std::string& path, uint32_t N,
     return true;
 }
 
-
 // ── Stage-specific twiddle precomputation ─────────────────────────────
-// For stage s (0-based), m = 2^(s+1), half_m = m/2.
-// The butterfly uses W_m^j for j = 0..half_m-1, repeated per group.
-// We materialize one packed tile-set per stage so the reader can stream the
-// correct twiddle layout for each stage directly from DRAM.
+// For stage s (m = 2^(s+1), half_m = m/2), odd lanes use W_m^(k mod half_m).
+// We materialize one tile-packed twiddle table per stage so the reader can
+// stream the correct table for each stage.
 static void precompute_stage_twiddles(
     uint32_t N, bool inv, uint32_t tiles_per_row,
-    std::vector<uint32_t>& tw_r, std::vector<uint32_t>& tw_i)
+    std::vector<uint32_t>& tw_r,
+    std::vector<uint32_t>& tw_i)
 {
     const uint32_t log2N  = log2_exact(N);
     const uint32_t half_N = N / 2;
-    const uint32_t stage_elems = tiles_per_row * TILE_SIZE;
     const float sign = inv ? 1.f : -1.f;
 
-    tw_r.assign(log2N * stage_elems, f2u(0.f));
-    tw_i.assign(log2N * stage_elems, f2u(0.f));
+    tw_r.assign(log2N * tiles_per_row * TILE_SIZE, f2u(0.f));
+    tw_i.assign(log2N * tiles_per_row * TILE_SIZE, f2u(0.f));
 
     for (uint32_t stage = 0; stage < log2N; ++stage) {
-        const uint32_t m      = 1u << (stage + 1);
+        const uint32_t m = 1u << (stage + 1);
         const uint32_t half_m = m >> 1;
-        const uint32_t base   = stage * stage_elems;
+        const uint32_t stage_base = stage * tiles_per_row * TILE_SIZE;
 
-        for (uint32_t i = 0; i < half_N; ++i) {
-            const uint32_t j = i % half_m;
+        for (uint32_t k = 0; k < half_N; ++k) {
+            const uint32_t j = k % half_m;
             const float angle = sign * 2.f * PI * static_cast<float>(j) / static_cast<float>(m);
-            tw_r[base + i] = f2u(cosf(angle));
-            tw_i[base + i] = f2u(sinf(angle));
+            tw_r[stage_base + k] = f2u(cosf(angle));
+            tw_i[stage_base + k] = f2u(sinf(angle));
         }
     }
 }
+
 
 // ── Host-side bit-reversal + even/odd split ───────────────────────────
 // Produces the stage-0 input buffers: bit-reversed permutation, then split
@@ -351,7 +350,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ── Stage-specific twiddle tiles ───────────────────────────────────
+    // ── Stage-specific twiddle tables ───────────────────────────────────
     std::vector<uint32_t> ctw_r, ctw_i;
     precompute_stage_twiddles(N, inv, tiles_per_row, ctw_r, ctw_i);
 
@@ -563,7 +562,7 @@ int main(int argc, char** argv) {
               << " Result           : " << (passed ? "✓ PASSED" : "✗ FAILED") << "\n";
 
     std::cout << "\n══════════════════════════════════════\n"
-              << " FIRST 16 BINS (row 0) ok\n"
+              << " FIRST 16 BINS (row 0)\n"
               << "══════════════════════════════════════\n"
               << std::fixed << std::setprecision(4);
     for (uint32_t i = 0; i < 16 && i < N; ++i) {
