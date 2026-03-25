@@ -38,7 +38,7 @@
 //    [10] rows_per_core
 
 #include <cstdint>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 void kernel_main() {
     const uint32_t even_r_addr   = get_arg_val<uint32_t>(0);

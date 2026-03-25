@@ -25,8 +25,8 @@
 //    [2] rows_per_core
 
 #include <cstdint>
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
 
 // ---------------------------------------------------------------------------
 // Helpers: compute and pack into dst_cb.  Inputs not popped — caller manages.
@@ -73,9 +73,7 @@ ALWI void sub_into(uint32_t a, uint32_t b, uint32_t dst) {
     cb_push_back(dst, 1);
 }
 
-namespace NAMESPACE {
-
-void MAIN {
+void kernel_main() {
     const uint32_t num_stages      = get_arg_val<uint32_t>(0);
     const uint32_t tiles_per_stage = get_arg_val<uint32_t>(1);
     const uint32_t rows_per_core   = get_arg_val<uint32_t>(2);
@@ -166,5 +164,3 @@ void MAIN {
         }
     }
 }
-
-} // namespace NAMESPACE
