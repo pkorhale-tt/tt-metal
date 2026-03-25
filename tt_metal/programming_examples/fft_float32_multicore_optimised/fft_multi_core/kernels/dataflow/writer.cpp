@@ -1,9 +1,4 @@
-// writer_fixed.cpp
-// Wormhole FFT writer / feedback kernel (RISCV_1)
-//
-// Key fix:
-//   Shuffle only over VALID FFT elements (half_N), not over the full padded tile.
-//   Padded lanes are kept zero.
+// writer.cpp — Wormhole 1-D FFT output / feedback kernel (RISCV_1)
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -19,9 +14,7 @@ void kernel_main() {
     const uint32_t tile_offset   = get_arg_val<uint32_t>(7);
     const uint32_t rows_per_core = get_arg_val<uint32_t>(8);
 
-    if (tiles_per_row == 0 || num_stages == 0 || rows_per_core == 0) {
-        return;
-    }
+    if (tiles_per_row == 0 || num_stages == 0 || rows_per_core == 0) return;
 
     constexpr uint32_t CB_OER    = 6;
     constexpr uint32_t CB_OEI    = 7;
@@ -37,39 +30,24 @@ void kernel_main() {
     constexpr uint32_t CB_SCR_OI = 19;
 
     const uint32_t tile_bytes = get_tile_size(CB_OER);
-    const DataFormat fmt = get_dataformat(CB_OER);
+    const DataFormat fmt      = get_dataformat(CB_OER);
     constexpr uint32_t F = 4u;
-
-    const uint32_t total_elems = tiles_per_row * (tile_bytes / F);
-    const uint32_t valid_elems = half_N;
+    const uint32_t elems_padded = tiles_per_row * (tile_bytes / F);
+    const uint32_t valid_elems  = half_N;
 
     const InterleavedAddrGenFast<true> gen_er = {
-        .bank_base_address = out_er_addr,
-        .page_size = tile_bytes,
-        .data_format = fmt,
-    };
+        .bank_base_address = out_er_addr, .page_size = tile_bytes, .data_format = fmt };
     const InterleavedAddrGenFast<true> gen_ei = {
-        .bank_base_address = out_ei_addr,
-        .page_size = tile_bytes,
-        .data_format = fmt,
-    };
+        .bank_base_address = out_ei_addr, .page_size = tile_bytes, .data_format = fmt };
     const InterleavedAddrGenFast<true> gen_or = {
-        .bank_base_address = out_or_addr,
-        .page_size = tile_bytes,
-        .data_format = fmt,
-    };
+        .bank_base_address = out_or_addr, .page_size = tile_bytes, .data_format = fmt };
     const InterleavedAddrGenFast<true> gen_oi = {
-        .bank_base_address = out_oi_addr,
-        .page_size = tile_bytes,
-        .data_format = fmt,
-    };
+        .bank_base_address = out_oi_addr, .page_size = tile_bytes, .data_format = fmt };
 
     auto rd32 = [](uint32_t a) -> uint32_t {
-        return *reinterpret_cast<volatile uint32_t*>(a);
-    };
+        return *reinterpret_cast<volatile uint32_t*>(a); };
     auto wr32 = [](uint32_t a, uint32_t v) {
-        *reinterpret_cast<volatile uint32_t*>(a) = v;
-    };
+        *reinterpret_cast<volatile uint32_t*>(a) = v; };
 
     const uint32_t scr_er = get_write_ptr(CB_SCR_ER);
     const uint32_t scr_ei = get_write_ptr(CB_SCR_EI);
@@ -107,18 +85,13 @@ void kernel_main() {
                 cb_pop_front(CB_OOR, tiles_per_row);
                 cb_pop_front(CB_OOI, tiles_per_row);
             } else {
-                const uint32_t m       = 1u << (stage + 1);
-                const uint32_t half_m  = m >> 1;
-                const uint32_t m2      = m << 1;
-                const uint32_t half_m2 = m2 >> 1;
-                const uint32_t G2      = valid_elems / half_m2;
-
                 const uint32_t src_er = get_read_ptr(CB_OER);
                 const uint32_t src_ei = get_read_ptr(CB_OEI);
                 const uint32_t src_or = get_read_ptr(CB_OOR);
                 const uint32_t src_oi = get_read_ptr(CB_OOI);
 
-                for (uint32_t lp = 0; lp < total_elems; ++lp) {
+                // zero entire padded region first
+                for (uint32_t lp = 0; lp < elems_padded; ++lp) {
                     const uint32_t off = lp * F;
                     wr32(scr_er + off, 0u);
                     wr32(scr_ei + off, 0u);
@@ -126,30 +99,31 @@ void kernel_main() {
                     wr32(scr_oi + off, 0u);
                 }
 
-                const uint32_t log2m  = stage + 1;
-                const uint32_t m_mask = m - 1u;
+                const uint32_t m       = 1u << (stage + 1);
+                const uint32_t half_m  = m >> 1;
+                const uint32_t next_m  = m << 1;
+                const uint32_t next_hm = next_m >> 1;
+                const uint32_t num_groups_next = (next_hm <= valid_elems) ? (valid_elems / next_hm) : 1u;
+                const uint32_t log2m   = stage + 1;
+                const uint32_t m_mask  = m - 1u;
 
                 uint32_t dst_idx = 0;
-                for (uint32_t g2 = 0; g2 < G2; ++g2) {
-                    const uint32_t base_e = g2 * m2;
-                    const uint32_t base_o = base_e + half_m2;
+                for (uint32_t g2 = 0; g2 < num_groups_next; ++g2) {
+                    const uint32_t base_e = g2 * next_m;
+                    const uint32_t base_o = base_e + next_hm;
 
-                    for (uint32_t j2 = 0; j2 < half_m2; ++j2, ++dst_idx) {
+                    for (uint32_t j2 = 0; j2 < next_hm && dst_idx < valid_elems; ++j2, ++dst_idx) {
                         {
                             const uint32_t f = base_e + j2;
                             const uint32_t g_cur = f >> log2m;
                             const uint32_t offset = f & m_mask;
-                            uint32_t idx;
-                            uint32_t sr;
-                            uint32_t si;
+                            uint32_t idx, sr, si;
                             if (offset < half_m) {
                                 idx = g_cur * half_m + offset;
-                                sr = src_er;
-                                si = src_ei;
+                                sr = src_er; si = src_ei;
                             } else {
                                 idx = g_cur * half_m + (offset - half_m);
-                                sr = src_or;
-                                si = src_oi;
+                                sr = src_or; si = src_oi;
                             }
                             wr32(scr_er + dst_idx * F, rd32(sr + idx * F));
                             wr32(scr_ei + dst_idx * F, rd32(si + idx * F));
@@ -158,17 +132,13 @@ void kernel_main() {
                             const uint32_t f = base_o + j2;
                             const uint32_t g_cur = f >> log2m;
                             const uint32_t offset = f & m_mask;
-                            uint32_t idx;
-                            uint32_t sr;
-                            uint32_t si;
+                            uint32_t idx, sr, si;
                             if (offset < half_m) {
                                 idx = g_cur * half_m + offset;
-                                sr = src_er;
-                                si = src_ei;
+                                sr = src_er; si = src_ei;
                             } else {
                                 idx = g_cur * half_m + (offset - half_m);
-                                sr = src_or;
-                                si = src_oi;
+                                sr = src_or; si = src_oi;
                             }
                             wr32(scr_or + dst_idx * F, rd32(sr + idx * F));
                             wr32(scr_oi + dst_idx * F, rd32(si + idx * F));
@@ -191,7 +161,7 @@ void kernel_main() {
                 const uint32_t dst_or = get_write_ptr(CB_OR);
                 const uint32_t dst_oi = get_write_ptr(CB_OI);
 
-                for (uint32_t lp = 0; lp < total_elems; ++lp) {
+                for (uint32_t lp = 0; lp < elems_padded; ++lp) {
                     const uint32_t off = lp * F;
                     wr32(dst_er + off, rd32(scr_er + off));
                     wr32(dst_ei + off, rd32(scr_ei + off));

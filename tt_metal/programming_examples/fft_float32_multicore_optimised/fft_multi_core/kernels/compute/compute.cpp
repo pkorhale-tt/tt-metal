@@ -1,53 +1,43 @@
-// compute_fixed.cpp
-// Same compute protocol as your version.
-// This part was mostly okay; the big correctness issue was the twiddle source.
+// compute.cpp — Tensix compute kernel (Wormhole 1-D FFT, DIT radix-2)
+//
+// Uses FPU tile ops directly on circular buffers. This avoids the fragile
+// scratch-CB round-trip through copy_tile/mul_binary_tile/add_binary_tile that
+// was producing incorrect zero outputs.
 
 #include <cstdint>
-#include "api/compute/tile_move_copy.h"
 #include "api/compute/eltwise_binary.h"
-#include "api/compute/eltwise_binary_sfpu.h"
-#include "api/compute/eltwise_unary/eltwise_unary.h"
 
-inline void mulCb(uint32_t a, uint32_t b, uint32_t dst) {
+inline void binaryOpToCbMul(uint32_t a, uint32_t b, uint32_t dst) {
     cb_reserve_back(dst, 1);
     tile_regs_acquire();
-    copy_tile_init(a); copy_tile(a, 0, 0);
-    copy_tile_init(b); copy_tile(b, 0, 1);
-    mul_binary_tile_init();
-    mul_binary_tile(0, 1, 0);
+    mul_tiles_init(a, b);
+    mul_tiles(a, b, 0, 0, 0);
     tile_regs_commit();
     tile_regs_wait();
-    pack_reconfig_data_format(dst);
     pack_tile(0, dst);
     tile_regs_release();
     cb_push_back(dst, 1);
 }
 
-inline void addCb(uint32_t a, uint32_t b, uint32_t dst) {
+inline void binaryOpToCbAdd(uint32_t a, uint32_t b, uint32_t dst) {
     cb_reserve_back(dst, 1);
     tile_regs_acquire();
-    copy_tile_init(a); copy_tile(a, 0, 0);
-    copy_tile_init(b); copy_tile(b, 0, 1);
-    add_binary_tile_init();
-    add_binary_tile(0, 1, 0);
+    add_tiles_init(a, b, false);
+    add_tiles(a, b, 0, 0, 0);
     tile_regs_commit();
     tile_regs_wait();
-    pack_reconfig_data_format(dst);
     pack_tile(0, dst);
     tile_regs_release();
     cb_push_back(dst, 1);
 }
 
-inline void subCb(uint32_t a, uint32_t b, uint32_t dst) {
+inline void binaryOpToCbSub(uint32_t a, uint32_t b, uint32_t dst) {
     cb_reserve_back(dst, 1);
     tile_regs_acquire();
-    copy_tile_init(a); copy_tile(a, 0, 0);
-    copy_tile_init(b); copy_tile(b, 0, 1);
-    sub_binary_tile_init();
-    sub_binary_tile(0, 1, 0);
+    sub_tiles_init(a, b, false);
+    sub_tiles(a, b, 0, 0, 0);
     tile_regs_commit();
     tile_regs_wait();
-    pack_reconfig_data_format(dst);
     pack_tile(0, dst);
     tile_regs_release();
     cb_push_back(dst, 1);
@@ -73,9 +63,7 @@ void kernel_main() {
     constexpr uint32_t CB_T2  = 12;
     constexpr uint32_t CB_T3  = 13;
 
-    if (num_stages == 0 || tiles_per_stage == 0 || rows_per_core == 0) {
-        return;
-    }
+    if (num_stages == 0 || tiles_per_stage == 0 || rows_per_core == 0) return;
 
     for (uint32_t row = 0; row < rows_per_core; ++row) {
         for (uint32_t stage = 0; stage < num_stages; ++stage) {
@@ -87,19 +75,21 @@ void kernel_main() {
                 cb_wait_front(CB_TWR, 1);
                 cb_wait_front(CB_TWI, 1);
 
-                mulCb(CB_TWR, CB_OR, CB_T0);
+                // W_real = tw_r*odd_r - tw_i*odd_i
+                binaryOpToCbMul(CB_TWR, CB_OR, CB_T0);
+                binaryOpToCbMul(CB_TWI, CB_OI, CB_T1);
                 cb_wait_front(CB_T0, 1);
-                mulCb(CB_TWI, CB_OI, CB_T1);
                 cb_wait_front(CB_T1, 1);
-                subCb(CB_T0, CB_T1, CB_T2);
+                binaryOpToCbSub(CB_T0, CB_T1, CB_T2);
                 cb_pop_front(CB_T0, 1);
                 cb_pop_front(CB_T1, 1);
 
-                mulCb(CB_TWR, CB_OI, CB_T0);
+                // W_imag = tw_r*odd_i + tw_i*odd_r
+                binaryOpToCbMul(CB_TWR, CB_OI, CB_T0);
+                binaryOpToCbMul(CB_TWI, CB_OR, CB_T1);
                 cb_wait_front(CB_T0, 1);
-                mulCb(CB_TWI, CB_OR, CB_T1);
                 cb_wait_front(CB_T1, 1);
-                addCb(CB_T0, CB_T1, CB_T3);
+                binaryOpToCbAdd(CB_T0, CB_T1, CB_T3);
                 cb_pop_front(CB_T0, 1);
                 cb_pop_front(CB_T1, 1);
 
@@ -111,10 +101,10 @@ void kernel_main() {
                 cb_wait_front(CB_T2, 1);
                 cb_wait_front(CB_T3, 1);
 
-                addCb(CB_ER, CB_T2, CB_OER);
-                addCb(CB_EI, CB_T3, CB_OEI);
-                subCb(CB_ER, CB_T2, CB_OOR);
-                subCb(CB_EI, CB_T3, CB_OOI);
+                binaryOpToCbAdd(CB_ER, CB_T2, CB_OER);
+                binaryOpToCbAdd(CB_EI, CB_T3, CB_OEI);
+                binaryOpToCbSub(CB_ER, CB_T2, CB_OOR);
+                binaryOpToCbSub(CB_EI, CB_T3, CB_OOI);
 
                 cb_pop_front(CB_ER, 1);
                 cb_pop_front(CB_EI, 1);
