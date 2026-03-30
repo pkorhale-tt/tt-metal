@@ -317,19 +317,19 @@ int main(int argc, char** argv) {
     
     // Create kernels
     KernelHandle reader_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/reader_fft_1d_64core.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/reader_fft.cpp",
         core_range,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                           .noc = NOC::RISCV_0_default});
     
     KernelHandle writer_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/writer_fft_1d_64core.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/writer.cpp",
         core_range,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
                           .noc = NOC::RISCV_1_default});
     
     KernelHandle compute_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/compute/fft_compute_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/compute/compute.cpp",
         core_range,
         ComputeConfig{.math_fidelity = MathFidelity::HiFi4,
                      .fp32_dest_acc_en = true,
