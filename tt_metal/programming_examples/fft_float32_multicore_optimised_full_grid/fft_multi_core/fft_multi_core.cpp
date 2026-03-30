@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
     
     // Create kernels
     KernelHandle reader_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/reader_fft.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/reader.cpp",
         core_range,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                           .noc = NOC::RISCV_0_default});
