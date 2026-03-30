@@ -1,4 +1,4 @@
-// fft_1d_64core.cpp - Host program for 64-core 1D FFT
+// fft_1d_64core.cpp - Complete host program for 64-core 1D FFT
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -9,9 +9,14 @@
 #include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <chrono>
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
 #include "tt_metal/api/tt-metalium/distributed.hpp"
+#include "tt_metal/api/tt-metalium/base_types.hpp"
+#include "tt_metal/api/tt-metalium/mesh_workload.hpp"
+#include "tt_metal/api/tt-metalium/allocator.hpp"
+#include "tt_metal/api/tt-metalium/hal.hpp"
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -22,7 +27,99 @@ constexpr uint32_t TILE_W     = tt::constants::TILE_WIDTH;
 constexpr uint32_t TILE_SIZE  = TILE_H * TILE_W;
 constexpr uint32_t TILE_BYTES = TILE_SIZE * sizeof(float);
 
-// Bit reversal with core-aware distribution
+// ─────── Missing utility functions ───────
+
+inline uint32_t f2u(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+
+inline float u2f(uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+uint32_t bit_reverse(uint32_t x, uint32_t log2n) {
+    uint32_t r = 0;
+    for (uint32_t i = 0; i < log2n; i++) {
+        r = (r << 1) | (x & 1);
+        x >>= 1;
+    }
+    return r;
+}
+
+void cpu_fft(std::vector<float>& re, std::vector<float>& im, bool inv) {
+    uint32_t N = re.size(), log2N = 0;
+    while ((1u << log2N) < N) log2N++;
+    
+    // Bit-reversal permutation
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t j = bit_reverse(i, log2N);
+        if (i < j) {
+            std::swap(re[i], re[j]);
+            std::swap(im[i], im[j]);
+        }
+    }
+    
+    // Cooley-Tukey FFT
+    for (uint32_t s = 0; s < log2N; s++) {
+        uint32_t m = 1u << (s + 1);
+        float angle_base = (inv ? 2.f : -2.f) * PI / m;
+        
+        for (uint32_t k = 0; k < N; k += m) {
+            for (uint32_t j = 0; j < m/2; j++) {
+                float wr = std::cos(angle_base * j);
+                float wi = std::sin(angle_base * j);
+                
+                uint32_t e = k + j;
+                uint32_t o = k + j + m/2;
+                
+                float tr = wr * re[o] - wi * im[o];
+                float ti = wr * im[o] + wi * re[o];
+                
+                float er = re[e], ei = im[e];
+                re[e] = er + tr;
+                im[e] = ei + ti;
+                re[o] = er - tr;
+                im[o] = ei - ti;
+            }
+        }
+    }
+    
+    if (inv) {
+        for (uint32_t i = 0; i < N; i++) {
+            re[i] /= N;
+            im[i] /= N;
+        }
+    }
+}
+
+std::pair<std::vector<uint32_t>, std::vector<uint32_t>> 
+precompute_compact_twiddles(uint32_t N, uint32_t direction) {
+    uint32_t half_N = N / 2;
+    float sign = (direction == 1) ? 1.f : -1.f;
+    std::vector<uint32_t> tw_r(half_N, 0u);
+    std::vector<uint32_t> tw_i(half_N, 0u);
+    
+    for (uint32_t k = 0; k < half_N; k++) {
+        float angle = sign * 2.f * PI * k / N;
+        tw_r[k] = f2u(std::cos(angle));
+        tw_i[k] = f2u(std::sin(angle));
+    }
+    
+    return {tw_r, tw_i};
+}
+
+CBHandle create_cb(Program& p, CoreCoord c, uint32_t id, uint32_t ntiles, uint32_t bytes) {
+    CircularBufferConfig cfg = 
+        CircularBufferConfig(ntiles * bytes, {{id, tt::DataFormat::Float32}})
+            .set_page_size(id, bytes);
+    return CreateCircularBuffer(p, c, cfg);
+}
+
+// Bit reversal with core-aware distribution for 64 cores
 void prepare_multicore_stage0(
     const std::vector<float>& sr, const std::vector<float>& si,
     uint32_t N, uint32_t log2N, uint32_t num_cores,
@@ -138,6 +235,15 @@ int main(int argc, char** argv) {
     // Precompute twiddles
     auto [tw_r, tw_i] = precompute_compact_twiddles(N, 0);
     
+    // Pad twiddle vectors to tile boundary
+    {
+        uint32_t tw_elems = N / 2;
+        uint32_t tw_tiles = (tw_elems + TILE_SIZE - 1) / TILE_SIZE;
+        uint32_t padded_size = tw_tiles * TILE_SIZE;
+        tw_r.resize(padded_size, 0u);
+        tw_i.resize(padded_size, 0u);
+    }
+    
     // Create program
     Program prog = CreateProgram();
     
@@ -213,19 +319,19 @@ int main(int argc, char** argv) {
     
     // Create kernels
     KernelHandle reader_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_1d_64core/kernels/dataflow/reader_fft_1d_64core.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/reader_fft_1d_64core.cpp",
         core_range,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                           .noc = NOC::RISCV_0_default});
     
     KernelHandle writer_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_1d_64core/kernels/dataflow/writer_fft_1d_64core.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/writer_fft_1d_64core.cpp",
         core_range,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
                           .noc = NOC::RISCV_1_default});
     
     KernelHandle compute_k = CreateKernel(prog,
-        "tt_metal/programming_examples/fft_float32_multicore/fft_multi_core/kernels/compute/fft_compute_f32.cpp",
+        "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/compute/fft_compute_f32.cpp",
         core_range,
         ComputeConfig{.math_fidelity = MathFidelity::HiFi4,
                      .fp32_dest_acc_en = true,

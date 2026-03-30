@@ -1,3 +1,5 @@
+cmake -B build -DBUILD_PROGRAMMING_EXAMPLES=ON -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20
+
 cmake --build build --target metal_example_fft_float32_multi_core_optimised_full_grid -j
 
 ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 ./build/programming_examples/fft_float32_multicore_optimised_full_grid/metal_example_fft_float32_multi_core_optimised_full_grid 0 65536 64
