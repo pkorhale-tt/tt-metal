@@ -1,4 +1,4 @@
-// fft_1d_64core.cpp - Complete host program for 64-core 1D FFT
+// fft_multi_core.cpp - Complete host program for 64-core 1D FFT
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -27,7 +27,7 @@ constexpr uint32_t TILE_W     = tt::constants::TILE_WIDTH;
 constexpr uint32_t TILE_SIZE  = TILE_H * TILE_W;
 constexpr uint32_t TILE_BYTES = TILE_SIZE * sizeof(float);
 
-// ─────── Missing utility functions ───────
+// ─────── Utility functions ───────
 
 inline uint32_t f2u(float f) {
     uint32_t u;
@@ -119,7 +119,7 @@ CBHandle create_cb(Program& p, CoreCoord c, uint32_t id, uint32_t ntiles, uint32
     return CreateCircularBuffer(p, c, cfg);
 }
 
-// Bit reversal with core-aware distribution for 64 cores
+// Bit reversal with core-aware distribution for multicore
 void prepare_multicore_stage0(
     const std::vector<float>& sr, const std::vector<float>& si,
     uint32_t N, uint32_t log2N, uint32_t num_cores,
@@ -129,7 +129,6 @@ void prepare_multicore_stage0(
     std::vector<std::vector<uint32_t>>& odd_i
 ) {
     uint32_t half_N = N / 2;
-    uint32_t elems_per_core = N / num_cores;
     uint32_t half_per_core = half_N / num_cores;
     uint32_t tiles_per_core = (half_per_core + TILE_SIZE - 1) / TILE_SIZE;
     
@@ -138,32 +137,33 @@ void prepare_multicore_stage0(
     odd_r.resize(num_cores);
     odd_i.resize(num_cores);
     
+    // Initialize vectors with proper size
+    for (uint32_t c = 0; c < num_cores; c++) {
+        even_r[c].resize(tiles_per_core * TILE_SIZE, 0u);
+        even_i[c].resize(tiles_per_core * TILE_SIZE, 0u);
+        odd_r[c].resize(tiles_per_core * TILE_SIZE, 0u);
+        odd_i[c].resize(tiles_per_core * TILE_SIZE, 0u);
+    }
+    
     // Use bit-reversed distribution for optimal data locality
     for (uint32_t i = 0; i < half_N; i++) {
         uint32_t e_idx = bit_reverse(2*i,   log2N);
         uint32_t o_idx = bit_reverse(2*i+1, log2N);
         
         // Determine which core owns this butterfly pair
-        // Use lower bits for core assignment to maintain locality
+        // Use modulo for cyclic distribution to maintain locality
         uint32_t core_id = i % num_cores;
         uint32_t local_idx = i / num_cores;
         
         // Pack into appropriate tile position
         uint32_t tile_idx = local_idx / TILE_SIZE;
         uint32_t elem_idx = local_idx % TILE_SIZE;
+        uint32_t flat_idx = tile_idx * TILE_SIZE + elem_idx;
         
-        // Ensure vector is large enough
-        if (even_r[core_id].size() <= tile_idx * TILE_SIZE + elem_idx) {
-            even_r[core_id].resize(tiles_per_core * TILE_SIZE, 0u);
-            even_i[core_id].resize(tiles_per_core * TILE_SIZE, 0u);
-            odd_r[core_id].resize(tiles_per_core * TILE_SIZE, 0u);
-            odd_i[core_id].resize(tiles_per_core * TILE_SIZE, 0u);
-        }
-        
-        even_r[core_id][tile_idx * TILE_SIZE + elem_idx] = f2u(sr[e_idx]);
-        even_i[core_id][tile_idx * TILE_SIZE + elem_idx] = f2u(si[e_idx]);
-        odd_r[core_id][tile_idx * TILE_SIZE + elem_idx]  = f2u(sr[o_idx]);
-        odd_i[core_id][tile_idx * TILE_SIZE + elem_idx]  = f2u(si[o_idx]);
+        even_r[core_id][flat_idx] = f2u(sr[e_idx]);
+        even_i[core_id][flat_idx] = f2u(si[e_idx]);
+        odd_r[core_id][flat_idx]  = f2u(sr[o_idx]);
+        odd_i[core_id][flat_idx]  = f2u(si[o_idx]);
     }
 }
 
@@ -185,8 +185,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    uint32_t elems_per_core = N / num_cores;
-    uint32_t half_per_core = elems_per_core / 2;
+    uint32_t half_per_core = (N / num_cores) / 2;
     uint32_t tiles_per_core = (half_per_core + TILE_SIZE - 1) / TILE_SIZE;
     uint32_t local_stages = log2N - log2_cores;
     
@@ -195,7 +194,7 @@ int main(int argc, char** argv) {
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << " N             : " << N << "\n";
     std::cout << " Cores         : " << num_cores << "\n";
-    std::cout << " Elems/core    : " << elems_per_core << "\n";
+    std::cout << " Elems/core    : " << (N / num_cores) << "\n";
     std::cout << " Local stages  : " << local_stages << "\n";
     std::cout << " Cross stages  : " << log2_cores << "\n";
     std::cout << " Tiles/core    : " << tiles_per_core << "\n";
@@ -215,7 +214,6 @@ int main(int argc, char** argv) {
     // Device setup
     auto mesh = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
     auto& cq  = mesh->mesh_command_queue();
-    IDevice* device = mesh->get_devices().at(0);
     
     // Prepare data with bit-reversal
     std::vector<std::vector<uint32_t>> core_even_r, core_even_i;
@@ -427,7 +425,7 @@ int main(int argc, char** argv) {
     std::vector<float> result_r(N), result_i(N);
     for (uint32_t core_id = 0; core_id < num_cores; core_id++) {
         uint32_t base_idx = core_id * tiles_per_core * TILE_SIZE;
-        uint32_t elem_base = core_id * elems_per_core;
+        uint32_t elem_base = core_id * (N / num_cores);
         
         for (uint32_t i = 0; i < half_per_core; i++) {
             result_r[elem_base + i] = u2f(out0_r_raw[base_idx + i]);
@@ -458,10 +456,17 @@ int main(int argc, char** argv) {
     
     // Show first few results
     std::cout << "\nFirst 8 values:\n";
+    std::cout << std::fixed << std::setprecision(4);
     for (uint32_t i = 0; i < 8 && i < N; i++) {
-        std::cout << " X[" << i << "] = " << std::fixed << std::setprecision(4)
-                  << result_r[i] << " + " << result_i[i] << "j"
-                  << " (ref: " << ref_r[i] << " + " << ref_i[i] << "j)\n";
+        std::cout << " X[" << std::setw(3) << i << "] = " 
+                  << std::setw(10) << result_r[i];
+        if (result_i[i] >= 0) std::cout << " + ";
+        else std::cout << " - ";
+        std::cout << std::setw(10) << std::abs(result_i[i]) << "j"
+                  << "   (ref: " << std::setw(10) << ref_r[i];
+        if (ref_i[i] >= 0) std::cout << " + ";
+        else std::cout << " - ";
+        std::cout << std::setw(10) << std::abs(ref_i[i]) << "j)\n";
     }
     
     mesh->close();
