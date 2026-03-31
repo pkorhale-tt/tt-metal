@@ -1,4 +1,4 @@
-// reader_fft_1d_64core.cpp - FIXED
+// reader_fft_1d_64core.cpp - FIXED with stage-by-stage twiddle generation
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -35,6 +35,7 @@ void kernel_main() {
     const uint32_t tile_bytes = get_tile_size(cb_even_r);
     const DataFormat data_format = get_dataformat(cb_even_r);
     constexpr uint32_t ELEM = sizeof(float);
+    constexpr uint32_t TILE_SIZE = 1024;
     
     const InterleavedAddrGenFast<true> even_r_gen = {
         .bank_base_address = even_r_addr,
@@ -49,7 +50,9 @@ void kernel_main() {
         .bank_base_address = odd_i_addr,
         .page_size = tile_bytes, .data_format = data_format };
     
-    // ─────── Phase 1: Load initial data ───────
+    // ═══════════════════════════════════════════════════
+    // Phase 1: Load Initial Data from DRAM
+    // ═══════════════════════════════════════════════════
     cb_reserve_back(cb_even_r, local_tiles);
     cb_reserve_back(cb_even_i, local_tiles);
     cb_reserve_back(cb_odd_r,  local_tiles);
@@ -67,65 +70,89 @@ void kernel_main() {
             get_write_ptr(cb_odd_i)  + t * tile_bytes);
     }
     
-    // Load compact twiddle table
-    const uint32_t compact_bytes = half_N * ELEM;
-    cb_reserve_back(cb_compact_r, 1);
-    cb_reserve_back(cb_compact_i, 1);
-    noc_async_read(compact_r_addr, get_write_ptr(cb_compact_r), compact_bytes);
-    noc_async_read(compact_i_addr, get_write_ptr(cb_compact_i), compact_bytes);
-    
     noc_async_read_barrier();
     
     cb_push_back(cb_even_r, local_tiles);
     cb_push_back(cb_even_i, local_tiles);
     cb_push_back(cb_odd_r,  local_tiles);
     cb_push_back(cb_odd_i,  local_tiles);
+    
+    // ═══════════════════════════════════════════════════
+    // Phase 2: Load Compact Twiddle Table
+    // ═══════════════════════════════════════════════════
+    const uint32_t compact_bytes = half_N * ELEM;
+    cb_reserve_back(cb_compact_r, 1);
+    cb_reserve_back(cb_compact_i, 1);
+    
+    noc_async_read(compact_r_addr, get_write_ptr(cb_compact_r), compact_bytes);
+    noc_async_read(compact_i_addr, get_write_ptr(cb_compact_i), compact_bytes);
+    
+    noc_async_read_barrier();
+    
     cb_push_back(cb_compact_r, 1);
     cb_push_back(cb_compact_i, 1);
     
-    // Get compact twiddle pointers
+    // Get compact twiddle base pointers
     cb_wait_front(cb_compact_r, 1);
     cb_wait_front(cb_compact_i, 1);
-    const uint32_t cmp_r_base = get_read_ptr(cb_compact_r);
-    const uint32_t cmp_i_base = get_read_ptr(cb_compact_i);
+    const volatile uint32_t* cmp_r_base = 
+        reinterpret_cast<volatile uint32_t*>(get_read_ptr(cb_compact_r));
+    const volatile uint32_t* cmp_i_base = 
+        reinterpret_cast<volatile uint32_t*>(get_read_ptr(cb_compact_i));
     
-    // ─────── Phase 2: Generate twiddles for ALL stages (FIXED) ───────
+    // ═══════════════════════════════════════════════════
+    // Phase 3: Generate Twiddles Stage-by-Stage
+    // ═══════════════════════════════════════════════════
     for (uint32_t stage = 0; stage < num_stages; stage++) {
         const uint32_t half_m      = 1u << stage;
         const uint32_t N_over_m    = half_N >> stage;
         const uint32_t half_m_mask = half_m - 1u;
         
+        // Reserve space for this stage's twiddles
         cb_reserve_back(cb_tw_r, local_tiles);
         cb_reserve_back(cb_tw_i, local_tiles);
         
-        const uint32_t dst_r = get_write_ptr(cb_tw_r);
-        const uint32_t dst_i = get_write_ptr(cb_tw_i);
+        volatile uint32_t* dst_r = 
+            reinterpret_cast<volatile uint32_t*>(get_write_ptr(cb_tw_r));
+        volatile uint32_t* dst_i = 
+            reinterpret_cast<volatile uint32_t*>(get_write_ptr(cb_tw_i));
         
-        // FIXED: Use consistent global indexing for all stages
+        // Generate twiddle factors for all local elements
         for (uint32_t lp = 0; lp < local_half; lp++) {
             // Global element index (contiguous distribution)
             uint32_t global_elem = core_elem_base + lp;
             
-            // Twiddle index based on position within butterfly group
-            uint32_t j   = global_elem & half_m_mask;
-            uint32_t idx = j * N_over_m;
+            // Determine twiddle index based on butterfly structure
+            // For stage s, element at position p needs twiddle W^((p mod 2^s) * (N/2^(s+1)))
+            uint32_t j   = global_elem & half_m_mask;  // Position within butterfly group
+            uint32_t idx = j * N_over_m;               // Twiddle table index
             
-            // Clamp to valid range
-            if (idx >= half_N) idx = 0;
+            // Bounds checking
+            if (idx >= half_N) {
+                idx = 0;  // Safety fallback
+            }
             
-            uint32_t raw_r = *reinterpret_cast<volatile uint32_t*>(
-                                 cmp_r_base + idx * ELEM);
-            uint32_t raw_i = *reinterpret_cast<volatile uint32_t*>(
-                                 cmp_i_base + idx * ELEM);
+            // Read from compact twiddle table
+            uint32_t raw_r = cmp_r_base[idx];
+            uint32_t raw_i = cmp_i_base[idx];
             
-            *reinterpret_cast<volatile uint32_t*>(dst_r + lp * ELEM) = raw_r;
-            *reinterpret_cast<volatile uint32_t*>(dst_i + lp * ELEM) = raw_i;
+            // Write to expanded twiddle buffer
+            dst_r[lp] = raw_r;
+            dst_i[lp] = raw_i;
         }
         
+        // Pad remaining tile space with zeros if needed
+        for (uint32_t lp = local_half; lp < local_tiles * TILE_SIZE; lp++) {
+            dst_r[lp] = 0;
+            dst_i[lp] = 0;
+        }
+        
+        // Release twiddles for this stage
         cb_push_back(cb_tw_r, local_tiles);
         cb_push_back(cb_tw_i, local_tiles);
     }
     
+    // Release compact twiddle table
     cb_pop_front(cb_compact_r, 1);
     cb_pop_front(cb_compact_i, 1);
 }

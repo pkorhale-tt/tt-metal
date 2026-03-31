@@ -100,18 +100,24 @@ void kernel_main() {
             cb_pop_front(cb_out1_r, local_tiles);
             cb_pop_front(cb_out1_i, local_tiles);
             
+        // writer.cpp - FIXED cross-core section (around line 80-180)
+
         } else if (is_cross_core) {
             // ═══════════════════════════════════════════════════
             // CROSS-CORE STAGE: Exchange data with partner
             // ═══════════════════════════════════════════════════
             const uint32_t stage_bit = stage - local_stages;
             const uint32_t partner_core = core_id ^ (1u << stage_bit);
-            const uint64_t partner_noc = get_noc_coords(partner_core);
+            
+            // FIXED: Calculate partner NOC coordinates
+            const uint32_t partner_x = partner_core % 8;
+            const uint32_t partner_y = partner_core / 8;
+            const uint64_t partner_noc_x = partner_x;
+            const uint64_t partner_noc_y = partner_y;
             
             const uint32_t half_size = local_half / 2;
             const uint32_t half_bytes = half_size * ELEM;
             
-            // Determine which half to keep and which to exchange
             const bool keep_lower = ((core_id >> stage_bit) & 1) == 0;
             
             // Reserve receive buffers
@@ -121,58 +127,48 @@ void kernel_main() {
             const uint32_t recv_r = get_write_ptr(cb_recv_r);
             const uint32_t recv_i = get_write_ptr(cb_recv_i);
             
+            // CRITICAL FIX: Use proper NOC addressing
             if (keep_lower) {
-                // Keep out0 (lower half), exchange out1 (upper half)
-                // Send upper half of out1 to partner
-                noc_async_write(src1r + half_size * ELEM, 
-                               partner_noc | recv_r,
-                               half_bytes);
-                noc_async_write(src1i + half_size * ELEM,
-                               partner_noc | recv_i,
-                               half_bytes);
+                // Send upper half, receive partner's lower half
+                uint64_t partner_recv_r_addr = get_noc_addr(partner_noc_x, partner_noc_y, recv_r);
+                uint64_t partner_recv_i_addr = get_noc_addr(partner_noc_x, partner_noc_y, recv_i);
                 
-                // Receive partner's lower half of out1
-                noc_async_read(partner_noc | (src1r + 0),
-                              recv_r + half_size * ELEM,
-                              half_bytes);
-                noc_async_read(partner_noc | (src1i + 0),
-                              recv_i + half_size * ELEM,
-                              half_bytes);
+                // Send to partner
+                noc_async_write(src1r + half_size * ELEM, partner_recv_r_addr, half_bytes);
+                noc_async_write(src1i + half_size * ELEM, partner_recv_i_addr, half_bytes);
+                noc_async_write_barrier();
+                
+                // Receive from partner  
+                uint64_t partner_src1r_addr = get_noc_addr(partner_noc_x, partner_noc_y, src1r);
+                uint64_t partner_src1i_addr = get_noc_addr(partner_noc_x, partner_noc_y, src1i);
+                
+                noc_async_read(partner_src1r_addr, recv_r + half_size * ELEM, half_bytes);
+                noc_async_read(partner_src1i_addr, recv_i + half_size * ELEM, half_bytes);
+                noc_async_read_barrier();
                 
             } else {
-                // Keep out1 (upper half), exchange out0 (lower half)
-                // Send lower half of out0 to partner
-                noc_async_write(src0r,
-                               partner_noc | recv_r,
-                               half_bytes);
-                noc_async_write(src0i,
-                               partner_noc | recv_i,
-                               half_bytes);
+                // Send lower half, receive partner's upper half
+                uint64_t partner_recv_r_addr = get_noc_addr(partner_noc_x, partner_noc_y, recv_r);
+                uint64_t partner_recv_i_addr = get_noc_addr(partner_noc_x, partner_noc_y, recv_i);
                 
-                // Receive partner's upper half of out0
-                noc_async_read(partner_noc | (src0r + half_size * ELEM),
-                              recv_r + half_size * ELEM,
-                              half_bytes);
-                noc_async_read(partner_noc | (src0i + half_size * ELEM),
-                              recv_i + half_size * ELEM,
-                              half_bytes);
+                // Send to partner
+                noc_async_write(src0r, partner_recv_r_addr, half_bytes);
+                noc_async_write(src0i, partner_recv_i_addr, half_bytes);
+                noc_async_write_barrier();
+                
+                // Receive from partner
+                uint64_t partner_src0r_addr = get_noc_addr(partner_noc_x, partner_noc_y, src0r);
+                uint64_t partner_src0i_addr = get_noc_addr(partner_noc_x, partner_noc_y, src0i);
+                
+                noc_async_read(partner_src0r_addr + half_size * ELEM, recv_r + half_size * ELEM, half_bytes);
+                noc_async_read(partner_src0i_addr + half_size * ELEM, recv_i + half_size * ELEM, half_bytes);
+                noc_async_read_barrier();
             }
-            
-            noc_async_read_barrier();
-            noc_async_write_barrier();
-            
-            // Synchronization barrier
-            volatile uint32_t* sync_ptr = reinterpret_cast<volatile uint32_t*>(
-                get_write_ptr(cb_sync));
-            *sync_ptr = 1;
-            noc_semaphore_inc(partner_noc | (uint32_t)sync_ptr, 1);
-            while (*sync_ptr < 2) {}  // Wait for partner
-            *sync_ptr = 0;  // Reset
             
             cb_push_back(cb_recv_r, local_tiles);
             cb_push_back(cb_recv_i, local_tiles);
             
-            // Prepare next stage inputs
+            // Continue with data preparation...
             cb_reserve_back(cb_even_r, local_tiles);
             cb_reserve_back(cb_even_i, local_tiles);
             cb_reserve_back(cb_odd_r, local_tiles);
@@ -186,23 +182,18 @@ void kernel_main() {
             cb_wait_front(cb_recv_r, local_tiles);
             cb_wait_front(cb_recv_i, local_tiles);
             
-            // Interleave local and received data for next stage
-            const uint32_t m = 1u << (stage + 1);
+            // Simple interleave for next stage
             for (uint32_t i = 0; i < half_size; i++) {
-                uint32_t dst_idx = i * 2;
-                
                 if (keep_lower) {
-                    // Even: local out0, Odd: received
-                    wr(dst_er + dst_idx * ELEM, rd(src0r + i * ELEM));
-                    wr(dst_ei + dst_idx * ELEM, rd(src0i + i * ELEM));
-                    wr(dst_or + dst_idx * ELEM, rd(recv_r + i * ELEM));
-                    wr(dst_oi + dst_idx * ELEM, rd(recv_i + i * ELEM));
+                    wr(dst_er + i * ELEM, rd(src0r + i * ELEM));
+                    wr(dst_ei + i * ELEM, rd(src0i + i * ELEM));
+                    wr(dst_or + i * ELEM, rd(recv_r + i * ELEM));
+                    wr(dst_oi + i * ELEM, rd(recv_i + i * ELEM));
                 } else {
-                    // Even: received, Odd: local out1
-                    wr(dst_er + dst_idx * ELEM, rd(recv_r + i * ELEM));
-                    wr(dst_ei + dst_idx * ELEM, rd(recv_i + i * ELEM));
-                    wr(dst_or + dst_idx * ELEM, rd(src1r + i * ELEM));
-                    wr(dst_oi + dst_idx * ELEM, rd(src1i + i * ELEM));
+                    wr(dst_er + i * ELEM, rd(recv_r + i * ELEM));
+                    wr(dst_ei + i * ELEM, rd(recv_i + i * ELEM));
+                    wr(dst_or + i * ELEM, rd(src1r + i * ELEM));
+                    wr(dst_oi + i * ELEM, rd(src1i + i * ELEM));
                 }
             }
             
