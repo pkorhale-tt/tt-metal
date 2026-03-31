@@ -1,4 +1,4 @@
-// reader_fft_1d_64core.cpp - FIXED with stage-by-stage twiddle generation
+// reader_fft_1d_64core.cpp - COMPLETE FIXED VERSION
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -95,9 +95,9 @@ void kernel_main() {
     // Get compact twiddle base pointers
     cb_wait_front(cb_compact_r, 1);
     cb_wait_front(cb_compact_i, 1);
-    const volatile uint32_t* cmp_r_base = 
+    volatile uint32_t* cmp_r_base = 
         reinterpret_cast<volatile uint32_t*>(get_read_ptr(cb_compact_r));
-    const volatile uint32_t* cmp_i_base = 
+    volatile uint32_t* cmp_i_base = 
         reinterpret_cast<volatile uint32_t*>(get_read_ptr(cb_compact_i));
     
     // ═══════════════════════════════════════════════════
@@ -123,13 +123,12 @@ void kernel_main() {
             uint32_t global_elem = core_elem_base + lp;
             
             // Determine twiddle index based on butterfly structure
-            // For stage s, element at position p needs twiddle W^((p mod 2^s) * (N/2^(s+1)))
-            uint32_t j   = global_elem & half_m_mask;  // Position within butterfly group
-            uint32_t idx = j * N_over_m;               // Twiddle table index
+            uint32_t j   = global_elem & half_m_mask;
+            uint32_t idx = j * N_over_m;
             
             // Bounds checking
             if (idx >= half_N) {
-                idx = 0;  // Safety fallback
+                idx = 0;
             }
             
             // Read from compact twiddle table

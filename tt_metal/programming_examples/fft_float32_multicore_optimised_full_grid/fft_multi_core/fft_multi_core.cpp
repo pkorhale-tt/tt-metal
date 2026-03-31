@@ -1,4 +1,4 @@
-// fft_multi_core.cpp - FIXED host program
+// fft_multi_core.cpp - COMPLETE FIXED HOST PROGRAM
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -115,7 +115,6 @@ CBHandle create_cb(Program& p, CoreCoord c, uint32_t id, uint32_t ntiles, uint32
     return CreateCircularBuffer(p, c, cfg);
 }
 
-// FIXED: Contiguous distribution with proper bit-reversal
 void prepare_multicore_stage0(
     const std::vector<float>& sr, const std::vector<float>& si,
     uint32_t N, uint32_t log2N, uint32_t num_cores,
@@ -140,12 +139,10 @@ void prepare_multicore_stage0(
         odd_i[c].resize(tiles_per_core * TILE_SIZE, 0u);
     }
     
-    // FIXED: Use contiguous distribution (matches writer expectations)
     for (uint32_t i = 0; i < half_N; i++) {
         uint32_t e_idx = bit_reverse(2*i,   log2N);
         uint32_t o_idx = bit_reverse(2*i+1, log2N);
         
-        // Contiguous distribution
         uint32_t core_id = i / half_per_core;
         uint32_t local_idx = i % half_per_core;
         
@@ -165,9 +162,6 @@ int main(int argc, char** argv) {
     if (argc > 1) N = std::stoul(argv[1]);
     if (argc > 2) num_cores = std::stoul(argv[2]);
     
-    // ═══════════════════════════════════════════════════
-    // CALCULATE ALL PARAMETERS BEFORE USING THEM
-    // ═══════════════════════════════════════════════════
     uint32_t log2N = 0;
     while ((1u << log2N) < N) log2N++;
     
@@ -179,8 +173,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    // DECLARE num_stages HERE (before it's used in CB creation)
-    //uint32_t num_stages = log2N;  // ← FIX: Add this line
     uint32_t elems_per_core = N / num_cores;
     uint32_t half_per_core = elems_per_core / 2;
     uint32_t tiles_per_core = (half_per_core + TILE_SIZE - 1) / TILE_SIZE;
@@ -197,28 +189,23 @@ int main(int argc, char** argv) {
     std::cout << " Tiles/core    : " << tiles_per_core << "\n";
     std::cout << "════════════════════════════════════════════════\n";
     
-    // Test signal
     std::vector<float> ir(N), ii(N, 0.0f);
     for (uint32_t i = 0; i < N; i++) {
         ir[i] = std::sin(2.f * PI * 4.f * i / N) + 
                 0.5f * std::sin(2.f * PI * 8.f * i / N);
     }
     
-    // CPU reference
     std::vector<float> ref_r(ir), ref_i(ii);
     cpu_fft(ref_r, ref_i, false);
     
-    // Device setup
     auto mesh = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
     auto& cq  = mesh->mesh_command_queue();
     
-    // Prepare data
     std::vector<std::vector<uint32_t>> core_even_r, core_even_i;
     std::vector<std::vector<uint32_t>> core_odd_r, core_odd_i;
     prepare_multicore_stage0(ir, ii, N, log2N, num_cores,
                             core_even_r, core_even_i, core_odd_r, core_odd_i);
     
-    // Flatten
     std::vector<uint32_t> all_even_r, all_even_i, all_odd_r, all_odd_i;
     for (uint32_t c = 0; c < num_cores; c++) {
         all_even_r.insert(all_even_r.end(), core_even_r[c].begin(), core_even_r[c].end());
@@ -265,57 +252,39 @@ int main(int argc, char** argv) {
     auto b_tw_r = mk_buf(compact_size);
     auto b_tw_i = mk_buf(compact_size);
     
-    // ═══════════════════════════════════════════════════
-    // CREATE CIRCULAR BUFFERS - NOW num_stages IS DEFINED
-    // ═══════════════════════════════════════════════════
-    // In the CB creation loop:
-for (uint32_t cy = 0; cy < 8; cy++) {
-    for (uint32_t cx = 0; cx < 8; cx++) {
-        if (cy * 8 + cx >= num_cores) continue;
-        
-        CoreCoord cc = {cx, cy};
-        
-        // Stage 0 input (from DRAM)
-        create_cb(prog, cc, 0,  tiles_per_core, TILE_BYTES);  // stage0_even_r
-        create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);  // stage0_even_i
-        create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);  // stage0_odd_r
-        create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);  // stage0_odd_i
-        
-        // Twiddles (per stage)
-        create_cb(prog, cc, 4,  tiles_per_core, TILE_BYTES);  // tw_r
-        create_cb(prog, cc, 5,  tiles_per_core, TILE_BYTES);  // tw_i
-        
-        // Compact twiddle table
-        uint32_t compact_tiles = compact_size / TILE_BYTES;
-        create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);   // compact_r
-        create_cb(prog, cc, 11, compact_tiles, TILE_BYTES);   // compact_i
-        
-        // Ping-pong input buffers (for inter-stage data)
-        create_cb(prog, cc, 12, tiles_per_core, TILE_BYTES);  // ping_even_r
-        create_cb(prog, cc, 13, tiles_per_core, TILE_BYTES);  // ping_even_i
-        create_cb(prog, cc, 14, tiles_per_core, TILE_BYTES);  // ping_odd_r
-        create_cb(prog, cc, 15, tiles_per_core, TILE_BYTES);  // ping_odd_i
-        
-        // Butterfly outputs
-        create_cb(prog, cc, 16, tiles_per_core, TILE_BYTES);  // out0_r
-        create_cb(prog, cc, 17, tiles_per_core, TILE_BYTES);  // out0_i
-        create_cb(prog, cc, 18, tiles_per_core, TILE_BYTES);  // out1_r
-        create_cb(prog, cc, 19, tiles_per_core, TILE_BYTES);  // out1_i
-        
-        // Compute temps
-        create_cb(prog, cc, 20, tiles_per_core, TILE_BYTES);  // tmp0
-        create_cb(prog, cc, 21, tiles_per_core, TILE_BYTES);  // tmp1
-        create_cb(prog, cc, 22, tiles_per_core, TILE_BYTES);  // tw_odd_r
-        create_cb(prog, cc, 23, tiles_per_core, TILE_BYTES);  // tw_odd_i
-        
-        // Cross-core (for multi-core)
-        create_cb(prog, cc, 24, tiles_per_core, TILE_BYTES);  // recv_r
-        create_cb(prog, cc, 25, tiles_per_core, TILE_BYTES);  // recv_i
-        create_cb(prog, cc, 28, 1, 32);                        // sync
+    for (uint32_t cy = 0; cy < 8; cy++) {
+        for (uint32_t cx = 0; cx < 8; cx++) {
+            if (cy * 8 + cx >= num_cores) continue;
+            
+            CoreCoord cc = {cx, cy};
+            
+            create_cb(prog, cc, 0,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 4,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 5,  tiles_per_core, TILE_BYTES);
+            
+            uint32_t compact_tiles = compact_size / TILE_BYTES;
+            create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);
+            create_cb(prog, cc, 11, compact_tiles, TILE_BYTES);
+            
+            create_cb(prog, cc, 16, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 17, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 18, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 19, tiles_per_core, TILE_BYTES);
+            
+            create_cb(prog, cc, 20, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 21, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 22, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 23, tiles_per_core, TILE_BYTES);
+            
+            create_cb(prog, cc, 24, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 25, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 28, 1, 32);
+        }
     }
-}
     
-    // Rest of the code continues unchanged...
     KernelHandle reader_k = CreateKernel(prog,
         "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/reader.cpp",
         core_range,
@@ -335,7 +304,6 @@ for (uint32_t cy = 0; cy < 8; cy++) {
                      .fp32_dest_acc_en = true,
                      .math_approx_mode = false});
     
-    // Set runtime arguments for each core
     for (uint32_t core_id = 0; core_id < num_cores; core_id++) {
         uint32_t cx = core_id % 8;
         uint32_t cy = core_id / 8;
@@ -392,7 +360,6 @@ for (uint32_t cy = 0; cy < 8; cy++) {
     
     std::cout << "Execution time: " << duration.count() << " µs\n";
     
-    // Read results
     std::vector<uint32_t> out0_r_raw(total_bytes/4);
     std::vector<uint32_t> out0_i_raw(total_bytes/4);
     std::vector<uint32_t> out1_r_raw(total_bytes/4);
@@ -403,7 +370,6 @@ for (uint32_t cy = 0; cy < 8; cy++) {
     EnqueueReadMeshBuffer(cq, out1_r_raw, b_out1_r, true);
     EnqueueReadMeshBuffer(cq, out1_i_raw, b_out1_i, true);
     
-    // Reconstruct full output
     std::vector<float> result_r(N), result_i(N);
     for (uint32_t core_id = 0; core_id < num_cores; core_id++) {
         uint32_t base_idx = core_id * tiles_per_core * TILE_SIZE;
@@ -417,7 +383,6 @@ for (uint32_t cy = 0; cy < 8; cy++) {
         }
     }
     
-    // Validate
     float max_err_r = 0.0f, max_err_i = 0.0f;
     for (uint32_t i = 0; i < N; i++) {
         float err_r = std::abs(result_r[i] - ref_r[i]);

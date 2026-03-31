@@ -1,4 +1,4 @@
-// writer_fft_1d_64core.cpp - FIXED with cross-core exchange
+// writer_fft_1d_64core.cpp - COMPLETE FIXED VERSION
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -53,19 +53,21 @@ void kernel_main() {
     
     auto rd = [](uint32_t addr) -> float {
         uint32_t raw = *reinterpret_cast<volatile uint32_t*>(addr);
-        float v; __builtin_memcpy(&v, &raw, 4); return v;
+        float v; 
+        __builtin_memcpy(&v, &raw, 4); 
+        return v;
     };
     
     auto wr = [](uint32_t addr, float v) {
-        uint32_t raw; __builtin_memcpy(&raw, &v, 4);
+        uint32_t raw; 
+        __builtin_memcpy(&raw, &v, 4);
         *reinterpret_cast<volatile uint32_t*>(addr) = raw;
     };
     
-    // Convert core_id to NOC coordinates (8x8 grid)
-    auto get_noc_coords = [](uint32_t cid) -> uint64_t {
+    auto get_noc_addr_from_core = [](uint32_t cid, uint32_t local_addr) -> uint64_t {
         uint32_t x = cid % 8;
         uint32_t y = cid / 8;
-        return NOC_XY_ADDR(x, y, 0);
+        return get_noc_addr(x, y, local_addr);
     };
     
     for (uint32_t stage = 0; stage < num_stages; stage++) {
@@ -100,75 +102,71 @@ void kernel_main() {
             cb_pop_front(cb_out1_r, local_tiles);
             cb_pop_front(cb_out1_i, local_tiles);
             
-        // writer.cpp - FIXED cross-core section (around line 80-180)
-
         } else if (is_cross_core) {
             // ═══════════════════════════════════════════════════
-            // CROSS-CORE STAGE: Exchange data with partner
+            // CROSS-CORE STAGE
             // ═══════════════════════════════════════════════════
             const uint32_t stage_bit = stage - local_stages;
             const uint32_t partner_core = core_id ^ (1u << stage_bit);
-            
-            // FIXED: Calculate partner NOC coordinates
-            const uint32_t partner_x = partner_core % 8;
-            const uint32_t partner_y = partner_core / 8;
-            const uint64_t partner_noc_x = partner_x;
-            const uint64_t partner_noc_y = partner_y;
             
             const uint32_t half_size = local_half / 2;
             const uint32_t half_bytes = half_size * ELEM;
             
             const bool keep_lower = ((core_id >> stage_bit) & 1) == 0;
             
-            // Reserve receive buffers
             cb_reserve_back(cb_recv_r, local_tiles);
             cb_reserve_back(cb_recv_i, local_tiles);
             
             const uint32_t recv_r = get_write_ptr(cb_recv_r);
             const uint32_t recv_i = get_write_ptr(cb_recv_i);
             
-            // CRITICAL FIX: Use proper NOC addressing
             if (keep_lower) {
-                // Send upper half, receive partner's lower half
-                uint64_t partner_recv_r_addr = get_noc_addr(partner_noc_x, partner_noc_y, recv_r);
-                uint64_t partner_recv_i_addr = get_noc_addr(partner_noc_x, partner_noc_y, recv_i);
+                uint64_t partner_recv_r_addr = get_noc_addr_from_core(partner_core, recv_r);
+                uint64_t partner_recv_i_addr = get_noc_addr_from_core(partner_core, recv_i);
                 
-                // Send to partner
                 noc_async_write(src1r + half_size * ELEM, partner_recv_r_addr, half_bytes);
                 noc_async_write(src1i + half_size * ELEM, partner_recv_i_addr, half_bytes);
                 noc_async_write_barrier();
                 
-                // Receive from partner  
-                uint64_t partner_src1r_addr = get_noc_addr(partner_noc_x, partner_noc_y, src1r);
-                uint64_t partner_src1i_addr = get_noc_addr(partner_noc_x, partner_noc_y, src1i);
+                uint64_t partner_src1r_addr = get_noc_addr_from_core(partner_core, src1r);
+                uint64_t partner_src1i_addr = get_noc_addr_from_core(partner_core, src1i);
                 
                 noc_async_read(partner_src1r_addr, recv_r + half_size * ELEM, half_bytes);
                 noc_async_read(partner_src1i_addr, recv_i + half_size * ELEM, half_bytes);
                 noc_async_read_barrier();
                 
             } else {
-                // Send lower half, receive partner's upper half
-                uint64_t partner_recv_r_addr = get_noc_addr(partner_noc_x, partner_noc_y, recv_r);
-                uint64_t partner_recv_i_addr = get_noc_addr(partner_noc_x, partner_noc_y, recv_i);
+                uint64_t partner_recv_r_addr = get_noc_addr_from_core(partner_core, recv_r);
+                uint64_t partner_recv_i_addr = get_noc_addr_from_core(partner_core, recv_i);
                 
-                // Send to partner
                 noc_async_write(src0r, partner_recv_r_addr, half_bytes);
                 noc_async_write(src0i, partner_recv_i_addr, half_bytes);
                 noc_async_write_barrier();
                 
-                // Receive from partner
-                uint64_t partner_src0r_addr = get_noc_addr(partner_noc_x, partner_noc_y, src0r);
-                uint64_t partner_src0i_addr = get_noc_addr(partner_noc_x, partner_noc_y, src0i);
+                uint64_t partner_src0r_addr = get_noc_addr_from_core(partner_core, src0r);
+                uint64_t partner_src0i_addr = get_noc_addr_from_core(partner_core, src0i);
                 
-                noc_async_read(partner_src0r_addr + half_size * ELEM, recv_r + half_size * ELEM, half_bytes);
-                noc_async_read(partner_src0i_addr + half_size * ELEM, recv_i + half_size * ELEM, half_bytes);
+                noc_async_read(partner_src0r_addr + half_size * ELEM, 
+                              recv_r + half_size * ELEM, half_bytes);
+                noc_async_read(partner_src0i_addr + half_size * ELEM, 
+                              recv_i + half_size * ELEM, half_bytes);
                 noc_async_read_barrier();
             }
+            
+            volatile uint32_t* sync_ptr = 
+                reinterpret_cast<volatile uint32_t*>(get_write_ptr(cb_sync));
+            *sync_ptr = 1;
+            
+            uint64_t partner_sync_addr = get_noc_addr_from_core(
+                partner_core, (uint32_t)sync_ptr);
+            noc_semaphore_inc(partner_sync_addr, 1);
+            
+            while (*sync_ptr < 2) {}
+            *sync_ptr = 0;
             
             cb_push_back(cb_recv_r, local_tiles);
             cb_push_back(cb_recv_i, local_tiles);
             
-            // Continue with data preparation...
             cb_reserve_back(cb_even_r, local_tiles);
             cb_reserve_back(cb_even_i, local_tiles);
             cb_reserve_back(cb_odd_r, local_tiles);
@@ -182,7 +180,6 @@ void kernel_main() {
             cb_wait_front(cb_recv_r, local_tiles);
             cb_wait_front(cb_recv_i, local_tiles);
             
-            // Simple interleave for next stage
             for (uint32_t i = 0; i < half_size; i++) {
                 if (keep_lower) {
                     wr(dst_er + i * ELEM, rd(src0r + i * ELEM));
@@ -195,6 +192,13 @@ void kernel_main() {
                     wr(dst_or + i * ELEM, rd(src1r + i * ELEM));
                     wr(dst_oi + i * ELEM, rd(src1i + i * ELEM));
                 }
+            }
+            
+            for (uint32_t i = half_size; i < local_tiles * TILE_SIZE; i++) {
+                wr(dst_er + i * ELEM, 0.0f);
+                wr(dst_ei + i * ELEM, 0.0f);
+                wr(dst_or + i * ELEM, 0.0f);
+                wr(dst_oi + i * ELEM, 0.0f);
             }
             
             cb_pop_front(cb_out0_r, local_tiles);
@@ -211,10 +215,10 @@ void kernel_main() {
             
         } else {
             // ═══════════════════════════════════════════════════
-            // LOCAL STAGE: Shuffle within core
+            // LOCAL STAGE
             // ═══════════════════════════════════════════════════
-            const uint32_t m       = 1u << (stage + 1);
-            const uint32_t half_m  = m >> 1;
+            const uint32_t m = 1u << (stage + 1);
+            const uint32_t half_m = m >> 1;
             
             cb_reserve_back(cb_even_r, local_tiles);
             cb_reserve_back(cb_even_i, local_tiles);
@@ -226,54 +230,67 @@ void kernel_main() {
             const uint32_t dst_or = get_write_ptr(cb_odd_r);
             const uint32_t dst_oi = get_write_ptr(cb_odd_i);
             
-            // Improved shuffle logic
-            const uint32_t num_groups = local_half / m;
             const uint32_t log2m = stage + 1;
             const uint32_t m_mask = m - 1;
+            const uint32_t num_groups = local_half / m;
             
-            for (uint32_t g = 0; g < num_groups; g++) {
-                for (uint32_t j = 0; j < half_m; j++) {
-                    uint32_t dst_idx = g * m + j;
-                    
-                    // Map to source in out0/out1
-                    uint32_t global_pos = core_elem_base + dst_idx;
-                    uint32_t old_group = global_pos >> log2m;
-                    uint32_t offset = global_pos & m_mask;
-                    
-                    uint32_t src_idx = old_group * half_m + offset;
-                    uint32_t local_src = src_idx >= core_elem_base ? 
-                                        src_idx - core_elem_base : 0;
-                    
-                    if (local_src < local_half) {
-                        bool from_out0 = (offset < half_m);
-                        uint32_t srcr = from_out0 ? src0r : src1r;
-                        uint32_t srci = from_out0 ? src0i : src1i;
+            if (num_groups > 0) {
+                for (uint32_t g = 0; g < num_groups; g++) {
+                    for (uint32_t j = 0; j < half_m; j++) {
+                        uint32_t dst_even_idx = g * m + j;
                         
-                        wr(dst_er + dst_idx * ELEM, rd(srcr + local_src * ELEM));
-                        wr(dst_ei + dst_idx * ELEM, rd(srci + local_src * ELEM));
-                    }
-                    
-                    // Odd part (offset by half_m in global space)
-                    dst_idx = g * m + half_m + j;
-                    global_pos = core_elem_base + dst_idx;
-                    old_group = global_pos >> log2m;
-                    offset = global_pos & m_mask;
-                    
-                    src_idx = old_group * half_m + offset;
-                    local_src = src_idx >= core_elem_base ? 
-                               src_idx - core_elem_base : 0;
-                    
-                    if (local_src < local_half) {
-                        bool from_out0 = (offset < half_m);
-                        uint32_t srcr = from_out0 ? src0r : src1r;
-                        uint32_t srci = from_out0 ? src0i : src1i;
+                        uint32_t global_pos = core_elem_base + dst_even_idx;
+                        uint32_t old_group = global_pos >> log2m;
+                        uint32_t offset = global_pos & m_mask;
                         
-                        wr(dst_or + (g * half_m + j) * ELEM, 
-                           rd(srcr + local_src * ELEM));
-                        wr(dst_oi + (g * half_m + j) * ELEM,
-                           rd(srci + local_src * ELEM));
+                        bool from_out0 = (offset < half_m);
+                        uint32_t src_within_group = offset;
+                        uint32_t src_idx = old_group * half_m + src_within_group;
+                        
+                        if (src_idx >= core_elem_base && 
+                            src_idx < core_elem_base + local_half) {
+                            uint32_t local_src = src_idx - core_elem_base;
+                            uint32_t srcr = from_out0 ? src0r : src1r;
+                            uint32_t srci = from_out0 ? src0i : src1i;
+                            
+                            wr(dst_er + dst_even_idx * ELEM, rd(srcr + local_src * ELEM));
+                            wr(dst_ei + dst_even_idx * ELEM, rd(srci + local_src * ELEM));
+                        }
+                        
+                        uint32_t dst_odd_idx = g * half_m + j;
+                        global_pos = core_elem_base + (g * m + half_m + j);
+                        old_group = global_pos >> log2m;
+                        offset = global_pos & m_mask;
+                        
+                        from_out0 = (offset < half_m);
+                        src_within_group = offset;
+                        src_idx = old_group * half_m + src_within_group;
+                        
+                        if (src_idx >= core_elem_base && 
+                            src_idx < core_elem_base + local_half) {
+                            uint32_t local_src = src_idx - core_elem_base;
+                            uint32_t srcr = from_out0 ? src0r : src1r;
+                            uint32_t srci = from_out0 ? src0i : src1i;
+                            
+                            wr(dst_or + dst_odd_idx * ELEM, rd(srcr + local_src * ELEM));
+                            wr(dst_oi + dst_odd_idx * ELEM, rd(srci + local_src * ELEM));
+                        }
                     }
                 }
+            } else {
+                for (uint32_t lp = 0; lp < local_half; lp++) {
+                    wr(dst_er + lp * ELEM, rd(src0r + lp * ELEM));
+                    wr(dst_ei + lp * ELEM, rd(src0i + lp * ELEM));
+                    wr(dst_or + lp * ELEM, rd(src1r + lp * ELEM));
+                    wr(dst_oi + lp * ELEM, rd(src1i + lp * ELEM));
+                }
+            }
+            
+            for (uint32_t lp = local_half; lp < local_tiles * TILE_SIZE; lp++) {
+                wr(dst_er + lp * ELEM, 0.0f);
+                wr(dst_ei + lp * ELEM, 0.0f);
+                wr(dst_or + lp * ELEM, 0.0f);
+                wr(dst_oi + lp * ELEM, 0.0f);
             }
             
             cb_pop_front(cb_out0_r, local_tiles);
