@@ -180,7 +180,7 @@ int main(int argc, char** argv) {
     }
     
     // DECLARE num_stages HERE (before it's used in CB creation)
-    uint32_t num_stages = log2N;  // ← FIX: Add this line
+    //uint32_t num_stages = log2N;  // ← FIX: Add this line
     uint32_t elems_per_core = N / num_cores;
     uint32_t half_per_core = elems_per_core / 2;
     uint32_t tiles_per_core = (half_per_core + TILE_SIZE - 1) / TILE_SIZE;
