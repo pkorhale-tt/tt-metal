@@ -1,4 +1,4 @@
-// fft_multi_core.cpp - Complete host program for 64-core 1D FFT
+// fft_multi_core.cpp - FIXED host program
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -27,8 +27,6 @@ constexpr uint32_t TILE_W     = tt::constants::TILE_WIDTH;
 constexpr uint32_t TILE_SIZE  = TILE_H * TILE_W;
 constexpr uint32_t TILE_BYTES = TILE_SIZE * sizeof(float);
 
-// ─────── Utility functions ───────
-
 inline uint32_t f2u(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);
@@ -54,7 +52,6 @@ void cpu_fft(std::vector<float>& re, std::vector<float>& im, bool inv) {
     uint32_t N = re.size(), log2N = 0;
     while ((1u << log2N) < N) log2N++;
     
-    // Bit-reversal permutation
     for (uint32_t i = 0; i < N; i++) {
         uint32_t j = bit_reverse(i, log2N);
         if (i < j) {
@@ -63,7 +60,6 @@ void cpu_fft(std::vector<float>& re, std::vector<float>& im, bool inv) {
         }
     }
     
-    // Cooley-Tukey FFT
     for (uint32_t s = 0; s < log2N; s++) {
         uint32_t m = 1u << (s + 1);
         float angle_base = (inv ? 2.f : -2.f) * PI / m;
@@ -119,7 +115,7 @@ CBHandle create_cb(Program& p, CoreCoord c, uint32_t id, uint32_t ntiles, uint32
     return CreateCircularBuffer(p, c, cfg);
 }
 
-// Bit reversal with core-aware distribution for multicore
+// FIXED: Contiguous distribution with proper bit-reversal
 void prepare_multicore_stage0(
     const std::vector<float>& sr, const std::vector<float>& si,
     uint32_t N, uint32_t log2N, uint32_t num_cores,
@@ -137,7 +133,6 @@ void prepare_multicore_stage0(
     odd_r.resize(num_cores);
     odd_i.resize(num_cores);
     
-    // Initialize vectors with proper size
     for (uint32_t c = 0; c < num_cores; c++) {
         even_r[c].resize(tiles_per_core * TILE_SIZE, 0u);
         even_i[c].resize(tiles_per_core * TILE_SIZE, 0u);
@@ -145,30 +140,26 @@ void prepare_multicore_stage0(
         odd_i[c].resize(tiles_per_core * TILE_SIZE, 0u);
     }
     
-    // Use bit-reversed distribution for optimal data locality
+    // FIXED: Use contiguous distribution (matches writer expectations)
     for (uint32_t i = 0; i < half_N; i++) {
         uint32_t e_idx = bit_reverse(2*i,   log2N);
         uint32_t o_idx = bit_reverse(2*i+1, log2N);
         
-        // Determine which core owns this butterfly pair
-        // Use modulo for cyclic distribution to maintain locality
-        uint32_t core_id = i % num_cores;
-        uint32_t local_idx = i / num_cores;
+        // Contiguous distribution
+        uint32_t core_id = i / half_per_core;
+        uint32_t local_idx = i % half_per_core;
         
-        // Pack into appropriate tile position
-        uint32_t tile_idx = local_idx / TILE_SIZE;
-        uint32_t elem_idx = local_idx % TILE_SIZE;
-        uint32_t flat_idx = tile_idx * TILE_SIZE + elem_idx;
-        
-        even_r[core_id][flat_idx] = f2u(sr[e_idx]);
-        even_i[core_id][flat_idx] = f2u(si[e_idx]);
-        odd_r[core_id][flat_idx]  = f2u(sr[o_idx]);
-        odd_i[core_id][flat_idx]  = f2u(si[o_idx]);
+        if (core_id < num_cores) {
+            even_r[core_id][local_idx] = f2u(sr[e_idx]);
+            even_i[core_id][local_idx] = f2u(si[e_idx]);
+            odd_r[core_id][local_idx]  = f2u(sr[o_idx]);
+            odd_i[core_id][local_idx]  = f2u(si[o_idx]);
+        }
     }
 }
 
 int main(int argc, char** argv) {
-    uint32_t N = 65536;  // 64K FFT
+    uint32_t N = 65536;
     uint32_t num_cores = 64;
     
     if (argc > 1) N = std::stoul(argv[1]);
@@ -185,22 +176,23 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    uint32_t half_per_core = (N / num_cores) / 2;
+    uint32_t elems_per_core = N / num_cores;
+    uint32_t half_per_core = elems_per_core / 2;
     uint32_t tiles_per_core = (half_per_core + TILE_SIZE - 1) / TILE_SIZE;
     uint32_t local_stages = log2N - log2_cores;
     
     std::cout << "════════════════════════════════════════════════\n";
-    std::cout << " TT-Metal 64-Core Optimized 1D FFT\n";
+    std::cout << " TT-Metal 64-Core FIXED 1D FFT\n";
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << " N             : " << N << "\n";
     std::cout << " Cores         : " << num_cores << "\n";
-    std::cout << " Elems/core    : " << (N / num_cores) << "\n";
+    std::cout << " Elems/core    : " << elems_per_core << "\n";
     std::cout << " Local stages  : " << local_stages << "\n";
     std::cout << " Cross stages  : " << log2_cores << "\n";
     std::cout << " Tiles/core    : " << tiles_per_core << "\n";
     std::cout << "════════════════════════════════════════════════\n";
     
-    // Initialize test signal
+    // Test signal
     std::vector<float> ir(N), ii(N, 0.0f);
     for (uint32_t i = 0; i < N; i++) {
         ir[i] = std::sin(2.f * PI * 4.f * i / N) + 
@@ -215,13 +207,13 @@ int main(int argc, char** argv) {
     auto mesh = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
     auto& cq  = mesh->mesh_command_queue();
     
-    // Prepare data with bit-reversal
+    // Prepare data
     std::vector<std::vector<uint32_t>> core_even_r, core_even_i;
     std::vector<std::vector<uint32_t>> core_odd_r, core_odd_i;
     prepare_multicore_stage0(ir, ii, N, log2N, num_cores,
                             core_even_r, core_even_i, core_odd_r, core_odd_i);
     
-    // Flatten for DRAM upload
+    // Flatten
     std::vector<uint32_t> all_even_r, all_even_i, all_odd_r, all_odd_i;
     for (uint32_t c = 0; c < num_cores; c++) {
         all_even_r.insert(all_even_r.end(), core_even_r[c].begin(), core_even_r[c].end());
@@ -230,10 +222,8 @@ int main(int argc, char** argv) {
         all_odd_i.insert(all_odd_i.end(), core_odd_i[c].begin(), core_odd_i[c].end());
     }
     
-    // Precompute twiddles
     auto [tw_r, tw_i] = precompute_compact_twiddles(N, 0);
     
-    // Pad twiddle vectors to tile boundary
     {
         uint32_t tw_elems = N / 2;
         uint32_t tw_tiles = (tw_elems + TILE_SIZE - 1) / TILE_SIZE;
@@ -242,13 +232,9 @@ int main(int argc, char** argv) {
         tw_i.resize(padded_size, 0u);
     }
     
-    // Create program
     Program prog = CreateProgram();
-    
-    // Create core range (8x8 grid for 64 cores)
     CoreRange core_range({0, 0}, {7, 7});
     
-    // Create DRAM buffers
     using namespace tt::tt_metal::distributed;
     DeviceLocalBufferConfig dram_cfg{
         .page_size = TILE_BYTES, 
@@ -274,48 +260,43 @@ int main(int argc, char** argv) {
     auto b_tw_r = mk_buf(compact_size);
     auto b_tw_i = mk_buf(compact_size);
     
-    // Create circular buffers for each core
+    // Create CBs
     for (uint32_t cy = 0; cy < 8; cy++) {
         for (uint32_t cx = 0; cx < 8; cx++) {
             if (cy * 8 + cx >= num_cores) continue;
             
             CoreCoord cc = {cx, cy};
             
-            // Data buffers
-            create_cb(prog, cc, 0,  tiles_per_core, TILE_BYTES);  // even_r
-            create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);  // even_i
-            create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);  // odd_r
-            create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);  // odd_i
-            create_cb(prog, cc, 4,  tiles_per_core, TILE_BYTES);  // tw_r
-            create_cb(prog, cc, 5,  tiles_per_core, TILE_BYTES);  // tw_i
+            create_cb(prog, cc, 0,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 4,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 5,  tiles_per_core, TILE_BYTES);
             
-            // Compact twiddle buffers
             uint32_t compact_tiles = compact_size / TILE_BYTES;
-            create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);   // compact_r
-            create_cb(prog, cc, 11, compact_tiles, TILE_BYTES);   // compact_i
+            create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);
+            create_cb(prog, cc, 11, compact_tiles, TILE_BYTES);
             
-            // Output buffers
-            create_cb(prog, cc, 16, tiles_per_core, TILE_BYTES);  // out0_r
-            create_cb(prog, cc, 17, tiles_per_core, TILE_BYTES);  // out0_i
-            create_cb(prog, cc, 18, tiles_per_core, TILE_BYTES);  // out1_r
-            create_cb(prog, cc, 19, tiles_per_core, TILE_BYTES);  // out1_i
+            create_cb(prog, cc, 16, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 17, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 18, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 19, tiles_per_core, TILE_BYTES);
             
-            // Temp buffers
-            create_cb(prog, cc, 20, tiles_per_core, TILE_BYTES);  // tmp0
-            create_cb(prog, cc, 21, tiles_per_core, TILE_BYTES);  // tmp1
-            create_cb(prog, cc, 22, tiles_per_core, TILE_BYTES);  // tw_odd_r
-            create_cb(prog, cc, 23, tiles_per_core, TILE_BYTES);  // tw_odd_i
+            create_cb(prog, cc, 20, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 21, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 22, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 23, tiles_per_core, TILE_BYTES);
             
-            // Cross-core communication buffers
-            create_cb(prog, cc, 24, tiles_per_core/2, TILE_BYTES);  // recv_r
-            create_cb(prog, cc, 25, tiles_per_core/2, TILE_BYTES);  // recv_i
-            create_cb(prog, cc, 26, tiles_per_core/2, TILE_BYTES);  // send_r
-            create_cb(prog, cc, 27, tiles_per_core/2, TILE_BYTES);  // send_i
-            create_cb(prog, cc, 28, 1, 32);                         // sync
+            // FIXED: Proper sized cross-core buffers
+            create_cb(prog, cc, 24, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 25, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 26, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 27, tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 28, 1, 32);
         }
     }
     
-    // Create kernels
     KernelHandle reader_k = CreateKernel(prog,
         "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/reader.cpp",
         core_range,
@@ -335,7 +316,6 @@ int main(int argc, char** argv) {
                      .fp32_dest_acc_en = true,
                      .math_approx_mode = false});
     
-    // Set runtime args for each core
     for (uint32_t core_id = 0; core_id < num_cores; core_id++) {
         uint32_t cx = core_id % 8;
         uint32_t cy = core_id / 8;
@@ -348,36 +328,19 @@ int main(int argc, char** argv) {
             b_even_r->address(), b_even_i->address(),
             b_odd_r->address(),  b_odd_i->address(),
             b_tw_r->address(),   b_tw_i->address(),
-            tiles_per_core,      // local_tiles
-            tile_offset,         // tile_offset
-            log2N,              // num_stages
-            N/2,                // half_N
-            half_per_core,      // local_half
-            core_elem_base,     // core_elem_base
-            core_id,            // core_id
-            num_cores,          // num_cores
-            log2_cores,         // log2_cores
-            local_stages        // local_stages
+            tiles_per_core, tile_offset, log2N, N/2,
+            half_per_core, core_elem_base, core_id,
+            num_cores, log2_cores, local_stages
         };
         
-        std::vector<uint32_t> compute_args = {
-            log2N,              // num_stages
-            tiles_per_core      // tiles_per_stage
-        };
+        std::vector<uint32_t> compute_args = {log2N, tiles_per_core};
         
         std::vector<uint32_t> writer_args = {
             b_out0_r->address(), b_out0_i->address(),
             b_out1_r->address(), b_out1_i->address(),
-            tiles_per_core,
-            log2N,
-            half_per_core,      // local_half
-            N/2,                // half_N
-            num_cores,
-            core_id,
-            log2_cores,
-            tile_offset,
-            core_elem_base,
-            local_stages
+            tiles_per_core, log2N, half_per_core, N/2,
+            num_cores, core_id, log2_cores,
+            tile_offset, core_elem_base, local_stages
         };
         
         SetRuntimeArgs(prog, reader_k,  cc, reader_args);
@@ -385,7 +348,6 @@ int main(int argc, char** argv) {
         SetRuntimeArgs(prog, writer_k,  cc, writer_args);
     }
     
-    // Upload data
     distributed::MeshWorkload wl;
     distributed::MeshCoordinateRange rng = 
         distributed::MeshCoordinateRange(mesh->shape());
@@ -421,11 +383,11 @@ int main(int argc, char** argv) {
     EnqueueReadMeshBuffer(cq, out1_r_raw, b_out1_r, true);
     EnqueueReadMeshBuffer(cq, out1_i_raw, b_out1_i, true);
     
-    // Reconstruct full output
+    // FIXED: Reconstruct with contiguous layout
     std::vector<float> result_r(N), result_i(N);
     for (uint32_t core_id = 0; core_id < num_cores; core_id++) {
         uint32_t base_idx = core_id * tiles_per_core * TILE_SIZE;
-        uint32_t elem_base = core_id * (N / num_cores);
+        uint32_t elem_base = core_id * elems_per_core;
         
         for (uint32_t i = 0; i < half_per_core; i++) {
             result_r[elem_base + i] = u2f(out0_r_raw[base_idx + i]);
@@ -450,11 +412,10 @@ int main(int argc, char** argv) {
     std::cout << " Max error (real): " << max_err_r << "\n";
     std::cout << " Max error (imag): " << max_err_i << "\n";
     
-    float threshold = 0.001f * N;
+    float threshold = 0.01f * std::sqrt(N);  // Adjusted threshold
     bool passed = (max_err_r < threshold) && (max_err_i < threshold);
     std::cout << " Status: " << (passed ? "PASSED ✓" : "FAILED ✗") << "\n";
     
-    // Show first few results
     std::cout << "\nFirst 8 values:\n";
     std::cout << std::fixed << std::setprecision(4);
     for (uint32_t i = 0; i < 8 && i < N; i++) {
