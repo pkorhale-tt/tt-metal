@@ -165,6 +165,9 @@ int main(int argc, char** argv) {
     if (argc > 1) N = std::stoul(argv[1]);
     if (argc > 2) num_cores = std::stoul(argv[2]);
     
+    // ═══════════════════════════════════════════════════
+    // CALCULATE ALL PARAMETERS BEFORE USING THEM
+    // ═══════════════════════════════════════════════════
     uint32_t log2N = 0;
     while ((1u << log2N) < N) log2N++;
     
@@ -176,6 +179,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     
+    // DECLARE num_stages HERE (before it's used in CB creation)
+    uint32_t num_stages = log2N;  // ← FIX: Add this line
     uint32_t elems_per_core = N / num_cores;
     uint32_t half_per_core = elems_per_core / 2;
     uint32_t tiles_per_core = (half_per_core + TILE_SIZE - 1) / TILE_SIZE;
@@ -260,43 +265,52 @@ int main(int argc, char** argv) {
     auto b_tw_r = mk_buf(compact_size);
     auto b_tw_i = mk_buf(compact_size);
     
-    // Create CBs
+    // ═══════════════════════════════════════════════════
+    // CREATE CIRCULAR BUFFERS - NOW num_stages IS DEFINED
+    // ═══════════════════════════════════════════════════
     for (uint32_t cy = 0; cy < 8; cy++) {
         for (uint32_t cx = 0; cx < 8; cx++) {
             if (cy * 8 + cx >= num_cores) continue;
             
             CoreCoord cc = {cx, cy};
             
-            create_cb(prog, cc, 0,  tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 4, num_stages * tiles_per_core, TILE_BYTES);  // tw_r  
-            create_cb(prog, cc, 5, num_stages * tiles_per_core, TILE_BYTES);  // tw_i
+            // Data input/output buffers
+            create_cb(prog, cc, 0,  tiles_per_core, TILE_BYTES);  // even_r
+            create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);  // even_i
+            create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);  // odd_r
+            create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);  // odd_i
             
+            // Twiddle buffers - NOW THIS WORKS
+            create_cb(prog, cc, 4,  num_stages * tiles_per_core, TILE_BYTES);  // tw_r
+            create_cb(prog, cc, 5,  num_stages * tiles_per_core, TILE_BYTES);  // tw_i
+            
+            // Compact twiddle table
             uint32_t compact_tiles = compact_size / TILE_BYTES;
-            create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);
-            create_cb(prog, cc, 11, compact_tiles, TILE_BYTES);
+            create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);   // compact_r
+            create_cb(prog, cc, 11, compact_tiles, TILE_BYTES);   // compact_i
             
-            create_cb(prog, cc, 16, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 17, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 18, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 19, tiles_per_core, TILE_BYTES);
+            // Butterfly output buffers
+            create_cb(prog, cc, 16, tiles_per_core, TILE_BYTES);  // out0_r
+            create_cb(prog, cc, 17, tiles_per_core, TILE_BYTES);  // out0_i
+            create_cb(prog, cc, 18, tiles_per_core, TILE_BYTES);  // out1_r
+            create_cb(prog, cc, 19, tiles_per_core, TILE_BYTES);  // out1_i
             
-            create_cb(prog, cc, 20, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 21, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 22, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 23, tiles_per_core, TILE_BYTES);
+            // Temporary computation buffers
+            create_cb(prog, cc, 20, tiles_per_core, TILE_BYTES);  // tmp0
+            create_cb(prog, cc, 21, tiles_per_core, TILE_BYTES);  // tmp1
+            create_cb(prog, cc, 22, tiles_per_core, TILE_BYTES);  // tw_odd_r
+            create_cb(prog, cc, 23, tiles_per_core, TILE_BYTES);  // tw_odd_i
             
-            // FIXED: Proper sized cross-core buffers
-            create_cb(prog, cc, 24, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 25, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 26, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 27, tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 28, 1, 32);
+            // Cross-core communication buffers
+            create_cb(prog, cc, 24, tiles_per_core, TILE_BYTES);  // recv_r
+            create_cb(prog, cc, 25, tiles_per_core, TILE_BYTES);  // recv_i
+            create_cb(prog, cc, 26, tiles_per_core, TILE_BYTES);  // send_r
+            create_cb(prog, cc, 27, tiles_per_core, TILE_BYTES);  // send_i
+            create_cb(prog, cc, 28, 1, 32);                        // sync
         }
     }
     
+    // Rest of the code continues unchanged...
     KernelHandle reader_k = CreateKernel(prog,
         "tt_metal/programming_examples/fft_float32_multicore_optimised_full_grid/fft_multi_core/kernels/dataflow/reader.cpp",
         core_range,
@@ -316,6 +330,7 @@ int main(int argc, char** argv) {
                      .fp32_dest_acc_en = true,
                      .math_approx_mode = false});
     
+    // Set runtime arguments for each core
     for (uint32_t core_id = 0; core_id < num_cores; core_id++) {
         uint32_t cx = core_id % 8;
         uint32_t cy = core_id / 8;
@@ -383,7 +398,7 @@ int main(int argc, char** argv) {
     EnqueueReadMeshBuffer(cq, out1_r_raw, b_out1_r, true);
     EnqueueReadMeshBuffer(cq, out1_i_raw, b_out1_i, true);
     
-    // FIXED: Reconstruct with contiguous layout
+    // Reconstruct full output
     std::vector<float> result_r(N), result_i(N);
     for (uint32_t core_id = 0; core_id < num_cores; core_id++) {
         uint32_t base_idx = core_id * tiles_per_core * TILE_SIZE;
@@ -412,7 +427,7 @@ int main(int argc, char** argv) {
     std::cout << " Max error (real): " << max_err_r << "\n";
     std::cout << " Max error (imag): " << max_err_i << "\n";
     
-    float threshold = 0.01f * std::sqrt(N);  // Adjusted threshold
+    float threshold = 0.01f * std::sqrt(N);
     bool passed = (max_err_r < threshold) && (max_err_i < threshold);
     std::cout << " Status: " << (passed ? "PASSED ✓" : "FAILED ✗") << "\n";
     
