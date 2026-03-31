@@ -271,8 +271,8 @@ int main(int argc, char** argv) {
             create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);
             create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);
             create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 4,  tiles_per_core, TILE_BYTES);
-            create_cb(prog, cc, 5,  tiles_per_core, TILE_BYTES);
+            create_cb(prog, cc, 4, num_stages * tiles_per_core, TILE_BYTES);  // tw_r  
+            create_cb(prog, cc, 5, num_stages * tiles_per_core, TILE_BYTES);  // tw_i
             
             uint32_t compact_tiles = compact_size / TILE_BYTES;
             create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);
