@@ -268,47 +268,52 @@ int main(int argc, char** argv) {
     // ═══════════════════════════════════════════════════
     // CREATE CIRCULAR BUFFERS - NOW num_stages IS DEFINED
     // ═══════════════════════════════════════════════════
-    for (uint32_t cy = 0; cy < 8; cy++) {
-        for (uint32_t cx = 0; cx < 8; cx++) {
-            if (cy * 8 + cx >= num_cores) continue;
-            
-            CoreCoord cc = {cx, cy};
-            
-            // Data input/output buffers
-            create_cb(prog, cc, 0,  tiles_per_core, TILE_BYTES);  // even_r
-            create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);  // even_i
-            create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);  // odd_r
-            create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);  // odd_i
-            
-            // Twiddle buffers - NOW THIS WORKS
-            create_cb(prog, cc, 4,  tiles_per_core, TILE_BYTES);  // tw_r
-            create_cb(prog, cc, 5,  tiles_per_core, TILE_BYTES);  // tw_i
-            
-            // Compact twiddle table
-            uint32_t compact_tiles = compact_size / TILE_BYTES;
-            create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);   // compact_r
-            create_cb(prog, cc, 11, compact_tiles, TILE_BYTES);   // compact_i
-            
-            // Butterfly output buffers
-            create_cb(prog, cc, 16, tiles_per_core, TILE_BYTES);  // out0_r
-            create_cb(prog, cc, 17, tiles_per_core, TILE_BYTES);  // out0_i
-            create_cb(prog, cc, 18, tiles_per_core, TILE_BYTES);  // out1_r
-            create_cb(prog, cc, 19, tiles_per_core, TILE_BYTES);  // out1_i
-            
-            // Temporary computation buffers
-            create_cb(prog, cc, 20, tiles_per_core, TILE_BYTES);  // tmp0
-            create_cb(prog, cc, 21, tiles_per_core, TILE_BYTES);  // tmp1
-            create_cb(prog, cc, 22, tiles_per_core, TILE_BYTES);  // tw_odd_r
-            create_cb(prog, cc, 23, tiles_per_core, TILE_BYTES);  // tw_odd_i
-            
-            // Cross-core communication buffers
-            create_cb(prog, cc, 24, tiles_per_core, TILE_BYTES);  // recv_r
-            create_cb(prog, cc, 25, tiles_per_core, TILE_BYTES);  // recv_i
-            create_cb(prog, cc, 26, tiles_per_core, TILE_BYTES);  // send_r
-            create_cb(prog, cc, 27, tiles_per_core, TILE_BYTES);  // send_i
-            create_cb(prog, cc, 28, 1, 32);                        // sync
-        }
+    // In the CB creation loop:
+for (uint32_t cy = 0; cy < 8; cy++) {
+    for (uint32_t cx = 0; cx < 8; cx++) {
+        if (cy * 8 + cx >= num_cores) continue;
+        
+        CoreCoord cc = {cx, cy};
+        
+        // Stage 0 input (from DRAM)
+        create_cb(prog, cc, 0,  tiles_per_core, TILE_BYTES);  // stage0_even_r
+        create_cb(prog, cc, 1,  tiles_per_core, TILE_BYTES);  // stage0_even_i
+        create_cb(prog, cc, 2,  tiles_per_core, TILE_BYTES);  // stage0_odd_r
+        create_cb(prog, cc, 3,  tiles_per_core, TILE_BYTES);  // stage0_odd_i
+        
+        // Twiddles (per stage)
+        create_cb(prog, cc, 4,  tiles_per_core, TILE_BYTES);  // tw_r
+        create_cb(prog, cc, 5,  tiles_per_core, TILE_BYTES);  // tw_i
+        
+        // Compact twiddle table
+        uint32_t compact_tiles = compact_size / TILE_BYTES;
+        create_cb(prog, cc, 10, compact_tiles, TILE_BYTES);   // compact_r
+        create_cb(prog, cc, 11, compact_tiles, TILE_BYTES);   // compact_i
+        
+        // Ping-pong input buffers (for inter-stage data)
+        create_cb(prog, cc, 12, tiles_per_core, TILE_BYTES);  // ping_even_r
+        create_cb(prog, cc, 13, tiles_per_core, TILE_BYTES);  // ping_even_i
+        create_cb(prog, cc, 14, tiles_per_core, TILE_BYTES);  // ping_odd_r
+        create_cb(prog, cc, 15, tiles_per_core, TILE_BYTES);  // ping_odd_i
+        
+        // Butterfly outputs
+        create_cb(prog, cc, 16, tiles_per_core, TILE_BYTES);  // out0_r
+        create_cb(prog, cc, 17, tiles_per_core, TILE_BYTES);  // out0_i
+        create_cb(prog, cc, 18, tiles_per_core, TILE_BYTES);  // out1_r
+        create_cb(prog, cc, 19, tiles_per_core, TILE_BYTES);  // out1_i
+        
+        // Compute temps
+        create_cb(prog, cc, 20, tiles_per_core, TILE_BYTES);  // tmp0
+        create_cb(prog, cc, 21, tiles_per_core, TILE_BYTES);  // tmp1
+        create_cb(prog, cc, 22, tiles_per_core, TILE_BYTES);  // tw_odd_r
+        create_cb(prog, cc, 23, tiles_per_core, TILE_BYTES);  // tw_odd_i
+        
+        // Cross-core (for multi-core)
+        create_cb(prog, cc, 24, tiles_per_core, TILE_BYTES);  // recv_r
+        create_cb(prog, cc, 25, tiles_per_core, TILE_BYTES);  // recv_i
+        create_cb(prog, cc, 28, 1, 32);                        // sync
     }
+}
     
     // Rest of the code continues unchanged...
     KernelHandle reader_k = CreateKernel(prog,
