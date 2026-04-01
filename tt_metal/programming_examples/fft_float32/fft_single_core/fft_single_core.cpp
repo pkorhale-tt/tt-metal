@@ -35,7 +35,7 @@
 
 #include <cstdint>
 
-#include "api/compute/common.h"
+
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_unary/negative.h"
