@@ -46,11 +46,11 @@ add_custom_target(
     programming_examples
     DEPENDS
         profiler_examples
-        metal_example_fft_single_core
+        # metal_example_fft_single_core
         metal_example_fft_float32_single_core
         metal_example_fft_float32_optimized_single_core
         metal_example_fft_float16_single_core
-        metal_example_fft_basic
+        # metal_example_fft_basic
         metal_example_fft_basic_copy_opt
         ${PROGRAMMING_EXAMPLES_TEST_TARGETS}
 )
