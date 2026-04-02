@@ -61,6 +61,7 @@ constexpr uint32_t CB_OUT   = 3;   // output rows
 // -------------------------------------------------------------------------
 // Radix-2 DIT FFT  (same logic as small kernel, but parametrised at runtime)
 // -------------------------------------------------------------------------
+#if COMPILE_FOR_TRISC == 1
 static void bit_reverse_inplace(volatile float* data, uint32_t n) {
     uint32_t j = 0;
     for (uint32_t i = 1; i < n; ++i) {
@@ -127,6 +128,7 @@ static void apply_mixed_twiddles(
         data[2*r+1] = re*wim + im*wre;
     }
 }
+#endif
 
 #include "api/compute/cb_api.h"
 
@@ -167,9 +169,17 @@ void kernel_main() {
     // Each row is stored contiguously: data[row * S_LEN * 2 ... (row+1)*S_LEN*2 - 1]
     // -----------------------------------------------------------------------
     for (uint32_t r = 0; r < rows_per_core; ++r) {
+#if COMPILE_FOR_TRISC == 1
         volatile float* row_ptr = data + r * S_LEN * 2;
         radix2_dit(row_ptr, tw_s, S_LEN, LOG2S, (bool)INVERSE);
+#endif
     }
+#if COMPILE_FOR_TRISC == 1
+    mailbox_write(ckernel::ThreadId::UnpackThreadId, 1);
+    mailbox_write(ckernel::ThreadId::PackThreadId, 1);
+#else
+    mailbox_read(ckernel::ThreadId::MathThreadId);
+#endif
 
     // Signal DM1 (writer) that phase-1 rows are ready for NOC transpose
     // Writer will multicast each row to the appropriate target core.
@@ -198,12 +208,20 @@ void kernel_main() {
     // -----------------------------------------------------------------------
     uint32_t N = R_LEN * S_LEN;
     for (uint32_t c = 0; c < rows_per_core; ++c) {
+#if COMPILE_FOR_TRISC == 1
         volatile float* col_ptr = col_data + c * R_LEN * 2;
         uint32_t s_col = row_start + c;   // actual column index in S_LEN dimension
 
         apply_mixed_twiddles(col_ptr, s_col, R_LEN, N);
         radix2_dit(col_ptr, tw_r, R_LEN, LOG2R, (bool)INVERSE);
+#endif
     }
+#if COMPILE_FOR_TRISC == 1
+    mailbox_write(ckernel::ThreadId::UnpackThreadId, 2);
+    mailbox_write(ckernel::ThreadId::PackThreadId, 2);
+#else
+    mailbox_read(ckernel::ThreadId::MathThreadId);
+#endif
 
     // Push final output
     cb_reserve_back(CB_OUT, 1);
