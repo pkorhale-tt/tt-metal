@@ -135,14 +135,14 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 }
 inline uint32_t get_write_ptr(uint32_t cb_id) {
     uint32_t address = 0;
-    UNPACK({
+    PACK({
         uint32_t operand_id = get_operand_id(cb_id);
         address = get_local_cb_interface(operand_id).fifo_wr_ptr << 4;
         mailbox_write(ckernel::ThreadId::MathThreadId, address);
-        mailbox_write(ckernel::ThreadId::PackThreadId, address);
+        mailbox_write(ckernel::ThreadId::UnpackThreadId, address);
     })
-    MATH(address = mailbox_read(ckernel::ThreadId::UnpackThreadId);)
-    PACK(address = mailbox_read(ckernel::ThreadId::UnpackThreadId);)
+    MATH(address = mailbox_read(ckernel::ThreadId::PackThreadId);)
+    UNPACK(address = mailbox_read(ckernel::ThreadId::PackThreadId);)
     return address;
 }
 
