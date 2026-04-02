@@ -53,28 +53,33 @@ void kernel_main() {
     //   (i.e. we're filling column row_start + r_local of the transposed matrix)
     // -------------------------------------------------------------------
 
+    // Scatter phase-1 row data to the cores that own the corresponding columns.
+    //
+    // Layout in each receiver's CB0 (an R × rows_per_core block, row-major):
+    //   element [abs_row][c_local] is at byte offset:
+    //     abs_row * rows_per_core * 2 * sizeof(float)
+    //   where c_local = c - target_core_id * rows_per_core (0-based within the
+    //   slice), and we transfer all rows_per_core complex floats in one write.
+    //   Because each write targets a *different* core for each c value, abs_row
+    //   alone uniquely identifies the slot within that target core's buffer.
     for (uint32_t r_local = 0; r_local < rows_per_core; ++r_local) {
         uint32_t abs_row = row_start + r_local;
 
         for (uint32_t c = 0; c < S; c += rows_per_core) {
-            // Determine target core ID
             uint32_t target_core_id = c / rows_per_core;
-            
-            // Read pre-translated physical NOC routing coordinates from runtime args
+
             uint32_t packed_noc = get_arg_val<uint32_t>(6 + target_core_id);
             uint32_t target_col = packed_noc & 0xFFFF;
             uint32_t target_row = packed_noc >> 16;
 
-            // NOC address for target core's L1 (uses local CB0 address as baseline)
             uint64_t noc_dst = get_noc_addr(target_col, target_row, get_write_ptr(0));
 
-            // Target core receives components interleaved.
-            // Address = abs_row * rows_per_core * 8
+            // Row slot for abs_row in the receiver's R × rows_per_core buffer.
             uint32_t dst_l1_offset = abs_row * rows_per_core * 2 * sizeof(float);
 
+            // Source: columns [c .. c+rows_per_core) of row r_local
             const volatile float* src_ptr = phase1_out + r_local * S * 2 + c * 2;
 
-            // Write 32 bytes (4 complex floats) linearly aligned!
             noc_async_write(
                 reinterpret_cast<uintptr_t>(src_ptr),
                 noc_dst + dst_l1_offset,
@@ -83,10 +88,15 @@ void kernel_main() {
         }
     }
 
-    // Flush all NOC writes before signalling
+    // Flush all NOC writes before incrementing any semaphore.
+    // Each target core's reader spins on its semaphore reaching cores_in_grp,
+    // counting one increment per sender core (not per row).  We fire all
+    // semaphore increments after a single barrier, so every write is visible
+    // before the receiver is unblocked.
     noc_async_write_barrier();
 
-    // Signal each target core's semaphore 0 that we've written our slice
+    // Increment semaphore on every target core exactly once — the reader waits
+    // for cores_in_grp increments total, one from each sender core.
     for (uint32_t target_core_id = 0; target_core_id < cores_in_grp; ++target_core_id) {
         uint32_t packed_noc = get_arg_val<uint32_t>(6 + target_core_id);
         uint32_t tc = packed_noc & 0xFFFF;

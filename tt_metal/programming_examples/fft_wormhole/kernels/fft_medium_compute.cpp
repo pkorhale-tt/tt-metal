@@ -106,7 +106,9 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 // KERNEL ENTRY POINT
 // ---------------------------------------------------------------------------
 void kernel_main() {
-#if COMPILE_FOR_TRISC == 1
+#if COMPILE_FOR_TRISC == 0
+    mailbox_write(ckernel::ThreadId::MathThreadId, 0);   // clear stale UNPACK→MATH mailbox
+#elif COMPILE_FOR_TRISC == 1
     mailbox_write(ckernel::ThreadId::MathThreadId, 0);
 #elif COMPILE_FOR_TRISC == 2
     mailbox_write(ckernel::ThreadId::PackThreadId, 0);
@@ -122,12 +124,15 @@ void kernel_main() {
         reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW));
 
     for (uint32_t i = 0; i < my_batch; ++i) {
-        // Wait for reader to deliver next input
+        // Wait for reader to deliver next input.
+        // UNPACK signals MATH only AFTER cb_wait_front confirms the NOC read
+        // has completed and the data is resident in L1.
         cb_wait_front(CB_IN, 1);
         volatile float* data =
             reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
 
 #if COMPILE_FOR_TRISC == 0
+        // Data is now in L1 — safe to tell MATH to proceed.
         mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
 #endif
 

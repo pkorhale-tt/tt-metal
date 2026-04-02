@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
+#include <unordered_map>
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -43,6 +44,12 @@ static constexpr uint32_t MEDIUM_THRESH = 32 * 1024;
 // ---------------------------------------------------------------------------
 enum class FFTStrategy { SMALL, MEDIUM, LARGE };
 
+// Select strategy based on both size and batch:
+//   - Large FFT path is only useful when one FFT needs multi-core cooperation
+//     (size > MEDIUM_THRESH).
+//   - For size <= SMALL_THRESH prefer SMALL even for large batches — each
+//     core handles a slice of the batch independently.
+//   - For MEDIUM range, one core per FFT; up to 64 cores run in parallel.
 static FFTStrategy select_strategy(uint32_t size, uint32_t /*batch*/) {
     if (size <= SMALL_THRESH)  return FFTStrategy::SMALL;
     if (size <= MEDIUM_THRESH) return FFTStrategy::MEDIUM;
@@ -59,16 +66,37 @@ static const char* strategy_name(FFTStrategy s) {
 }
 
 // ---------------------------------------------------------------------------
-// Twiddle-factor precomputation
+// Twiddle-factor precomputation — cached by FFT size to avoid recomputing
+// on repeated calls with the same size.
 // ---------------------------------------------------------------------------
-static std::vector<float> precompute_twiddles(uint32_t N) {
+static std::unordered_map<uint32_t, std::vector<float>> g_twiddle_cache;
+
+static const std::vector<float>& get_twiddles(uint32_t N) {
+    auto it = g_twiddle_cache.find(N);
+    if (it != g_twiddle_cache.end()) return it->second;
+
     std::vector<float> tw(N * 2);
     for (uint32_t k = 0; k < N; ++k) {
         double angle = -2.0 * M_PI * static_cast<double>(k) / static_cast<double>(N);
         tw[2 * k]     = static_cast<float>(std::cos(angle));
         tw[2 * k + 1] = static_cast<float>(std::sin(angle));
     }
-    return tw;
+    g_twiddle_cache[N] = std::move(tw);
+    return g_twiddle_cache[N];
+}
+
+// For Tier 3: build a split twiddle buffer [R twiddles | S twiddles].
+// fft_large_reader1 expects:
+//   pages [0 .. R*2-1]       → R-point twiddle table  (tw_r)
+//   pages [R*2 .. R*2+S*2-1] → S-point twiddle table  (tw_s)
+static std::vector<float> make_large_twiddles(uint32_t R, uint32_t S) {
+    const auto& tw_r = get_twiddles(R);
+    const auto& tw_s = get_twiddles(S);
+    std::vector<float> combined;
+    combined.reserve(tw_r.size() + tw_s.size());
+    combined.insert(combined.end(), tw_r.begin(), tw_r.end());
+    combined.insert(combined.end(), tw_s.begin(), tw_s.end());
+    return combined;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,11 +261,16 @@ static void run_medium_fft(
     const uint32_t fft_bytes = size * COMPLEX_BYTES;
     const uint32_t tw_bytes  = size * COMPLEX_BYTES;
 
-    if (fft_bytes * 2 + tw_bytes > L1_BUDGET) {
+    // FIX: L1 budget check must account for all four CBs:
+    //   CB0 (input) + CB1 (scratch/ping-pong) + CB2 (twiddle) + CB3 (output)
+    //   = fft_bytes * 3 + tw_bytes
+    // The original check used fft_bytes * 2 + tw_bytes, missing CB3.
+    const uint32_t l1_needed = fft_bytes * 3 + tw_bytes;
+    if (l1_needed > L1_BUDGET) {
         throw std::runtime_error(
             "Medium FFT size=" + std::to_string(size) +
-            " needs " + std::to_string(fft_bytes * 2 + tw_bytes) +
-            " bytes, L1 budget=" + std::to_string(L1_BUDGET));
+            " needs " + std::to_string(l1_needed) +
+            " bytes across 4 CBs, L1 budget=" + std::to_string(L1_BUDGET));
     }
 
     Program program = CreateProgram();
@@ -327,10 +360,15 @@ static void run_large_fft(
     const uint32_t R     = 1u << log2R;
     const uint32_t S     = size / R;
 
-    // Keep your original grouping logic for now.
-    // If runtime placement becomes a problem, we can refine this next.
-    const uint32_t cores_per_fft = std::max(1u, 64u / batch);
-    const uint32_t active_groups = std::min(batch, 64u);
+    // FIX: Guard against R < cores_per_fft producing rows_per_core = 0.
+    // cores_per_fft must not exceed R (can't give a core 0 rows).
+    const uint32_t max_cores_per_fft = R;   // one row minimum per core
+    const uint32_t cores_per_fft = std::min(
+        max_cores_per_fft,
+        std::max(1u, 64u / std::max(batch, 1u))
+    );
+    const uint32_t rows_per_core  = R / cores_per_fft;  // guaranteed >= 1
+    const uint32_t active_groups  = std::min(batch, 64u / cores_per_fft);
 
     std::vector<CoreRange> group_ranges;
     group_ranges.reserve(active_groups);
@@ -344,7 +382,7 @@ static void run_large_fft(
 
     Program program = CreateProgram();
 
-    // Build the Physical NOC coordinate mapping for Tier 3 All-To-All Scatter
+    // Build physical NOC coordinate map for the all-to-all scatter.
     std::vector<uint32_t> noc_coords_packed(64, 0);
     IDevice* dev = mesh_device->get_devices()[0];
     for (uint32_t i = 0; i < 64; ++i) {
@@ -359,15 +397,13 @@ static void run_large_fft(
     for (uint32_t g = 0; g < active_groups; ++g) {
         auto& cr = group_ranges[g];
 
-        const uint32_t rows_per_core = std::max(1u, R / cores_per_fft);
-        const uint32_t chunk_bytes   = rows_per_core * S * COMPLEX_BYTES;
+        const uint32_t chunk_bytes = rows_per_core * S * COMPLEX_BYTES;
 
         make_cb(program, cr, 0, chunk_bytes,       chunk_bytes);
         make_cb(program, cr, 1, R * COMPLEX_BYTES, R * COMPLEX_BYTES);
         make_cb(program, cr, 2, S * COMPLEX_BYTES, S * COMPLEX_BYTES);
         make_cb(program, cr, 3, chunk_bytes,       chunk_bytes);
 
-        // Add semaphore for NOC transpose sync (reader waits for writers)
         CreateSemaphore(program, cr, 0);
 
         auto reader = CreateKernel(
@@ -444,11 +480,11 @@ static void run_large_fft(
                     R,
                     S
                 };
-                writer_args.insert(writer_args.end(), noc_coords_packed.begin(), noc_coords_packed.end());
+                writer_args.insert(writer_args.end(),
+                                   noc_coords_packed.begin(),
+                                   noc_coords_packed.end());
 
-                SetRuntimeArgs(
-                    program, writer, coord, writer_args);
-
+                SetRuntimeArgs(program, writer, coord, writer_args);
                 ++local_core;
             }
         }
@@ -507,8 +543,6 @@ void fft_universal(
               << " batch=" << batch
               << " strategy=" << strategy_name(strategy) << "\n";
 
-    auto twiddles = precompute_twiddles(size);
-
     distributed::DeviceLocalBufferConfig dram_config{
         .page_size   = COMPLEX_BYTES,
         .buffer_type = BufferType::DRAM
@@ -518,17 +552,38 @@ void fft_universal(
         .size = total_bytes
     };
 
-    distributed::ReplicatedBufferConfig tw_buffer_config{
-        .size = static_cast<uint32_t>(twiddles.size() * FLOAT_BYTES)
-    };
-
     auto src_buf = distributed::MeshBuffer::create(data_buffer_config, dram_config, mesh_device.get());
     auto dst_buf = distributed::MeshBuffer::create(data_buffer_config, dram_config, mesh_device.get());
-    auto tw_buf  = distributed::MeshBuffer::create(tw_buffer_config,   dram_config, mesh_device.get());
 
-    std::vector<float> input_vec(data_host, data_host + (batch * size * 2));
-    distributed::EnqueueWriteMeshBuffer(cq, src_buf, input_vec, false);
-    distributed::EnqueueWriteMeshBuffer(cq, tw_buf, twiddles, false);
+    // FIX: Tier 3 needs a split twiddle buffer [R entries | S entries].
+    // Tier 1 and 2 need a flat N-entry buffer.  Build the right one.
+    std::shared_ptr<distributed::MeshBuffer> tw_buf;
+    if (strategy == FFTStrategy::LARGE) {
+        const uint32_t log2n = static_cast<uint32_t>(std::log2(size));
+        const uint32_t log2R = log2n / 2;
+        const uint32_t R     = 1u << log2R;
+        const uint32_t S     = size / R;
+
+        auto combined_twiddles = make_large_twiddles(R, S);
+        distributed::ReplicatedBufferConfig tw_config{
+            .size = static_cast<uint32_t>(combined_twiddles.size() * FLOAT_BYTES)
+        };
+        tw_buf = distributed::MeshBuffer::create(tw_config, dram_config, mesh_device.get());
+
+        std::vector<float> input_vec(data_host, data_host + (batch * size * 2));
+        distributed::EnqueueWriteMeshBuffer(cq, src_buf, input_vec, false);
+        distributed::EnqueueWriteMeshBuffer(cq, tw_buf, combined_twiddles, false);
+    } else {
+        const auto& twiddles = get_twiddles(size);
+        distributed::ReplicatedBufferConfig tw_config{
+            .size = static_cast<uint32_t>(twiddles.size() * FLOAT_BYTES)
+        };
+        tw_buf = distributed::MeshBuffer::create(tw_config, dram_config, mesh_device.get());
+
+        std::vector<float> input_vec(data_host, data_host + (batch * size * 2));
+        distributed::EnqueueWriteMeshBuffer(cq, src_buf, input_vec, false);
+        distributed::EnqueueWriteMeshBuffer(cq, tw_buf, twiddles, false);
+    }
 
     switch (strategy) {
         case FFTStrategy::SMALL:
@@ -607,8 +662,8 @@ int main() {
             v = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
         }
 
-        fft_universal(ctx, in.data(),      fwd.data(),     N, B, false);
-        fft_universal(ctx, fwd.data(),     inv_out.data(), N, B, true);
+        fft_universal(ctx, in.data(),  fwd.data(),     N, B, false);
+        fft_universal(ctx, fwd.data(), inv_out.data(), N, B, true);
 
         float max_err = 0.0f;
         for (uint32_t i = 0; i < B * N * 2; ++i) {

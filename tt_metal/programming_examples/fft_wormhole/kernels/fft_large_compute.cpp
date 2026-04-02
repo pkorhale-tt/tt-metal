@@ -109,23 +109,47 @@ static void radix2_dit(
 }
 
 // -------------------------------------------------------------------------
-// Mixed-radix twiddle multiply  W_n^(r·s) applied to transposed data
-// W_n^{r*s} = exp(-2πi·r·s / N)  where N = R*S
+// Mixed-radix twiddle multiply  W_N^(r·s_col)  applied to transposed data.
+// W_N^{r*s} = exp(-2πi·r·s / N)  where N = R*S.
+//
+// Rather than calling __builtin_cos/__builtin_sin for every element (slow
+// on Tensix RISC-V), we derive W_step = exp(-2πi·s_col/N) from the
+// pre-loaded twiddle tables and accumulate by sequential complex multiply:
+//   W^0 = (1, 0)
+//   W^r = W^{r-1} * W_step
+//
+// W_step itself equals tw_s[s_col * R / N] only when s_col is a multiple
+// of (N/S) = R.  For the general case we construct it from tw_r and tw_s:
+//   exp(-2πi·s_col/N) = exp(-2πi·s_col/(R*S))
+// which is NOT directly available as a single entry in either table.
+// We therefore keep one cos/sin call — but only ONCE per column, not once
+// per element, reducing the cost from O(R) transcendentals to O(1).
 // -------------------------------------------------------------------------
 static void apply_mixed_twiddles(
-    volatile float* data,   // column data after transpose  [R points]
-    uint32_t s_col,         // column index in the S dimension
+    volatile float* data,           // R-point column buffer after transpose
+    uint32_t s_col,                 // column index in [0, S_LEN)
     uint32_t R_val,
     uint32_t N)
 {
-    for (uint32_t r = 0; r < R_val; ++r) {
-        double angle = -2.0 * 3.14159265358979323846 * (double)r * (double)s_col / (double)N;
-        float wre = static_cast<float>(__builtin_cos(angle));
-        float wim = static_cast<float>(__builtin_sin(angle));
+    // One transcendental pair per column (not per element).
+    double angle = -2.0 * 3.14159265358979323846 * static_cast<double>(s_col)
+                   / static_cast<double>(N);
+    float wstep_re = static_cast<float>(__builtin_cos(angle));
+    float wstep_im = static_cast<float>(__builtin_sin(angle));
 
+    // Accumulator starts at W^0 = (1, 0)
+    float wacc_re = 1.0f, wacc_im = 0.0f;
+
+    for (uint32_t r = 0; r < R_val; ++r) {
         float re = data[2*r], im = data[2*r+1];
-        data[2*r]   = re*wre - im*wim;
-        data[2*r+1] = re*wim + im*wre;
+        data[2*r]   = re * wacc_re - im * wacc_im;
+        data[2*r+1] = re * wacc_im + im * wacc_re;
+
+        // Advance accumulator: wacc *= wstep  (complex multiply)
+        float new_re = wacc_re * wstep_re - wacc_im * wstep_im;
+        float new_im = wacc_re * wstep_im + wacc_im * wstep_re;
+        wacc_re = new_re;
+        wacc_im = new_im;
     }
 }
 #endif
@@ -210,23 +234,23 @@ void kernel_main() {
     cb_reserve_back(CB_OUT, 1);
 
 #if COMPILE_FOR_TRISC == 1
-    // Un-interleave the NOC-transposed payload from CB_IN directly into CB_OUT!
-    // The writer interleaved it to respect 16-byte alignment hardware rules
-    volatile float* out_ptr = reinterpret_cast<volatile float*>(cb_out_addr);
+    // Un-interleave the NOC-transposed payload from CB_DATA into CB_OUT.
+    // col_out_ptr targets the CB_OUT buffer (address broadcast by UNPACK at startup).
+    volatile float* col_out_ptr = reinterpret_cast<volatile float*>(cb_out_addr);
 
     for (uint32_t r = 0; r < R_LEN; ++r) {
         for (uint32_t c = 0; c < rows_per_core; ++c) {
             uint32_t src_idx = (r * rows_per_core + c) * 2;
             uint32_t dst_idx = (c * R_LEN + r) * 2;
-            out_ptr[dst_idx]     = col_data[src_idx];
-            out_ptr[dst_idx + 1] = col_data[src_idx + 1];
+            col_out_ptr[dst_idx]     = col_data[src_idx];
+            col_out_ptr[dst_idx + 1] = col_data[src_idx + 1];
         }
     }
 
     uint32_t N = R_LEN * S_LEN;
     for (uint32_t c = 0; c < rows_per_core; ++c) {
-        volatile float* col_ptr = out_ptr + c * R_LEN * 2;
-        uint32_t s_col = row_start + c;   // actual column index in S_LEN dimension
+        volatile float* col_ptr = col_out_ptr + c * R_LEN * 2;
+        uint32_t s_col = row_start + c;   // actual column index in the S dimension
 
         apply_mixed_twiddles(col_ptr, s_col, R_LEN, N);
         radix2_dit(col_ptr, tw_r, R_LEN, LOG2R, (bool)INVERSE);
