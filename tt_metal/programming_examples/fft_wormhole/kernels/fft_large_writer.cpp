@@ -68,9 +68,8 @@ void kernel_main() {
                 abs_row * 2 * sizeof(float) +     // column r maps to row r in transpose
                 c * rows_per_core * sizeof(float); // position within the column block
 
-            // NOC address for target core's L1
-            uint64_t noc_dst = get_noc_addr(target_col, target_row,
-                                            get_write_ptr_of_core(0, target_col, target_row));
+            // NOC address for target core's L1 (uses local CB0 address as baseline)
+            uint64_t noc_dst = get_noc_addr(target_col, target_row, get_write_ptr(0));
 
             // Source pointer into our phase-1 output CB
             const volatile float* src_ptr =
@@ -91,7 +90,7 @@ void kernel_main() {
     // Signal each target core's semaphore 0 that we've written our slice
     for (uint32_t target = 0; target < cores_in_grp; ++target) {
         uint32_t tc = target % 8, tr = target / 8;
-        uint64_t sem_noc = get_noc_addr(tc, tr, get_semaphore_addr(0, tc, tr));
+        uint64_t sem_noc = get_noc_addr(tc, tr, get_semaphore(0));
         noc_semaphore_inc(sem_noc, 1);
     }
 
