@@ -156,10 +156,10 @@ void kernel_main() {
         }
 
         // signal UNPACK and PACK that math is done
-        mailbox_write(ckernel::ThreadId::UnpackThreadId, 1);
-        mailbox_write(ckernel::ThreadId::PackThreadId, 1);
+        mailbox_write(ckernel::ThreadId::UnpackThreadId, fft_i + 1);
+        mailbox_write(ckernel::ThreadId::PackThreadId, fft_i + 1);
 #else
-        while(mailbox_read(ckernel::ThreadId::MathThreadId) != 1) { /* spin */ }
+        while(mailbox_read(ckernel::ThreadId::MathThreadId) != fft_i + 1) { /* spin */ }
 #endif
 
         // data now contains the FFT result in L1

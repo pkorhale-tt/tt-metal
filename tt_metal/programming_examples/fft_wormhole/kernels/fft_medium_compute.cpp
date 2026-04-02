@@ -137,10 +137,10 @@ void kernel_main() {
         // Compute FFT in-place on L1 data
 #if COMPILE_FOR_TRISC == 1
         radix2_dit(data, tw, size, log2n, (bool)inv);
-        mailbox_write(ckernel::ThreadId::UnpackThreadId, 1);
-        mailbox_write(ckernel::ThreadId::PackThreadId, 1);
+        mailbox_write(ckernel::ThreadId::UnpackThreadId, i + 1);
+        mailbox_write(ckernel::ThreadId::PackThreadId, i + 1);
 #else
-        while (mailbox_read(ckernel::ThreadId::MathThreadId) != 1) { /* spin */ }
+        while (mailbox_read(ckernel::ThreadId::MathThreadId) != i + 1) { /* spin */ }
 #endif
 
         // Copy result to output CB for writer
