@@ -32,9 +32,9 @@ using namespace tt::tt_metal;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static constexpr uint32_t L1_BUDGET     = 1024 * 1024;   // 1 MB safe budget
+static constexpr uint32_t L1_BUDGET     = 1024 * 1024;
 static constexpr uint32_t FLOAT_BYTES   = 4;
-static constexpr uint32_t COMPLEX_BYTES = 2 * FLOAT_BYTES; // re + im = 8 bytes
+static constexpr uint32_t COMPLEX_BYTES = 2 * FLOAT_BYTES;
 
 static constexpr uint32_t SMALL_THRESH  =  4 * 1024;
 static constexpr uint32_t MEDIUM_THRESH = 32 * 1024;
@@ -44,12 +44,6 @@ static constexpr uint32_t MEDIUM_THRESH = 32 * 1024;
 // ---------------------------------------------------------------------------
 enum class FFTStrategy { SMALL, MEDIUM, LARGE };
 
-// Select strategy based on both size and batch:
-//   - Large FFT path is only useful when one FFT needs multi-core cooperation
-//     (size > MEDIUM_THRESH).
-//   - For size <= SMALL_THRESH prefer SMALL even for large batches — each
-//     core handles a slice of the batch independently.
-//   - For MEDIUM range, one core per FFT; up to 64 cores run in parallel.
 static FFTStrategy select_strategy(uint32_t size, uint32_t /*batch*/) {
     if (size <= SMALL_THRESH)  return FFTStrategy::SMALL;
     if (size <= MEDIUM_THRESH) return FFTStrategy::MEDIUM;
@@ -66,8 +60,7 @@ static const char* strategy_name(FFTStrategy s) {
 }
 
 // ---------------------------------------------------------------------------
-// Twiddle-factor precomputation — cached by FFT size to avoid recomputing
-// on repeated calls with the same size.
+// Twiddle cache
 // ---------------------------------------------------------------------------
 static std::unordered_map<uint32_t, std::vector<float>> g_twiddle_cache;
 
@@ -85,13 +78,11 @@ static const std::vector<float>& get_twiddles(uint32_t N) {
     return g_twiddle_cache[N];
 }
 
-// For Tier 3: build a split twiddle buffer [R twiddles | S twiddles].
-// fft_large_reader1 expects:
-//   pages [0 .. R*2-1]       → R-point twiddle table  (tw_r)
-//   pages [R*2 .. R*2+S*2-1] → S-point twiddle table  (tw_s)
+// Tier 3 split twiddle buffer [R twiddles | S twiddles]
 static std::vector<float> make_large_twiddles(uint32_t R, uint32_t S) {
     const auto& tw_r = get_twiddles(R);
     const auto& tw_s = get_twiddles(S);
+
     std::vector<float> combined;
     combined.reserve(tw_r.size() + tw_s.size());
     combined.insert(combined.end(), tw_r.begin(), tw_r.end());
@@ -100,15 +91,12 @@ static std::vector<float> make_large_twiddles(uint32_t R, uint32_t S) {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: aligned bytes
+// Helpers
 // ---------------------------------------------------------------------------
 static uint32_t align32(uint32_t x) {
     return (x + 31u) & ~31u;
 }
 
-// ---------------------------------------------------------------------------
-// Helper: create circular buffer
-// ---------------------------------------------------------------------------
 static void make_cb(
     Program&         program,
     const CoreRange& cr,
@@ -124,9 +112,6 @@ static void make_cb(
     CreateCircularBuffer(program, cr, cfg);
 }
 
-// ---------------------------------------------------------------------------
-// Helper: compile-time TensorAccessor args for mesh buffers
-// ---------------------------------------------------------------------------
 static std::vector<uint32_t> make_accessor_args_2(
     const std::shared_ptr<distributed::MeshBuffer>& a,
     const std::shared_ptr<distributed::MeshBuffer>& b)
@@ -145,8 +130,14 @@ static std::vector<uint32_t> make_accessor_args_1(
     return args;
 }
 
+static CoreCoord get_worker_grid(const std::shared_ptr<distributed::MeshDevice>& mesh_device) {
+    auto* dev = mesh_device->get_devices()[0];
+    return dev->compute_with_storage_grid_size();
+}
+
 // ===========================================================================
 //  TIER 1 — Small FFT
+//  Permanent fix: one FFT/core, scheduled in waves across actual worker grid.
 // ===========================================================================
 static void run_small_fft(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
@@ -161,22 +152,31 @@ static void run_small_fft(
     const uint32_t log2n         = static_cast<uint32_t>(std::log2(size));
     const uint32_t bytes_per_fft = size * COMPLEX_BYTES;
 
+    const CoreCoord grid = get_worker_grid(mesh_device);
+    const uint32_t num_cores_x = grid.x;
+    const uint32_t num_cores_y = grid.y;
+    const uint32_t max_active_cores = num_cores_x * num_cores_y;
+
+    std::cout << "[small] worker_grid=" << num_cores_x << "x" << num_cores_y
+              << " max_active_cores=" << max_active_cores << "\n";
+
     auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
     auto writer_ct_args = make_accessor_args_1(dst_buf);
 
-    for (uint32_t wave_base = 0; wave_base < batch; wave_base += 64) {
-        const uint32_t wave_batch   = std::min(64u, batch - wave_base);
+    for (uint32_t wave_base = 0; wave_base < batch; wave_base += max_active_cores) {
+        const uint32_t wave_batch   = std::min(max_active_cores, batch - wave_base);
         const uint32_t active_cores = wave_batch;
-        const uint32_t rows         = (active_cores + 7) / 8;
-        const uint32_t cols         = std::min(active_cores, 8u);
+        const uint32_t rows         = (active_cores + num_cores_x - 1) / num_cores_x;
+        const uint32_t cols         = std::min(active_cores, num_cores_x);
 
         std::cout << "[small wave] base=" << wave_base
-                  << " count=" << wave_batch << "\n";
+                  << " count=" << wave_batch
+                  << " rows=" << rows
+                  << " cols=" << cols << "\n";
 
         CoreRange core_range(CoreCoord{0, 0}, CoreCoord{cols - 1, rows - 1});
         Program program = CreateProgram();
 
-        // one FFT per core only
         make_cb(program, core_range, 0, bytes_per_fft, bytes_per_fft);
         make_cb(program, core_range, 1, size * COMPLEX_BYTES, size * COMPLEX_BYTES);
         make_cb(program, core_range, 2, bytes_per_fft, bytes_per_fft);
@@ -242,10 +242,14 @@ static void run_small_fft(
 
         distributed::EnqueueMeshWorkload(cq, workload, false);
         distributed::Finish(cq);
+
+        std::cout << "[small wave done] base=" << wave_base << "\n";
     }
 }
+
 // ===========================================================================
 //  TIER 2 — Medium FFT
+//  Permanent fix: one FFT/core, wave scheduler, actual worker grid.
 // ===========================================================================
 static void run_medium_fft(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
@@ -269,14 +273,27 @@ static void run_medium_fft(
             " bytes across 4 CBs, L1 budget=" + std::to_string(L1_BUDGET));
     }
 
+    const CoreCoord grid = get_worker_grid(mesh_device);
+    const uint32_t num_cores_x = grid.x;
+    const uint32_t num_cores_y = grid.y;
+    const uint32_t max_active_cores = num_cores_x * num_cores_y;
+
+    std::cout << "[medium] worker_grid=" << num_cores_x << "x" << num_cores_y
+              << " max_active_cores=" << max_active_cores << "\n";
+
     auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
     auto writer_ct_args = make_accessor_args_1(dst_buf);
 
-    for (uint32_t wave_base = 0; wave_base < batch; wave_base += 64) {
-        const uint32_t wave_batch   = std::min(64u, batch - wave_base);
+    for (uint32_t wave_base = 0; wave_base < batch; wave_base += max_active_cores) {
+        const uint32_t wave_batch   = std::min(max_active_cores, batch - wave_base);
         const uint32_t active_cores = wave_batch;
-        const uint32_t rows         = (active_cores + 7) / 8;
-        const uint32_t cols         = std::min(active_cores, 8u);
+        const uint32_t rows         = (active_cores + num_cores_x - 1) / num_cores_x;
+        const uint32_t cols         = std::min(active_cores, num_cores_x);
+
+        std::cout << "[medium wave] base=" << wave_base
+                  << " count=" << wave_batch
+                  << " rows=" << rows
+                  << " cols=" << cols << "\n";
 
         CoreRange core_range(CoreCoord{0, 0}, CoreCoord{cols - 1, rows - 1});
         Program program = CreateProgram();
@@ -346,10 +363,14 @@ static void run_medium_fft(
 
         distributed::EnqueueMeshWorkload(cq, workload, false);
         distributed::Finish(cq);
+
+        std::cout << "[medium wave done] base=" << wave_base << "\n";
     }
 }
+
 // ===========================================================================
 //  TIER 3 — Large FFT
+//  Uses actual worker grid instead of hardcoded 64/8 assumptions.
 // ===========================================================================
 static void run_large_fft(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
@@ -367,15 +388,24 @@ static void run_large_fft(
     const uint32_t R     = 1u << log2R;
     const uint32_t S     = size / R;
 
-    // FIX: Guard against R < cores_per_fft producing rows_per_core = 0.
-    // cores_per_fft must not exceed R (can't give a core 0 rows).
-    const uint32_t max_cores_per_fft = R;   // one row minimum per core
+    const CoreCoord grid = get_worker_grid(mesh_device);
+    const uint32_t num_cores_x = grid.x;
+    const uint32_t num_cores_y = grid.y;
+    const uint32_t num_worker_cores = num_cores_x * num_cores_y;
+
+    const uint32_t max_cores_per_fft = R;
     const uint32_t cores_per_fft = std::min(
         max_cores_per_fft,
-        std::max(1u, 64u / std::max(batch, 1u))
+        std::max(1u, num_worker_cores / std::max(batch, 1u))
     );
-    const uint32_t rows_per_core  = R / cores_per_fft;  // guaranteed >= 1
-    const uint32_t active_groups  = std::min(batch, 64u / cores_per_fft);
+    const uint32_t rows_per_core = R / cores_per_fft;
+    const uint32_t active_groups = std::min(batch, num_worker_cores / cores_per_fft);
+
+    std::cout << "[large] worker_grid=" << num_cores_x << "x" << num_cores_y
+              << " num_worker_cores=" << num_worker_cores
+              << " cores_per_fft=" << cores_per_fft
+              << " rows_per_core=" << rows_per_core
+              << " active_groups=" << active_groups << "\n";
 
     std::vector<CoreRange> group_ranges;
     group_ranges.reserve(active_groups);
@@ -383,17 +413,16 @@ static void run_large_fft(
         uint32_t first = g * cores_per_fft;
         uint32_t last  = first + cores_per_fft - 1;
         group_ranges.push_back(CoreRange(
-            CoreCoord{first % 8, first / 8},
-            CoreCoord{last  % 8, last  / 8}));
+            CoreCoord{first % num_cores_x, first / num_cores_x},
+            CoreCoord{last  % num_cores_x, last  / num_cores_x}));
     }
 
     Program program = CreateProgram();
 
-    // Build physical NOC coordinate map for the all-to-all scatter.
-    std::vector<uint32_t> noc_coords_packed(64, 0);
+    std::vector<uint32_t> noc_coords_packed(num_worker_cores, 0);
     IDevice* dev = mesh_device->get_devices()[0];
-    for (uint32_t i = 0; i < 64; ++i) {
-        CoreCoord logical_coord{i % 8, i / 8};
+    for (uint32_t i = 0; i < num_worker_cores; ++i) {
+        CoreCoord logical_coord{i % num_cores_x, i / num_cores_x};
         CoreCoord physical_coord = dev->worker_core_from_logical_core(logical_coord);
         noc_coords_packed[i] = (physical_coord.y << 16) | physical_coord.x;
     }
@@ -403,7 +432,6 @@ static void run_large_fft(
 
     for (uint32_t g = 0; g < active_groups; ++g) {
         auto& cr = group_ranges[g];
-
         const uint32_t chunk_bytes = rows_per_core * S * COMPLEX_BYTES;
 
         make_cb(program, cr, 0, chunk_bytes,       chunk_bytes);
@@ -487,9 +515,11 @@ static void run_large_fft(
                     R,
                     S
                 };
-                writer_args.insert(writer_args.end(),
-                                   noc_coords_packed.begin(),
-                                   noc_coords_packed.end());
+                writer_args.insert(
+                    writer_args.end(),
+                    noc_coords_packed.begin(),
+                    noc_coords_packed.end()
+                );
 
                 SetRuntimeArgs(program, writer, coord, writer_args);
                 ++local_core;
@@ -562,8 +592,6 @@ void fft_universal(
     auto src_buf = distributed::MeshBuffer::create(data_buffer_config, dram_config, mesh_device.get());
     auto dst_buf = distributed::MeshBuffer::create(data_buffer_config, dram_config, mesh_device.get());
 
-    // FIX: Tier 3 needs a split twiddle buffer [R entries | S entries].
-    // Tier 1 and 2 need a flat N-entry buffer.  Build the right one.
     std::shared_ptr<distributed::MeshBuffer> tw_buf;
     if (strategy == FFTStrategy::LARGE) {
         const uint32_t log2n = static_cast<uint32_t>(std::log2(size));
@@ -625,7 +653,6 @@ void fft_universal(
 int main() {
     FFTContext ctx(/*device_id=*/0);
 
-    // Test 1: 256 × 1K — Tier 1
     {
         const uint32_t N = 1024;
         const uint32_t B = 256;
@@ -642,7 +669,6 @@ int main() {
                   << " out[2]=" << out[2] << "  (both ~1.0)\n";
     }
 
-    // Test 2: 1 × 64K — Tier 3
     {
         const uint32_t N = 65536;
         const uint32_t B = 1;
@@ -656,7 +682,6 @@ int main() {
         std::cout << "Tier3 smoke: out[0]=" << out[0] << "  (~1.0)\n";
     }
 
-    // Test 3: round-trip IFFT(FFT(x)) / N ≈ x
     {
         const uint32_t N = 8192;
         const uint32_t B = 4;
