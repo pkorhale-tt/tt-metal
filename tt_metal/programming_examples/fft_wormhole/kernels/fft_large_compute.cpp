@@ -199,7 +199,7 @@ void kernel_main() {
 #if COMPILE_FOR_TRISC == 1
     // Un-interleave the NOC-transposed payload from CB_IN directly into CB_OUT!
     // The writer interleaved it to respect 16-byte alignment hardware rules
-    volatile float* out_ptr = reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+    volatile float* out_ptr = reinterpret_cast<volatile float*>(cb_out_addr);
 
     for (uint32_t r = 0; r < R_LEN; ++r) {
         for (uint32_t c = 0; c < rows_per_core; ++c) {
