@@ -100,19 +100,7 @@ static void radix2_dit(
 inline uint32_t get_read_ptr(uint32_t cb_id) {
     return get_tile_address(cb_id, 0);
 }
-inline uint32_t get_write_ptr(uint32_t cb_id) {
-    uint32_t address = 0;
-#if COMPILE_FOR_TRISC == 0
-    address = get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
-    mailbox_write(ckernel::ThreadId::MathThreadId, address);
-    mailbox_write(ckernel::ThreadId::PackThreadId, address);
-#elif COMPILE_FOR_TRISC == 1
-    address = mailbox_read(ckernel::ThreadId::UnpackThreadId);
-#elif COMPILE_FOR_TRISC == 2
-    address = mailbox_read(ckernel::ThreadId::UnpackThreadId);
-#endif
-    return address;
-}
+
 
 // ---------------------------------------------------------------------------
 // KERNEL ENTRY POINT
@@ -145,11 +133,12 @@ void kernel_main() {
 
         // Copy result to output CB for writer
         cb_reserve_back(CB_OUT, 1);
+#if COMPILE_FOR_TRISC == 2
         volatile float* out =
-            reinterpret_cast<volatile float*>(get_write_ptr(CB_OUT));
+            reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
 
         for (uint32_t j = 0; j < size * 2; ++j) out[j] = data[j];
-
+#endif
         cb_push_back(CB_OUT, 1);
         cb_pop_front(CB_IN, 1);
     }

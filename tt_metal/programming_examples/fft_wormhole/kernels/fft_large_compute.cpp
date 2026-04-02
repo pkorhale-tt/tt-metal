@@ -135,17 +135,7 @@ static void apply_mixed_twiddles(
 inline uint32_t get_read_ptr(uint32_t cb_id) {
     return get_tile_address(cb_id, 0);
 }
-inline uint32_t get_write_ptr(uint32_t cb_id) {
-    uint32_t address = 0;
-    PACK({
-        address = get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
-        mailbox_write(ckernel::ThreadId::MathThreadId, address);
-        mailbox_write(ckernel::ThreadId::UnpackThreadId, address);
-    })
-    MATH(address = mailbox_read(ckernel::ThreadId::PackThreadId);)
-    UNPACK(address = mailbox_read(ckernel::ThreadId::PackThreadId);)
-    return address;
-}
+
 
 // =========================================================================
 // KERNEL ENTRY POINT
@@ -185,12 +175,14 @@ void kernel_main() {
     // Writer will multicast each row to the appropriate target core.
     // The CB push acts as the producer signal.
     cb_reserve_back(CB_OUT, 1);
-    volatile float* out_ptr = reinterpret_cast<volatile float*>(get_write_ptr(CB_OUT));
+#if COMPILE_FOR_TRISC == 2
+    volatile float* out_ptr = reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
 
     // Copy phase-1 results to output CB for writer to transmit
     for (uint32_t i = 0; i < rows_per_core * S_LEN * 2; ++i) {
         out_ptr[i] = data[i];
     }
+#endif
     cb_push_back(CB_OUT, 1);
     cb_pop_front(CB_DATA, 1);
 
@@ -225,10 +217,12 @@ void kernel_main() {
 
     // Push final output
     cb_reserve_back(CB_OUT, 1);
-    out_ptr = reinterpret_cast<volatile float*>(get_write_ptr(CB_OUT));
+#if COMPILE_FOR_TRISC == 2
+    volatile float* out_ptr_p2 = reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
     for (uint32_t i = 0; i < rows_per_core * R_LEN * 2; ++i) {
-        out_ptr[i] = col_data[i];
+        out_ptr_p2[i] = col_data[i];
     }
+#endif
     cb_push_back(CB_OUT, 1);
     cb_pop_front(CB_DATA, 1);
 
