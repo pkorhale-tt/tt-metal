@@ -78,6 +78,9 @@ void kernel_main() {
                     2 * sizeof(float)  // 1 complex sample
                 );
             }
+            
+            // Prevent NOC command queue overflow! Each core receives 4 requests. Wait for them to issue.
+            noc_async_write_barrier();
         }
     }
 
