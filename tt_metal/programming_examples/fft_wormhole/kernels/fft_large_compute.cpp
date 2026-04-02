@@ -31,9 +31,9 @@
 //   [4] = rows_per_core  — rows / cols each core is responsible for
 // =============================================================================
 
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/tile_move_copy.h"
+#include "api/compute/common.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/tile_move_copy.h"
 
 constexpr uint32_t LOG2R          = get_compile_time_arg_val(0);
 constexpr uint32_t LOG2S          = get_compile_time_arg_val(1);

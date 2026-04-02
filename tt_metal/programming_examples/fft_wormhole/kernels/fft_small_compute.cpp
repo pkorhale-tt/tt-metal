@@ -18,11 +18,11 @@
 //   [1] = inverse  (0 = forward FFT, 1 = IFFT)
 // =============================================================================
 
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/reconfig.h"
+#include "api/compute/common.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/reconfig_data_format.h"
 
 // Compile-time constants injected from host
 constexpr uint32_t LOG2N   = get_compile_time_arg_val(0);
