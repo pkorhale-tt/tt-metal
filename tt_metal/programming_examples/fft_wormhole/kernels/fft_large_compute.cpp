@@ -142,11 +142,15 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 // =========================================================================
 void kernel_main() {
     uint32_t cb_out_addr = 0;
-#if COMPILE_FOR_TRISC == 0
-    cb_out_addr = get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4;
-    mailbox_write(ckernel::ThreadId::MathThreadId, cb_out_addr);
-#elif COMPILE_FOR_TRISC == 1
+#if COMPILE_FOR_TRISC == 1
+    mailbox_write(ckernel::ThreadId::MathThreadId, 0); // clear math sync
+    // Wait for UNPACK to send the CB_OUT address cleanly into UNPACK's mailbox
+    while (mailbox_read(ckernel::ThreadId::UnpackThreadId) == 0) { asm volatile("" ::: "memory"); }
     cb_out_addr = mailbox_read(ckernel::ThreadId::UnpackThreadId);
+#elif COMPILE_FOR_TRISC == 0
+    cb_out_addr = get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4;
+    // UNPACK writes its own mailbox to broadcast address to MATH safely
+    mailbox_write(ckernel::ThreadId::UnpackThreadId, cb_out_addr);
 #endif
 
     uint32_t row_start     = get_arg_val<uint32_t>(0);
@@ -173,10 +177,11 @@ void kernel_main() {
 #endif
     }
 #if COMPILE_FOR_TRISC == 1
-    mailbox_write(ckernel::ThreadId::UnpackThreadId, 1);
-    mailbox_write(ckernel::ThreadId::PackThreadId, 1);
+    mailbox_write(ckernel::ThreadId::MathThreadId, 1);
 #else
-    while (mailbox_read(ckernel::ThreadId::MathThreadId) != 1) { /* spin */ }
+    while (mailbox_read(ckernel::ThreadId::MathThreadId) < 1) {
+        asm volatile("" ::: "memory");
+    }
 #endif
 
     // Signal DM1 (writer) that phase-1 rows are ready for NOC transpose
@@ -229,10 +234,11 @@ void kernel_main() {
 #endif
 
 #if COMPILE_FOR_TRISC == 1
-    mailbox_write(ckernel::ThreadId::UnpackThreadId, 2);
-    mailbox_write(ckernel::ThreadId::PackThreadId, 2);
+    mailbox_write(ckernel::ThreadId::MathThreadId, 2);
 #else
-    while (mailbox_read(ckernel::ThreadId::MathThreadId) != 2) { /* spin */ }
+    while (mailbox_read(ckernel::ThreadId::MathThreadId) < 2) {
+        asm volatile("" ::: "memory");
+    }
 #endif
 
     // Push final output (It's already in CB_OUT thanks to MATH thread un-interleave)

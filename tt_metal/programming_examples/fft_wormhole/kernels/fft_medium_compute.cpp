@@ -106,6 +106,9 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 // KERNEL ENTRY POINT
 // ---------------------------------------------------------------------------
 void kernel_main() {
+#if COMPILE_FOR_TRISC == 1
+    mailbox_write(ckernel::ThreadId::MathThreadId, 0);
+#endif
     uint32_t my_batch = get_arg_val<uint32_t>(0);
     uint32_t size     = get_arg_val<uint32_t>(1);
     uint32_t log2n    = get_arg_val<uint32_t>(2);
@@ -125,10 +128,11 @@ void kernel_main() {
         // Compute FFT in-place on L1 data
 #if COMPILE_FOR_TRISC == 1
         radix2_dit(data, tw, size, log2n, (bool)inv);
-        mailbox_write(ckernel::ThreadId::UnpackThreadId, i + 1);
-        mailbox_write(ckernel::ThreadId::PackThreadId, i + 1);
+        mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
 #else
-        while (mailbox_read(ckernel::ThreadId::MathThreadId) != i + 1) { /* spin */ }
+        while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) {
+            asm volatile("" ::: "memory");
+        }
 #endif
 
         // Copy result to output CB for writer

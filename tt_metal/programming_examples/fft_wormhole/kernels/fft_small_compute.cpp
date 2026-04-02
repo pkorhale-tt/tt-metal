@@ -115,6 +115,11 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 // KERNEL ENTRY POINT
 // ---------------------------------------------------------------------------
 void kernel_main() {
+    // Handshake to clear stale math sync state
+#if COMPILE_FOR_TRISC == 1
+    mailbox_write(ckernel::ThreadId::MathThreadId, 0);
+#endif
+
     // Runtime args
     uint32_t my_batch = get_arg_val<uint32_t>(0);
     // size and log2n are known at compile time (LOG2N, N)
@@ -144,10 +149,11 @@ void kernel_main() {
         }
 
         // signal UNPACK and PACK that math is done
-        mailbox_write(ckernel::ThreadId::UnpackThreadId, fft_i + 1);
-        mailbox_write(ckernel::ThreadId::PackThreadId, fft_i + 1);
+        mailbox_write(ckernel::ThreadId::MathThreadId, fft_i + 1);
 #else
-        while(mailbox_read(ckernel::ThreadId::MathThreadId) != fft_i + 1) { /* spin */ }
+        while (mailbox_read(ckernel::ThreadId::MathThreadId) < fft_i + 1) {
+            asm volatile("" ::: "memory");
+        }
 #endif
 
         // data now contains the FFT result in L1
