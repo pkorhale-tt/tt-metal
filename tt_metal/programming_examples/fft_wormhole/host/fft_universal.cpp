@@ -173,6 +173,7 @@ static void run_small_fft(
         CoreRange core_range(CoreCoord{0, 0}, CoreCoord{cols - 1, rows - 1});
         Program program = CreateProgram();
 
+        // one FFT per core only
         make_cb(program, core_range, 0, bytes_per_fft, bytes_per_fft);
         make_cb(program, core_range, 1, size * COMPLEX_BYTES, size * COMPLEX_BYTES);
         make_cb(program, core_range, 2, bytes_per_fft, bytes_per_fft);
@@ -215,11 +216,16 @@ static void run_small_fft(
                 uint32_t fft_offset = wave_base + core_idx;
                 uint32_t my_batch   = 1;
 
-                SetRuntimeArgs(program, reader, coord,
+                SetRuntimeArgs(
+                    program, reader, coord,
                     {src_buf->address(), tw_buf->address(), fft_offset, my_batch, size});
-                SetRuntimeArgs(program, compute, coord,
+
+                SetRuntimeArgs(
+                    program, compute, coord,
                     {my_batch, size, log2n, static_cast<uint32_t>(inverse)});
-                SetRuntimeArgs(program, writer, coord,
+
+                SetRuntimeArgs(
+                    program, writer, coord,
                     {dst_buf->address(), fft_offset, my_batch, size});
 
                 ++core_idx;
@@ -248,20 +254,10 @@ static void run_medium_fft(
     uint32_t                                        batch,
     bool                                            inverse)
 {
-    const uint32_t log2n        = static_cast<uint32_t>(std::log2(size));
-    const uint32_t active_cores = std::min(batch, 64u);
-
-    const uint32_t rows = (active_cores + 7) / 8;
-    const uint32_t cols = std::min(active_cores, 8u);
-    CoreRange core_range(CoreCoord{0, 0}, CoreCoord{cols - 1, rows - 1});
-
+    const uint32_t log2n     = static_cast<uint32_t>(std::log2(size));
     const uint32_t fft_bytes = size * COMPLEX_BYTES;
     const uint32_t tw_bytes  = size * COMPLEX_BYTES;
 
-    // FIX: L1 budget check must account for all four CBs:
-    //   CB0 (input) + CB1 (scratch/ping-pong) + CB2 (twiddle) + CB3 (output)
-    //   = fft_bytes * 3 + tw_bytes
-    // The original check used fft_bytes * 2 + tw_bytes, missing CB3.
     const uint32_t l1_needed = fft_bytes * 3 + tw_bytes;
     if (l1_needed > L1_BUDGET) {
         throw std::runtime_error(
@@ -270,72 +266,83 @@ static void run_medium_fft(
             " bytes across 4 CBs, L1 budget=" + std::to_string(L1_BUDGET));
     }
 
-    Program program = CreateProgram();
-
-    make_cb(program, core_range, 0, fft_bytes, fft_bytes);
-    make_cb(program, core_range, 1, fft_bytes, fft_bytes);
-    make_cb(program, core_range, 2, tw_bytes,  tw_bytes);
-    make_cb(program, core_range, 3, fft_bytes, fft_bytes);
-
     auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
     auto writer_ct_args = make_accessor_args_1(dst_buf);
 
-    auto reader = CreateKernel(
-        program,
-        OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_reader.cpp",
-        core_range,
-        DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_0,
-            .noc       = NOC::RISCV_0_default,
-            .compile_args = reader_ct_args
-        });
+    for (uint32_t wave_base = 0; wave_base < batch; wave_base += 64) {
+        const uint32_t wave_batch   = std::min(64u, batch - wave_base);
+        const uint32_t active_cores = wave_batch;
+        const uint32_t rows         = (active_cores + 7) / 8;
+        const uint32_t cols         = std::min(active_cores, 8u);
 
-    auto compute = CreateKernel(
-        program,
-        OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_compute.cpp",
-        core_range,
-        ComputeConfig{
-            .math_fidelity    = MathFidelity::HiFi4,
-            .fp32_dest_acc_en = true,
-            .compile_args     = {log2n, static_cast<uint32_t>(inverse)}
-        });
+        CoreRange core_range(CoreCoord{0, 0}, CoreCoord{cols - 1, rows - 1});
+        Program program = CreateProgram();
 
-    auto writer = CreateKernel(
-        program,
-        OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_writer.cpp",
-        core_range,
-        DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_1,
-            .noc       = NOC::RISCV_1_default,
-            .compile_args = writer_ct_args
-        });
+        make_cb(program, core_range, 0, fft_bytes, fft_bytes);
+        make_cb(program, core_range, 1, fft_bytes, fft_bytes);
+        make_cb(program, core_range, 2, tw_bytes,  tw_bytes);
+        make_cb(program, core_range, 3, fft_bytes, fft_bytes);
 
-    const uint32_t ffts_per_core = (batch + active_cores - 1) / active_cores;
+        auto reader = CreateKernel(
+            program,
+            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_reader.cpp",
+            core_range,
+            DataMovementConfig{
+                .processor = DataMovementProcessor::RISCV_0,
+                .noc       = NOC::RISCV_0_default,
+                .compile_args = reader_ct_args
+            });
 
-    for (uint32_t i = 0; i < active_cores; ++i) {
-        CoreCoord coord{i % cols, i / cols};
+        auto compute = CreateKernel(
+            program,
+            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_compute.cpp",
+            core_range,
+            ComputeConfig{
+                .math_fidelity    = MathFidelity::HiFi4,
+                .fp32_dest_acc_en = true,
+                .compile_args     = {log2n, static_cast<uint32_t>(inverse)}
+            });
 
-        uint32_t fft_offset = i * ffts_per_core;
-        uint32_t my_batch   = std::min(ffts_per_core, batch - fft_offset);
+        auto writer = CreateKernel(
+            program,
+            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_writer.cpp",
+            core_range,
+            DataMovementConfig{
+                .processor = DataMovementProcessor::RISCV_1,
+                .noc       = NOC::RISCV_1_default,
+                .compile_args = writer_ct_args
+            });
 
-        SetRuntimeArgs(
-            program, reader, coord,
-            {src_buf->address(), tw_buf->address(), fft_offset, my_batch, size});
+        uint32_t core_idx = 0;
+        for (uint32_t r = 0; r < rows && core_idx < active_cores; ++r) {
+            for (uint32_t c = 0; c < cols && core_idx < active_cores; ++c) {
+                CoreCoord coord{c, r};
+                uint32_t fft_offset = wave_base + core_idx;
+                uint32_t my_batch   = 1;
 
-        SetRuntimeArgs(
-            program, compute, coord,
-            {my_batch, size, log2n, static_cast<uint32_t>(inverse)});
+                SetRuntimeArgs(
+                    program, reader, coord,
+                    {src_buf->address(), tw_buf->address(), fft_offset, my_batch, size});
 
-        SetRuntimeArgs(
-            program, writer, coord,
-            {dst_buf->address(), fft_offset, my_batch, size});
+                SetRuntimeArgs(
+                    program, compute, coord,
+                    {my_batch, size, log2n, static_cast<uint32_t>(inverse)});
+
+                SetRuntimeArgs(
+                    program, writer, coord,
+                    {dst_buf->address(), fft_offset, my_batch, size});
+
+                ++core_idx;
+            }
+        }
+
+        distributed::MeshWorkload workload;
+        distributed::MeshCoordinateRange device_range(mesh_device->shape());
+        workload.add_program(device_range, std::move(program));
+
+        distributed::EnqueueMeshWorkload(cq, workload, false);
+        distributed::Finish(cq);
     }
-
-    distributed::MeshWorkload workload;
-    distributed::MeshCoordinateRange device_range(mesh_device->shape());
-    workload.add_program(device_range, std::move(program));
-
-    distributed::EnqueueMeshWorkload(cq, workload, false);
 }
 
 // ===========================================================================

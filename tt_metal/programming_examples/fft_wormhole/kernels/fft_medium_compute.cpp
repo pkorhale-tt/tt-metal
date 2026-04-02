@@ -1,3 +1,21 @@
+// =============================================================================
+// kernels/fft_medium_compute.cpp
+// Tensix COMPUTE kernel — Tier 2 Medium FFT  (4K < size ≤ 32K)
+//
+// One complete FFT per iteration, runs my_batch FFTs sequentially.
+// The entire FFT (data + twiddles) fits in L1 — no NOC during butterflies.
+//
+// Compile args:
+//   [0] = log2n    — log2 of FFT size
+//   [1] = inverse  — 0 = FFT, 1 = IFFT
+//
+// Runtime args:
+//   [0] = my_batch
+//   [1] = size
+//   [2] = log2n
+//   [3] = inverse
+// =============================================================================
+
 #include "api/compute/common.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/tile_move_copy.h"
@@ -6,19 +24,13 @@
 constexpr uint32_t LOG2N   = get_compile_time_arg_val(0);
 constexpr uint32_t INVERSE = get_compile_time_arg_val(1);
 
+// CB indices
 constexpr uint32_t CB_IN  = 0;
 constexpr uint32_t CB_SCR = 1;
 constexpr uint32_t CB_TW  = 2;
 constexpr uint32_t CB_OUT = 3;
 
-inline uint32_t cb_front_ptr(uint32_t cb_id) {
-    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
-}
-
-inline uint32_t cb_back_ptr(uint32_t cb_id) {
-    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
-}
-
+#if COMPILE_FOR_TRISC == 1
 static inline void bit_reverse(volatile float* data, uint32_t n) {
     uint32_t j = 0;
     for (uint32_t i = 1; i < n; ++i) {
@@ -26,9 +38,11 @@ static inline void bit_reverse(volatile float* data, uint32_t n) {
         for (; j & bit; bit >>= 1) j ^= bit;
         j ^= bit;
         if (i < j) {
-            float re = data[2*i], im = data[2*i+1];
-            data[2*i] = data[2*j]; data[2*i+1] = data[2*j+1];
-            data[2*j] = re;        data[2*j+1] = im;
+            float re = data[2 * i], im = data[2 * i + 1];
+            data[2 * i]     = data[2 * j];
+            data[2 * i + 1] = data[2 * j + 1];
+            data[2 * j]     = re;
+            data[2 * j + 1] = im;
         }
     }
 }
@@ -55,10 +69,8 @@ static void radix2_dit(
 
                 float Wre = tw[wi];
                 float Wim = inverse ? -tw[wi + 1] : tw[wi + 1];
-                float Ore = data[oi];
-                float Oim = data[oi + 1];
-                float Ere = data[ei];
-                float Eim = data[ei + 1];
+                float Ore = data[oi], Oim = data[oi + 1];
+                float Ere = data[ei], Eim = data[ei + 1];
 
                 float Tre = Wre * Ore - Wim * Oim;
                 float Tim = Wre * Oim + Wim * Ore;
@@ -72,7 +84,20 @@ static void radix2_dit(
         stage_len <<= 1;
     }
 }
+#endif
 
+inline uint32_t get_read_ptr(uint32_t cb_id) {
+    return get_tile_address(cb_id, 0);
+}
+
+// ---------------------------------------------------------------------------
+// KERNEL ENTRY POINT
+//
+// TRISC thread responsibilities:
+//   TRISC 0 (UNPACK) — no work
+//   TRISC 1 (MATH)   — waits for PACK signal, runs radix2_dit, signals PACK
+//   TRISC 2 (PACK)   — owns all CB operations
+// ---------------------------------------------------------------------------
 void kernel_main() {
 #if COMPILE_FOR_TRISC == 1
     mailbox_write(ckernel::ThreadId::MathThreadId, 0);
@@ -81,21 +106,21 @@ void kernel_main() {
 #endif
 
 #if COMPILE_FOR_TRISC == 1
-    uint32_t my_batch = get_arg_val<uint32_t>(0);
-    uint32_t size     = get_arg_val<uint32_t>(1);
-    uint32_t log2n    = get_arg_val<uint32_t>(2);
-    uint32_t inv      = get_arg_val<uint32_t>(3);
+    uint32_t size  = get_arg_val<uint32_t>(1);
+    uint32_t log2n = get_arg_val<uint32_t>(2);
+    uint32_t inv   = get_arg_val<uint32_t>(3);
 
+    const volatile float* tw =
+        reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW));
+
+    uint32_t my_batch = get_arg_val<uint32_t>(0);
     for (uint32_t i = 0; i < my_batch; ++i) {
         while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) {
             asm volatile("" ::: "memory");
         }
 
-        const volatile float* tw =
-            reinterpret_cast<const volatile float*>(cb_front_ptr(CB_TW));
         volatile float* data =
-            reinterpret_cast<volatile float*>(cb_front_ptr(CB_IN));
-
+            reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
         radix2_dit(data, tw, size, log2n, static_cast<bool>(inv));
         mailbox_write(ckernel::ThreadId::PackThreadId, i + 1);
     }
@@ -108,6 +133,7 @@ void kernel_main() {
 
     for (uint32_t i = 0; i < my_batch; ++i) {
         cb_wait_front(CB_IN, 1);
+
         mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
 
         cb_reserve_back(CB_OUT, 1);
@@ -117,11 +143,14 @@ void kernel_main() {
         }
 
         volatile float* out =
-            reinterpret_cast<volatile float*>(cb_back_ptr(CB_OUT));
+            reinterpret_cast<volatile float*>(
+                get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
         const volatile float* data =
-            reinterpret_cast<const volatile float*>(cb_front_ptr(CB_IN));
+            reinterpret_cast<const volatile float*>(get_read_ptr(CB_IN));
 
-        for (uint32_t j = 0; j < size * 2; ++j) out[j] = data[j];
+        for (uint32_t j = 0; j < size * 2; ++j) {
+            out[j] = data[j];
+        }
 
         cb_push_back(CB_OUT, 1);
         cb_pop_front(CB_IN, 1);
@@ -129,4 +158,5 @@ void kernel_main() {
 
     cb_pop_front(CB_TW, 1);
 #endif
+    // TRISC 0 (UNPACK): nothing to do
 }
