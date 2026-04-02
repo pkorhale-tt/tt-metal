@@ -358,6 +358,9 @@ static void run_large_fft(
         make_cb(program, cr, 2, S * COMPLEX_BYTES, S * COMPLEX_BYTES);
         make_cb(program, cr, 3, chunk_bytes,       chunk_bytes);
 
+        // Add semaphore for NOC transpose sync (reader waits for writers)
+        CreateSemaphore(program, cr, 0);
+
         auto reader = CreateKernel(
             program,
             OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_large_reader1.cpp",
