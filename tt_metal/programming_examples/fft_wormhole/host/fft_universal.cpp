@@ -170,6 +170,9 @@ static void run_small_fft(
         const uint32_t rows         = (active_cores + 7) / 8;
         const uint32_t cols         = std::min(active_cores, 8u);
 
+        std::cout << "[small wave] base=" << wave_base
+                  << " count=" << wave_batch << "\n";
+
         CoreRange core_range(CoreCoord{0, 0}, CoreCoord{cols - 1, rows - 1});
         Program program = CreateProgram();
 
