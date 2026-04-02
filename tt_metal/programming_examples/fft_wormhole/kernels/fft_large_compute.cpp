@@ -194,20 +194,32 @@ void kernel_main() {
     cb_wait_front(CB_DATA, 1);
     volatile float* col_data = reinterpret_cast<volatile float*>(get_read_ptr(CB_DATA));
 
-    // -----------------------------------------------------------------------
-    // PHASE 2: Apply mixed-radix twiddles, then R-point column FFTs
-    // After transpose, col_data holds [rows_per_core] columns of R_LEN points each.
-    // -----------------------------------------------------------------------
+    cb_reserve_back(CB_OUT, 1);
+
+#if COMPILE_FOR_TRISC == 1
+    // Un-interleave the NOC-transposed payload from CB_IN directly into CB_OUT!
+    // The writer interleaved it to respect 16-byte alignment hardware rules
+    volatile float* out_ptr = reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+
+    for (uint32_t r = 0; r < R_LEN; ++r) {
+        for (uint32_t c = 0; c < rows_per_core; ++c) {
+            uint32_t src_idx = (r * rows_per_core + c) * 2;
+            uint32_t dst_idx = (c * R_LEN + r) * 2;
+            out_ptr[dst_idx]     = col_data[src_idx];
+            out_ptr[dst_idx + 1] = col_data[src_idx + 1];
+        }
+    }
+
     uint32_t N = R_LEN * S_LEN;
     for (uint32_t c = 0; c < rows_per_core; ++c) {
-#if COMPILE_FOR_TRISC == 1
-        volatile float* col_ptr = col_data + c * R_LEN * 2;
+        volatile float* col_ptr = out_ptr + c * R_LEN * 2;
         uint32_t s_col = row_start + c;   // actual column index in S_LEN dimension
 
         apply_mixed_twiddles(col_ptr, s_col, R_LEN, N);
         radix2_dit(col_ptr, tw_r, R_LEN, LOG2R, (bool)INVERSE);
-#endif
     }
+#endif
+
 #if COMPILE_FOR_TRISC == 1
     mailbox_write(ckernel::ThreadId::UnpackThreadId, 2);
     mailbox_write(ckernel::ThreadId::PackThreadId, 2);
@@ -215,14 +227,8 @@ void kernel_main() {
     while (mailbox_read(ckernel::ThreadId::MathThreadId) != 2) { /* spin */ }
 #endif
 
-    // Push final output
-    cb_reserve_back(CB_OUT, 1);
-#if COMPILE_FOR_TRISC == 2
-    volatile float* out_ptr_p2 = reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
-    for (uint32_t i = 0; i < rows_per_core * R_LEN * 2; ++i) {
-        out_ptr_p2[i] = col_data[i];
-    }
-#endif
+    // Push final output (It's already in CB_OUT thanks to MATH thread un-interleave)
+    // The memory is exactly linearly formatted for exact DRAM mapping.
     cb_push_back(CB_OUT, 1);
     cb_pop_front(CB_DATA, 1);
 

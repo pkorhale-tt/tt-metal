@@ -68,22 +68,18 @@ void kernel_main() {
             // NOC address for target core's L1 (uses local CB0 address as baseline)
             uint64_t noc_dst = get_noc_addr(target_col, target_row, get_write_ptr(0));
 
-            // Write each of the 'rows_per_core' column elements independently
-            // so they land in their contiguous column arrays on the target core!
-            for (uint32_t c_local = 0; c_local < rows_per_core; ++c_local) {
-                uint32_t dst_l1_offset = (c_local * R + abs_row) * 2 * sizeof(float);
+            // Target core receives components interleaved.
+            // Address = abs_row * rows_per_core * 8
+            uint32_t dst_l1_offset = abs_row * rows_per_core * 2 * sizeof(float);
 
-                const volatile float* src_ptr = phase1_out + r_local * S * 2 + (c + c_local) * 2;
+            const volatile float* src_ptr = phase1_out + r_local * S * 2 + c * 2;
 
-                noc_async_write(
-                    reinterpret_cast<uintptr_t>(src_ptr),
-                    noc_dst + dst_l1_offset,
-                    2 * sizeof(float)  // 1 complex sample
-                );
-            }
-            
-            // Prevent NOC command queue overflow! Each core receives 4 requests. Wait for them to issue.
-            noc_async_write_barrier();
+            // Write 32 bytes (4 complex floats) linearly aligned!
+            noc_async_write(
+                reinterpret_cast<uintptr_t>(src_ptr),
+                noc_dst + dst_l1_offset,
+                rows_per_core * 2 * sizeof(float)
+            );
         }
     }
 
