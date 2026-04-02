@@ -14,7 +14,7 @@
 //   [4] = size            — N, number of complex points per FFT
 // =============================================================================
 
-#include "tt_metal/hw/inc/dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 void kernel_main() {
     // ---- Runtime args -------------------------------------------------------
