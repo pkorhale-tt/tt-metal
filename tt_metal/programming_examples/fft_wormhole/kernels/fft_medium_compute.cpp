@@ -40,6 +40,7 @@ constexpr uint32_t CB_OUT = 3;
 // ---------------------------------------------------------------------------
 // Bit-reverse permutation (in-place)
 // ---------------------------------------------------------------------------
+#if COMPILE_FOR_TRISC == 1
 static inline void bit_reverse(volatile float* data, uint32_t n) {
     uint32_t j = 0;
     for (uint32_t i = 1; i < n; ++i) {
@@ -92,6 +93,7 @@ static void radix2_dit(
         stage_len <<= 1;
     }
 }
+#endif
 
 #include "api/compute/cb_api.h"
 
@@ -100,13 +102,15 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 }
 inline uint32_t get_write_ptr(uint32_t cb_id) {
     uint32_t address = 0;
-    PACK({
-        address = get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
-        mailbox_write(ckernel::ThreadId::MathThreadId, address);
-        mailbox_write(ckernel::ThreadId::UnpackThreadId, address);
-    })
-    MATH(address = mailbox_read(ckernel::ThreadId::PackThreadId);)
-    UNPACK(address = mailbox_read(ckernel::ThreadId::PackThreadId);)
+#if COMPILE_FOR_TRISC == 0
+    address = get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
+    mailbox_write(ckernel::ThreadId::MathThreadId, address);
+    mailbox_write(ckernel::ThreadId::PackThreadId, address);
+#elif COMPILE_FOR_TRISC == 1
+    address = mailbox_read(ckernel::ThreadId::UnpackThreadId);
+#elif COMPILE_FOR_TRISC == 2
+    address = mailbox_read(ckernel::ThreadId::UnpackThreadId);
+#endif
     return address;
 }
 
@@ -131,7 +135,13 @@ void kernel_main() {
             reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
 
         // Compute FFT in-place on L1 data
+#if COMPILE_FOR_TRISC == 1
         radix2_dit(data, tw, size, log2n, (bool)inv);
+        mailbox_write(ckernel::ThreadId::UnpackThreadId, 1);
+        mailbox_write(ckernel::ThreadId::PackThreadId, 1);
+#else
+        while (mailbox_read(ckernel::ThreadId::MathThreadId) != 1) { /* spin */ }
+#endif
 
         // Copy result to output CB for writer
         cb_reserve_back(CB_OUT, 1);
