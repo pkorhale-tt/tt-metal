@@ -113,74 +113,108 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 
 // ---------------------------------------------------------------------------
 // KERNEL ENTRY POINT
+//
+// TRISC thread responsibilities:
+//   TRISC 0 (UNPACK) — no work; immediately returns.
+//   TRISC 1 (MATH)   — waits for PACK to signal data-ready, runs butterflies,
+//                       signals PACK when done.  No CB calls.
+//   TRISC 2 (PACK)   — owns ALL CB operations (wait/reserve/push/pop),
+//                       signals MATH to start, waits for MATH to finish,
+//                       copies result to CB_OUT.
+//
+// Keeping CB calls on a single thread is mandatory: the CB hardware counter
+// is not atomic across TRISC cores, so concurrent cb_wait_front / cb_pop_front
+// from multiple threads causes triple-pop and permanent hangs.
 // ---------------------------------------------------------------------------
 void kernel_main() {
-    // Handshake to clear stale math sync state
 #if COMPILE_FOR_TRISC == 1
+    // MATH: clear stale mailbox value so the first wait below doesn't
+    // spuriously pass if a previous kernel left a non-zero value.
     mailbox_write(ckernel::ThreadId::MathThreadId, 0);
 #elif COMPILE_FOR_TRISC == 2
+    // PACK: clear stale PackThreadId mailbox.
     mailbox_write(ckernel::ThreadId::PackThreadId, 0);
 #endif
 
-    // Runtime args
-    uint32_t my_batch = get_arg_val<uint32_t>(0);
-    // size and log2n are known at compile time (LOG2N, N)
+#if COMPILE_FOR_TRISC == 1
+    // -----------------------------------------------------------------------
+    // MATH thread: pure compute, no CB interaction.
+    // PACK signals us via MathThreadId mailbox once input data is in L1,
+    // then we run the FFT and signal PACK via PackThreadId.
+    // -----------------------------------------------------------------------
 
-    // Acquire twiddle table — it stays in L1 for the entire kernel lifetime
-    cb_wait_front(CB_TW, 1);
+    // Read twiddle pointer once — PACK will have pushed CB_TW before it ever
+    // signals us, so by the time MathThreadId becomes non-zero, tw_ptr is valid.
     const volatile float* tw_ptr =
         reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW));
 
-    // Process each FFT in this core's batch slice
-    for (uint32_t fft_i = 0; fft_i < my_batch; ++fft_i) {
+    uint32_t my_batch = get_arg_val<uint32_t>(0);
 
-        // Wait for reader to deliver one page of input data
-        cb_wait_front(CB_IN, 1);
+    for (uint32_t fft_i = 0; fft_i < my_batch; ++fft_i) {
+        // Wait for PACK to confirm this iteration's data is in L1
+        while (mailbox_read(ckernel::ThreadId::MathThreadId) < fft_i + 1) {
+            asm volatile("" ::: "memory");
+        }
+
         volatile float* data =
             reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
 
-#if COMPILE_FOR_TRISC == 0
-        // UNPACK tells MATH data is ready
-        mailbox_write(ckernel::ThreadId::MathThreadId, fft_i + 1);
-#endif
-
-#if COMPILE_FOR_TRISC == 1
-        // MATH waits for UNPACK
-        while (mailbox_read(ckernel::ThreadId::MathThreadId) < fft_i + 1) { asm volatile("" ::: "memory"); }
-
-        // ---- Step 1: bit-reverse permutation --------------------------------
         bit_reverse(data, N);
 
-        // ---- Step 2: butterfly stages  (log2N stages total) ----------------
         uint32_t stage_len = 2;
         for (uint32_t s = 0; s < LOG2N; ++s) {
             butterfly_stage(data, tw_ptr, N, stage_len);
             stage_len <<= 1;
         }
 
-        // MATH tells PACK it's done
+        // Tell PACK the result is ready in CB_IN's L1 region
         mailbox_write(ckernel::ThreadId::PackThreadId, fft_i + 1);
-#endif
+    }
 
-        // data now contains the FFT result in L1
+#elif COMPILE_FOR_TRISC == 2
+    // -----------------------------------------------------------------------
+    // PACK thread: owns all CB operations and the data copy.
+    // -----------------------------------------------------------------------
+    uint32_t my_batch = get_arg_val<uint32_t>(0);
 
-        // ---- Step 3: reserve output CB and copy ----------------------------
+    // Wait for twiddle table once; MATH reads it directly via pointer so
+    // we must hold the CB open (do NOT pop) for the entire kernel lifetime.
+    cb_wait_front(CB_TW, 1);
+
+    for (uint32_t fft_i = 0; fft_i < my_batch; ++fft_i) {
+        // Pull one input page from the reader
+        cb_wait_front(CB_IN, 1);
+
+        // Tell MATH it can start on this page
+        mailbox_write(ckernel::ThreadId::MathThreadId, fft_i + 1);
+
+        // Reserve output slot before MATH finishes so the write address is
+        // stable.  cb_reserve_back spins until the writer has drained the slot.
         cb_reserve_back(CB_OUT, 1);
-#if COMPILE_FOR_TRISC == 2
-        // PACK waits for MATH
-        while (mailbox_read(ckernel::ThreadId::PackThreadId) < fft_i + 1) { asm volatile("" ::: "memory"); }
 
+        // Wait for MATH to finish the butterfly
+        while (mailbox_read(ckernel::ThreadId::PackThreadId) < fft_i + 1) {
+            asm volatile("" ::: "memory");
+        }
+
+        // Copy result (still in CB_IN's L1 region) to CB_OUT
         volatile float* out_ptr =
-            reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+            reinterpret_cast<volatile float*>(
+                get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+        const volatile float* data =
+            reinterpret_cast<const volatile float*>(get_read_ptr(CB_IN));
 
         for (uint32_t i = 0; i < N * 2; ++i) {
             out_ptr[i] = data[i];
         }
-#endif
+
         cb_push_back(CB_OUT, 1);
         cb_pop_front(CB_IN,  1);
     }
 
-    // Release twiddle table
+    // Release twiddle table only after all FFTs are done
     cb_pop_front(CB_TW, 1);
+
+#endif
+    // TRISC 0 (UNPACK): no work for this kernel — reader DMA handles all loads.
 }

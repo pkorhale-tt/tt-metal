@@ -105,57 +105,85 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 // ---------------------------------------------------------------------------
 // KERNEL ENTRY POINT
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// KERNEL ENTRY POINT
+//
+// TRISC thread responsibilities  (same rule as fft_small_compute):
+//   TRISC 0 (UNPACK) — no work; exits immediately.
+//   TRISC 1 (MATH)   — waits for PACK's MathThreadId signal, runs radix2_dit,
+//                       signals PACK via PackThreadId.  No CB calls.
+//   TRISC 2 (PACK)   — owns ALL CB operations.  Signals MATH, waits for
+//                       result, copies to CB_OUT.
+// ---------------------------------------------------------------------------
 void kernel_main() {
-#if COMPILE_FOR_TRISC == 0
-    mailbox_write(ckernel::ThreadId::MathThreadId, 0);   // clear stale UNPACK→MATH mailbox
-#elif COMPILE_FOR_TRISC == 1
+#if COMPILE_FOR_TRISC == 1
     mailbox_write(ckernel::ThreadId::MathThreadId, 0);
 #elif COMPILE_FOR_TRISC == 2
     mailbox_write(ckernel::ThreadId::PackThreadId, 0);
 #endif
-    uint32_t my_batch = get_arg_val<uint32_t>(0);
-    uint32_t size     = get_arg_val<uint32_t>(1);
-    uint32_t log2n    = get_arg_val<uint32_t>(2);
-    uint32_t inv      = get_arg_val<uint32_t>(3);
 
-    // Twiddle table stays in L1 for all iterations
-    cb_wait_front(CB_TW, 1);
+#if COMPILE_FOR_TRISC == 1
+    // -----------------------------------------------------------------------
+    // MATH thread — pure compute, no CB calls.
+    // -----------------------------------------------------------------------
+    uint32_t size  = get_arg_val<uint32_t>(1);
+    uint32_t log2n = get_arg_val<uint32_t>(2);
+    uint32_t inv   = get_arg_val<uint32_t>(3);
+
+    // PACK holds CB_TW open for the kernel lifetime; read the pointer once.
     const volatile float* tw =
         reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW));
 
+    uint32_t my_batch = get_arg_val<uint32_t>(0);
     for (uint32_t i = 0; i < my_batch; ++i) {
-        // Wait for reader to deliver next input.
-        // UNPACK signals MATH only AFTER cb_wait_front confirms the NOC read
-        // has completed and the data is resident in L1.
-        cb_wait_front(CB_IN, 1);
+        while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) {
+            asm volatile("" ::: "memory");
+        }
         volatile float* data =
             reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
-
-#if COMPILE_FOR_TRISC == 0
-        // Data is now in L1 — safe to tell MATH to proceed.
-        mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
-#endif
-
-        // Compute FFT in-place on L1 data
-#if COMPILE_FOR_TRISC == 1
-        while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) { asm volatile("" ::: "memory"); }
         radix2_dit(data, tw, size, log2n, (bool)inv);
         mailbox_write(ckernel::ThreadId::PackThreadId, i + 1);
-#endif
+    }
 
-        // Copy result to output CB for writer
+#elif COMPILE_FOR_TRISC == 2
+    // -----------------------------------------------------------------------
+    // PACK thread — owns all CB operations.
+    // -----------------------------------------------------------------------
+    uint32_t my_batch = get_arg_val<uint32_t>(0);
+    uint32_t size     = get_arg_val<uint32_t>(1);
+
+    // Hold twiddle table in L1 for entire kernel; do NOT pop until the end.
+    cb_wait_front(CB_TW, 1);
+
+    for (uint32_t i = 0; i < my_batch; ++i) {
+        cb_wait_front(CB_IN, 1);
+
+        // Signal MATH — data is now resident in L1.
+        mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
+
+        // Reserve output slot while MATH is computing.
         cb_reserve_back(CB_OUT, 1);
-#if COMPILE_FOR_TRISC == 2
-        while (mailbox_read(ckernel::ThreadId::PackThreadId) < i + 1) { asm volatile("" ::: "memory"); }
 
+        // Wait for MATH to finish.
+        while (mailbox_read(ckernel::ThreadId::PackThreadId) < i + 1) {
+            asm volatile("" ::: "memory");
+        }
+
+        // Copy result from CB_IN region into CB_OUT region.
         volatile float* out =
-            reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+            reinterpret_cast<volatile float*>(
+                get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+        const volatile float* data =
+            reinterpret_cast<const volatile float*>(get_read_ptr(CB_IN));
 
         for (uint32_t j = 0; j < size * 2; ++j) out[j] = data[j];
-#endif
+
         cb_push_back(CB_OUT, 1);
         cb_pop_front(CB_IN, 1);
     }
 
     cb_pop_front(CB_TW, 1);
+
+#endif
+    // TRISC 0 (UNPACK): nothing to do — DMA reader handles all DRAM→L1 loads.
 }

@@ -163,81 +163,61 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 
 // =========================================================================
 // KERNEL ENTRY POINT
+//
+// TRISC thread responsibilities:
+//   TRISC 0 (UNPACK) — exits immediately; all DRAM→L1 is done by the
+//                       DATA-MOVEMENT-0 reader kernel.
+//   TRISC 1 (MATH)   — no CB calls.  Waits for PACK to signal readiness
+//                       via MathThreadId mailbox, runs FFT math, signals
+//                       PACK via PackThreadId.
+//   TRISC 2 (PACK)   — owns ALL cb_wait_front / cb_reserve_back /
+//                       cb_push_back / cb_pop_front calls.  Coordinates
+//                       MATH via mailbox and handles data copies.
 // =========================================================================
 void kernel_main() {
-    uint32_t cb_out_addr = 0;
 #if COMPILE_FOR_TRISC == 1
-    mailbox_write(ckernel::ThreadId::MathThreadId, 0); // clear math sync
-    // Wait for UNPACK to send the CB_OUT address cleanly into UNPACK's mailbox
-    while (mailbox_read(ckernel::ThreadId::UnpackThreadId) == 0) { asm volatile("" ::: "memory"); }
-    cb_out_addr = mailbox_read(ckernel::ThreadId::UnpackThreadId);
-#elif COMPILE_FOR_TRISC == 0
-    cb_out_addr = get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4;
-    // UNPACK writes its own mailbox to broadcast address to MATH safely
-    mailbox_write(ckernel::ThreadId::UnpackThreadId, cb_out_addr);
-#endif
+    // Clear stale mailbox values from any prior kernel run.
+    mailbox_write(ckernel::ThreadId::MathThreadId, 0);
 
+    // -----------------------------------------------------------------------
+    // MATH thread
+    // -----------------------------------------------------------------------
     uint32_t row_start     = get_arg_val<uint32_t>(0);
     uint32_t rows_per_core = get_arg_val<uint32_t>(1);
-    // R, S from compile-time constants
 
-    // Wait for reader to deliver: data block + both twiddle tables
-    cb_wait_front(CB_TW_R, 1);
-    cb_wait_front(CB_TW_S, 1);
-    cb_wait_front(CB_DATA, 1);
+    // PACK holds the twiddle CBs open; read their pointers here after PACK
+    // has signalled phase-1-ready (MathThreadId >= 1).
+    const volatile float* tw_r = nullptr;
+    const volatile float* tw_s = nullptr;
 
-    volatile float* data   = reinterpret_cast<volatile float*>(get_read_ptr(CB_DATA));
-    const volatile float* tw_r = reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW_R));
-    const volatile float* tw_s = reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW_S));
-
-    // -----------------------------------------------------------------------
-    // PHASE 1: Row FFTs  (S-point FFT on each of my rows_per_core rows)
-    // Each row is stored contiguously: data[row * S_LEN * 2 ... (row+1)*S_LEN*2 - 1]
-    // -----------------------------------------------------------------------
-    for (uint32_t r = 0; r < rows_per_core; ++r) {
-#if COMPILE_FOR_TRISC == 1
-        volatile float* row_ptr = data + r * S_LEN * 2;
-        radix2_dit(row_ptr, tw_s, S_LEN, LOG2S, (bool)INVERSE);
-#endif
-    }
-#if COMPILE_FOR_TRISC == 1
-    mailbox_write(ckernel::ThreadId::MathThreadId, 1);
-#else
+    // --- Phase 1: row FFTs ---
+    // Wait for PACK to confirm twiddles + data are in L1.
     while (mailbox_read(ckernel::ThreadId::MathThreadId) < 1) {
         asm volatile("" ::: "memory");
     }
-#endif
+    tw_s = reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW_S));
+    volatile float* data = reinterpret_cast<volatile float*>(get_read_ptr(CB_DATA));
 
-    // Signal DM1 (writer) that phase-1 rows are ready for NOC transpose
-    // Writer will multicast each row to the appropriate target core.
-    // The CB push acts as the producer signal.
-    cb_reserve_back(CB_OUT, 1);
-#if COMPILE_FOR_TRISC == 2
-    volatile float* out_ptr = reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
-
-    // Copy phase-1 results to output CB for writer to transmit
-    for (uint32_t i = 0; i < rows_per_core * S_LEN * 2; ++i) {
-        out_ptr[i] = data[i];
+    for (uint32_t r = 0; r < rows_per_core; ++r) {
+        volatile float* row_ptr = data + r * S_LEN * 2;
+        radix2_dit(row_ptr, tw_s, S_LEN, LOG2S, (bool)INVERSE);
     }
-#endif
-    cb_push_back(CB_OUT, 1);
-    cb_pop_front(CB_DATA, 1);
+    // Tell PACK phase-1 math is done.
+    mailbox_write(ckernel::ThreadId::PackThreadId, 1);
 
-    // -----------------------------------------------------------------------
-    // Wait for transposed data to arrive from other cores via NOC
-    // (Reader kernel fft_large_reader1 handles the receive side and places
-    //  transposed column data back into CB_DATA)
-    // -----------------------------------------------------------------------
-    cb_wait_front(CB_DATA, 1);
-    volatile float* col_data = reinterpret_cast<volatile float*>(get_read_ptr(CB_DATA));
+    // --- Phase 2: column FFTs ---
+    // Wait for PACK to push transposed data into CB_DATA and signal us.
+    while (mailbox_read(ckernel::ThreadId::MathThreadId) < 2) {
+        asm volatile("" ::: "memory");
+    }
+    tw_r     = reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW_R));
+    // Phase-2 output goes directly to the CB_OUT write region.  PACK has
+    // reserved it and passes its address via PackThreadId mailbox.
+    volatile float* col_data   = reinterpret_cast<volatile float*>(get_read_ptr(CB_DATA));
+    volatile float* col_out_ptr = reinterpret_cast<volatile float*>(
+        static_cast<uintptr_t>(mailbox_read(ckernel::ThreadId::PackThreadId)));
 
-    cb_reserve_back(CB_OUT, 1);
-
-#if COMPILE_FOR_TRISC == 1
-    // Un-interleave the NOC-transposed payload from CB_DATA into CB_OUT.
-    // col_out_ptr targets the CB_OUT buffer (address broadcast by UNPACK at startup).
-    volatile float* col_out_ptr = reinterpret_cast<volatile float*>(cb_out_addr);
-
+    // Un-interleave: received layout is [R][rows_per_core]; output is [rows_per_core][R]
     for (uint32_t r = 0; r < R_LEN; ++r) {
         for (uint32_t c = 0; c < rows_per_core; ++c) {
             uint32_t src_idx = (r * rows_per_core + c) * 2;
@@ -247,30 +227,78 @@ void kernel_main() {
         }
     }
 
-    uint32_t N = R_LEN * S_LEN;
+    const uint32_t N = R_LEN * S_LEN;
     for (uint32_t c = 0; c < rows_per_core; ++c) {
         volatile float* col_ptr = col_out_ptr + c * R_LEN * 2;
-        uint32_t s_col = row_start + c;   // actual column index in the S dimension
-
+        uint32_t s_col = row_start + c;
         apply_mixed_twiddles(col_ptr, s_col, R_LEN, N);
         radix2_dit(col_ptr, tw_r, R_LEN, LOG2R, (bool)INVERSE);
     }
-#endif
+    // Signal PACK that phase-2 is done.
+    mailbox_write(ckernel::ThreadId::PackThreadId, 2);
 
-#if COMPILE_FOR_TRISC == 1
-    mailbox_write(ckernel::ThreadId::MathThreadId, 2);
-#else
-    while (mailbox_read(ckernel::ThreadId::MathThreadId) < 2) {
+#elif COMPILE_FOR_TRISC == 2
+    // -----------------------------------------------------------------------
+    // PACK thread — owns all CB operations.
+    // -----------------------------------------------------------------------
+    mailbox_write(ckernel::ThreadId::PackThreadId, 0);
+
+    uint32_t rows_per_core = get_arg_val<uint32_t>(1);
+
+    // Wait for reader to deliver twiddles and initial row data.
+    cb_wait_front(CB_TW_R, 1);
+    cb_wait_front(CB_TW_S, 1);
+    cb_wait_front(CB_DATA, 1);
+
+    // Tell MATH: twiddles + data are ready (phase-1 start).
+    mailbox_write(ckernel::ThreadId::MathThreadId, 1);
+
+    // Wait for MATH to finish phase-1 row FFTs.
+    while (mailbox_read(ckernel::ThreadId::PackThreadId) < 1) {
         asm volatile("" ::: "memory");
     }
-#endif
 
-    // Push final output (It's already in CB_OUT thanks to MATH thread un-interleave)
-    // The memory is exactly linearly formatted for exact DRAM mapping.
+    // Copy phase-1 results to CB_OUT for the writer to scatter via NOC.
+    cb_reserve_back(CB_OUT, 1);
+    volatile float* out_ptr =
+        reinterpret_cast<volatile float*>(
+            get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+    const volatile float* data =
+        reinterpret_cast<const volatile float*>(get_read_ptr(CB_DATA));
+
+    for (uint32_t i = 0; i < rows_per_core * S_LEN * 2; ++i) {
+        out_ptr[i] = data[i];
+    }
+    cb_push_back(CB_OUT, 1);
+    cb_pop_front(CB_DATA, 1);   // release phase-1 input
+
+    // Wait for the transposed column data that the NOC scatter delivers.
+    cb_wait_front(CB_DATA, 1);
+
+    // Reserve phase-2 output slot and pass its L1 address to MATH via mailbox.
+    cb_reserve_back(CB_OUT, 1);
+    uint32_t col_out_addr =
+        get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4;
+
+    // Tell MATH: transposed data is in CB_DATA, output slot is at col_out_addr.
+    // We encode the address in PackThreadId so MATH can derive the write pointer.
+    // First bump MathThreadId to 2 to release MATH's phase-2 wait, then
+    // write the address into PackThreadId (MATH reads it after unblocking).
+    mailbox_write(ckernel::ThreadId::PackThreadId, col_out_addr);
+    mailbox_write(ckernel::ThreadId::MathThreadId, 2);
+
+    // Wait for MATH to finish phase-2 column FFTs.
+    while (mailbox_read(ckernel::ThreadId::PackThreadId) < 2) {
+        asm volatile("" ::: "memory");
+    }
+
     cb_push_back(CB_OUT, 1);
     cb_pop_front(CB_DATA, 1);
 
-    // Release twiddle tables
+    // Release twiddle tables.
     cb_pop_front(CB_TW_R, 1);
     cb_pop_front(CB_TW_S, 1);
+
+#endif
+    // TRISC 0 (UNPACK): nothing to do.
 }
