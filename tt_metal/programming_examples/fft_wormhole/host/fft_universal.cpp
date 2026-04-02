@@ -443,7 +443,7 @@ int main() {
     {
         const uint32_t N = 8192, B = 4;
         std::vector<float> in(B*N*2), fwd(B*N*2), inv_out(B*N*2);
-        for (auto& v : in) v = static_cast<float>(rand()) / RAND_MAX;
+        for (auto& v : in) v = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
 
         fft_universal(ctx, in.data(),  fwd.data(),     N, B, false);
         fft_universal(ctx, fwd.data(), inv_out.data(), N, B, true);
