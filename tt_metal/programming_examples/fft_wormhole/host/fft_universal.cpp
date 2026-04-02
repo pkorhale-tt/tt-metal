@@ -14,7 +14,16 @@
 //   • No implicit synchronisation — all barriers are explicit
 // =============================================================================
 
-#include "tt_metal/host_api.hpp"
+
+#include "tt_metal/api/tt-metalium/host_api.hpp"
+#include "tt_metal/api/tt-metalium/constants.hpp"
+#include "tt_metal/api/tt-metalium/distributed.hpp"
+#include "tt_metal/api/tt-metalium/base_types.hpp"
+#include "tt_metal/api/tt-metalium/mesh_workload.hpp"
+#include "tt_metal/api/tt-metalium/allocator.hpp"
+#include "tt_metal/api/tt-metalium/hal.hpp"
+
+// #include "tt_metal/host_api.hpp"
 #include "tt_metal/common/bfloat16.hpp"
 #include "tt_metal/impl/device/device.hpp"
 #include "common/core_coord.h"
