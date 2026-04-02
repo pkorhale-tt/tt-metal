@@ -141,6 +141,14 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 // KERNEL ENTRY POINT
 // =========================================================================
 void kernel_main() {
+    uint32_t cb_out_addr = 0;
+#if COMPILE_FOR_TRISC == 0
+    cb_out_addr = get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4;
+    mailbox_write(ckernel::ThreadId::MathThreadId, cb_out_addr);
+#elif COMPILE_FOR_TRISC == 1
+    cb_out_addr = mailbox_read(ckernel::ThreadId::UnpackThreadId);
+#endif
+
     uint32_t row_start     = get_arg_val<uint32_t>(0);
     uint32_t rows_per_core = get_arg_val<uint32_t>(1);
     // R, S from compile-time constants
