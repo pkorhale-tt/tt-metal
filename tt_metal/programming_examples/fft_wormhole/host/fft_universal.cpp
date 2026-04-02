@@ -213,8 +213,9 @@ static void run_small_fft(
         for (uint32_t r = 0; r < rows && core_idx < active_cores; ++r) {
             for (uint32_t c = 0; c < cols && core_idx < active_cores; ++c) {
                 CoreCoord coord{c, r};
-                uint32_t fft_offset = wave_base + core_idx;
-                uint32_t my_batch   = 1;
+
+                const uint32_t fft_offset = wave_base + core_idx;
+                const uint32_t my_batch   = 1;
 
                 SetRuntimeArgs(
                     program, reader, coord,
@@ -240,7 +241,6 @@ static void run_small_fft(
         distributed::Finish(cq);
     }
 }
-
 // ===========================================================================
 //  TIER 2 — Medium FFT
 // ===========================================================================
@@ -317,8 +317,9 @@ static void run_medium_fft(
         for (uint32_t r = 0; r < rows && core_idx < active_cores; ++r) {
             for (uint32_t c = 0; c < cols && core_idx < active_cores; ++c) {
                 CoreCoord coord{c, r};
-                uint32_t fft_offset = wave_base + core_idx;
-                uint32_t my_batch   = 1;
+
+                const uint32_t fft_offset = wave_base + core_idx;
+                const uint32_t my_batch   = 1;
 
                 SetRuntimeArgs(
                     program, reader, coord,
@@ -344,7 +345,6 @@ static void run_medium_fft(
         distributed::Finish(cq);
     }
 }
-
 // ===========================================================================
 //  TIER 3 — Large FFT
 // ===========================================================================
