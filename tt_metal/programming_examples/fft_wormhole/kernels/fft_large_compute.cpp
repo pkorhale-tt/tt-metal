@@ -41,8 +41,8 @@ constexpr uint32_t INVERSE        = get_compile_time_arg_val(2);
 constexpr uint32_t CORES_PER_FFT  = get_compile_time_arg_val(3);
 constexpr uint32_t ROWS_PER_CORE  = get_compile_time_arg_val(4);
 
-constexpr uint32_t R = 1u << LOG2R;   // row FFT length  (= sqrt(N))
-constexpr uint32_t S = 1u << LOG2S;   // col FFT length  (= N/R)
+constexpr uint32_t R_LEN = 1u << LOG2R;   // row FFT length  (= sqrt(N))
+constexpr uint32_t S_LEN = 1u << LOG2S;   // col FFT length  (= N/R)
 
 // CB indices
 constexpr uint32_t CB_DATA  = 0;   // input / working data (rows_per_core rows × S cols)
@@ -164,11 +164,11 @@ void kernel_main() {
 
     // -----------------------------------------------------------------------
     // PHASE 1: Row FFTs  (S-point FFT on each of my rows_per_core rows)
-    // Each row is stored contiguously: data[row * S * 2 ... (row+1)*S*2 - 1]
+    // Each row is stored contiguously: data[row * S_LEN * 2 ... (row+1)*S_LEN*2 - 1]
     // -----------------------------------------------------------------------
     for (uint32_t r = 0; r < rows_per_core; ++r) {
-        volatile float* row_ptr = data + r * S * 2;
-        radix2_dit(row_ptr, tw_s, S, LOG2S, (bool)INVERSE);
+        volatile float* row_ptr = data + r * S_LEN * 2;
+        radix2_dit(row_ptr, tw_s, S_LEN, LOG2S, (bool)INVERSE);
     }
 
     // Signal DM1 (writer) that phase-1 rows are ready for NOC transpose
@@ -178,7 +178,7 @@ void kernel_main() {
     volatile float* out_ptr = reinterpret_cast<volatile float*>(get_write_ptr(CB_OUT));
 
     // Copy phase-1 results to output CB for writer to transmit
-    for (uint32_t i = 0; i < rows_per_core * S * 2; ++i) {
+    for (uint32_t i = 0; i < rows_per_core * S_LEN * 2; ++i) {
         out_ptr[i] = data[i];
     }
     cb_push_back(CB_OUT, 1);
@@ -194,21 +194,21 @@ void kernel_main() {
 
     // -----------------------------------------------------------------------
     // PHASE 2: Apply mixed-radix twiddles, then R-point column FFTs
-    // After transpose, col_data holds [rows_per_core] columns of R points each.
+    // After transpose, col_data holds [rows_per_core] columns of R_LEN points each.
     // -----------------------------------------------------------------------
-    uint32_t N = R * S;
+    uint32_t N = R_LEN * S_LEN;
     for (uint32_t c = 0; c < rows_per_core; ++c) {
-        volatile float* col_ptr = col_data + c * R * 2;
-        uint32_t s_col = row_start + c;   // actual column index in S dimension
+        volatile float* col_ptr = col_data + c * R_LEN * 2;
+        uint32_t s_col = row_start + c;   // actual column index in S_LEN dimension
 
-        apply_mixed_twiddles(col_ptr, s_col, R, N);
-        radix2_dit(col_ptr, tw_r, R, LOG2R, (bool)INVERSE);
+        apply_mixed_twiddles(col_ptr, s_col, R_LEN, N);
+        radix2_dit(col_ptr, tw_r, R_LEN, LOG2R, (bool)INVERSE);
     }
 
     // Push final output
     cb_reserve_back(CB_OUT, 1);
     out_ptr = reinterpret_cast<volatile float*>(get_write_ptr(CB_OUT));
-    for (uint32_t i = 0; i < rows_per_core * R * 2; ++i) {
+    for (uint32_t i = 0; i < rows_per_core * R_LEN * 2; ++i) {
         out_ptr[i] = col_data[i];
     }
     cb_push_back(CB_OUT, 1);
