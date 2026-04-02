@@ -344,6 +344,15 @@ static void run_large_fft(
 
     Program program = CreateProgram();
 
+    // Build the Physical NOC coordinate mapping for Tier 3 All-To-All Scatter
+    std::vector<uint32_t> noc_coords_packed(64, 0);
+    IDevice* dev = mesh_device->get_devices()[0];
+    for (uint32_t i = 0; i < 64; ++i) {
+        CoreCoord logical_coord{i % 8, i / 8};
+        CoreCoord physical_coord = dev->worker_core_from_logical_core(logical_coord);
+        noc_coords_packed[i] = (physical_coord.y << 16) | physical_coord.x;
+    }
+
     auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
     auto writer_ct_args = make_accessor_args_1(dst_buf);
 
@@ -427,16 +436,18 @@ static void run_large_fft(
                         g
                     });
 
+                std::vector<uint32_t> writer_args = {
+                    dst_buf->address(),
+                    g,
+                    row_start,
+                    rows_per_core,
+                    R,
+                    S
+                };
+                writer_args.insert(writer_args.end(), noc_coords_packed.begin(), noc_coords_packed.end());
+
                 SetRuntimeArgs(
-                    program, writer, coord,
-                    {
-                        dst_buf->address(),
-                        g,
-                        row_start,
-                        rows_per_core,
-                        R,
-                        S
-                    });
+                    program, writer, coord, writer_args);
 
                 ++local_core;
             }

@@ -57,10 +57,13 @@ void kernel_main() {
         uint32_t abs_row = row_start + r_local;
 
         for (uint32_t c = 0; c < S; c += rows_per_core) {
-            // Determine target core
+            // Determine target core ID
             uint32_t target_core_id = c / rows_per_core;
-            uint32_t target_col     = target_core_id % 8;
-            uint32_t target_row     = target_core_id / 8;
+            
+            // Read pre-translated physical NOC routing coordinates from runtime args
+            uint32_t packed_noc = get_arg_val<uint32_t>(6 + target_core_id);
+            uint32_t target_col = packed_noc & 0xFFFF;
+            uint32_t target_row = packed_noc >> 16;
 
             // NOC address for target core's L1 (uses local CB0 address as baseline)
             uint64_t noc_dst = get_noc_addr(target_col, target_row, get_write_ptr(0));
@@ -88,8 +91,10 @@ void kernel_main() {
     noc_async_write_barrier();
 
     // Signal each target core's semaphore 0 that we've written our slice
-    for (uint32_t target = 0; target < cores_in_grp; ++target) {
-        uint32_t tc = target % 8, tr = target / 8;
+    for (uint32_t target_core_id = 0; target_core_id < cores_in_grp; ++target_core_id) {
+        uint32_t packed_noc = get_arg_val<uint32_t>(6 + target_core_id);
+        uint32_t tc = packed_noc & 0xFFFF;
+        uint32_t tr = packed_noc >> 16;
         uint64_t sem_noc = get_noc_addr(tc, tr, get_semaphore(0));
         noc_semaphore_inc(sem_noc, 1);
     }
