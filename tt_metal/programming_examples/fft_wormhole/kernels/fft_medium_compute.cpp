@@ -1,46 +1,24 @@
-// =============================================================================
-// kernels/fft_medium_compute.cpp
-// Tensix COMPUTE kernel — Tier 2 Medium FFT  (4K < size ≤ 32K)
-//
-// One complete FFT per iteration, runs my_batch FFTs sequentially.
-// The entire FFT (data + twiddles) fits in L1 — no NOC during butterflies.
-//
-// Difference from Tier 1 (small):
-//   • size is a runtime value (not compile-time), because medium covers a
-//     range of sizes (4K–32K) and we don't want a separate binary per size.
-//   • Uses a ping-pong scratch buffer (CB1) as a second working area so the
-//     reader can pre-load the next FFT into CB0 while we compute on CB1.
-//     (For simplicity this version processes in-place on CB0; enable the
-//      ping-pong path by uncommenting the CB1 swap below.)
-//
-// Compile args:
-//   [0] = log2n    — log2 of FFT size
-//   [1] = inverse  — 0 = FFT, 1 = IFFT
-//
-// Runtime args:
-//   [0] = my_batch
-//   [1] = size
-//   [2] = log2n    (same as compile arg, explicit for clarity)
-//   [3] = inverse
-// =============================================================================
-
 #include "api/compute/common.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/tile_move_copy.h"
+#include "api/compute/cb_api.h"
 
 constexpr uint32_t LOG2N   = get_compile_time_arg_val(0);
 constexpr uint32_t INVERSE = get_compile_time_arg_val(1);
 
-// CB indices
 constexpr uint32_t CB_IN  = 0;
-constexpr uint32_t CB_SCR = 1;   // scratch / ping-pong (reserved, not used in this path)
+constexpr uint32_t CB_SCR = 1;
 constexpr uint32_t CB_TW  = 2;
 constexpr uint32_t CB_OUT = 3;
 
-// ---------------------------------------------------------------------------
-// Bit-reverse permutation (in-place)
-// ---------------------------------------------------------------------------
-#if COMPILE_FOR_TRISC == 1
+inline uint32_t cb_front_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
+}
+
+inline uint32_t cb_back_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
+}
+
 static inline void bit_reverse(volatile float* data, uint32_t n) {
     uint32_t j = 0;
     for (uint32_t i = 1; i < n; ++i) {
@@ -48,16 +26,13 @@ static inline void bit_reverse(volatile float* data, uint32_t n) {
         for (; j & bit; bit >>= 1) j ^= bit;
         j ^= bit;
         if (i < j) {
-            float re = data[2*i],   im = data[2*i+1];
-            data[2*i]   = data[2*j];   data[2*i+1] = data[2*j+1];
-            data[2*j]   = re;          data[2*j+1] = im;
+            float re = data[2*i], im = data[2*i+1];
+            data[2*i] = data[2*j]; data[2*i+1] = data[2*j+1];
+            data[2*j] = re;        data[2*j+1] = im;
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Full radix-2 DIT FFT — runtime-parametrised size
-// ---------------------------------------------------------------------------
 static void radix2_dit(
     volatile float* data,
     const volatile float* tw,
@@ -79,42 +54,25 @@ static void radix2_dit(
                 uint32_t wi = (m * tw_stride) * 2;
 
                 float Wre = tw[wi];
-                float Wim = inverse ? -tw[wi+1] : tw[wi+1];
-                float Ore = data[oi], Oim = data[oi+1];
-                float Ere = data[ei], Eim = data[ei+1];
+                float Wim = inverse ? -tw[wi + 1] : tw[wi + 1];
+                float Ore = data[oi];
+                float Oim = data[oi + 1];
+                float Ere = data[ei];
+                float Eim = data[ei + 1];
 
-                float Tre = Wre*Ore - Wim*Oim;
-                float Tim = Wre*Oim + Wim*Ore;
+                float Tre = Wre * Ore - Wim * Oim;
+                float Tim = Wre * Oim + Wim * Ore;
 
-                data[ei]   = Ere + Tre;   data[ei+1] = Eim + Tim;
-                data[oi]   = Ere - Tre;   data[oi+1] = Eim - Tim;
+                data[ei]     = Ere + Tre;
+                data[ei + 1] = Eim + Tim;
+                data[oi]     = Ere - Tre;
+                data[oi + 1] = Eim - Tim;
             }
         }
         stage_len <<= 1;
     }
 }
-#endif
 
-#include "api/compute/cb_api.h"
-
-inline uint32_t get_read_ptr(uint32_t cb_id) {
-    return get_tile_address(cb_id, 0);
-}
-
-
-// ---------------------------------------------------------------------------
-// KERNEL ENTRY POINT
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// KERNEL ENTRY POINT
-//
-// TRISC thread responsibilities  (same rule as fft_small_compute):
-//   TRISC 0 (UNPACK) — no work; exits immediately.
-//   TRISC 1 (MATH)   — waits for PACK's MathThreadId signal, runs radix2_dit,
-//                       signals PACK via PackThreadId.  No CB calls.
-//   TRISC 2 (PACK)   — owns ALL CB operations.  Signals MATH, waits for
-//                       result, copies to CB_OUT.
-// ---------------------------------------------------------------------------
 void kernel_main() {
 #if COMPILE_FOR_TRISC == 1
     mailbox_write(ckernel::ThreadId::MathThreadId, 0);
@@ -123,58 +81,45 @@ void kernel_main() {
 #endif
 
 #if COMPILE_FOR_TRISC == 1
-    // -----------------------------------------------------------------------
-    // MATH thread — pure compute, no CB calls.
-    // -----------------------------------------------------------------------
-    uint32_t size  = get_arg_val<uint32_t>(1);
-    uint32_t log2n = get_arg_val<uint32_t>(2);
-    uint32_t inv   = get_arg_val<uint32_t>(3);
-
-    // PACK holds CB_TW open for the kernel lifetime; read the pointer once.
-    const volatile float* tw =
-        reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW));
-
     uint32_t my_batch = get_arg_val<uint32_t>(0);
+    uint32_t size     = get_arg_val<uint32_t>(1);
+    uint32_t log2n    = get_arg_val<uint32_t>(2);
+    uint32_t inv      = get_arg_val<uint32_t>(3);
+
     for (uint32_t i = 0; i < my_batch; ++i) {
         while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) {
             asm volatile("" ::: "memory");
         }
+
+        const volatile float* tw =
+            reinterpret_cast<const volatile float*>(cb_front_ptr(CB_TW));
         volatile float* data =
-            reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
-        radix2_dit(data, tw, size, log2n, (bool)inv);
+            reinterpret_cast<volatile float*>(cb_front_ptr(CB_IN));
+
+        radix2_dit(data, tw, size, log2n, static_cast<bool>(inv));
         mailbox_write(ckernel::ThreadId::PackThreadId, i + 1);
     }
 
 #elif COMPILE_FOR_TRISC == 2
-    // -----------------------------------------------------------------------
-    // PACK thread — owns all CB operations.
-    // -----------------------------------------------------------------------
     uint32_t my_batch = get_arg_val<uint32_t>(0);
     uint32_t size     = get_arg_val<uint32_t>(1);
 
-    // Hold twiddle table in L1 for entire kernel; do NOT pop until the end.
     cb_wait_front(CB_TW, 1);
 
     for (uint32_t i = 0; i < my_batch; ++i) {
         cb_wait_front(CB_IN, 1);
-
-        // Signal MATH — data is now resident in L1.
         mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
 
-        // Reserve output slot while MATH is computing.
         cb_reserve_back(CB_OUT, 1);
 
-        // Wait for MATH to finish.
         while (mailbox_read(ckernel::ThreadId::PackThreadId) < i + 1) {
             asm volatile("" ::: "memory");
         }
 
-        // Copy result from CB_IN region into CB_OUT region.
         volatile float* out =
-            reinterpret_cast<volatile float*>(
-                get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+            reinterpret_cast<volatile float*>(cb_back_ptr(CB_OUT));
         const volatile float* data =
-            reinterpret_cast<const volatile float*>(get_read_ptr(CB_IN));
+            reinterpret_cast<const volatile float*>(cb_front_ptr(CB_IN));
 
         for (uint32_t j = 0; j < size * 2; ++j) out[j] = data[j];
 
@@ -183,7 +128,5 @@ void kernel_main() {
     }
 
     cb_pop_front(CB_TW, 1);
-
 #endif
-    // TRISC 0 (UNPACK): nothing to do — DMA reader handles all DRAM→L1 loads.
 }

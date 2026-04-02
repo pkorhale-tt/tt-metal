@@ -156,8 +156,12 @@ static void apply_mixed_twiddles(
 
 #include "api/compute/cb_api.h"
 
-inline uint32_t get_read_ptr(uint32_t cb_id) {
-    return get_tile_address(cb_id, 0);
+inline uint32_t cb_front_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
+}
+
+inline uint32_t cb_back_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
 }
 
 
