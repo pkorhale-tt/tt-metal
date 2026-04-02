@@ -102,11 +102,21 @@ static inline void butterfly_stage(
     }
 }
 
+#include "hw/inc/internal/circular_buffer_interface.h"
+
+// Polyfills for dataflow-like raw pointer access inside the compute kernel
+inline uint32_t get_read_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
+}
+
+inline uint32_t get_write_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
+}
+
 // ---------------------------------------------------------------------------
 // KERNEL ENTRY POINT
 // ---------------------------------------------------------------------------
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     // Runtime args
     uint32_t my_batch = get_arg_val<uint32_t>(0);
     // size and log2n are known at compile time (LOG2N, N)
@@ -152,4 +162,3 @@ void MAIN {
     // Release twiddle table
     cb_pop_front(CB_TW, 1);
 }
-} // namespace NAMESPACE

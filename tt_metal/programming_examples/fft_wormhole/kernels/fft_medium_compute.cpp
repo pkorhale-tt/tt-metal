@@ -93,11 +93,19 @@ static void radix2_dit(
     }
 }
 
+#include "hw/inc/internal/circular_buffer_interface.h"
+
+inline uint32_t get_read_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
+}
+inline uint32_t get_write_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
+}
+
 // ---------------------------------------------------------------------------
 // KERNEL ENTRY POINT
 // ---------------------------------------------------------------------------
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t my_batch = get_arg_val<uint32_t>(0);
     uint32_t size     = get_arg_val<uint32_t>(1);
     uint32_t log2n    = get_arg_val<uint32_t>(2);
@@ -130,4 +138,3 @@ void MAIN {
 
     cb_pop_front(CB_TW, 1);
 }
-} // namespace NAMESPACE

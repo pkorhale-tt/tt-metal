@@ -128,11 +128,19 @@ static void apply_mixed_twiddles(
     }
 }
 
+#include "hw/inc/internal/circular_buffer_interface.h"
+
+inline uint32_t get_read_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
+}
+inline uint32_t get_write_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
+}
+
 // =========================================================================
 // KERNEL ENTRY POINT
 // =========================================================================
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t row_start     = get_arg_val<uint32_t>(0);
     uint32_t rows_per_core = get_arg_val<uint32_t>(1);
     // R, S from compile-time constants
@@ -202,4 +210,3 @@ void MAIN {
     cb_pop_front(CB_TW_R, 1);
     cb_pop_front(CB_TW_S, 1);
 }
-} // namespace NAMESPACE
