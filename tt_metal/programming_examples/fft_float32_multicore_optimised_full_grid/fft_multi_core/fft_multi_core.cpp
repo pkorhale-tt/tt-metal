@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
     auto& cq    = mesh->mesh_command_queue();
     IDevice* device = mesh->get_devices().at(0);
     CoreCoord phys  = device->compute_with_storage_grid_size();
-    uint32_t phys_cores = phys.x * phys.y;   // 64 on Wormhole 8×8
+    uint32_t phys_cores = (uint32_t)phys.x * (uint32_t)phys.y;   // 64 on Wormhole 8×8
 
     // ── Core count selection ──────────────────────────────────────────
     // Key constraint: num_cores MUST be a power of 2 for the butterfly
@@ -290,9 +290,10 @@ int main(int argc, char** argv) {
     uint32_t local_tiles= local_half / TILE_SIZE; // tiles per core (exact)
 
     // Grid: pack cores column-major (matches matmul_multicore)
-    uint32_t grid_x = std::min((uint32_t)phys.x,
-                                (num_cores + (uint32_t)phys.y - 1) / phys.y);
-    uint32_t grid_y = std::min((uint32_t)phys.y, num_cores);
+    uint32_t phys_x = (uint32_t)phys.x;
+    uint32_t phys_y = (uint32_t)phys.y;
+    uint32_t grid_y = std::min(phys_y, num_cores);
+    uint32_t grid_x = std::min(phys_x, (num_cores + phys_y - 1) / phys_y);
     CoreCoord grid{grid_x, grid_y};
 
     // Use split_work_to_cores for CoreRangeSet construction
@@ -301,7 +302,7 @@ int main(int argc, char** argv) {
         split_work_to_cores(grid, num_cores);
 
     std::cout<<"═══════════════════════════════════════════════════\n";
-    std::cout<<" TRUE MULTICORE 1D FFT  —  Configuration\n with butterfly partitioning";
+    std::cout<<" TRUE MULTICORE 1D FFT  —  Configuration\n";
     std::cout<<"═══════════════════════════════════════════════════\n";
     std::cout<<"  N            : "<<N<<"\n";
     std::cout<<"  log2(N)      : "<<log2N<<"\n";
