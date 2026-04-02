@@ -108,6 +108,8 @@ inline uint32_t get_read_ptr(uint32_t cb_id) {
 void kernel_main() {
 #if COMPILE_FOR_TRISC == 1
     mailbox_write(ckernel::ThreadId::MathThreadId, 0);
+#elif COMPILE_FOR_TRISC == 2
+    mailbox_write(ckernel::ThreadId::PackThreadId, 0);
 #endif
     uint32_t my_batch = get_arg_val<uint32_t>(0);
     uint32_t size     = get_arg_val<uint32_t>(1);
@@ -125,19 +127,22 @@ void kernel_main() {
         volatile float* data =
             reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
 
+#if COMPILE_FOR_TRISC == 0
+        mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
+#endif
+
         // Compute FFT in-place on L1 data
 #if COMPILE_FOR_TRISC == 1
+        while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) { asm volatile("" ::: "memory"); }
         radix2_dit(data, tw, size, log2n, (bool)inv);
-        mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
-#else
-        while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) {
-            asm volatile("" ::: "memory");
-        }
+        mailbox_write(ckernel::ThreadId::PackThreadId, i + 1);
 #endif
 
         // Copy result to output CB for writer
         cb_reserve_back(CB_OUT, 1);
 #if COMPILE_FOR_TRISC == 2
+        while (mailbox_read(ckernel::ThreadId::PackThreadId) < i + 1) { asm volatile("" ::: "memory"); }
+
         volatile float* out =
             reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
 

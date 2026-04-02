@@ -118,6 +118,8 @@ void kernel_main() {
     // Handshake to clear stale math sync state
 #if COMPILE_FOR_TRISC == 1
     mailbox_write(ckernel::ThreadId::MathThreadId, 0);
+#elif COMPILE_FOR_TRISC == 2
+    mailbox_write(ckernel::ThreadId::PackThreadId, 0);
 #endif
 
     // Runtime args
@@ -137,8 +139,16 @@ void kernel_main() {
         volatile float* data =
             reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
 
-        // ---- Step 1: bit-reverse permutation --------------------------------
+#if COMPILE_FOR_TRISC == 0
+        // UNPACK tells MATH data is ready
+        mailbox_write(ckernel::ThreadId::MathThreadId, fft_i + 1);
+#endif
+
 #if COMPILE_FOR_TRISC == 1
+        // MATH waits for UNPACK
+        while (mailbox_read(ckernel::ThreadId::MathThreadId) < fft_i + 1) { asm volatile("" ::: "memory"); }
+
+        // ---- Step 1: bit-reverse permutation --------------------------------
         bit_reverse(data, N);
 
         // ---- Step 2: butterfly stages  (log2N stages total) ----------------
@@ -148,12 +158,8 @@ void kernel_main() {
             stage_len <<= 1;
         }
 
-        // signal UNPACK and PACK that math is done
-        mailbox_write(ckernel::ThreadId::MathThreadId, fft_i + 1);
-#else
-        while (mailbox_read(ckernel::ThreadId::MathThreadId) < fft_i + 1) {
-            asm volatile("" ::: "memory");
-        }
+        // MATH tells PACK it's done
+        mailbox_write(ckernel::ThreadId::PackThreadId, fft_i + 1);
 #endif
 
         // data now contains the FFT result in L1
@@ -161,6 +167,9 @@ void kernel_main() {
         // ---- Step 3: reserve output CB and copy ----------------------------
         cb_reserve_back(CB_OUT, 1);
 #if COMPILE_FOR_TRISC == 2
+        // PACK waits for MATH
+        while (mailbox_read(ckernel::ThreadId::PackThreadId) < fft_i + 1) { asm volatile("" ::: "memory"); }
+
         volatile float* out_ptr =
             reinterpret_cast<volatile float*>(get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
 
