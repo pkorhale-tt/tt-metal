@@ -19,7 +19,7 @@
 //   [4] = size           — N, complex points per FFT
 // =============================================================================
 
-#include "dataflow_kernel_api.h"
+#include "tt_metal/hw/inc/dataflow_api.h"
 
 void kernel_main() {
     uint32_t src_addr   = get_arg_val<uint32_t>(0);

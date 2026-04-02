@@ -25,7 +25,7 @@
 //   [7] = inverse
 // =============================================================================
 
-#include "dataflow_kernel_api.h"
+#include "tt_metal/hw/inc/dataflow_api.h"
 #include "debug/dprint.h"      // optional, remove for production
 
 void kernel_main() {
