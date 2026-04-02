@@ -36,23 +36,22 @@ static constexpr uint32_t L1_BUDGET     = 1024 * 1024;
 static constexpr uint32_t FLOAT_BYTES   = 4;
 static constexpr uint32_t COMPLEX_BYTES = 2 * FLOAT_BYTES;
 
-static constexpr uint32_t SMALL_THRESH  =  4 * 1024;
 static constexpr uint32_t MEDIUM_THRESH = 32 * 1024;
 
 // ---------------------------------------------------------------------------
 // Strategy tag
 // ---------------------------------------------------------------------------
-enum class FFTStrategy { SMALL, MEDIUM, LARGE };
+enum class FFTStrategy { MEDIUM, LARGE };
 
+// Route everything up to 32K through MEDIUM.
+// Tier1-Small is intentionally disabled because that path is the one hanging.
 static FFTStrategy select_strategy(uint32_t size, uint32_t /*batch*/) {
-    if (size <= SMALL_THRESH)  return FFTStrategy::SMALL;
     if (size <= MEDIUM_THRESH) return FFTStrategy::MEDIUM;
     return FFTStrategy::LARGE;
 }
 
 static const char* strategy_name(FFTStrategy s) {
     switch (s) {
-        case FFTStrategy::SMALL:  return "Tier1-Small";
         case FFTStrategy::MEDIUM: return "Tier2-Medium";
         case FFTStrategy::LARGE:  return "Tier3-Large";
     }
@@ -136,120 +135,8 @@ static CoreCoord get_worker_grid(const std::shared_ptr<distributed::MeshDevice>&
 }
 
 // ===========================================================================
-//  TIER 1 — Small FFT
-//  Permanent fix: one FFT/core, scheduled in waves across actual worker grid.
-// ===========================================================================
-static void run_small_fft(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
-    distributed::MeshCommandQueue&                  cq,
-    const std::shared_ptr<distributed::MeshBuffer>& src_buf,
-    const std::shared_ptr<distributed::MeshBuffer>& dst_buf,
-    const std::shared_ptr<distributed::MeshBuffer>& tw_buf,
-    uint32_t                                        size,
-    uint32_t                                        batch,
-    bool                                            inverse)
-{
-    const uint32_t log2n         = static_cast<uint32_t>(std::log2(size));
-    const uint32_t bytes_per_fft = size * COMPLEX_BYTES;
-
-    const CoreCoord grid = get_worker_grid(mesh_device);
-    const uint32_t num_cores_x = grid.x;
-    const uint32_t num_cores_y = grid.y;
-    const uint32_t max_active_cores = num_cores_x * num_cores_y;
-
-    std::cout << "[small] worker_grid=" << num_cores_x << "x" << num_cores_y
-              << " max_active_cores=" << max_active_cores << "\n";
-
-    auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
-    auto writer_ct_args = make_accessor_args_1(dst_buf);
-
-    for (uint32_t wave_base = 0; wave_base < batch; wave_base += max_active_cores) {
-        const uint32_t wave_batch   = std::min(max_active_cores, batch - wave_base);
-        const uint32_t active_cores = wave_batch;
-        const uint32_t rows         = (active_cores + num_cores_x - 1) / num_cores_x;
-        const uint32_t cols         = std::min(active_cores, num_cores_x);
-
-        std::cout << "[small wave] base=" << wave_base
-                  << " count=" << wave_batch
-                  << " rows=" << rows
-                  << " cols=" << cols << "\n";
-
-        CoreRange core_range(CoreCoord{0, 0}, CoreCoord{cols - 1, rows - 1});
-        Program program = CreateProgram();
-
-        make_cb(program, core_range, 0, bytes_per_fft, bytes_per_fft);
-        make_cb(program, core_range, 1, size * COMPLEX_BYTES, size * COMPLEX_BYTES);
-        make_cb(program, core_range, 2, bytes_per_fft, bytes_per_fft);
-
-        auto reader = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_small_reader.cpp",
-            core_range,
-            DataMovementConfig{
-                .processor = DataMovementProcessor::RISCV_0,
-                .noc       = NOC::RISCV_0_default,
-                .compile_args = reader_ct_args
-            });
-
-        auto compute = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_small_compute.cpp",
-            core_range,
-            ComputeConfig{
-                .math_fidelity    = MathFidelity::HiFi4,
-                .fp32_dest_acc_en = true,
-                .math_approx_mode = false,
-                .compile_args     = {log2n, static_cast<uint32_t>(inverse)}
-            });
-
-        auto writer = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_small_writer.cpp",
-            core_range,
-            DataMovementConfig{
-                .processor = DataMovementProcessor::RISCV_1,
-                .noc       = NOC::RISCV_1_default,
-                .compile_args = writer_ct_args
-            });
-
-        uint32_t core_idx = 0;
-        for (uint32_t r = 0; r < rows && core_idx < active_cores; ++r) {
-            for (uint32_t c = 0; c < cols && core_idx < active_cores; ++c) {
-                CoreCoord coord{c, r};
-
-                const uint32_t fft_offset = wave_base + core_idx;
-                const uint32_t my_batch   = 1;
-
-                SetRuntimeArgs(
-                    program, reader, coord,
-                    {src_buf->address(), tw_buf->address(), fft_offset, my_batch, size});
-
-                SetRuntimeArgs(
-                    program, compute, coord,
-                    {my_batch, size, log2n, static_cast<uint32_t>(inverse)});
-
-                SetRuntimeArgs(
-                    program, writer, coord,
-                    {dst_buf->address(), fft_offset, my_batch, size});
-
-                ++core_idx;
-            }
-        }
-
-        distributed::MeshWorkload workload;
-        distributed::MeshCoordinateRange device_range(mesh_device->shape());
-        workload.add_program(device_range, std::move(program));
-
-        distributed::EnqueueMeshWorkload(cq, workload, false);
-        distributed::Finish(cq);
-
-        std::cout << "[small wave done] base=" << wave_base << "\n";
-    }
-}
-
-// ===========================================================================
 //  TIER 2 — Medium FFT
-//  Permanent fix: one FFT/core, wave scheduler, actual worker grid.
+//  One FFT/core, wave scheduler, actual worker grid.
 // ===========================================================================
 static void run_medium_fft(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
@@ -370,7 +257,6 @@ static void run_medium_fft(
 
 // ===========================================================================
 //  TIER 3 — Large FFT
-//  Uses actual worker grid instead of hardcoded 64/8 assumptions.
 // ===========================================================================
 static void run_large_fft(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
@@ -621,9 +507,6 @@ void fft_universal(
     }
 
     switch (strategy) {
-        case FFTStrategy::SMALL:
-            run_small_fft(mesh_device, cq, src_buf, dst_buf, tw_buf, size, batch, inverse);
-            break;
         case FFTStrategy::MEDIUM:
             run_medium_fft(mesh_device, cq, src_buf, dst_buf, tw_buf, size, batch, inverse);
             break;
@@ -665,7 +548,7 @@ int main() {
         }
 
         fft_universal(ctx, in.data(), out.data(), N, B);
-        std::cout << "Tier1 smoke: out[0]=" << out[0]
+        std::cout << "Tier1/2 smoke: out[0]=" << out[0]
                   << " out[2]=" << out[2] << "  (both ~1.0)\n";
     }
 
