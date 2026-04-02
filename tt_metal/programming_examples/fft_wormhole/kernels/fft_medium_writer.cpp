@@ -33,7 +33,7 @@ void kernel_main() {
         uint32_t out_l1 = get_read_ptr(3);
 
         uint32_t abs_fft    = fft_offset + i;
-        uint32_t page_start = abs_fft * size * 2;
+        uint32_t page_start = abs_fft * size;
         uint64_t noc_addr   = get_noc_addr(page_start, dst_gen);
 
         noc_async_write(out_l1, noc_addr, fft_bytes);

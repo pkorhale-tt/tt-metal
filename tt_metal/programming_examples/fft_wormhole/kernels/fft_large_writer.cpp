@@ -62,25 +62,22 @@ void kernel_main() {
             uint32_t target_col     = target_core_id % 8;
             uint32_t target_row     = target_core_id / 8;
 
-            // Get L1 address of CB0 on the target core
-            // (Metalium provides get_noc_addr_from_bank_id for L1 targets)
-            uint32_t dst_l1_offset =
-                abs_row * 2 * sizeof(float) +     // column r maps to row r in transpose
-                c * rows_per_core * sizeof(float); // position within the column block
-
             // NOC address for target core's L1 (uses local CB0 address as baseline)
             uint64_t noc_dst = get_noc_addr(target_col, target_row, get_write_ptr(0));
 
-            // Source pointer into our phase-1 output CB
-            const volatile float* src_ptr =
-                phase1_out + r_local * S * 2 + c * 2;
+            // Write each of the 'rows_per_core' column elements independently
+            // so they land in their contiguous column arrays on the target core!
+            for (uint32_t c_local = 0; c_local < rows_per_core; ++c_local) {
+                uint32_t dst_l1_offset = (c_local * R + abs_row) * 2 * sizeof(float);
 
-            // Write rows_per_core column elements to target core
-            noc_async_write(
-                reinterpret_cast<uintptr_t>(src_ptr),
-                noc_dst + dst_l1_offset,
-                rows_per_core * 2 * sizeof(float)  // rows_per_core complex samples
-            );
+                const volatile float* src_ptr = phase1_out + r_local * S * 2 + (c + c_local) * 2;
+
+                noc_async_write(
+                    reinterpret_cast<uintptr_t>(src_ptr),
+                    noc_dst + dst_l1_offset,
+                    2 * sizeof(float)  // 1 complex sample
+                );
+            }
         }
     }
 
@@ -112,7 +109,7 @@ void kernel_main() {
     // Output layout matches input: [batch_idx * N + row_start * R + ...]
     // After the 2D FFT, our core holds rows [row_start .. row_start+rows_per_core)
     // of the R×S output matrix (now S×R after col FFTs, reinterpreted as N).
-    uint32_t base_page = (batch_idx * N + row_start * R) * 2;
+    uint32_t base_page = batch_idx * N + row_start * R;
     uint64_t dst_noc   = get_noc_addr(base_page, dst_gen);
 
     noc_async_write(

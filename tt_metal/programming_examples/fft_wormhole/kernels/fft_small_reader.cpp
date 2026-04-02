@@ -60,7 +60,7 @@ void kernel_main() {
         // Byte offset in the flat DRAM buffer: abs_fft * fft_bytes
         // Page index for InterleavedAddrGen: abs_fft * size * 2  pages
         //   (each page = 8 bytes = 1 complex sample)
-        uint32_t page_start = abs_fft * size * 2;  // page index of first sample
+        uint32_t page_start = abs_fft * size;  // page index of first sample
         uint64_t noc_addr   = get_noc_addr(page_start, src_gen);
 
         noc_async_read(noc_addr, in_l1, fft_bytes);

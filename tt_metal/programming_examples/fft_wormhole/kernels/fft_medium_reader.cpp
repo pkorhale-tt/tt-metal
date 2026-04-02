@@ -57,7 +57,7 @@ void kernel_main() {
         cb_reserve_back(0, 1);
 
         uint32_t abs_fft    = fft_offset + i;
-        uint32_t page_start = abs_fft * size * 2;   // complex page index
+        uint32_t page_start = abs_fft * size;   // complex page index
         uint64_t noc_addr   = get_noc_addr(page_start, src_gen);
 
         noc_async_read(noc_addr, get_write_ptr(0), fft_bytes);

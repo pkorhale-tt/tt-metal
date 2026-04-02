@@ -76,7 +76,7 @@ void kernel_main() {
     //    Page index = (batch_idx * N + row_start * S) * 2  (×2 for complex)
     // -----------------------------------------------------------------------
     cb_reserve_back(0, 1);
-    uint32_t base_page  = (batch_idx * N + row_start * S) * 2;
+    uint32_t base_page  = batch_idx * N + row_start * S;
     uint64_t src_noc    = get_noc_addr(base_page, src_gen);
     noc_async_read(src_noc, get_write_ptr(0), chunk_bytes);
     noc_async_read_barrier();
