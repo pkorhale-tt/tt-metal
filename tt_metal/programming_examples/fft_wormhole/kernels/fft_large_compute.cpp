@@ -178,7 +178,7 @@ void kernel_main() {
     mailbox_write(ckernel::ThreadId::UnpackThreadId, 1);
     mailbox_write(ckernel::ThreadId::PackThreadId, 1);
 #else
-    mailbox_read(ckernel::ThreadId::MathThreadId);
+    while (mailbox_read(ckernel::ThreadId::MathThreadId) != 1) { /* spin */ }
 #endif
 
     // Signal DM1 (writer) that phase-1 rows are ready for NOC transpose
@@ -220,7 +220,7 @@ void kernel_main() {
     mailbox_write(ckernel::ThreadId::UnpackThreadId, 2);
     mailbox_write(ckernel::ThreadId::PackThreadId, 2);
 #else
-    mailbox_read(ckernel::ThreadId::MathThreadId);
+    while (mailbox_read(ckernel::ThreadId::MathThreadId) != 2) { /* spin */ }
 #endif
 
     // Push final output
