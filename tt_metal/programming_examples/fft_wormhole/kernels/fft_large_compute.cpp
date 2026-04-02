@@ -128,13 +128,23 @@ static void apply_mixed_twiddles(
     }
 }
 
+#include "api/compute/cb_api.h"
 #include "hw/inc/internal/circular_buffer_interface.h"
 
 inline uint32_t get_read_ptr(uint32_t cb_id) {
-    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
+    return get_tile_address(cb_id, 0);
 }
 inline uint32_t get_write_ptr(uint32_t cb_id) {
-    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
+    uint32_t address = 0;
+    UNPACK({
+        uint32_t operand_id = get_operand_id(cb_id);
+        address = get_local_cb_interface(operand_id).fifo_wr_ptr << 4;
+        mailbox_write(ckernel::ThreadId::MathThreadId, address);
+        mailbox_write(ckernel::ThreadId::PackThreadId, address);
+    })
+    MATH(address = mailbox_read(ckernel::ThreadId::UnpackThreadId);)
+    PACK(address = mailbox_read(ckernel::ThreadId::UnpackThreadId);)
+    return address;
 }
 
 // =========================================================================
