@@ -23,10 +23,14 @@
 #include "tt_metal/api/tt-metalium/allocator.hpp"
 #include "tt_metal/api/tt-metalium/hal.hpp"
 
+#include "tt_metal/api/tt-metalium/bfloat16.hpp"
+#include "tt_metal/api/tt-metalium/device.hpp"
+#include "tt_metal/api/tt-metalium/core_coord.hpp"
+
 // #include "tt_metal/host_api.hpp"
-#include "tt_metal/common/bfloat16.hpp"
-#include "tt_metal/impl/device/device.hpp"
-#include "common/core_coord.h"
+// #include "tt_metal/common/bfloat16.hpp"
+// #include "tt_metal/impl/device/device.hpp"
+// #include "common/core_coord.h"
 
 #include <cstdint>
 #include <cmath>
