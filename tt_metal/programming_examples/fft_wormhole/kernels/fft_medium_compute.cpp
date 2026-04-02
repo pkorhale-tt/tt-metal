@@ -94,7 +94,6 @@ static void radix2_dit(
 }
 
 #include "api/compute/cb_api.h"
-#include "hw/inc/internal/circular_buffer_interface.h"
 
 inline uint32_t get_read_ptr(uint32_t cb_id) {
     return get_tile_address(cb_id, 0);

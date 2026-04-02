@@ -103,7 +103,6 @@ static inline void butterfly_stage(
 }
 
 #include "api/compute/cb_api.h"
-#include "hw/inc/internal/circular_buffer_interface.h"
 
 // Polyfills for dataflow-like raw pointer access inside the compute kernel
 inline uint32_t get_read_ptr(uint32_t cb_id) {
