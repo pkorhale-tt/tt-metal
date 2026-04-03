@@ -284,7 +284,6 @@ int main(int argc, char** argv) {
                     .set_page_size(cbId, TILE_BYTES);
             CreateCircularBuffer(program, coreRange, cbConfig);
         };
-
         makeCb(CB_EVEN_R, 2 * tilesPerRow);
         makeCb(CB_EVEN_I, 2 * tilesPerRow);
         makeCb(CB_ODD_R,  2 * tilesPerRow);
@@ -297,8 +296,10 @@ int main(int argc, char** argv) {
         makeCb(CB_OUT1_R, 2 * tilesPerRow);
         makeCb(CB_OUT1_I, 2 * tilesPerRow);
 
-        makeCb(CB_TMP_R, 1);
-        makeCb(CB_TMP_I, 1);
+        makeCb(CB_TMP_R, 1);   // cb 20
+        makeCb(CB_TMP_I, 1);   // cb 21
+        makeCb(22, 1);         // cb_tw_odd_r
+        makeCb(23, 1);         // cb_tw_odd_i
 
         KernelHandle readerKernel = CreateKernel(
             program,
