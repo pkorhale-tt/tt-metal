@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
     uint32_t compact_page_bytes = TILE_BYTES;   // always tile-aligned
 
     std::cout << "════════════════════════════════════════════════\n";
-    std::cout << " TT-Metal MULTICORE FFT (row decomposition)\n";
+    std::cout << " TT-Metal MULTICORE FFT (row decomposition)....\n";
     std::cout << "════════════════════════════════════════════════\n";
     std::cout << " N_row        : " << N_row << "\n";
     std::cout << " num_rows     : " << num_rows << "\n";
