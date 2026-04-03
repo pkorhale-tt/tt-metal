@@ -28,6 +28,10 @@ void kernel_main() {
     uint32_t my_batch   = get_arg_val<uint32_t>(3);
     uint32_t size       = get_arg_val<uint32_t>(4);
 
+    if (my_batch == 0) {
+        return;
+    }
+
     const uint32_t fft_bytes    = size * 2 * sizeof(float);
     const uint32_t twiddle_bytes = fft_bytes;
 

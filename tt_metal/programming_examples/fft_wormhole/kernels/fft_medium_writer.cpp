@@ -20,6 +20,10 @@ void kernel_main() {
     uint32_t my_batch   = get_arg_val<uint32_t>(2);
     uint32_t size       = get_arg_val<uint32_t>(3);
 
+    if (my_batch == 0) {
+        return;
+    }
+
     const uint32_t fft_bytes = size * 2 * sizeof(float);
 
     const InterleavedAddrGen<true> dst_gen = {

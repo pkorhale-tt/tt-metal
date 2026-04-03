@@ -86,8 +86,12 @@ static void radix2_dit(
 }
 #endif
 
-inline uint32_t get_read_ptr(uint32_t cb_id) {
-    return get_tile_address(cb_id, 0);
+inline uint32_t cb_front_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
+}
+
+inline uint32_t cb_back_ptr(uint32_t cb_id) {
+    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,17 +114,21 @@ void kernel_main() {
     uint32_t log2n = get_arg_val<uint32_t>(2);
     uint32_t inv   = get_arg_val<uint32_t>(3);
 
-    const volatile float* tw =
-        reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW));
-
     uint32_t my_batch = get_arg_val<uint32_t>(0);
+    if (my_batch == 0) {
+        return;
+    }
+
+    const volatile float* tw =
+        reinterpret_cast<const volatile float*>(cb_front_ptr(CB_TW));
+
     for (uint32_t i = 0; i < my_batch; ++i) {
         while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) {
             asm volatile("" ::: "memory");
         }
 
         volatile float* data =
-            reinterpret_cast<volatile float*>(get_read_ptr(CB_IN));
+            reinterpret_cast<volatile float*>(cb_front_ptr(CB_IN));
         radix2_dit(data, tw, size, log2n, static_cast<bool>(inv));
         mailbox_write(ckernel::ThreadId::PackThreadId, i + 1);
     }
@@ -128,6 +136,10 @@ void kernel_main() {
 #elif COMPILE_FOR_TRISC == 2
     uint32_t my_batch = get_arg_val<uint32_t>(0);
     uint32_t size     = get_arg_val<uint32_t>(1);
+
+    if (my_batch == 0) {
+        return;
+    }
 
     cb_wait_front(CB_TW, 1);
 
@@ -147,9 +159,9 @@ void kernel_main() {
 
         volatile float* out =
             reinterpret_cast<volatile float*>(
-                get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
+                cb_back_ptr(CB_OUT));
         const volatile float* data =
-            reinterpret_cast<const volatile float*>(get_read_ptr(CB_IN));
+            reinterpret_cast<const volatile float*>(cb_front_ptr(CB_IN));
 
         for (uint32_t j = 0; j < size * 2; ++j) {
             out[j] = data[j];
