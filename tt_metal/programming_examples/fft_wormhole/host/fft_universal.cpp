@@ -764,8 +764,7 @@ static void run_medium_fft(
     const CoreCoord grid = get_worker_grid(mesh_device);
     std::cout << "[medium-safe] worker_grid=" << grid.x << "x" << grid.y
               << " batch=" << batch
-              << " using_single_core=(0,0)" << "
-";
+              << " using_single_core=(0,0)" << "\n";
 
     auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
     auto writer_ct_args = make_accessor_args_1(dst_buf);
@@ -823,8 +822,7 @@ static void run_medium_fft(
     distributed::EnqueueMeshWorkload(cq, workload, false);
     distributed::Finish(cq);
 
-    std::cout << "[medium-safe done] total_fft_assigned=" << batch << "
-";
+    std::cout << "[medium-safe done] total_fft_assigned=" << batch << "\n";
 }
 
 // ===========================================================================
