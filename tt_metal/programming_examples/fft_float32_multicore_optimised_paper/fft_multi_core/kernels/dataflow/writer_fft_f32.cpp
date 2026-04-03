@@ -8,8 +8,7 @@
 //   - write to the next stage ping-pong buffer (or final output buffer).
 
 #include <cstdint>
-#include "dataflow_api.h"
-
+#include "api/dataflow/dataflow_api.h"
 namespace {
 
 constexpr uint32_t TILE_ELEMS = 32u * 32u;
