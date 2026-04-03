@@ -100,9 +100,11 @@ inline uint32_t get_read_ptr_cb(uint32_t cb_id) {
 // ---------------------------------------------------------------------------
 void kernel_main() {
 #if COMPILE_FOR_TRISC == 1
-    mailbox_write(ckernel::ThreadId::MathThreadId, 0);
-#elif COMPILE_FOR_TRISC == 2
+    // MATH owns PackThreadId; initialize only the mailbox this thread writes.
     mailbox_write(ckernel::ThreadId::PackThreadId, 0);
+#elif COMPILE_FOR_TRISC == 2
+    // PACK owns MathThreadId; initialize only the mailbox this thread writes.
+    mailbox_write(ckernel::ThreadId::MathThreadId, 0);
 #endif
 
 #if COMPILE_FOR_TRISC == 1
