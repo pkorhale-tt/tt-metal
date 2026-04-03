@@ -10,8 +10,8 @@
 #include "api/compute/copy_dest_values.h"
 
 void kernel_main() {
-    const uint32_t num_stages = get_arg_val(0);
-    const uint32_t tiles_per_stage = get_arg_val(1);
+    const uint32_t num_stages = get_arg_val<uint32_t>(0);
+    const uint32_t tiles_per_stage = get_arg_val<uint32_t>(1);
 
     constexpr uint32_t cb_even_r = 0;
     constexpr uint32_t cb_even_i = 1;
