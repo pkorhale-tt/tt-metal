@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary.h"
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     const uint32_t numStages = get_arg_val<uint32_t>(0);
     const uint32_t tilesPerRow = get_arg_val<uint32_t>(1);
 
@@ -106,4 +103,3 @@ void MAIN {
         }
     }
 }
-}  // namespace NAMESPACE
