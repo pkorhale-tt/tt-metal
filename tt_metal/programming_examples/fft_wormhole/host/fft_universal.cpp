@@ -256,6 +256,73 @@ static void run_medium_fft(
 }
 
 // ===========================================================================
+//  TIER 3 — Large FFT
+//  2D Cooley–Tukey decomposition, N = R × S, distributed across cores.
+// ===========================================================================
+static void run_large_fft(
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
+    distributed::MeshCommandQueue&                  cq,
+    const std::shared_ptr<distributed::MeshBuffer>& src_buf,
+    const std::shared_ptr<distributed::MeshBuffer>& dst_buf,
+    const std::shared_ptr<distributed::MeshBuffer>& tw_buf,
+    uint32_t                                        size,
+    uint32_t                                        batch,
+    bool                                            inverse)
+{
+    const uint32_t log2n        = static_cast<uint32_t>(std::log2(size));
+    const uint32_t log2R        = log2n / 2;
+    const uint32_t log2S        = log2n - log2R;
+    const uint32_t R            = 1u << log2R;
+    const uint32_t S            = 1u << log2S;
+
+    const CoreCoord grid        = get_worker_grid(mesh_device);
+    const uint32_t cores_per_fft = std::min(R, grid.x * grid.y);
+    const uint32_t rows_per_core = R / cores_per_fft;
+
+    std::cout << "[large] size=" << size
+              << " R=" << R << " S=" << S
+              << " cores_per_fft=" << cores_per_fft
+              << " rows_per_core=" << rows_per_core << "\n";
+
+    auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
+    auto writer_ct_args = make_accessor_args_1(dst_buf);
+
+    const uint32_t fft_row_bytes = rows_per_core * S * COMPLEX_BYTES;
+    const uint32_t tw_r_bytes    = R * COMPLEX_BYTES;
+    const uint32_t tw_s_bytes    = S * COMPLEX_BYTES;
+    const uint32_t col_bytes     = R * rows_per_core * COMPLEX_BYTES;
+
+    for (uint32_t g = 0; g < batch; ++g) {
+        const uint32_t num_cols = std::min(cores_per_fft, grid.x);
+        const uint32_t num_rows = (cores_per_fft + num_cols - 1) / num_cols;
+        CoreRange cr(CoreCoord{0, 0}, CoreCoord{num_cols - 1, num_rows - 1});
+
+        // Pack target NOC coordinates for the writer scatter
+        std::vector<uint32_t> noc_coords_packed;
+        noc_coords_packed.reserve(cores_per_fft);
+        {
+            uint32_t idx = 0;
+            for (uint32_t row = 0; row < num_rows && idx < cores_per_fft; ++row) {
+                for (uint32_t col = 0; col < num_cols && idx < cores_per_fft; ++col) {
+                    // packed = (noc_row << 16) | noc_col  — logical coords == NOC coords on Wormhole
+                    noc_coords_packed.push_back((row << 16) | col);
+                    ++idx;
+                }
+            }
+        }
+
+        Program program = CreateProgram();
+
+        // CB layout per core:
+        //   CB0 (CB_DATA)  — row slice + later transposed column data
+        //   CB1 (CB_TW_R)  — R-point twiddles
+        //   CB2 (CB_TW_S)  — S-point twiddles
+        //   CB3 (CB_OUT)   — phase-1 output (rows after FFT) + phase-2 output (cols)
+        make_cb(program, cr, 0, std::max(fft_row_bytes, col_bytes), std::max(fft_row_bytes, col_bytes));
+        make_cb(program, cr, 1, tw_r_bytes, tw_r_bytes);
+        make_cb(program, cr, 2, tw_s_bytes, tw_s_bytes);
+        make_cb(program, cr, 3, fft_row_bytes, fft_row_bytes);
+
         CreateSemaphore(program, cr, 0);
         
         auto reader = CreateKernel(
@@ -342,17 +409,17 @@ static void run_medium_fft(
                 ++local_core;
             }
         }
+
+        distributed::MeshWorkload workload;
+        distributed::MeshCoordinateRange device_range(mesh_device->shape());
+        workload.add_program(device_range, std::move(program));
+
+        distributed::EnqueueMeshWorkload(cq, workload, false);
+        distributed::Finish(cq);
+
+        std::cout << "[large wave done] batch_idx=" << g << "\n";
     }
-    
-    distributed::MeshWorkload workload;
-    distributed::MeshCoordinateRange device_range(mesh_device->shape());
-    workload.add_program(device_range, std::move(program));
-    
-    distributed::EnqueueMeshWorkload(cq, workload, false);
-    
-    // **CRITICAL FIX: Add Finish call**
-    distributed::Finish(cq);
-    
+
     std::cout << "[large FFT done] batch=" << batch << "\n";
 }
 
