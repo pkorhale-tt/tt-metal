@@ -256,77 +256,8 @@ static void run_medium_fft(
 }
 
 // ===========================================================================
-//  TIER 3 — Large FFT
-// ===========================================================================
-static void run_large_fft(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
-    distributed::MeshCommandQueue&                  cq,
-    const std::shared_ptr<distributed::MeshBuffer>& src_buf,
-    const std::shared_ptr<distributed::MeshBuffer>& dst_buf,
-    const std::shared_ptr<distributed::MeshBuffer>& tw_buf,
-    uint32_t                                        size,
-    uint32_t                                        batch,
-    bool                                            inverse)
-{
-    const uint32_t log2n = static_cast<uint32_t>(std::log2(size));
-    const uint32_t log2R = log2n / 2;
-    const uint32_t log2S = log2n - log2R;
-    const uint32_t R     = 1u << log2R;
-    const uint32_t S     = size / R;
-
-    const CoreCoord grid = get_worker_grid(mesh_device);
-    const uint32_t num_cores_x = grid.x;
-    const uint32_t num_cores_y = grid.y;
-    const uint32_t num_worker_cores = num_cores_x * num_cores_y;
-
-    const uint32_t max_cores_per_fft = R;
-    const uint32_t cores_per_fft = std::min(
-        max_cores_per_fft,
-        std::max(1u, num_worker_cores / std::max(batch, 1u))
-    );
-    const uint32_t rows_per_core = R / cores_per_fft;
-    const uint32_t active_groups = std::min(batch, num_worker_cores / cores_per_fft);
-
-    std::cout << "[large] worker_grid=" << num_cores_x << "x" << num_cores_y
-              << " num_worker_cores=" << num_worker_cores
-              << " cores_per_fft=" << cores_per_fft
-              << " rows_per_core=" << rows_per_core
-              << " active_groups=" << active_groups << "\n";
-
-    std::vector<CoreRange> group_ranges;
-    group_ranges.reserve(active_groups);
-    for (uint32_t g = 0; g < active_groups; ++g) {
-        uint32_t first = g * cores_per_fft;
-        uint32_t last  = first + cores_per_fft - 1;
-        group_ranges.push_back(CoreRange(
-            CoreCoord{first % num_cores_x, first / num_cores_x},
-            CoreCoord{last  % num_cores_x, last  / num_cores_x}));
-    }
-
-    Program program = CreateProgram();
-
-    std::vector<uint32_t> noc_coords_packed(num_worker_cores, 0);
-    IDevice* dev = mesh_device->get_devices()[0];
-    for (uint32_t i = 0; i < num_worker_cores; ++i) {
-        CoreCoord logical_coord{i % num_cores_x, i / num_cores_x};
-        CoreCoord physical_coord = dev->worker_core_from_logical_core(logical_coord);
-        noc_coords_packed[i] = (physical_coord.y << 16) | physical_coord.x;
-    }
-
-    auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
-    auto writer_ct_args = make_accessor_args_1(dst_buf);
-
-    for (uint32_t g = 0; g < active_groups; ++g) {
-        auto& cr = group_ranges[g];
-        const uint32_t chunk_bytes = rows_per_core * S * COMPLEX_BYTES;
-
-        make_cb(program, cr, 0, chunk_bytes,       chunk_bytes);
-        make_cb(program, cr, 1, R * COMPLEX_BYTES, R * COMPLEX_BYTES);
-        make_cb(program, cr, 2, S * COMPLEX_BYTES, S * COMPLEX_BYTES);
-        make_cb(program, cr, 3, chunk_bytes,       chunk_bytes);
-
         CreateSemaphore(program, cr, 0);
-
+        
         auto reader = CreateKernel(
             program,
             OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_large_reader1.cpp",
@@ -336,7 +267,7 @@ static void run_large_fft(
                 .noc       = NOC::RISCV_0_default,
                 .compile_args = reader_ct_args
             });
-
+        
         auto compute = CreateKernel(
             program,
             OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_large_compute.cpp",
@@ -352,7 +283,7 @@ static void run_large_fft(
                     rows_per_core
                 }
             });
-
+        
         auto writer = CreateKernel(
             program,
             OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_large_writer.cpp",
@@ -362,13 +293,13 @@ static void run_large_fft(
                 .noc       = NOC::RISCV_1_default,
                 .compile_args = writer_ct_args
             });
-
+        
         uint32_t local_core = 0;
         for (uint32_t r = cr.start_coord.y; r <= cr.end_coord.y; ++r) {
             for (uint32_t c = cr.start_coord.x; c <= cr.end_coord.x; ++c) {
                 CoreCoord coord{c, r};
                 uint32_t row_start = local_core * rows_per_core;
-
+                
                 SetRuntimeArgs(
                     program, reader, coord,
                     {
@@ -381,7 +312,7 @@ static void run_large_fft(
                         S,
                         static_cast<uint32_t>(inverse)
                     });
-
+                
                 SetRuntimeArgs(
                     program, compute, coord,
                     {
@@ -392,7 +323,7 @@ static void run_large_fft(
                         local_core,
                         g
                     });
-
+                
                 std::vector<uint32_t> writer_args = {
                     dst_buf->address(),
                     g,
@@ -406,18 +337,23 @@ static void run_large_fft(
                     noc_coords_packed.begin(),
                     noc_coords_packed.end()
                 );
-
                 SetRuntimeArgs(program, writer, coord, writer_args);
+                
                 ++local_core;
             }
         }
     }
-
+    
     distributed::MeshWorkload workload;
     distributed::MeshCoordinateRange device_range(mesh_device->shape());
     workload.add_program(device_range, std::move(program));
-
+    
     distributed::EnqueueMeshWorkload(cq, workload, false);
+    
+    // **CRITICAL FIX: Add Finish call**
+    distributed::Finish(cq);
+    
+    std::cout << "[large FFT done] batch=" << batch << "\n";
 }
 
 // ===========================================================================
