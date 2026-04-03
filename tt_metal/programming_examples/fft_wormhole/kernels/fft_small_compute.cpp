@@ -166,13 +166,15 @@ void kernel_main() {
     for (uint32_t fft_i = 0; fft_i < my_batch; ++fft_i) {
         cb_wait_front(CB_IN, 1);
 
+        // Signal MATH to start computing on CB_IN data
         mailbox_write(ckernel::ThreadId::MathThreadId, fft_i + 1);
 
-        cb_reserve_back(CB_OUT, 1);
-
+        // Wait for MATH to finish before reserving output — avoids deadlock with writer
         while (mailbox_read(ckernel::ThreadId::PackThreadId) < fft_i + 1) {
             asm volatile("" ::: "memory");
         }
+
+        cb_reserve_back(CB_OUT, 1);
 
         volatile float* out_ptr =
             reinterpret_cast<volatile float*>(
