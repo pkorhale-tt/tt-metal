@@ -276,7 +276,7 @@ static void run_large_fft(
     const uint32_t S            = 1u << log2S;
 
     const CoreCoord grid        = get_worker_grid(mesh_device);
-    const uint32_t cores_per_fft = std::min(R, grid.x * grid.y);
+    const uint32_t cores_per_fft = std::min(R, static_cast<uint32_t>(grid.x * grid.y));
     const uint32_t rows_per_core = R / cores_per_fft;
 
     std::cout << "[large] size=" << size
@@ -293,7 +293,7 @@ static void run_large_fft(
     const uint32_t col_bytes     = R * rows_per_core * COMPLEX_BYTES;
 
     for (uint32_t g = 0; g < batch; ++g) {
-        const uint32_t num_cols = std::min(cores_per_fft, grid.x);
+        const uint32_t num_cols = std::min(cores_per_fft, static_cast<uint32_t>(grid.x));
         const uint32_t num_rows = (cores_per_fft + num_cols - 1) / num_cols;
         CoreRange cr(CoreCoord{0, 0}, CoreCoord{num_cols - 1, num_rows - 1});
 
