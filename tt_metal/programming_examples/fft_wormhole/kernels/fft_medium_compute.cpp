@@ -86,12 +86,8 @@ static void radix2_dit(
 }
 #endif
 
-inline uint32_t cb_front_ptr(uint32_t cb_id) {
-    return get_local_cb_interface(cb_id).fifo_rd_ptr << 4;
-}
-
-inline uint32_t cb_back_ptr(uint32_t cb_id) {
-    return get_local_cb_interface(cb_id).fifo_wr_ptr << 4;
+inline uint32_t get_read_ptr_cb(uint32_t cb_id) {
+    return get_tile_address(cb_id, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -113,14 +109,14 @@ void kernel_main() {
     uint32_t size  = get_arg_val<uint32_t>(1);
     uint32_t log2n = get_arg_val<uint32_t>(2);
     uint32_t inv   = get_arg_val<uint32_t>(3);
-
     uint32_t my_batch = get_arg_val<uint32_t>(0);
+
     if (my_batch == 0) {
         return;
     }
 
     const volatile float* tw =
-        reinterpret_cast<const volatile float*>(cb_front_ptr(CB_TW));
+        reinterpret_cast<const volatile float*>(get_read_ptr_cb(CB_TW));
 
     for (uint32_t i = 0; i < my_batch; ++i) {
         while (mailbox_read(ckernel::ThreadId::MathThreadId) < i + 1) {
@@ -128,7 +124,7 @@ void kernel_main() {
         }
 
         volatile float* data =
-            reinterpret_cast<volatile float*>(cb_front_ptr(CB_IN));
+            reinterpret_cast<volatile float*>(get_read_ptr_cb(CB_IN));
         radix2_dit(data, tw, size, log2n, static_cast<bool>(inv));
         mailbox_write(ckernel::ThreadId::PackThreadId, i + 1);
     }
@@ -146,22 +142,19 @@ void kernel_main() {
     for (uint32_t i = 0; i < my_batch; ++i) {
         cb_wait_front(CB_IN, 1);
 
-        // Signal MATH to start computing on CB_IN data
         mailbox_write(ckernel::ThreadId::MathThreadId, i + 1);
 
-        // Wait for MATH to finish before reserving output or touching data
         while (mailbox_read(ckernel::ThreadId::PackThreadId) < i + 1) {
             asm volatile("" ::: "memory");
         }
 
-        // Only reserve CB_OUT after MATH is done — avoids deadlock with writer
         cb_reserve_back(CB_OUT, 1);
 
         volatile float* out =
             reinterpret_cast<volatile float*>(
-                cb_back_ptr(CB_OUT));
+                get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4);
         const volatile float* data =
-            reinterpret_cast<const volatile float*>(cb_front_ptr(CB_IN));
+            reinterpret_cast<const volatile float*>(get_read_ptr_cb(CB_IN));
 
         for (uint32_t j = 0; j < size * 2; ++j) {
             out[j] = data[j];
@@ -173,5 +166,4 @@ void kernel_main() {
 
     cb_pop_front(CB_TW, 1);
 #endif
-    // TRISC 0 (UNPACK): nothing to do
 }
