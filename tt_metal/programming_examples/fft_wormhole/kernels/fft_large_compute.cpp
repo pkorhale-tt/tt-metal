@@ -215,11 +215,11 @@ void kernel_main() {
         asm volatile("" ::: "memory");
     }
     tw_r     = reinterpret_cast<const volatile float*>(get_read_ptr(CB_TW_R));
-    // Phase-2 output goes directly to the CB_OUT write region.  PACK has
-    // reserved it and passes its address via PackThreadId mailbox.
-    volatile float* col_data   = reinterpret_cast<volatile float*>(get_read_ptr(CB_DATA));
-    volatile float* col_out_ptr = reinterpret_cast<volatile float*>(
-        static_cast<uintptr_t>(mailbox_read(ckernel::ThreadId::PackThreadId)));
+    // Phase-2 output goes directly to the reserved CB_OUT write region.
+    // PACK reserves the slot before releasing phase 2, so MATH can read the
+    // current CB_OUT write pointer directly without overloading PackThreadId.
+    volatile float* col_data    = reinterpret_cast<volatile float*>(get_read_ptr(CB_DATA));
+    volatile float* col_out_ptr = reinterpret_cast<volatile float*>(cb_back_ptr(CB_OUT));
 
     // Un-interleave: received layout is [R][rows_per_core]; output is [rows_per_core][R]
     for (uint32_t r = 0; r < R_LEN; ++r) {
@@ -279,16 +279,9 @@ void kernel_main() {
     // Wait for the transposed column data that the NOC scatter delivers.
     cb_wait_front(CB_DATA, 1);
 
-    // Reserve phase-2 output slot and pass its L1 address to MATH via mailbox.
+    // Reserve the phase-2 output slot, then signal MATH to start phase 2.
+    // MATH reads the reserved CB_OUT write pointer directly via cb_back_ptr().
     cb_reserve_back(CB_OUT, 1);
-    uint32_t col_out_addr =
-        get_local_cb_interface(CB_OUT).fifo_wr_ptr << 4;
-
-    // Tell MATH: transposed data is in CB_DATA, output slot is at col_out_addr.
-    // We encode the address in PackThreadId so MATH can derive the write pointer.
-    // First bump MathThreadId to 2 to release MATH's phase-2 wait, then
-    // write the address into PackThreadId (MATH reads it after unblocking).
-    mailbox_write(ckernel::ThreadId::PackThreadId, col_out_addr);
     mailbox_write(ckernel::ThreadId::MathThreadId, 2);
 
     // Wait for MATH to finish phase-2 column FFTs.

@@ -136,7 +136,8 @@ static CoreCoord get_worker_grid(const std::shared_ptr<distributed::MeshDevice>&
 
 // ===========================================================================
 //  TIER 2 — Medium FFT
-//  One FFT/core, wave scheduler, actual worker grid.
+//  L1-only batched FFT. One program launch over the full worker grid; each
+//  core receives my_batch FFTs (possibly 0 for idle cores).
 // ===========================================================================
 static void run_medium_fft(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
@@ -161,98 +162,89 @@ static void run_medium_fft(
     }
 
     const CoreCoord grid = get_worker_grid(mesh_device);
-    const uint32_t num_cores_x = grid.x;
-    const uint32_t num_cores_y = grid.y;
-    const uint32_t max_active_cores = num_cores_x * num_cores_y;
+    const uint32_t num_cores_x      = grid.x;
+    const uint32_t num_cores_y      = grid.y;
+    const uint32_t total_grid_cores = num_cores_x * num_cores_y;
 
     std::cout << "[medium] worker_grid=" << num_cores_x << "x" << num_cores_y
-              << " max_active_cores=" << max_active_cores << "\n";
+              << " total_grid_cores=" << total_grid_cores
+              << " batch=" << batch << "\n";
 
     auto reader_ct_args = make_accessor_args_2(src_buf, tw_buf);
     auto writer_ct_args = make_accessor_args_1(dst_buf);
 
-    for (uint32_t wave_base = 0; wave_base < batch; wave_base += max_active_cores) {
-        const uint32_t wave_batch   = std::min(max_active_cores, batch - wave_base);
-        const uint32_t active_cores = wave_batch;
-        const uint32_t rows         = (active_cores + num_cores_x - 1) / num_cores_x;
-        const uint32_t cols         = std::min(active_cores, num_cores_x);
+    CoreRange core_range(CoreCoord{0, 0}, CoreCoord{num_cores_x - 1, num_cores_y - 1});
+    Program program = CreateProgram();
 
-        std::cout << "[medium wave] base=" << wave_base
-                  << " count=" << wave_batch
-                  << " rows=" << rows
-                  << " cols=" << cols << "\n";
+    make_cb(program, core_range, 0, fft_bytes, fft_bytes);
+    make_cb(program, core_range, 1, fft_bytes, fft_bytes);
+    make_cb(program, core_range, 2, tw_bytes,  tw_bytes);
+    make_cb(program, core_range, 3, fft_bytes, fft_bytes);
 
-        CoreRange core_range(CoreCoord{0, 0}, CoreCoord{cols - 1, rows - 1});
-        Program program = CreateProgram();
+    auto reader = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_reader.cpp",
+        core_range,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc       = NOC::RISCV_0_default,
+            .compile_args = reader_ct_args
+        });
 
-        make_cb(program, core_range, 0, fft_bytes, fft_bytes);
-        make_cb(program, core_range, 1, fft_bytes, fft_bytes);
-        make_cb(program, core_range, 2, tw_bytes,  tw_bytes);
-        make_cb(program, core_range, 3, fft_bytes, fft_bytes);
+    auto compute = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_compute.cpp",
+        core_range,
+        ComputeConfig{
+            .math_fidelity    = MathFidelity::HiFi4,
+            .fp32_dest_acc_en = true,
+            .compile_args     = {log2n, static_cast<uint32_t>(inverse)}
+        });
 
-        auto reader = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_reader.cpp",
-            core_range,
-            DataMovementConfig{
-                .processor = DataMovementProcessor::RISCV_0,
-                .noc       = NOC::RISCV_0_default,
-                .compile_args = reader_ct_args
-            });
+    auto writer = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_writer.cpp",
+        core_range,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc       = NOC::RISCV_1_default,
+            .compile_args = writer_ct_args
+        });
 
-        auto compute = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_compute.cpp",
-            core_range,
-            ComputeConfig{
-                .math_fidelity    = MathFidelity::HiFi4,
-                .fp32_dest_acc_en = true,
-                .compile_args     = {log2n, static_cast<uint32_t>(inverse)}
-            });
+    const uint32_t base_batch = batch / total_grid_cores;
+    const uint32_t extra      = batch % total_grid_cores;
 
-        auto writer = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "fft_wormhole/kernels/fft_medium_writer.cpp",
-            core_range,
-            DataMovementConfig{
-                .processor = DataMovementProcessor::RISCV_1,
-                .noc       = NOC::RISCV_1_default,
-                .compile_args = writer_ct_args
-            });
+    uint32_t fft_offset = 0;
+    uint32_t core_idx   = 0;
+    for (uint32_t r = 0; r < num_cores_y; ++r) {
+        for (uint32_t c = 0; c < num_cores_x; ++c, ++core_idx) {
+            CoreCoord coord{c, r};
+            const uint32_t my_batch = base_batch + (core_idx < extra ? 1u : 0u);
 
-        uint32_t core_idx = 0;
-        for (uint32_t r = 0; r < rows && core_idx < active_cores; ++r) {
-            for (uint32_t c = 0; c < cols && core_idx < active_cores; ++c) {
-                CoreCoord coord{c, r};
+            SetRuntimeArgs(
+                program, reader, coord,
+                {src_buf->address(), tw_buf->address(), fft_offset, my_batch, size});
 
-                const uint32_t fft_offset = wave_base + core_idx;
-                const uint32_t my_batch   = 1;
+            SetRuntimeArgs(
+                program, compute, coord,
+                {my_batch, size, log2n, static_cast<uint32_t>(inverse)});
 
-                SetRuntimeArgs(
-                    program, reader, coord,
-                    {src_buf->address(), tw_buf->address(), fft_offset, my_batch, size});
+            SetRuntimeArgs(
+                program, writer, coord,
+                {dst_buf->address(), fft_offset, my_batch, size});
 
-                SetRuntimeArgs(
-                    program, compute, coord,
-                    {my_batch, size, log2n, static_cast<uint32_t>(inverse)});
-
-                SetRuntimeArgs(
-                    program, writer, coord,
-                    {dst_buf->address(), fft_offset, my_batch, size});
-
-                ++core_idx;
-            }
+            fft_offset += my_batch;
         }
-
-        distributed::MeshWorkload workload;
-        distributed::MeshCoordinateRange device_range(mesh_device->shape());
-        workload.add_program(device_range, std::move(program));
-
-        distributed::EnqueueMeshWorkload(cq, workload, false);
-        distributed::Finish(cq);
-
-        std::cout << "[medium wave done] base=" << wave_base << "\n";
     }
+
+    distributed::MeshWorkload workload;
+    distributed::MeshCoordinateRange device_range(mesh_device->shape());
+    workload.add_program(device_range, std::move(program));
+
+    distributed::EnqueueMeshWorkload(cq, workload, false);
+    distributed::Finish(cq);
+
+    std::cout << "[medium done] total_fft_assigned=" << fft_offset << "\n";
 }
 
 // ===========================================================================
@@ -269,13 +261,24 @@ static void run_large_fft(
     uint32_t                                        batch,
     bool                                            inverse)
 {
-    const uint32_t log2n        = static_cast<uint32_t>(std::log2(size));
-    const uint32_t log2R        = log2n / 2;
-    const uint32_t log2S        = log2n - log2R;
-    const uint32_t R            = 1u << log2R;
-    const uint32_t S            = 1u << log2S;
+    const uint32_t log2n = static_cast<uint32_t>(std::log2(size));
+    if ((log2n & 1u) != 0u) {
+        throw std::runtime_error(
+            "Large FFT v1 only supports even log2 sizes (square 2D split). size=" +
+            std::to_string(size));
+    }
 
-    const CoreCoord grid        = get_worker_grid(mesh_device);
+    const uint32_t log2R = log2n / 2;
+    const uint32_t log2S = log2n - log2R;
+    const uint32_t R     = 1u << log2R;
+    const uint32_t S     = 1u << log2S;
+
+    if (R != S) {
+        throw std::runtime_error(
+            "Large FFT v1 requires square split R == S. size=" + std::to_string(size));
+    }
+
+    const CoreCoord grid         = get_worker_grid(mesh_device);
     const uint32_t cores_per_fft = std::min(R, static_cast<uint32_t>(grid.x * grid.y));
     const uint32_t rows_per_core = R / cores_per_fft;
 
