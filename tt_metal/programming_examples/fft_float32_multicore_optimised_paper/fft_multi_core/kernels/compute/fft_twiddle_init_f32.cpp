@@ -11,7 +11,6 @@
 //   4  bytes           – number of bytes to copy for each component
 
 #include "api/dataflow/dataflow_api.h"
-
 void kernel_main() {
     const uint32_t dram_tw_r = get_arg_val<uint32_t>(0);
     const uint32_t dram_tw_i = get_arg_val<uint32_t>(1);
@@ -19,17 +18,11 @@ void kernel_main() {
     const uint32_t sram_tw_i = get_arg_val<uint32_t>(3);
     const uint32_t bytes     = get_arg_val<uint32_t>(4);
 
-    // Copy twiddle real from DRAM to SRAM.
-    noc_async_read(
-        get_noc_addr(dram_tw_r),
-        sram_tw_r,
-        bytes);
+    uint64_t noc_addr_r = get_noc_addr(dram_tw_r);
+    noc_async_read(noc_addr_r, sram_tw_r, bytes);
 
-    // Copy twiddle imag from DRAM to SRAM.
-    noc_async_read(
-        get_noc_addr(dram_tw_i),
-        sram_tw_i,
-        bytes);
+    uint64_t noc_addr_i = get_noc_addr(dram_tw_i);
+    noc_async_read(noc_addr_i, sram_tw_i, bytes);
 
     noc_async_read_barrier();
 }
