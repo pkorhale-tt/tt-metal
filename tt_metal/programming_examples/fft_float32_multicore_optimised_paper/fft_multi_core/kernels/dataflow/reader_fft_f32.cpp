@@ -33,7 +33,6 @@
 //   5  chunk_size         – number of element pairs per chunk
 //   6  sram_buf_r_addr    – base address of SRAM ping buffer, real
 //      (imaginary SRAM buffer immediately follows at +sram_buf_bytes)
-
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 
@@ -120,41 +119,32 @@ void kernel_main() {
             volatile float* dst1_i = reinterpret_cast<volatile float*>(get_write_ptr(cb_data1_i));
 
             if (is_first_step) {
-                // Read from DRAM: one full tile covering the whole domain,
-                // then pick out the correct pair indices for this chunk.
-                // For step 0 half_m = 1, m = 2: even index = p, odd = p+1.
-                //
-                // Paper uses a single DRAM read of all input data at the
-                // start and keeps it in SRAM; here we mirror that by
-                // reading the relevant tile from DRAM once per chunk.
-                // (For simplicity we assume n <= TILE_ELEMS so one tile
-                //  covers the whole domain, matching the paper's single-
-                //  core SRAM design where N ≤ 16384.)
-                uint32_t dram_r_write = get_write_ptr(cb_data0_r);  // temp read target
-                // We need the full domain to do the index calculation, so
-                // read both DRAM tiles into temporary CB space once per step
-                // and then scatter.  For the paper-faithful single-tile case
-                // we read tile 0 (the only tile) per step.
-                noc_async_read_tile(0u, dram_r_gen, dram_r_write);
-                uint32_t dram_i_write = get_write_ptr(cb_data0_i);
-                noc_async_read_tile(0u, dram_i_gen, dram_i_write);
+                // Step 0: Read from DRAM into a temporary SRAM buffer, then scatter.
+                // We can't use the CB buffers directly because we need to read the
+                // full tile before scattering into multiple CBs.
+                
+                // Use a temporary buffer in L1 (after all CB space)
+                constexpr uint32_t temp_buf_addr = 0x80000;  // 512KB offset, safe area
+                volatile float* temp_r = reinterpret_cast<volatile float*>(temp_buf_addr);
+                volatile float* temp_i = reinterpret_cast<volatile float*>(temp_buf_addr + tile_bytes);
+                
+                // Read full DRAM tiles into temporary buffer
+                noc_async_read_tile(0u, dram_r_gen, temp_buf_addr);
+                noc_async_read_tile(0u, dram_i_gen, temp_buf_addr + tile_bytes);
                 noc_async_read_barrier();
-
-                // Reorder: scatter loaded data into even/odd slots.
-                const volatile float* src_r = reinterpret_cast<volatile float*>(dram_r_write);
-                const volatile float* src_i = reinterpret_cast<volatile float*>(dram_i_write);
-
+                
+                // Now scatter from temp buffer into CB buffers
                 for (uint32_t p = 0; p < chunk_size; ++p) {
                     const uint32_t global_p = pair_base + p;
                     const uint32_t group    = global_p / half_m;
                     const uint32_t j        = global_p % half_m;
                     const uint32_t a        = group * m + j;
                     const uint32_t b        = a + half_m;
-
-                    dst0_r[p] = src_r[a];
-                    dst0_i[p] = src_i[a];
-                    dst1_r[p] = src_r[b];
-                    dst1_i[p] = src_i[b];
+                    
+                    dst0_r[p] = temp_r[a];
+                    dst0_i[p] = temp_i[a];
+                    dst1_r[p] = temp_r[b];
+                    dst1_i[p] = temp_i[b];
                 }
             } else {
                 // Read from SRAM ping buffer (results of previous step).
@@ -163,14 +153,14 @@ void kernel_main() {
                     reinterpret_cast<const volatile float*>(sram_buf_r_addr);
                 const volatile float* src_i =
                     reinterpret_cast<const volatile float*>(sram_buf_i_addr);
-
+                
                 for (uint32_t p = 0; p < chunk_size; ++p) {
                     const uint32_t global_p = pair_base + p;
                     const uint32_t group    = global_p / half_m;
                     const uint32_t j        = global_p % half_m;
                     const uint32_t a        = group * m + j;
                     const uint32_t b        = a + half_m;
-
+                    
                     dst0_r[p] = src_r[a];
                     dst0_i[p] = src_i[a];
                     dst1_r[p] = src_r[b];
