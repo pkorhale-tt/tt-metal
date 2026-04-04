@@ -308,7 +308,7 @@ int main(int argc, char** argv) {
         return 0;
 
     } catch (const std::exception& e) {
-        std::cerr << "FFT host failed: " << e.what() << "\n";
+        std::cerr << "FFT host failed: ..." << e.what() << "\n";
         return 1;
     }
 }
