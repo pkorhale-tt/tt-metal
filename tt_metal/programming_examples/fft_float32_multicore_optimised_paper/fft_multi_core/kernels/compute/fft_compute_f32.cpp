@@ -1,70 +1,87 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
+//
+// fft_compute_f32.cpp  –  fixed for tt-metal LLK-direct API
 
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary.h"
+#include "llk_math_common_api.h"
+#include "llk_math_eltwise_binary_api.h"
+#include "llk_unpack_AB_api.h"
+#include "llk_pack_api.h"
 
-namespace NAMESPACE {
+// ---------------------------------------------------------------------------
+// maths_sfpu helpers using the LLK API directly
+// Each helper:
+//   1. Calls the op-specific init OUTSIDE acquire (deadlock fix, paper Listing 1.3)
+//   2. Reserves output CB page
+//   3. acquire → unpack both inputs into dst[0], dst[1] → op → commit
+//   4. Optionally pops input CBs
+//   5. wait → pack dst[0] to output CB → release → push
+// ---------------------------------------------------------------------------
 
-// Multiply: cb_tgt = cb_in_1 * cb_in_2
 inline void maths_sfpu_mul(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
                             bool pop_in1 = false, bool pop_in2 = false) {
-    mul_tiles_init();
+    llk_math_eltwise_binary_init<ELEWISE_BINARY_MUL, NONE, MATH_FIDELITY>();
+    llk_unpack_AB_init<BroadcastType::NONE>(cb_in_1, cb_in_2);
+
     cb_reserve_back(cb_tgt, 1);
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_in_1);
-    copy_tile(cb_in_1, 0, 0);
-    copy_tile(cb_in_2, 0, 1);
-    mul_tiles(cb_in_1, cb_in_2, 0, 0, 0);
-    tile_regs_commit();
+
+    llk_math_wait_for_dest_available();
+    llk_unpack_AB(cb_in_1, cb_in_2, 0, 0);
+    llk_math_eltwise_binary<ELEWISE_BINARY_MUL, NONE, MATH_FIDELITY, EltwiseBinaryReuseDestType::NONE>(0);
+    llk_math_dest_section_done();
+
     if (pop_in1) cb_pop_front(cb_in_1, 1);
     if (pop_in2) cb_pop_front(cb_in_2, 1);
-    tile_regs_wait();
-    pack_tile(0, cb_tgt);
-    tile_regs_release();
+
+    llk_packer_wait_for_math_done();
+    llk_pack<false, false>(0, cb_tgt, 0);
+    llk_pack_dest_section_done();
     cb_push_back(cb_tgt, 1);
 }
 
-// Subtract: cb_tgt = cb_in_1 - cb_in_2
 inline void maths_sfpu_sub(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
                             bool pop_in1 = false, bool pop_in2 = false) {
-    sub_tiles_init();
+    llk_math_eltwise_binary_init<ELEWISE_BINARY_SUB, NONE, MATH_FIDELITY>();
+    llk_unpack_AB_init<BroadcastType::NONE>(cb_in_1, cb_in_2);
+
     cb_reserve_back(cb_tgt, 1);
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_in_1);
-    copy_tile(cb_in_1, 0, 0);
-    copy_tile(cb_in_2, 0, 1);
-    sub_tiles(cb_in_1, cb_in_2, 0, 0, 0);
-    tile_regs_commit();
+
+    llk_math_wait_for_dest_available();
+    llk_unpack_AB(cb_in_1, cb_in_2, 0, 0);
+    llk_math_eltwise_binary<ELEWISE_BINARY_SUB, NONE, MATH_FIDELITY, EltwiseBinaryReuseDestType::NONE>(0);
+    llk_math_dest_section_done();
+
     if (pop_in1) cb_pop_front(cb_in_1, 1);
     if (pop_in2) cb_pop_front(cb_in_2, 1);
-    tile_regs_wait();
-    pack_tile(0, cb_tgt);
-    tile_regs_release();
+
+    llk_packer_wait_for_math_done();
+    llk_pack<false, false>(0, cb_tgt, 0);
+    llk_pack_dest_section_done();
     cb_push_back(cb_tgt, 1);
 }
 
-// Add: cb_tgt = cb_in_1 + cb_in_2
 inline void maths_sfpu_add(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
                             bool pop_in1 = false, bool pop_in2 = false) {
-    add_tiles_init();
+    llk_math_eltwise_binary_init<ELEWISE_BINARY_ADD, NONE, MATH_FIDELITY>();
+    llk_unpack_AB_init<BroadcastType::NONE>(cb_in_1, cb_in_2);
+
     cb_reserve_back(cb_tgt, 1);
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_in_1);
-    copy_tile(cb_in_1, 0, 0);
-    copy_tile(cb_in_2, 0, 1);
-    add_tiles(cb_in_1, cb_in_2, 0, 0, 0);
-    tile_regs_commit();
+
+    llk_math_wait_for_dest_available();
+    llk_unpack_AB(cb_in_1, cb_in_2, 0, 0);
+    llk_math_eltwise_binary<ELEWISE_BINARY_ADD, NONE, MATH_FIDELITY, EltwiseBinaryReuseDestType::NONE>(0);
+    llk_math_dest_section_done();
+
     if (pop_in1) cb_pop_front(cb_in_1, 1);
     if (pop_in2) cb_pop_front(cb_in_2, 1);
-    tile_regs_wait();
-    pack_tile(0, cb_tgt);
-    tile_regs_release();
+
+    llk_packer_wait_for_math_done();
+    llk_pack<false, false>(0, cb_tgt, 0);
+    llk_pack_dest_section_done();
     cb_push_back(cb_tgt, 1);
 }
 
-void MAIN {
+void kernel_main() {
     const uint32_t num_steps  = get_arg_val<uint32_t>(0);
     const uint32_t num_chunks = get_arg_val<uint32_t>(1);
 
@@ -106,26 +123,24 @@ void MAIN {
             cb_wait_front(cb_data0_r, 1);
             cb_wait_front(cb_data0_i, 1);
 
-            // out1 = data0 - f  (odd butterfly output)
+            // out1 = data0 - f
             cb_wait_front(cb_f0, 1);
             maths_sfpu_sub(cb_data0_r, cb_f0, cb_out1_r);
             cb_wait_front(cb_f1, 1);
             maths_sfpu_sub(cb_data0_i, cb_f1, cb_out1_i);
 
-            // out0 = data0 + f  (even butterfly output)
+            // out0 = data0 + f
             cb_wait_front(cb_f0, 1);
             maths_sfpu_add(cb_data0_r, cb_f0, cb_out0_r);
             cb_wait_front(cb_f1, 1);
             maths_sfpu_add(cb_data0_i, cb_f1, cb_out0_i);
 
-            cb_pop_front(cb_data0_r,   1);
-            cb_pop_front(cb_data0_i,   1);
-            cb_pop_front(cb_data1_r,   1);
-            cb_pop_front(cb_data1_i,   1);
-            cb_pop_front(cb_f0,        1);
-            cb_pop_front(cb_f1,        1);
+            cb_pop_front(cb_data0_r, 1);
+            cb_pop_front(cb_data0_i, 1);
+            cb_pop_front(cb_data1_r, 1);
+            cb_pop_front(cb_data1_i, 1);
+            cb_pop_front(cb_f0,      1);
+            cb_pop_front(cb_f1,      1);
         }
     }
 }
-
-} // namespace NAMESPACE
