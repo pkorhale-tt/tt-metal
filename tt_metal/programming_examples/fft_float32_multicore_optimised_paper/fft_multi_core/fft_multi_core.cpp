@@ -304,7 +304,7 @@ int main(int argc, char** argv) {
         if (!meshDevice->close())
             throw std::runtime_error("meshDevice->close() failed");
 
-        std::cout << "FFT host run finished.\n";
+        std::cout << "FFT host run finished......\n";
         return 0;
 
     } catch (const std::exception& e) {
