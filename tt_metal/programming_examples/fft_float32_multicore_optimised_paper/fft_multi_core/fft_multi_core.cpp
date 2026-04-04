@@ -82,7 +82,8 @@ std::shared_ptr<distributed::MeshBuffer> createDramMeshBuffer(
     return distributed::MeshBuffer::create(replicatedConfig, localConfig, meshDevice.get());
 }
 
-std::shared_ptr<distributed::MeshBuffer> createL1MeshBuffer(
+// FIX: marked [[maybe_unused]] to suppress -Wunused-function with -Werror
+[[maybe_unused]] static std::shared_ptr<distributed::MeshBuffer> createL1MeshBuffer(
     const std::shared_ptr<distributed::MeshDevice>& meshDevice,
     uint32_t sizeBytes)
 {
@@ -94,7 +95,10 @@ std::shared_ptr<distributed::MeshBuffer> createL1MeshBuffer(
     return distributed::MeshBuffer::create(replicatedConfig, localConfig, meshDevice.get());
 }
 
-std::vector<uint32_t> packRow(const std::vector<float>& data, uint32_t nRow, uint32_t rowTiles) {
+// FIX: marked [[maybe_unused]] to suppress -Wunused-function with -Werror
+[[maybe_unused]] static std::vector<uint32_t> packRow(
+    const std::vector<float>& data, uint32_t nRow, uint32_t rowTiles)
+{
     const uint32_t padded = rowTiles * TILE_ELEMS;
     std::vector<uint32_t> out(padded, 0u);
     for (uint32_t i = 0; i < nRow; ++i) {
