@@ -85,30 +85,6 @@ std::shared_ptr<distributed::MeshBuffer> createDramMeshBuffer(
     distributed::ReplicatedBufferConfig replicatedConfig{.size = rounded};
     return distributed::MeshBuffer::create(replicatedConfig, localConfig, meshDevice.get());
 }
-
-// Create an L1 (SRAM) MeshBuffer for twiddle pre-loading.
-std::shared_ptr<distributed::MeshBuffer> createL1MeshBuffer(
-    const std::shared_ptr<distributed::MeshDevice>& meshDevice,
-    uint32_t sizeBytes)
-{
-    const uint32_t rounded = ceilDiv(sizeBytes, TILE_BYTES) * TILE_BYTES;
-    distributed::DeviceLocalBufferConfig localConfig{
-        .page_size   = TILE_BYTES,
-        .buffer_type = BufferType::L1};
-    distributed::ReplicatedBufferConfig replicatedConfig{.size = rounded};
-    return distributed::MeshBuffer::create(replicatedConfig, localConfig, meshDevice.get());
-}
-
-// Pack one row of floats into a flat uint32 tile-padded buffer.
-std::vector<uint32_t> packRow(const std::vector<float>& data,
-                               uint32_t nRow, uint32_t rowTiles) {
-    const uint32_t padded = rowTiles * TILE_ELEMS;
-    std::vector<uint32_t> out(padded, 0u);
-    for (uint32_t i = 0; i < nRow; ++i)
-        out[i] = floatToU32(data[i]);
-    return out;
-}
-
 // Build twiddle factors for all stages for one row.
 // Layout: tw_r[step * halfN + p], tw_i[step * halfN + p]
 // (flat array, step-major, matching reader's sram_tw_r layout)
