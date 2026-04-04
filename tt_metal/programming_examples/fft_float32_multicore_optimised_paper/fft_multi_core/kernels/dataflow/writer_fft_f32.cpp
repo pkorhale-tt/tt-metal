@@ -3,6 +3,12 @@
 //
 // Writer kernel for FFT.
 //
+// After scattering each stage's butterfly results back into SRAM, this
+// kernel signals the reader (RISCV_0) that the data is ready for the
+// next stage.  Because the reader bit-reversed the input in SRAM before
+// stage 0, the DIT butterfly loop produces naturally-ordered output —
+// no permutation is needed here before the final DRAM write.
+//
 // Runtime args:
 //   0 : dram_output_r_addr
 //   1 : dram_output_i_addr
@@ -11,17 +17,7 @@
 //   4 : num_chunks
 //   5 : chunk_size
 //   6 : sram_buf_r_addr
-//   7 : sync_flag_addr   ← NEW: same L1 word that the reader spins on.
-//                          After scattering each step's results the writer
-//                          sets this to 1 so the reader can proceed to the
-//                          next step.  The reader resets it to 0.
-//
-// After the final butterfly stage the writer applies a bit-reversal
-// permutation in SRAM before writing results back to DRAM.
-// The Cooley-Tukey DIF butterfly loop naturally produces output in
-// bit-reversed index order; without this step every bin lands at the
-// wrong position, making all outputs appear wrong when compared against
-// a natural-order CPU FFT reference.
+//   7 : sync_flag_addr  – same L1 word the reader spins on.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -34,7 +30,7 @@ void kernel_main() {
     const uint32_t num_chunks         = get_arg_val<uint32_t>(4);
     const uint32_t chunk_size         = get_arg_val<uint32_t>(5);
     const uint32_t sram_buf_r_addr    = get_arg_val<uint32_t>(6);
-    const uint32_t sync_flag_addr     = get_arg_val<uint32_t>(7);  // NEW
+    const uint32_t sync_flag_addr     = get_arg_val<uint32_t>(7);
 
     constexpr uint32_t cb_out0_r = tt::CBIndex::c_16;
     constexpr uint32_t cb_out0_i = tt::CBIndex::c_17;
@@ -108,34 +104,15 @@ void kernel_main() {
         }
 
         if (is_last_step) {
-            // ── Bit-reversal permutation ──────────────────────────────────────
-            // The DIF butterfly loop above produces results in bit-reversed
-            // index order.  Swap each element with its bit-reversed counterpart
-            // (in-place, only when i < bit_rev(i) to avoid double-swapping).
-            for (uint32_t i = 0; i < n; ++i) {
-                uint32_t j   = 0u;
-                uint32_t tmp = i;
-                for (uint32_t b = 0; b < num_steps; ++b) {
-                    j   = (j << 1u) | (tmp & 1u);
-                    tmp >>= 1u;
-                }
-                if (i < j) {
-                    float tr  = sram_r[i]; sram_r[i] = sram_r[j]; sram_r[j] = tr;
-                    float ti  = sram_i[i]; sram_i[i] = sram_i[j]; sram_i[j] = ti;
-                }
-            }
-
-            // ── Write final results to DRAM ───────────────────────────────────
+            // Input was bit-reversed before stage 0, so DIT output is in
+            // natural order.  Write directly to DRAM — no permutation needed.
             for (uint32_t t = 0; t < row_tiles; ++t) {
                 noc_async_write_tile(t, dram_r_gen, sram_buf_r_addr + t * tile_bytes);
                 noc_async_write_tile(t, dram_i_gen, sram_buf_i_addr + t * tile_bytes);
             }
             noc_async_write_barrier();
         } else {
-            // ── Signal reader that SRAM is ready for the next step ────────────
-            // The reader on RISCV_0 is spinning on this flag.  Setting it to 1
-            // tells it the scatter for this step is complete and it is safe to
-            // read sram_buf for step+1.
+            // Signal reader that SRAM is ready for the next stage.
             *sync_flag = 1u;
         }
     }

@@ -3,6 +3,15 @@
 //
 // Reader kernel for FFT.
 //
+// The hardware butterfly kernel is DIT (decimation-in-time): stage 0
+// processes stride-1 pairs, stage 1 stride-2, ..., stage log2(N)-1
+// stride-N/2.  DIT requires the input to be in bit-reversed order.
+// We therefore bit-reverse the data in SRAM immediately after the
+// initial DRAM load (step 0 only).  This lets every subsequent stage
+// read natural-position outputs from the previous stage and produce
+// the final result in natural (non-reversed) order — no output
+// permutation is needed in the writer.
+//
 // Runtime args:
 //   0 : dram_input_r_addr
 //   1 : dram_input_i_addr
@@ -11,10 +20,9 @@
 //   4 : num_chunks
 //   5 : chunk_size
 //   6 : sram_buf_r_addr
-//   7 : sync_flag_addr   ← NEW: L1 address of the single uint32 handshake flag
-//                          shared with the writer on RISCV_1.
-//                          Writer sets it to 1 after scattering each step's
-//                          results; reader clears it to 0 before moving on.
+//   7 : sync_flag_addr  – L1 address of the uint32 handshake word shared
+//                         with the writer (RISCV_1). Writer sets it to 1
+//                         after scattering each step; reader clears to 0.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -27,7 +35,7 @@ void kernel_main() {
     const uint32_t num_chunks        = get_arg_val<uint32_t>(4);
     const uint32_t chunk_size        = get_arg_val<uint32_t>(5);
     const uint32_t sram_buf_r_addr   = get_arg_val<uint32_t>(6);
-    const uint32_t sync_flag_addr    = get_arg_val<uint32_t>(7);  // NEW
+    const uint32_t sync_flag_addr    = get_arg_val<uint32_t>(7);
 
     constexpr uint32_t cb_data0_r   = tt::CBIndex::c_0;
     constexpr uint32_t cb_data0_i   = tt::CBIndex::c_1;
@@ -57,9 +65,8 @@ void kernel_main() {
         .page_size         = tile_bytes,
         .data_format       = data_format};
 
-    // Initialise the sync flag to 0 so the writer can set it to 1 when ready.
-    // Both RISCV_0 and RISCV_1 start simultaneously; only RISCV_0 (us) writes
-    // the initial value, so there is no write-after-write hazard here.
+    // Initialise the sync flag to 0.  The writer sets it to 1 after each
+    // stage's scatter so we know it is safe to read SRAM for the next stage.
     volatile tt_l1_ptr uint32_t* sync_flag =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_flag_addr);
     *sync_flag = 0u;
@@ -70,19 +77,41 @@ void kernel_main() {
         const uint32_t tw_step_offset = step * (n / 2u);
 
         if (step == 0u) {
-            // Load the entire row from DRAM into SRAM on the first step only.
+            // ── Load row from DRAM ────────────────────────────────────────────
             for (uint32_t t = 0; t < row_tiles; ++t) {
                 noc_async_read_tile(t, dram_r_gen, sram_buf_r_addr + t * tile_bytes);
                 noc_async_read_tile(t, dram_i_gen, sram_buf_i_addr + t * tile_bytes);
             }
             noc_async_read_barrier();
+
+            // ── Bit-reverse permutation on SRAM ───────────────────────────────
+            // The butterfly loop is DIT order (stride grows each stage).
+            // DIT requires the input in bit-reversed index order.
+            // Performing the permutation here once means every stage reads
+            // naturally-ordered intermediate results and the final output
+            // is already in natural order — the writer needs no permutation.
+            volatile tt_l1_ptr float* sr =
+                reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_r_addr);
+            volatile tt_l1_ptr float* si =
+                reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_i_addr);
+
+            for (uint32_t i = 0; i < n; ++i) {
+                uint32_t j   = 0u;
+                uint32_t tmp = i;
+                for (uint32_t b = 0; b < num_steps; ++b) {
+                    j   = (j << 1u) | (tmp & 1u);
+                    tmp >>= 1u;
+                }
+                if (i < j) {
+                    float tr = sr[i]; sr[i] = sr[j]; sr[j] = tr;
+                    float ti = si[i]; si[i] = si[j]; si[j] = ti;
+                }
+            }
         } else {
-            // For steps 1+, wait until the writer has finished scattering the
-            // previous step's butterfly outputs back into sram_buf.
-            // Without this barrier the reader can race ahead and pick up stale
-            // (or partially-written) values, producing garbage / inf results.
+            // For steps 1+: spin until the writer signals that it has finished
+            // scattering the previous step's results back into sram_buf.
             while (*sync_flag == 0u) { /* spin */ }
-            *sync_flag = 0u;  // reset for the next step
+            *sync_flag = 0u;
         }
 
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
