@@ -43,7 +43,7 @@ constexpr uint32_t CB_INT1    = 21;
 constexpr uint32_t CB_F0      = 22;
 constexpr uint32_t CB_F1      = 23;
 
-constexpr uint32_t SRAM_DATA_BASE = 0x40000;  // 256 KB
+constexpr uint32_t SRAM_DATA_BASE = 0x40000;
 
 inline uint32_t ceilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 inline bool isPowerOfTwo(uint32_t x) { return x > 0 && ((x & (x - 1)) == 0); }
@@ -102,29 +102,26 @@ int main(int argc, char** argv) {
         const uint32_t numCores  = (argc > 4) ? static_cast<uint32_t>(std::stoul(argv[4])) : 8;
         const uint32_t direction = (argc > 5) ? static_cast<uint32_t>(std::stoul(argv[5])) : 0;
 
-        if (!isPowerOfTwo(nRow))           throw std::runtime_error("nRow must be power of 2");
-        if (nRow < 2 * TILE_ELEMS)         throw std::runtime_error("nRow must be >= 2048");
-        if (nRow > 8192)                   throw std::runtime_error("nRow > 8192 exceeds SRAM budget with scratch");
+        if (!isPowerOfTwo(nRow))            throw std::runtime_error("nRow must be power of 2");
+        if (nRow < 2 * TILE_ELEMS)          throw std::runtime_error("nRow must be >= 2048");
+        if (nRow > 8192)                    throw std::runtime_error("nRow > 8192 exceeds SRAM budget");
         if (numCores == 0 || numCores > 64) throw std::runtime_error("numCores must be in [1,64]");
         if (batchSize < numCores)           throw std::runtime_error("batchSize must be >= numCores");
 
         auto meshDevice = distributed::MeshDevice::create_unit_mesh(deviceId);
         auto& cq = meshDevice->mesh_command_queue();
 
-        const uint32_t numStages = log2u32(nRow);
-        const uint32_t halfN     = nRow / 2;
-
-        // One tile = TILE_ELEMS butterfly pairs per chunk
+        const uint32_t numStages      = log2u32(nRow);
+        const uint32_t halfN          = nRow / 2;
         const uint32_t chunkSize      = TILE_ELEMS;
         const uint32_t numChunks      = halfN / chunkSize;
         const uint32_t rowTiles       = ceilDiv(nRow, TILE_ELEMS);
         const uint32_t rowsThisLaunch = std::min(batchSize, numCores);
 
-        const uint32_t sramDataBytes   = nRow * sizeof(float);
-        const uint32_t sramTwBytes     = numStages * halfN * sizeof(float);
-        // scratch = 2 full rows for DRAM->SRAM load on step 0
-        const uint32_t sramScratch     = 2 * sramDataBytes;
-        const uint32_t sramTotal       = 2 * sramDataBytes + 2 * sramTwBytes + sramScratch;
+        const uint32_t sramDataBytes = nRow * sizeof(float);
+        const uint32_t sramTwBytes   = numStages * halfN * sizeof(float);
+        const uint32_t sramScratch   = 2 * sramDataBytes;
+        const uint32_t sramTotal     = 2 * sramDataBytes + 2 * sramTwBytes + sramScratch;
 
         std::cout << "[fft_paper_host]\n"
                   << "  nRow           = " << nRow << "\n"
@@ -139,12 +136,18 @@ int main(int argc, char** argv) {
         if (SRAM_DATA_BASE + sramTotal > 1300000)
             throw std::runtime_error("SRAM layout exceeds 1.3MB");
 
-        // ── DRAM buffers ──────────────────────────────────────────────────────
         const uint32_t rowBufBytes = rowsThisLaunch * rowTiles * TILE_BYTES;
         auto inputRealBuf  = createDramMeshBuffer(meshDevice, rowBufBytes);
         auto inputImagBuf  = createDramMeshBuffer(meshDevice, rowBufBytes);
         auto outputRealBuf = createDramMeshBuffer(meshDevice, rowBufBytes);
         auto outputImagBuf = createDramMeshBuffer(meshDevice, rowBufBytes);
+
+        // DEBUG: print buffer addresses to verify they are distinct
+        std::cout << "  [DEBUG] inputReal  DRAM addr = 0x" << std::hex << inputRealBuf->address()  << "\n"
+                  << "  [DEBUG] inputImag  DRAM addr = 0x" << std::hex << inputImagBuf->address()  << "\n"
+                  << "  [DEBUG] outputReal DRAM addr = 0x" << std::hex << outputRealBuf->address() << "\n"
+                  << "  [DEBUG] outputImag DRAM addr = 0x" << std::hex << outputImagBuf->address() << "\n"
+                  << std::dec;
 
         const uint32_t elemsPerRow = rowTiles * TILE_ELEMS;
         std::vector<uint32_t> inputRealPacked(rowsThisLaunch * elemsPerRow, 0u);
@@ -160,10 +163,15 @@ int main(int argc, char** argv) {
             }
         }
 
+        // DEBUG: verify imaginary input is actually zeros
+        float sumImag = 0.0f;
+        for (auto v : inputImagPacked) sumImag += u32ToFloat(v);
+        std::cout << "  [DEBUG] sum of imag input = " << sumImag
+                  << " (should be 0.0)\n";
+
         distributed::EnqueueWriteMeshBuffer(cq, inputRealBuf, inputRealPacked, false);
         distributed::EnqueueWriteMeshBuffer(cq, inputImagBuf, inputImagPacked, false);
 
-        // ── Twiddle factors ───────────────────────────────────────────────────
         std::vector<uint32_t> twR, twI;
         buildTwiddles(nRow, numStages, direction, twR, twI);
 
@@ -173,7 +181,7 @@ int main(int argc, char** argv) {
         distributed::EnqueueWriteMeshBuffer(cq, twRealDramBuf, twR, false);
         distributed::EnqueueWriteMeshBuffer(cq, twImagDramBuf, twI, false);
 
-        // ── Twiddle init kernel ───────────────────────────────────────────────
+        // ── Twiddle init ──────────────────────────────────────────────────────
         {
             Program twInitProg = CreateProgram();
             CoreRange coreRange({0, 0}, {rowsThisLaunch - 1, 0});
@@ -189,6 +197,10 @@ int main(int argc, char** argv) {
 
             const uint32_t sramTwRAddr = SRAM_DATA_BASE + 2 * sramDataBytes;
             const uint32_t sramTwIAddr = sramTwRAddr + twBufBytes;
+
+            std::cout << "  [DEBUG] sramTwRAddr = 0x" << std::hex << sramTwRAddr << "\n"
+                      << "  [DEBUG] sramTwIAddr = 0x" << std::hex << sramTwIAddr << "\n"
+                      << std::dec;
 
             for (uint32_t c = 0; c < rowsThisLaunch; ++c) {
                 SetRuntimeArgs(twInitProg, twInitKernel, CoreCoord{c, 0},
@@ -263,6 +275,19 @@ int main(int argc, char** argv) {
                 CoreCoord cc{c, 0};
                 const uint32_t rowByteOffset = c * rowTiles * TILE_BYTES;
 
+                // DEBUG: print per-core DRAM addresses
+                if (c == 0) {
+                    std::cout << "  [DEBUG] core 0 reader  inReal  = 0x"
+                              << std::hex << (inputRealBuf->address()  + rowByteOffset) << "\n"
+                              << "  [DEBUG] core 0 reader  inImag  = 0x"
+                              << std::hex << (inputImagBuf->address()  + rowByteOffset) << "\n"
+                              << "  [DEBUG] core 0 writer  outReal = 0x"
+                              << std::hex << (outputRealBuf->address() + rowByteOffset) << "\n"
+                              << "  [DEBUG] core 0 writer  outImag = 0x"
+                              << std::hex << (outputImagBuf->address() + rowByteOffset) << "\n"
+                              << std::dec;
+                }
+
                 SetRuntimeArgs(fftProg, readerKernel, cc,
                     { inputRealBuf->address()  + rowByteOffset,
                       inputImagBuf->address()  + rowByteOffset,
@@ -285,10 +310,16 @@ int main(int argc, char** argv) {
             std::cout << "FFT kernel execution finished.\n";
         }
 
-        // ── Read and print results ────────────────────────────────────────────
         std::vector<uint32_t> outRawReal, outRawImag;
         distributed::EnqueueReadMeshBuffer(cq, outRawReal, outputRealBuf, true);
         distributed::EnqueueReadMeshBuffer(cq, outRawImag, outputImagBuf, true);
+
+        // DEBUG: check if real and imag output buffers are actually different
+        uint32_t numEqual = 0;
+        for (size_t i = 0; i < std::min(outRawReal.size(), outRawImag.size()); ++i)
+            if (outRawReal[i] == outRawImag[i]) ++numEqual;
+        std::cout << "  [DEBUG] elements where outReal==outImag: "
+                  << numEqual << " / " << outRawReal.size() << "\n";
 
         std::cout << "Results (first 8 elements of first 2 rows):\n";
         for (uint32_t r = 0; r < std::min(rowsThisLaunch, 2u); ++r) {
@@ -308,7 +339,7 @@ int main(int argc, char** argv) {
         return 0;
 
     } catch (const std::exception& e) {
-        std::cerr << "FFT host failed: ...." << e.what() << "\n";
+        std::cerr << "FFT host failed: " << e.what() << "\n";
         return 1;
     }
 }
