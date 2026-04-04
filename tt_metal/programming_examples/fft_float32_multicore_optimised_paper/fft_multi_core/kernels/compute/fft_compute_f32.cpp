@@ -66,7 +66,7 @@ inline void maths_sfpu_add(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
 void kernel_main() {
     const uint32_t num_steps  = get_arg_val<uint32_t>(0);
     const uint32_t num_chunks = get_arg_val<uint32_t>(1);
-
+    
     constexpr uint32_t cb_data0_r   = tt::CBIndex::c_0;
     constexpr uint32_t cb_data0_i   = tt::CBIndex::c_1;
     constexpr uint32_t cb_data1_r   = tt::CBIndex::c_2;
@@ -82,50 +82,52 @@ void kernel_main() {
     constexpr uint32_t cb_f0        = tt::CBIndex::c_22;
     constexpr uint32_t cb_f1        = tt::CBIndex::c_23;
 
-    // Global init: prime the unpacker for the first CB it will see
     copy_tile_to_dst_init_short(cb_data1_r);
 
     for (uint32_t step = 0; step < num_steps; ++step) {
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
-
             cb_wait_front(cb_data1_r, 1);
             cb_wait_front(cb_data1_i, 1);
-
+            cb_wait_front(cb_twiddle_r, 1);  // ✓ ADDED
+            cb_wait_front(cb_twiddle_i, 1);  // ✓ ADDED
+            
             // f0 = data1_r*tw_r - data1_i*tw_i
             maths_sfpu_mul(cb_data1_r, cb_twiddle_r, cb_int0);
             maths_sfpu_mul(cb_data1_i, cb_twiddle_i, cb_int1);
             cb_wait_front(cb_int0, 1);
             cb_wait_front(cb_int1, 1);
             maths_sfpu_sub(cb_int0, cb_int1, cb_f0, true, true);
-
+            
             // f1 = data1_r*tw_i + data1_i*tw_r
             maths_sfpu_mul(cb_data1_r, cb_twiddle_i, cb_int0);
             maths_sfpu_mul(cb_data1_i, cb_twiddle_r, cb_int1);
             cb_wait_front(cb_int0, 1);
             cb_wait_front(cb_int1, 1);
             maths_sfpu_add(cb_int0, cb_int1, cb_f1, true, true);
-
+            
             cb_wait_front(cb_data0_r, 1);
             cb_wait_front(cb_data0_i, 1);
-
-            // out1 = data0 - f  (odd output)
+            
+            // out1 = data0 - f
             cb_wait_front(cb_f0, 1);
             maths_sfpu_sub(cb_data0_r, cb_f0, cb_out1_r);
             cb_wait_front(cb_f1, 1);
             maths_sfpu_sub(cb_data0_i, cb_f1, cb_out1_i);
-
-            // out0 = data0 + f  (even output)
+            
+            // out0 = data0 + f
             cb_wait_front(cb_f0, 1);
             maths_sfpu_add(cb_data0_r, cb_f0, cb_out0_r);
             cb_wait_front(cb_f1, 1);
             maths_sfpu_add(cb_data0_i, cb_f1, cb_out0_i);
-
+            
             cb_pop_front(cb_data0_r, 1);
             cb_pop_front(cb_data0_i, 1);
             cb_pop_front(cb_data1_r, 1);
             cb_pop_front(cb_data1_i, 1);
-            cb_pop_front(cb_f0,      1);
-            cb_pop_front(cb_f1,      1);
+            cb_pop_front(cb_twiddle_r, 1);  // ✓ ADDED
+            cb_pop_front(cb_twiddle_i, 1);  // ✓ ADDED
+            cb_pop_front(cb_f0, 1);
+            cb_pop_front(cb_f1, 1);
         }
     }
 }
