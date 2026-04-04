@@ -40,6 +40,17 @@
 #include "api/compute/copy_dest_values.h"
 
 // ---------------------------------------------------------------------------
+// Forward declarations required so that add_binary_tile / sub_binary_tile /
+// mul_binary_tile are visible inside the maths_sfpu_op<> template body.
+// Without these, the RISC-V g++ compiler rejects them with
+//   "there are no arguments ... that depend on a template parameter"
+// because two-phase lookup cannot find non-dependent names at instantiation.
+// ---------------------------------------------------------------------------
+ALWI void add_binary_tile(uint32_t idst0, uint32_t idst1);
+ALWI void sub_binary_tile(uint32_t idst0, uint32_t idst1);
+ALWI void mul_binary_tile(uint32_t idst0, uint32_t idst1);
+
+// ---------------------------------------------------------------------------
 // maths_sfpu_op  –  faithful to paper Listing 1.3
 //
 // Acquires dst lock, copies cb_in_1[0] → dst[0] and cb_in_2[0] → dst[1],
