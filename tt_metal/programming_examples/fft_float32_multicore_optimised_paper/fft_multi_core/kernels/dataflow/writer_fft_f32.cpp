@@ -24,6 +24,8 @@ void kernel_main() {
     const uint32_t sram_buf_bytes  = n * sizeof(float);
     const uint32_t sram_buf_i_addr = sram_buf_r_addr + sram_buf_bytes;
 
+    const uint32_t row_tiles = (n * sizeof(float) + tile_bytes - 1) / tile_bytes;
+
     const InterleavedAddrGenFast<true> dram_r_gen = {
         .bank_base_address = dram_output_r_addr,
         .page_size         = tile_bytes,
@@ -34,9 +36,9 @@ void kernel_main() {
         .data_format       = data_format};
 
     for (uint32_t step = 0; step < num_steps; ++step) {
-        const uint32_t half_m     = 1u << step;
-        const uint32_t m          = half_m << 1u;
-        const bool is_last_step   = (step + 1u == num_steps);
+        const uint32_t half_m   = 1u << step;
+        const uint32_t m        = half_m << 1u;
+        const bool is_last_step = (step + 1u == num_steps);
 
         volatile tt_l1_ptr float* sram_r =
             reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_r_addr);
@@ -79,10 +81,12 @@ void kernel_main() {
             cb_pop_front(cb_out1_i, 1);
         }
 
-        // On the last step write results out to DRAM
+        // After all chunks of the last step, write all tiles back to DRAM
         if (is_last_step) {
-            noc_async_write_tile(0u, dram_r_gen, sram_buf_r_addr);
-            noc_async_write_tile(0u, dram_i_gen, sram_buf_i_addr);
+            for (uint32_t t = 0; t < row_tiles; ++t) {
+                noc_async_write_tile(t, dram_r_gen, sram_buf_r_addr + t * tile_bytes);
+                noc_async_write_tile(t, dram_i_gen, sram_buf_i_addr + t * tile_bytes);
+            }
             noc_async_write_barrier();
         }
     }

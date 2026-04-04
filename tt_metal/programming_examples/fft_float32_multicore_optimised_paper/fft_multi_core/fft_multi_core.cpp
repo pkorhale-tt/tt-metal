@@ -28,23 +28,22 @@ constexpr uint32_t TILE_W     = 32;
 constexpr uint32_t TILE_ELEMS = TILE_H * TILE_W;
 constexpr uint32_t TILE_BYTES = TILE_ELEMS * sizeof(float);
 
-constexpr uint32_t CB_DATA0_R   = 0;
-constexpr uint32_t CB_DATA0_I   = 1;
-constexpr uint32_t CB_DATA1_R   = 2;
-constexpr uint32_t CB_DATA1_I   = 3;
-constexpr uint32_t CB_TW_R      = 4;
-constexpr uint32_t CB_TW_I      = 5;
-constexpr uint32_t CB_OUT0_R    = 16;
-constexpr uint32_t CB_OUT0_I    = 17;
-constexpr uint32_t CB_OUT1_R    = 18;
-constexpr uint32_t CB_OUT1_I    = 19;
-constexpr uint32_t CB_INT0      = 20;
-constexpr uint32_t CB_INT1      = 21;
-constexpr uint32_t CB_F0        = 22;
-constexpr uint32_t CB_F1        = 23;
+constexpr uint32_t CB_DATA0_R = 0;
+constexpr uint32_t CB_DATA0_I = 1;
+constexpr uint32_t CB_DATA1_R = 2;
+constexpr uint32_t CB_DATA1_I = 3;
+constexpr uint32_t CB_TW_R    = 4;
+constexpr uint32_t CB_TW_I    = 5;
+constexpr uint32_t CB_OUT0_R  = 16;
+constexpr uint32_t CB_OUT0_I  = 17;
+constexpr uint32_t CB_OUT1_R  = 18;
+constexpr uint32_t CB_OUT1_I  = 19;
+constexpr uint32_t CB_INT0    = 20;
+constexpr uint32_t CB_INT1    = 21;
+constexpr uint32_t CB_F0      = 22;
+constexpr uint32_t CB_F1      = 23;
 
-// SRAM base above CB region
-constexpr uint32_t SRAM_DATA_BASE = 0x40000;
+constexpr uint32_t SRAM_DATA_BASE = 0x40000;  // 256 KB
 
 inline uint32_t ceilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 inline bool isPowerOfTwo(uint32_t x) { return x > 0 && ((x & (x - 1)) == 0); }
@@ -65,17 +64,13 @@ std::shared_ptr<distributed::MeshBuffer> createDramMeshBuffer(
 }
 
 void buildTwiddles(
-    uint32_t nRow,
-    uint32_t numStages,
-    uint32_t direction,
-    std::vector<uint32_t>& twR,
-    std::vector<uint32_t>& twI)
+    uint32_t nRow, uint32_t numStages, uint32_t direction,
+    std::vector<uint32_t>& twR, std::vector<uint32_t>& twI)
 {
     const uint32_t halfN = nRow / 2;
     const float sign = (direction == 1) ? 1.0f : -1.0f;
     twR.assign(numStages * halfN, 0u);
     twI.assign(numStages * halfN, 0u);
-
     for (uint32_t step = 0; step < numStages; ++step) {
         const uint32_t halfM = 1u << step;
         const uint32_t m     = halfM << 1u;
@@ -92,10 +87,9 @@ void buildTwiddles(
 void makeTestInput(uint32_t nRow, std::vector<float>& real, std::vector<float>& imag) {
     real.resize(nRow);
     imag.resize(nRow, 0.0f);
-    for (uint32_t i = 0; i < nRow; ++i) {
+    for (uint32_t i = 0; i < nRow; ++i)
         real[i] = std::sin(2.0f * PI * i / nRow)
                 + 0.25f * std::cos(6.0f * PI * i / nRow);
-    }
 }
 
 }  // namespace
@@ -108,11 +102,11 @@ int main(int argc, char** argv) {
         const uint32_t numCores  = (argc > 4) ? static_cast<uint32_t>(std::stoul(argv[4])) : 8;
         const uint32_t direction = (argc > 5) ? static_cast<uint32_t>(std::stoul(argv[5])) : 0;
 
-        if (!isPowerOfTwo(nRow))    throw std::runtime_error("nRow must be power of 2");
-        if (nRow < 2 * TILE_ELEMS)  throw std::runtime_error("nRow must be >= 2048 (2 x TILE_ELEMS)");
-        if (nRow > 16384)           throw std::runtime_error("nRow > 16384 exceeds SRAM budget");
+        if (!isPowerOfTwo(nRow))           throw std::runtime_error("nRow must be power of 2");
+        if (nRow < 2 * TILE_ELEMS)         throw std::runtime_error("nRow must be >= 2048");
+        if (nRow > 8192)                   throw std::runtime_error("nRow > 8192 exceeds SRAM budget with scratch");
         if (numCores == 0 || numCores > 64) throw std::runtime_error("numCores must be in [1,64]");
-        if (batchSize < numCores)   throw std::runtime_error("batchSize must be >= numCores");
+        if (batchSize < numCores)           throw std::runtime_error("batchSize must be >= numCores");
 
         auto meshDevice = distributed::MeshDevice::create_unit_mesh(deviceId);
         auto& cq = meshDevice->mesh_command_queue();
@@ -120,17 +114,17 @@ int main(int argc, char** argv) {
         const uint32_t numStages = log2u32(nRow);
         const uint32_t halfN     = nRow / 2;
 
-        // chunkSize = one full tile worth of butterfly pairs
-        // numChunks = how many tiles needed to cover all halfN pairs
-        const uint32_t chunkSize = TILE_ELEMS;
-        const uint32_t numChunks = halfN / chunkSize;
-
-        const uint32_t rowTiles      = ceilDiv(nRow, TILE_ELEMS);
+        // One tile = TILE_ELEMS butterfly pairs per chunk
+        const uint32_t chunkSize      = TILE_ELEMS;
+        const uint32_t numChunks      = halfN / chunkSize;
+        const uint32_t rowTiles       = ceilDiv(nRow, TILE_ELEMS);
         const uint32_t rowsThisLaunch = std::min(batchSize, numCores);
 
-        const uint32_t sramDataBytes = nRow * sizeof(float);
-        const uint32_t sramTwBytes   = numStages * halfN * sizeof(float);
-        const uint32_t sramTotal     = 2 * sramDataBytes + 2 * sramTwBytes;
+        const uint32_t sramDataBytes   = nRow * sizeof(float);
+        const uint32_t sramTwBytes     = numStages * halfN * sizeof(float);
+        // scratch = 2 full rows for DRAM->SRAM load on step 0
+        const uint32_t sramScratch     = 2 * sramDataBytes;
+        const uint32_t sramTotal       = 2 * sramDataBytes + 2 * sramTwBytes + sramScratch;
 
         std::cout << "[fft_paper_host]\n"
                   << "  nRow           = " << nRow << "\n"
@@ -237,7 +231,6 @@ int main(int argc, char** argv) {
             makeCb(CB_INT1,    2);
             makeCb(CB_F0,      2);
             makeCb(CB_F1,      2);
-            // NOTE: CB_STEP_SYNC removed — was causing deadlock
 
             KernelHandle readerKernel = CreateKernel(
                 fftProg,
@@ -271,10 +264,9 @@ int main(int argc, char** argv) {
                 const uint32_t rowByteOffset = c * rowTiles * TILE_BYTES;
 
                 SetRuntimeArgs(fftProg, readerKernel, cc,
-                    { inputRealBuf->address() + rowByteOffset,
-                      inputImagBuf->address() + rowByteOffset,
-                      nRow, numStages, numChunks, chunkSize,
-                      SRAM_DATA_BASE });
+                    { inputRealBuf->address()  + rowByteOffset,
+                      inputImagBuf->address()  + rowByteOffset,
+                      nRow, numStages, numChunks, chunkSize, SRAM_DATA_BASE });
 
                 SetRuntimeArgs(fftProg, computeKernel, cc,
                     { numStages, numChunks });
@@ -282,8 +274,7 @@ int main(int argc, char** argv) {
                 SetRuntimeArgs(fftProg, writerKernel, cc,
                     { outputRealBuf->address() + rowByteOffset,
                       outputImagBuf->address() + rowByteOffset,
-                      nRow, numStages, numChunks, chunkSize,
-                      SRAM_DATA_BASE });
+                      nRow, numStages, numChunks, chunkSize, SRAM_DATA_BASE });
             }
 
             distributed::MeshWorkload fftWorkload;
