@@ -1,23 +1,10 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
-//
-// fft_compute_f32.cpp  –  fixed using api/compute headers confirmed in repo
 
 #include <cstdint>
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_binary_sfpu.h"
-
-// ---------------------------------------------------------------------------
-// maths_sfpu helpers – matching the single-core reference exactly.
-// Key points vs original broken version:
-//   1. add/sub/mul_binary_tile_init() INSIDE acquire but BEFORE the op.
-//   2. Second copy_tile uses copy_tile_to_dst_init_short_with_dt (not the
-//      same init as the first) so the unpacker knows the source CB changed.
-//   3. op takes three args: dst_a, dst_b, dst_result (all 0,1,0 here).
-//   4. cb_reserve_back moved to BEFORE tile_regs_acquire so the pack core
-//      can't race ahead; matches single-core reference ordering.
-// ---------------------------------------------------------------------------
 
 inline void maths_sfpu_mul(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
                             bool pop_in1 = false, bool pop_in2 = false) {
@@ -95,8 +82,7 @@ void kernel_main() {
     constexpr uint32_t cb_f0        = tt::CBIndex::c_22;
     constexpr uint32_t cb_f1        = tt::CBIndex::c_23;
 
-    // Required global init – matches single-core reference (line 225-228)
-    unary_op_init_common(cb_data1_r, cb_out0_r);
+    // Global init: prime the unpacker for the first CB it will see
     copy_tile_to_dst_init_short(cb_data1_r);
 
     for (uint32_t step = 0; step < num_steps; ++step) {
