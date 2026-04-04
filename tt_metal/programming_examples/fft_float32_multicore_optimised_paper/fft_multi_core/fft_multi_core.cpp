@@ -1,5 +1,19 @@
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// KEY DESIGN DECISION:
+//   nRow must satisfy: halfN = nRow/2 <= TILE_ELEMS = 1024
+//   So nRow <= 2048, but we use nRow=1024 as default so halfN=512
+//   fits cleanly in one tile with room to spare.
+//
+//   Each CB tile holds TILE_ELEMS=1024 floats.
+//   The reader fills positions [0..chunkSize) with data0 values
+//   and positions [chunkSize..2*chunkSize) with data1 values
+//   in the SAME tile — both halves of the butterfly in one tile.
+//   chunkSize = halfN / numChunks, and chunkSize*2 <= TILE_ELEMS.
+//
+//   For nRow=1024: halfN=512, numChunks=1, chunkSize=512, tile used=1024 ✓
+//   For nRow=2048: halfN=1024, numChunks=2, chunkSize=512, tile used=1024 ✓
 
 #include <cmath>
 #include <cstdint>
@@ -25,12 +39,8 @@ namespace {
 constexpr float    PI         = 3.14159265358979323846f;
 constexpr uint32_t TILE_H     = 32;
 constexpr uint32_t TILE_W     = 32;
-constexpr uint32_t TILE_ELEMS = TILE_H * TILE_W;
+constexpr uint32_t TILE_ELEMS = TILE_H * TILE_W;   // 1024
 constexpr uint32_t TILE_BYTES = TILE_ELEMS * sizeof(float);
-
-// Each butterfly uses 2 elements per pair (data0, data1).
-// One tile holds TILE_ELEMS floats, so max pairs per tile = TILE_ELEMS/2.
-constexpr uint32_t PAIRS_PER_TILE = TILE_ELEMS / 2;  // = 512
 
 constexpr uint32_t CB_DATA0_R = 0;
 constexpr uint32_t CB_DATA0_I = 1;
@@ -126,14 +136,15 @@ void cpuFft(std::vector<float>& re, std::vector<float>& im) {
 int main(int argc, char** argv) {
     try {
         const int deviceId       = (argc > 1) ? std::stoi(argv[1]) : 0;
-        const uint32_t nRow      = (argc > 2) ? static_cast<uint32_t>(std::stoul(argv[2])) : 2048;
+        // Default nRow=1024: halfN=512, fits in one tile (TILE_ELEMS=1024)
+        const uint32_t nRow      = (argc > 2) ? static_cast<uint32_t>(std::stoul(argv[2])) : 1024;
         const uint32_t batchSize = (argc > 3) ? static_cast<uint32_t>(std::stoul(argv[3])) : 8;
         const uint32_t numCores  = (argc > 4) ? static_cast<uint32_t>(std::stoul(argv[4])) : 8;
         const uint32_t direction = (argc > 5) ? static_cast<uint32_t>(std::stoul(argv[5])) : 0;
 
         if (!isPowerOfTwo(nRow))            throw std::runtime_error("nRow must be power of 2");
-        if (nRow < 2 * TILE_ELEMS)          throw std::runtime_error("nRow must be >= 2048");
-        if (nRow > 8192)                    throw std::runtime_error("nRow > 8192 exceeds SRAM budget");
+        if (nRow < 2)                       throw std::runtime_error("nRow must be >= 2");
+        if (nRow > 2048)                    throw std::runtime_error("nRow > 2048: halfN would exceed one tile");
         if (numCores == 0 || numCores > 64) throw std::runtime_error("numCores must be in [1,64]");
         if (batchSize < numCores)           throw std::runtime_error("batchSize must be >= numCores");
 
@@ -143,17 +154,18 @@ int main(int argc, char** argv) {
         const uint32_t numStages      = log2u32(nRow);
         const uint32_t halfN          = nRow / 2;
 
-        // KEY FIX: chunkSize = PAIRS_PER_TILE = 512, not TILE_ELEMS = 1024.
-        // A tile holds 1024 floats. Each chunk fills one tile for EACH of
-        // cb_data0_r, cb_data0_i, cb_data1_r, cb_data1_i separately.
-        // So each tile holds chunkSize elements, and chunkSize <= TILE_ELEMS.
-        // We set chunkSize = TILE_ELEMS/2 = 512 so that indices a,b (which
-        // can differ by halfM) both stay within the n elements of the row,
-        // and we need numChunks = halfN / chunkSize chunks to cover all pairs.
-        const uint32_t chunkSize      = PAIRS_PER_TILE;          // 512
-        const uint32_t numChunks      = halfN / chunkSize;        // 2 for n=2048
+        // chunkSize: pairs per chunk. Must satisfy chunkSize*2 <= TILE_ELEMS.
+        // We pack data0[0..chunkSize) and data1[0..chunkSize) into one tile,
+        // so the tile is used as [data0 | data1] = 2*chunkSize elements.
+        // Set numChunks=1 (process all pairs in one chunk) when halfN*2 <= TILE_ELEMS,
+        // otherwise use numChunks=2.
+        const uint32_t numChunks      = (halfN * 2 <= TILE_ELEMS) ? 1u : 2u;
+        const uint32_t chunkSize      = halfN / numChunks;
         const uint32_t rowTiles       = ceilDiv(nRow, TILE_ELEMS);
         const uint32_t rowsThisLaunch = std::min(batchSize, numCores);
+
+        if (chunkSize * 2 > TILE_ELEMS)
+            throw std::runtime_error("chunkSize*2 > TILE_ELEMS: reduce nRow");
 
         const uint32_t sramDataBytes = nRow * sizeof(float);
         const uint32_t sramTwBytes   = numStages * halfN * sizeof(float);
@@ -185,7 +197,7 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> inputImagPacked(rowsThisLaunch * elemsPerRow, 0u);
 
         std::vector<float> refRe, refIm;
-        makeTestInput(nRow, refRe, refIm);  // save for CPU reference
+        makeTestInput(nRow, refRe, refIm);
 
         for (uint32_t r = 0; r < rowsThisLaunch; ++r) {
             std::vector<float> rowR, rowI;
@@ -327,7 +339,7 @@ int main(int argc, char** argv) {
         distributed::EnqueueReadMeshBuffer(cq, outRawReal, outputRealBuf, true);
         distributed::EnqueueReadMeshBuffer(cq, outRawImag, outputImagBuf, true);
 
-        // ── CPU reference FFT for row 0 ───────────────────────────────────────
+        // ── CPU reference ─────────────────────────────────────────────────────
         cpuFft(refRe, refIm);
 
         // ── Print key bins ────────────────────────────────────────────────────
@@ -337,8 +349,7 @@ int main(int argc, char** argv) {
         std::cout << std::string(110, '-') << "\n";
 
         std::vector<uint32_t> checkBins = {
-            0u, 1u, 2u, 3u, 4u,
-            nRow/2,
+            0u, 1u, 2u, 3u, 4u, nRow/2,
             nRow-4, nRow-3, nRow-2, nRow-1};
 
         for (uint32_t bin : checkBins) {
@@ -352,7 +363,7 @@ int main(int argc, char** argv) {
                         bin, wre, wim, wmag, cre, cim, cmag);
         }
 
-        // ── Max error for row 0 ───────────────────────────────────────────────
+        // ── Error vs CPU ──────────────────────────────────────────────────────
         float maxErr = 0.0f, maxMag = 0.0f;
         for (uint32_t i = 0; i < nRow; ++i) {
             float wre = u32ToFloat(outRawReal[i]);

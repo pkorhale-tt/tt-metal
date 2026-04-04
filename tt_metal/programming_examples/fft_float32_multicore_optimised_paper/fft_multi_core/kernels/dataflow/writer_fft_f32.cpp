@@ -81,7 +81,7 @@ void kernel_main() {
             cb_pop_front(cb_out1_i, 1);
         }
 
-        // After all chunks of the last step, write all tiles back to DRAM
+        // After last step write all tiles back to DRAM
         if (is_last_step) {
             for (uint32_t t = 0; t < row_tiles; ++t) {
                 noc_async_write_tile(t, dram_r_gen, sram_buf_r_addr + t * tile_bytes);
