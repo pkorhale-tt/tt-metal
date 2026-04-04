@@ -1,83 +1,78 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
 //
-// fft_compute_f32.cpp  –  fixed for tt-metal LLK-direct API
+// fft_compute_f32.cpp  –  fixed using api/compute headers confirmed in repo
 
-#include "llk_math_common_api.h"
-#include "llk_math_eltwise_binary_api.h"
-#include "llk_unpack_AB_api.h"
-#include "llk_pack_api.h"
+#include <cstdint>
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
 
 // ---------------------------------------------------------------------------
-// maths_sfpu helpers using the LLK API directly
-// Each helper:
-//   1. Calls the op-specific init OUTSIDE acquire (deadlock fix, paper Listing 1.3)
-//   2. Reserves output CB page
-//   3. acquire → unpack both inputs into dst[0], dst[1] → op → commit
-//   4. Optionally pops input CBs
-//   5. wait → pack dst[0] to output CB → release → push
+// maths_sfpu helpers – matching the single-core reference exactly.
+// Key points vs original broken version:
+//   1. add/sub/mul_binary_tile_init() INSIDE acquire but BEFORE the op.
+//   2. Second copy_tile uses copy_tile_to_dst_init_short_with_dt (not the
+//      same init as the first) so the unpacker knows the source CB changed.
+//   3. op takes three args: dst_a, dst_b, dst_result (all 0,1,0 here).
+//   4. cb_reserve_back moved to BEFORE tile_regs_acquire so the pack core
+//      can't race ahead; matches single-core reference ordering.
 // ---------------------------------------------------------------------------
 
 inline void maths_sfpu_mul(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
                             bool pop_in1 = false, bool pop_in2 = false) {
-    llk_math_eltwise_binary_init<ELEWISE_BINARY_MUL, NONE, MATH_FIDELITY>();
-    llk_unpack_AB_init<BroadcastType::NONE>(cb_in_1, cb_in_2);
-
     cb_reserve_back(cb_tgt, 1);
-
-    llk_math_wait_for_dest_available();
-    llk_unpack_AB(cb_in_1, cb_in_2, 0, 0);
-    llk_math_eltwise_binary<ELEWISE_BINARY_MUL, NONE, MATH_FIDELITY, EltwiseBinaryReuseDestType::NONE>(0);
-    llk_math_dest_section_done();
-
+    tile_regs_acquire();
+    copy_tile_to_dst_init_short(cb_in_1);
+    copy_tile(cb_in_1, 0, 0);
+    copy_tile_to_dst_init_short_with_dt(cb_in_1, cb_in_2);
+    copy_tile(cb_in_2, 0, 1);
+    mul_binary_tile_init();
+    mul_binary_tile(0, 1, 0);
+    tile_regs_commit();
     if (pop_in1) cb_pop_front(cb_in_1, 1);
     if (pop_in2) cb_pop_front(cb_in_2, 1);
-
-    llk_packer_wait_for_math_done();
-    llk_pack<false, false>(0, cb_tgt, 0);
-    llk_pack_dest_section_done();
+    tile_regs_wait();
+    pack_tile(0, cb_tgt);
+    tile_regs_release();
     cb_push_back(cb_tgt, 1);
 }
 
 inline void maths_sfpu_sub(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
                             bool pop_in1 = false, bool pop_in2 = false) {
-    llk_math_eltwise_binary_init<ELEWISE_BINARY_SUB, NONE, MATH_FIDELITY>();
-    llk_unpack_AB_init<BroadcastType::NONE>(cb_in_1, cb_in_2);
-
     cb_reserve_back(cb_tgt, 1);
-
-    llk_math_wait_for_dest_available();
-    llk_unpack_AB(cb_in_1, cb_in_2, 0, 0);
-    llk_math_eltwise_binary<ELEWISE_BINARY_SUB, NONE, MATH_FIDELITY, EltwiseBinaryReuseDestType::NONE>(0);
-    llk_math_dest_section_done();
-
+    tile_regs_acquire();
+    copy_tile_to_dst_init_short(cb_in_1);
+    copy_tile(cb_in_1, 0, 0);
+    copy_tile_to_dst_init_short_with_dt(cb_in_1, cb_in_2);
+    copy_tile(cb_in_2, 0, 1);
+    sub_binary_tile_init();
+    sub_binary_tile(0, 1, 0);
+    tile_regs_commit();
     if (pop_in1) cb_pop_front(cb_in_1, 1);
     if (pop_in2) cb_pop_front(cb_in_2, 1);
-
-    llk_packer_wait_for_math_done();
-    llk_pack<false, false>(0, cb_tgt, 0);
-    llk_pack_dest_section_done();
+    tile_regs_wait();
+    pack_tile(0, cb_tgt);
+    tile_regs_release();
     cb_push_back(cb_tgt, 1);
 }
 
 inline void maths_sfpu_add(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
                             bool pop_in1 = false, bool pop_in2 = false) {
-    llk_math_eltwise_binary_init<ELEWISE_BINARY_ADD, NONE, MATH_FIDELITY>();
-    llk_unpack_AB_init<BroadcastType::NONE>(cb_in_1, cb_in_2);
-
     cb_reserve_back(cb_tgt, 1);
-
-    llk_math_wait_for_dest_available();
-    llk_unpack_AB(cb_in_1, cb_in_2, 0, 0);
-    llk_math_eltwise_binary<ELEWISE_BINARY_ADD, NONE, MATH_FIDELITY, EltwiseBinaryReuseDestType::NONE>(0);
-    llk_math_dest_section_done();
-
+    tile_regs_acquire();
+    copy_tile_to_dst_init_short(cb_in_1);
+    copy_tile(cb_in_1, 0, 0);
+    copy_tile_to_dst_init_short_with_dt(cb_in_1, cb_in_2);
+    copy_tile(cb_in_2, 0, 1);
+    add_binary_tile_init();
+    add_binary_tile(0, 1, 0);
+    tile_regs_commit();
     if (pop_in1) cb_pop_front(cb_in_1, 1);
     if (pop_in2) cb_pop_front(cb_in_2, 1);
-
-    llk_packer_wait_for_math_done();
-    llk_pack<false, false>(0, cb_tgt, 0);
-    llk_pack_dest_section_done();
+    tile_regs_wait();
+    pack_tile(0, cb_tgt);
+    tile_regs_release();
     cb_push_back(cb_tgt, 1);
 }
 
@@ -85,20 +80,24 @@ void kernel_main() {
     const uint32_t num_steps  = get_arg_val<uint32_t>(0);
     const uint32_t num_chunks = get_arg_val<uint32_t>(1);
 
-    constexpr uint32_t cb_data0_r   = 0;
-    constexpr uint32_t cb_data0_i   = 1;
-    constexpr uint32_t cb_data1_r   = 2;
-    constexpr uint32_t cb_data1_i   = 3;
-    constexpr uint32_t cb_twiddle_r = 4;
-    constexpr uint32_t cb_twiddle_i = 5;
-    constexpr uint32_t cb_out0_r    = 16;
-    constexpr uint32_t cb_out0_i    = 17;
-    constexpr uint32_t cb_out1_r    = 18;
-    constexpr uint32_t cb_out1_i    = 19;
-    constexpr uint32_t cb_int0      = 20;
-    constexpr uint32_t cb_int1      = 21;
-    constexpr uint32_t cb_f0        = 22;
-    constexpr uint32_t cb_f1        = 23;
+    constexpr uint32_t cb_data0_r   = tt::CBIndex::c_0;
+    constexpr uint32_t cb_data0_i   = tt::CBIndex::c_1;
+    constexpr uint32_t cb_data1_r   = tt::CBIndex::c_2;
+    constexpr uint32_t cb_data1_i   = tt::CBIndex::c_3;
+    constexpr uint32_t cb_twiddle_r = tt::CBIndex::c_4;
+    constexpr uint32_t cb_twiddle_i = tt::CBIndex::c_5;
+    constexpr uint32_t cb_out0_r    = tt::CBIndex::c_16;
+    constexpr uint32_t cb_out0_i    = tt::CBIndex::c_17;
+    constexpr uint32_t cb_out1_r    = tt::CBIndex::c_18;
+    constexpr uint32_t cb_out1_i    = tt::CBIndex::c_19;
+    constexpr uint32_t cb_int0      = tt::CBIndex::c_20;
+    constexpr uint32_t cb_int1      = tt::CBIndex::c_21;
+    constexpr uint32_t cb_f0        = tt::CBIndex::c_22;
+    constexpr uint32_t cb_f1        = tt::CBIndex::c_23;
+
+    // Required global init – matches single-core reference (line 225-228)
+    unary_op_init_common(cb_data1_r, cb_out0_r);
+    copy_tile_to_dst_init_short(cb_data1_r);
 
     for (uint32_t step = 0; step < num_steps; ++step) {
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
@@ -123,13 +122,13 @@ void kernel_main() {
             cb_wait_front(cb_data0_r, 1);
             cb_wait_front(cb_data0_i, 1);
 
-            // out1 = data0 - f
+            // out1 = data0 - f  (odd output)
             cb_wait_front(cb_f0, 1);
             maths_sfpu_sub(cb_data0_r, cb_f0, cb_out1_r);
             cb_wait_front(cb_f1, 1);
             maths_sfpu_sub(cb_data0_i, cb_f1, cb_out1_i);
 
-            // out0 = data0 + f
+            // out0 = data0 + f  (even output)
             cb_wait_front(cb_f0, 1);
             maths_sfpu_add(cb_data0_r, cb_f0, cb_out0_r);
             cb_wait_front(cb_f1, 1);
