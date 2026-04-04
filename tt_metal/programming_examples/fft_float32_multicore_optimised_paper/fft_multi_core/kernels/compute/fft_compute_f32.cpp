@@ -40,55 +40,70 @@
 #include "api/compute/copy_dest_values.h"
 
 // ---------------------------------------------------------------------------
-// Forward declarations required so that add_binary_tile / sub_binary_tile /
-// mul_binary_tile are visible inside the maths_sfpu_op<> template body.
-// Without these, the RISC-V g++ compiler rejects them with
-//   "there are no arguments ... that depend on a template parameter"
-// because two-phase lookup cannot find non-dependent names at instantiation.
-// ---------------------------------------------------------------------------
-ALWI void add_binary_tile(uint32_t idst0, uint32_t idst1);
-ALWI void sub_binary_tile(uint32_t idst0, uint32_t idst1);
-ALWI void mul_binary_tile(uint32_t idst0, uint32_t idst1);
-
-// ---------------------------------------------------------------------------
-// maths_sfpu_op  –  faithful to paper Listing 1.3
+// maths_sfpu_op helpers  –  faithful to paper Listing 1.3
 //
-// Acquires dst lock, copies cb_in_1[0] → dst[0] and cb_in_2[0] → dst[1],
-// performs OPERATION on dst[0] using dst[1], commits, packs result to
-// cb_tgt, releases.  Optionally pops input CBs if CB_OP_IN1/IN2 are true.
+// Three concrete functions (one per operation) avoid the two-phase lookup
+// problem that arises when add/sub/mul_binary_tile are called inside a
+// function template: those ALWI functions have no template-dependent
+// arguments, so the RISC-V g++ rejects forward declarations without bodies.
+// Using concrete functions means all names are resolved at definition time.
 //
-// *_init calls appear BEFORE tile_regs_acquire() per the deadlock fix.
+// Each helper:
+//   1. Optionally waits on / pops input CBs (paper lines 4-5, 19-20).
+//   2. Calls copy_tile_to_dst_init_short OUTSIDE acquire (deadlock fix).
+//   3. Acquires dst lock → copies both inputs into dst[0] and dst[1] →
+//      performs the operation → commits (paper lines 6-18).
+//   4. Packs dst[0] to cb_tgt → releases (paper lines 22-25).
 // ---------------------------------------------------------------------------
-enum SfpuOp { ADD, SUB, MUL };
 
-template <SfpuOp OPERATION, bool CB_OP_IN1 = false, bool CB_OP_IN2 = false>
-inline void maths_sfpu_op(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt) {
-    if constexpr (CB_OP_IN1) cb_wait_front(cb_in_1, 1);
-    if constexpr (CB_OP_IN2) cb_wait_front(cb_in_2, 1);
-
-    // Init must be outside the acquire/release critical section (bug fix).
-    copy_tile_to_dst_init_short(cb_in_1);
-
+// Multiply: cb_tgt = cb_in_1 * cb_in_2
+inline void maths_sfpu_mul(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
+                            bool pop_in1 = false, bool pop_in2 = false) {
+    copy_tile_to_dst_init_short(cb_in_1);   // OUTSIDE acquire (deadlock fix)
     cb_reserve_back(cb_tgt, 1);
     tile_regs_acquire();
-
-    // Copy both inputs into dst segments 0 and 1.
     copy_tile(cb_in_1, 0, 0);
     copy_tile(cb_in_2, 0, 1);
-
-    if constexpr (OPERATION == ADD) {
-        add_binary_tile(0, 1);
-    } else if constexpr (OPERATION == SUB) {
-        sub_binary_tile(0, 1);
-    } else if constexpr (OPERATION == MUL) {
-        mul_binary_tile(0, 1);
-    }
-
+    mul_binary_tile(0, 1);
     tile_regs_commit();
+    if (pop_in1) cb_pop_front(cb_in_1, 1);
+    if (pop_in2) cb_pop_front(cb_in_2, 1);
+    tile_regs_wait();
+    pack_tile(0, cb_tgt);
+    tile_regs_release();
+    cb_push_back(cb_tgt, 1);
+}
 
-    if constexpr (CB_OP_IN1) cb_pop_front(cb_in_1, 1);
-    if constexpr (CB_OP_IN2) cb_pop_front(cb_in_2, 1);
+// Subtract: cb_tgt = cb_in_1 - cb_in_2
+inline void maths_sfpu_sub(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
+                            bool pop_in1 = false, bool pop_in2 = false) {
+    copy_tile_to_dst_init_short(cb_in_1);
+    cb_reserve_back(cb_tgt, 1);
+    tile_regs_acquire();
+    copy_tile(cb_in_1, 0, 0);
+    copy_tile(cb_in_2, 0, 1);
+    sub_binary_tile(0, 1);
+    tile_regs_commit();
+    if (pop_in1) cb_pop_front(cb_in_1, 1);
+    if (pop_in2) cb_pop_front(cb_in_2, 1);
+    tile_regs_wait();
+    pack_tile(0, cb_tgt);
+    tile_regs_release();
+    cb_push_back(cb_tgt, 1);
+}
 
+// Add: cb_tgt = cb_in_1 + cb_in_2
+inline void maths_sfpu_add(uint32_t cb_in_1, uint32_t cb_in_2, uint32_t cb_tgt,
+                            bool pop_in1 = false, bool pop_in2 = false) {
+    copy_tile_to_dst_init_short(cb_in_1);
+    cb_reserve_back(cb_tgt, 1);
+    tile_regs_acquire();
+    copy_tile(cb_in_1, 0, 0);
+    copy_tile(cb_in_2, 0, 1);
+    add_binary_tile(0, 1);
+    tile_regs_commit();
+    if (pop_in1) cb_pop_front(cb_in_1, 1);
+    if (pop_in2) cb_pop_front(cb_in_2, 1);
     tile_regs_wait();
     pack_tile(0, cb_tgt);
     tile_regs_release();
@@ -137,30 +152,30 @@ void kernel_main() {
             // ------------------------------------------------------------------
 
             // int0 = data1_r * twiddle_r
-            maths_sfpu_op<MUL>(cb_data1_r, cb_twiddle_r, cb_int0);
+            maths_sfpu_mul(cb_data1_r, cb_twiddle_r, cb_int0);
 
             // int1 = data1_i * twiddle_i
-            maths_sfpu_op<MUL>(cb_data1_i, cb_twiddle_i, cb_int1);
+            maths_sfpu_mul(cb_data1_i, cb_twiddle_i, cb_int1);
 
             // f0 = int0 - int1  (pops both int CBs)
             cb_wait_front(cb_int0, 1);
             cb_wait_front(cb_int1, 1);
-            maths_sfpu_op<SUB, true, true>(cb_int0, cb_int1, cb_f0);
+            maths_sfpu_sub(cb_int0, cb_int1, cb_f0, true, true);
 
             // ------------------------------------------------------------------
             // Paper Listing 1.2, lines 11-13: f1 = data1_r*tw_i + data1_i*tw_r
             // ------------------------------------------------------------------
 
             // int0 = data1_r * twiddle_i
-            maths_sfpu_op<MUL>(cb_data1_r, cb_twiddle_i, cb_int0);
+            maths_sfpu_mul(cb_data1_r, cb_twiddle_i, cb_int0);
 
             // int1 = data1_i * twiddle_r
-            maths_sfpu_op<MUL>(cb_data1_i, cb_twiddle_r, cb_int1);
+            maths_sfpu_mul(cb_data1_i, cb_twiddle_r, cb_int1);
 
             // f1 = int0 + int1  (pops both int CBs)
             cb_wait_front(cb_int0, 1);
             cb_wait_front(cb_int1, 1);
-            maths_sfpu_op<ADD, true, true>(cb_int0, cb_int1, cb_f1);
+            maths_sfpu_add(cb_int0, cb_int1, cb_f1, true, true);
 
             // ------------------------------------------------------------------
             // Paper Listing 1.2, lines 15-16:
@@ -177,19 +192,19 @@ void kernel_main() {
 
             // out1_r = data0_r - f0
             cb_wait_front(cb_f0, 1);
-            maths_sfpu_op<SUB>(cb_data0_r, cb_f0, cb_out1_r);
+            maths_sfpu_sub(cb_data0_r, cb_f0, cb_out1_r);
 
             // out1_i = data0_i - f1
             cb_wait_front(cb_f1, 1);
-            maths_sfpu_op<SUB>(cb_data0_i, cb_f1, cb_out1_i);
+            maths_sfpu_sub(cb_data0_i, cb_f1, cb_out1_i);
 
             // out0_r = data0_r + f0
             cb_wait_front(cb_f0, 1);
-            maths_sfpu_op<ADD>(cb_data0_r, cb_f0, cb_out0_r);
+            maths_sfpu_add(cb_data0_r, cb_f0, cb_out0_r);
 
             // out0_i = data0_i + f1
             cb_wait_front(cb_f1, 1);
-            maths_sfpu_op<ADD>(cb_data0_i, cb_f1, cb_out0_i);
+            maths_sfpu_add(cb_data0_i, cb_f1, cb_out0_i);
 
             // ------------------------------------------------------------------
             // Paper Listing 1.2, lines 27-30:  pop all input pages.
