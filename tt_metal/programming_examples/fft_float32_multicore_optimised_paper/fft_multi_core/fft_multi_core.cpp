@@ -92,6 +92,35 @@ void makeTestInput(uint32_t nRow, std::vector<float>& real, std::vector<float>& 
                 + 0.25f * std::cos(6.0f * PI * i / nRow);
 }
 
+// Reference FFT on CPU for verification
+void cpuFft(std::vector<float>& re, std::vector<float>& im) {
+    const uint32_t n = re.size();
+    // bit-reversal
+    for (uint32_t i = 1, j = 0; i < n; ++i) {
+        uint32_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
+    }
+    for (uint32_t len = 2; len <= n; len <<= 1) {
+        float ang = -2.0f * PI / len;
+        float wr = std::cos(ang), wi = std::sin(ang);
+        for (uint32_t i = 0; i < n; i += len) {
+            float cr = 1.0f, ci = 0.0f;
+            for (uint32_t j = 0; j < len / 2; ++j) {
+                float ur = re[i+j],        ui = im[i+j];
+                float vr = re[i+j+len/2] * cr - im[i+j+len/2] * ci;
+                float vi = re[i+j+len/2] * ci + im[i+j+len/2] * cr;
+                re[i+j]         = ur + vr;  im[i+j]         = ui + vi;
+                re[i+j+len/2]   = ur - vr;  im[i+j+len/2]   = ui - vi;
+                float ncr = cr*wr - ci*wi;
+                ci = cr*wi + ci*wr;
+                cr = ncr;
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -136,22 +165,20 @@ int main(int argc, char** argv) {
         if (SRAM_DATA_BASE + sramTotal > 1300000)
             throw std::runtime_error("SRAM layout exceeds 1.3MB");
 
+        // ── DRAM buffers ──────────────────────────────────────────────────────
         const uint32_t rowBufBytes = rowsThisLaunch * rowTiles * TILE_BYTES;
         auto inputRealBuf  = createDramMeshBuffer(meshDevice, rowBufBytes);
         auto inputImagBuf  = createDramMeshBuffer(meshDevice, rowBufBytes);
         auto outputRealBuf = createDramMeshBuffer(meshDevice, rowBufBytes);
         auto outputImagBuf = createDramMeshBuffer(meshDevice, rowBufBytes);
 
-        // DEBUG: print buffer addresses to verify they are distinct
-        std::cout << "  [DEBUG] inputReal  DRAM addr = 0x" << std::hex << inputRealBuf->address()  << "\n"
-                  << "  [DEBUG] inputImag  DRAM addr = 0x" << std::hex << inputImagBuf->address()  << "\n"
-                  << "  [DEBUG] outputReal DRAM addr = 0x" << std::hex << outputRealBuf->address() << "\n"
-                  << "  [DEBUG] outputImag DRAM addr = 0x" << std::hex << outputImagBuf->address() << "\n"
-                  << std::dec;
-
         const uint32_t elemsPerRow = rowTiles * TILE_ELEMS;
         std::vector<uint32_t> inputRealPacked(rowsThisLaunch * elemsPerRow, 0u);
         std::vector<uint32_t> inputImagPacked(rowsThisLaunch * elemsPerRow, 0u);
+
+        // Save row 0 input for CPU reference comparison
+        std::vector<float> refRe, refIm;
+        makeTestInput(nRow, refRe, refIm);
 
         for (uint32_t r = 0; r < rowsThisLaunch; ++r) {
             std::vector<float> rowR, rowI;
@@ -163,15 +190,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        // DEBUG: verify imaginary input is actually zeros
-        float sumImag = 0.0f;
-        for (auto v : inputImagPacked) sumImag += u32ToFloat(v);
-        std::cout << "  [DEBUG] sum of imag input = " << sumImag
-                  << " (should be 0.0)\n";
-
         distributed::EnqueueWriteMeshBuffer(cq, inputRealBuf, inputRealPacked, false);
         distributed::EnqueueWriteMeshBuffer(cq, inputImagBuf, inputImagPacked, false);
 
+        // ── Twiddle factors ───────────────────────────────────────────────────
         std::vector<uint32_t> twR, twI;
         buildTwiddles(nRow, numStages, direction, twR, twI);
 
@@ -181,7 +203,7 @@ int main(int argc, char** argv) {
         distributed::EnqueueWriteMeshBuffer(cq, twRealDramBuf, twR, false);
         distributed::EnqueueWriteMeshBuffer(cq, twImagDramBuf, twI, false);
 
-        // ── Twiddle init ──────────────────────────────────────────────────────
+        // ── Twiddle init kernel ───────────────────────────────────────────────
         {
             Program twInitProg = CreateProgram();
             CoreRange coreRange({0, 0}, {rowsThisLaunch - 1, 0});
@@ -197,10 +219,6 @@ int main(int argc, char** argv) {
 
             const uint32_t sramTwRAddr = SRAM_DATA_BASE + 2 * sramDataBytes;
             const uint32_t sramTwIAddr = sramTwRAddr + twBufBytes;
-
-            std::cout << "  [DEBUG] sramTwRAddr = 0x" << std::hex << sramTwRAddr << "\n"
-                      << "  [DEBUG] sramTwIAddr = 0x" << std::hex << sramTwIAddr << "\n"
-                      << std::dec;
 
             for (uint32_t c = 0; c < rowsThisLaunch; ++c) {
                 SetRuntimeArgs(twInitProg, twInitKernel, CoreCoord{c, 0},
@@ -275,19 +293,6 @@ int main(int argc, char** argv) {
                 CoreCoord cc{c, 0};
                 const uint32_t rowByteOffset = c * rowTiles * TILE_BYTES;
 
-                // DEBUG: print per-core DRAM addresses
-                if (c == 0) {
-                    std::cout << "  [DEBUG] core 0 reader  inReal  = 0x"
-                              << std::hex << (inputRealBuf->address()  + rowByteOffset) << "\n"
-                              << "  [DEBUG] core 0 reader  inImag  = 0x"
-                              << std::hex << (inputImagBuf->address()  + rowByteOffset) << "\n"
-                              << "  [DEBUG] core 0 writer  outReal = 0x"
-                              << std::hex << (outputRealBuf->address() + rowByteOffset) << "\n"
-                              << "  [DEBUG] core 0 writer  outImag = 0x"
-                              << std::hex << (outputImagBuf->address() + rowByteOffset) << "\n"
-                              << std::dec;
-                }
-
                 SetRuntimeArgs(fftProg, readerKernel, cc,
                     { inputRealBuf->address()  + rowByteOffset,
                       inputImagBuf->address()  + rowByteOffset,
@@ -310,32 +315,59 @@ int main(int argc, char** argv) {
             std::cout << "FFT kernel execution finished.\n";
         }
 
+        // ── Read results ──────────────────────────────────────────────────────
         std::vector<uint32_t> outRawReal, outRawImag;
         distributed::EnqueueReadMeshBuffer(cq, outRawReal, outputRealBuf, true);
         distributed::EnqueueReadMeshBuffer(cq, outRawImag, outputImagBuf, true);
 
-        // DEBUG: check if real and imag output buffers are actually different
-        uint32_t numEqual = 0;
-        for (size_t i = 0; i < std::min(outRawReal.size(), outRawImag.size()); ++i)
-            if (outRawReal[i] == outRawImag[i]) ++numEqual;
-        std::cout << "  [DEBUG] elements where outReal==outImag: "
-                  << numEqual << " / " << outRawReal.size() << "\n";
+        // ── CPU reference FFT for row 0 ───────────────────────────────────────
+        cpuFft(refRe, refIm);
 
-        std::cout << "Results (first 8 elements of first 2 rows):\n";
-        for (uint32_t r = 0; r < std::min(rowsThisLaunch, 2u); ++r) {
-            std::cout << "row " << r << ":\n";
-            for (uint32_t i = 0; i < std::min(nRow, 8u); ++i) {
-                const uint32_t idx = r * elemsPerRow + i;
-                std::cout << "  [" << i << "] = ("
-                          << u32ToFloat(outRawReal[idx]) << ", "
-                          << u32ToFloat(outRawImag[idx]) << ")\n";
-            }
+        // ── Print key frequency bins for row 0 ───────────────────────────────
+        // Input = sin(2pi*i/N) + 0.25*cos(6pi*i/N)
+        // Expected peaks: bin 1 (mag~1024), bin 3 (mag~256), conjugates at N-1, N-3
+        std::cout << "\n=== Row 0: Key frequency bins ===\n";
+        std::cout << "bin |   Wormhole re   |   Wormhole im   |   Wormhole mag  ||"
+                  << "   CPU ref re    |   CPU ref im    |   CPU ref mag\n";
+        std::cout << std::string(120, '-') << "\n";
+
+        std::vector<uint32_t> checkBins = {0, 1, 2, 3, 4,
+                                           nRow/2,
+                                           nRow-4, nRow-3, nRow-2, nRow-1};
+        for (uint32_t bin : checkBins) {
+            const uint32_t idx = bin;  // row 0
+            float wre = u32ToFloat(outRawReal[idx]);
+            float wim = u32ToFloat(outRawImag[idx]);
+            float wmag = std::sqrt(wre*wre + wim*wim);
+            float cre = refRe[bin];
+            float cim = refIm[bin];
+            float cmag = std::sqrt(cre*cre + cim*cim);
+            std::printf("%-5u | %15.3f | %15.3f | %15.3f || %15.3f | %15.3f | %15.3f\n",
+                        bin, wre, wim, wmag, cre, cim, cmag);
         }
+
+        // ── Max error across all bins for row 0 ──────────────────────────────
+        float maxErr = 0.0f;
+        float maxMag = 0.0f;
+        for (uint32_t i = 0; i < nRow; ++i) {
+            float wre = u32ToFloat(outRawReal[i]);
+            float wim = u32ToFloat(outRawImag[i]);
+            float cre = refRe[i];
+            float cim = refIm[i];
+            float err = std::sqrt((wre-cre)*(wre-cre) + (wim-cim)*(wim-cim));
+            float mag = std::sqrt(cre*cre + cim*cim);
+            maxErr = std::max(maxErr, err);
+            maxMag = std::max(maxMag, mag);
+        }
+        std::cout << "\nRow 0 max absolute error vs CPU FFT: " << maxErr << "\n";
+        std::cout << "Row 0 max bin magnitude (CPU):       " << maxMag << "\n";
+        std::cout << "Row 0 relative error:                "
+                  << (maxErr / maxMag * 100.0f) << " %\n";
 
         if (!meshDevice->close())
             throw std::runtime_error("meshDevice->close() failed");
 
-        std::cout << "FFT host run finished......\n";
+        std::cout << "\nFFT host run finished.\n";
         return 0;
 
     } catch (const std::exception& e) {
