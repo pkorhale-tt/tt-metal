@@ -22,7 +22,7 @@
 //   2  cb_data1_r   RHS real
 //   3  cb_data1_i   RHS imaginary
 //   4  cb_twiddle_r twiddle real
-//   5  cb_twiddle_i twiddle imaginary
+//   5  cb_twiddle_i twiddle imag
 //
 // Kernel args (7):
 //   0  dram_input_r_addr  – DRAM address of real input array
@@ -33,6 +33,7 @@
 //   5  chunk_size         – number of element pairs per chunk
 //   6  sram_buf_r_addr    – base address of SRAM ping buffer, real
 //      (imaginary SRAM buffer immediately follows at +sram_buf_bytes)
+
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 
@@ -56,14 +57,14 @@ void kernel_main() {
     constexpr uint32_t cb_twiddle_r = tt::CBIndex::c_4;
     constexpr uint32_t cb_twiddle_i = tt::CBIndex::c_5;
 
-    const uint32_t tile_bytes   = get_tile_size(cb_data0_r);
+    const uint32_t tile_bytes    = get_tile_size(cb_data0_r);
     const DataFormat data_format = get_dataformat(cb_data0_r);
 
     // SRAM buffers for intermediate results between steps.
     // Real and imaginary buffers are laid out contiguously; imaginary
     // starts at sram_buf_r_addr + n * sizeof(float).
-    const uint32_t sram_buf_bytes   = n * sizeof(float);
-    const uint32_t sram_buf_i_addr  = sram_buf_r_addr + sram_buf_bytes;
+    const uint32_t sram_buf_bytes  = n * sizeof(float);
+    const uint32_t sram_buf_i_addr = sram_buf_r_addr + sram_buf_bytes;
 
     // DRAM address generators for the first-step input.
     const InterleavedAddrGenFast<true> dram_r_gen = {
@@ -76,7 +77,7 @@ void kernel_main() {
         .data_format       = data_format};
 
     // Twiddle factors live in SRAM, precomputed by the compute kernel
-    // at initialisation (paper Fig. 3, caption).  Their base addresses
+    // at initialisation (paper Fig. 3, caption). Their base addresses
     // are stored in the CB itself; the reader just pushes pages.
     // Layout: [step][element], step-major, chunk-minor within each step.
     // The host provides twiddles packed per-step starting at the next
@@ -85,29 +86,17 @@ void kernel_main() {
     const uint32_t sram_tw_i_addr = sram_tw_r_addr + num_steps * (n / 2) * sizeof(float);
 
     for (uint32_t step = 0; step < num_steps; ++step) {
-        // half_m and m define which pairs this step operates on.
-        const uint32_t half_m  = 1u << step;
-        const uint32_t m       = half_m << 1u;
-        const uint32_t pair_count = n >> 1u;  // total pairs = N/2
+        const uint32_t half_m     = 1u << step;
+        const uint32_t m          = half_m << 1u;
+        const uint32_t pair_count = n >> 1u;
 
-        // Base pointer into the source data for this step.
-        // Step 0 reads from DRAM; all others read from the SRAM ping
-        // buffer written by the previous step's writer.
-        // (Paper Fig. 3: "read either from external on-card DDR for the
-        // first step or from local SRAM for subsequent ones.")
         const bool is_first_step = (step == 0u);
 
-        // Twiddle base offset for this step (pairs are step-major).
         const uint32_t tw_step_offset = step * (n / 2u);
 
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
-            const uint32_t pair_base = chunk * chunk_size;  // first pair in chunk
+            const uint32_t pair_base = chunk * chunk_size;
 
-            // ------------------------------------------------------------------
-            // Load source data for this chunk and reorder into even/odd CBs.
-            // Paper: "a page in four CBs is populated with the data correctly
-            // ordered for that specific step."
-            // ------------------------------------------------------------------
             cb_reserve_back(cb_data0_r, 1);
             cb_reserve_back(cb_data0_i, 1);
             cb_reserve_back(cb_data1_r, 1);
@@ -122,17 +111,17 @@ void kernel_main() {
                 // Step 0: Read from DRAM into a temporary SRAM buffer, then scatter.
                 // We can't use the CB buffers directly because we need to read the
                 // full tile before scattering into multiple CBs.
-                
+
                 // Use a temporary buffer in L1 (after all CB space)
                 constexpr uint32_t temp_buf_addr = 0x80000;  // 512KB offset, safe area
                 volatile float* temp_r = reinterpret_cast<volatile float*>(temp_buf_addr);
                 volatile float* temp_i = reinterpret_cast<volatile float*>(temp_buf_addr + tile_bytes);
-                
+
                 // Read full DRAM tiles into temporary buffer
                 noc_async_read_tile(0u, dram_r_gen, temp_buf_addr);
                 noc_async_read_tile(0u, dram_i_gen, temp_buf_addr + tile_bytes);
                 noc_async_read_barrier();
-                
+
                 // Now scatter from temp buffer into CB buffers
                 for (uint32_t p = 0; p < chunk_size; ++p) {
                     const uint32_t global_p = pair_base + p;
@@ -140,7 +129,7 @@ void kernel_main() {
                     const uint32_t j        = global_p % half_m;
                     const uint32_t a        = group * m + j;
                     const uint32_t b        = a + half_m;
-                    
+
                     dst0_r[p] = temp_r[a];
                     dst0_i[p] = temp_i[a];
                     dst1_r[p] = temp_r[b];
@@ -148,19 +137,18 @@ void kernel_main() {
                 }
             } else {
                 // Read from SRAM ping buffer (results of previous step).
-                // Paper: "from local SRAM for subsequent [steps]".
                 const volatile float* src_r =
                     reinterpret_cast<const volatile float*>(sram_buf_r_addr);
                 const volatile float* src_i =
                     reinterpret_cast<const volatile float*>(sram_buf_i_addr);
-                
+
                 for (uint32_t p = 0; p < chunk_size; ++p) {
                     const uint32_t global_p = pair_base + p;
                     const uint32_t group    = global_p / half_m;
                     const uint32_t j        = global_p % half_m;
                     const uint32_t a        = group * m + j;
                     const uint32_t b        = a + half_m;
-                    
+
                     dst0_r[p] = src_r[a];
                     dst0_i[p] = src_i[a];
                     dst1_r[p] = src_r[b];
@@ -173,12 +161,6 @@ void kernel_main() {
             cb_push_back(cb_data1_r, 1);
             cb_push_back(cb_data1_i, 1);
 
-            // ------------------------------------------------------------------
-            // Load twiddle factors for this chunk.
-            // Paper Fig. 3: "twiddle factors are calculated by the compute
-            // engine on initialisation and stored in SRAM."
-            // We read them from their SRAM location here.
-            // ------------------------------------------------------------------
             cb_reserve_back(cb_twiddle_r, 1);
             cb_reserve_back(cb_twiddle_i, 1);
 
