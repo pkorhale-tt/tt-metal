@@ -298,7 +298,8 @@ int main(int argc, char** argv) {
             makeCb(CB_INT1,      1);
             makeCb(CB_F0,        1);
             makeCb(CB_F1,        1);
-            makeCb(CB_STEP_SYNC, 1);
+            // makeCb(CB_STEP_SYNC, 1);
+            makeCb(CB_STEP_SYNC, 2);
 
             KernelHandle readerKernel = CreateKernel(
                 fftProg,
