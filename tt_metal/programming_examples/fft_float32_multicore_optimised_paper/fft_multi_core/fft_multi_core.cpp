@@ -59,6 +59,11 @@ constexpr uint32_t CB_F1      = 23;
 
 constexpr uint32_t SRAM_DATA_BASE = 0x40000;
 
+// One uint32 placed just below SRAM_DATA_BASE for the reader/writer sync flag.
+// The reader (RISCV_0) spins on this word waiting for the writer (RISCV_1)
+// to set it after scattering each butterfly stage's results back into SRAM.
+constexpr uint32_t SYNC_FLAG_ADDR = SRAM_DATA_BASE - sizeof(uint32_t);
+
 inline uint32_t ceilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 inline bool isPowerOfTwo(uint32_t x) { return x > 0 && ((x & (x - 1)) == 0); }
 inline uint32_t log2u32(uint32_t x) { uint32_t r = 0; while ((1u << r) < x) ++r; return r; }
@@ -136,7 +141,6 @@ void cpuFft(std::vector<float>& re, std::vector<float>& im) {
 int main(int argc, char** argv) {
     try {
         const int deviceId       = (argc > 1) ? std::stoi(argv[1]) : 0;
-        // Default nRow=1024: halfN=512, fits in one tile (TILE_ELEMS=1024)
         const uint32_t nRow      = (argc > 2) ? static_cast<uint32_t>(std::stoul(argv[2])) : 1024;
         const uint32_t batchSize = (argc > 3) ? static_cast<uint32_t>(std::stoul(argv[3])) : 8;
         const uint32_t numCores  = (argc > 4) ? static_cast<uint32_t>(std::stoul(argv[4])) : 8;
@@ -153,12 +157,6 @@ int main(int argc, char** argv) {
 
         const uint32_t numStages      = log2u32(nRow);
         const uint32_t halfN          = nRow / 2;
-
-        // chunkSize: pairs per chunk. Must satisfy chunkSize*2 <= TILE_ELEMS.
-        // We pack data0[0..chunkSize) and data1[0..chunkSize) into one tile,
-        // so the tile is used as [data0 | data1] = 2*chunkSize elements.
-        // Set numChunks=1 (process all pairs in one chunk) when halfN*2 <= TILE_ELEMS,
-        // otherwise use numChunks=2.
         const uint32_t numChunks      = (halfN * 2 <= TILE_ELEMS) ? 1u : 2u;
         const uint32_t chunkSize      = halfN / numChunks;
         const uint32_t rowTiles       = ceilDiv(nRow, TILE_ELEMS);
@@ -170,7 +168,9 @@ int main(int argc, char** argv) {
         const uint32_t sramDataBytes = nRow * sizeof(float);
         const uint32_t sramTwBytes   = numStages * halfN * sizeof(float);
         const uint32_t sramScratch   = 2 * sramDataBytes;
-        const uint32_t sramTotal     = 2 * sramDataBytes + 2 * sramTwBytes + sramScratch;
+        // +4 for the sync flag word that sits at SYNC_FLAG_ADDR (just below SRAM_DATA_BASE)
+        const uint32_t sramTotal     = 2 * sramDataBytes + 2 * sramTwBytes + sramScratch
+                                     + sizeof(uint32_t);
 
         std::cout << "[fft_paper_host]\n"
                   << "  nRow           = " << nRow << "\n"
@@ -180,7 +180,9 @@ int main(int argc, char** argv) {
                   << "  numChunks      = " << numChunks << "\n"
                   << "  rowTiles       = " << rowTiles << "\n"
                   << "  rowsThisLaunch = " << rowsThisLaunch << "\n"
-                  << "  SRAM per core  = " << sramTotal << " bytes\n";
+                  << "  SRAM per core  = " << sramTotal << " bytes\n"
+                  << "  sync_flag_addr = 0x" << std::hex << SYNC_FLAG_ADDR
+                  << std::dec << "\n";
 
         if (SRAM_DATA_BASE + sramTotal > 1300000)
             throw std::runtime_error("SRAM layout exceeds 1.3MB");
@@ -315,7 +317,8 @@ int main(int argc, char** argv) {
                 SetRuntimeArgs(fftProg, readerKernel, cc,
                     { inputRealBuf->address()  + rowByteOffset,
                       inputImagBuf->address()  + rowByteOffset,
-                      nRow, numStages, numChunks, chunkSize, SRAM_DATA_BASE });
+                      nRow, numStages, numChunks, chunkSize, SRAM_DATA_BASE,
+                      SYNC_FLAG_ADDR });  // arg 7: sync flag
 
                 SetRuntimeArgs(fftProg, computeKernel, cc,
                     { numStages, numChunks });
@@ -323,7 +326,8 @@ int main(int argc, char** argv) {
                 SetRuntimeArgs(fftProg, writerKernel, cc,
                     { outputRealBuf->address() + rowByteOffset,
                       outputImagBuf->address() + rowByteOffset,
-                      nRow, numStages, numChunks, chunkSize, SRAM_DATA_BASE });
+                      nRow, numStages, numChunks, chunkSize, SRAM_DATA_BASE,
+                      SYNC_FLAG_ADDR });  // arg 7: sync flag
             }
 
             distributed::MeshWorkload fftWorkload;

@@ -2,12 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Reader kernel for FFT.
-// Assumptions (enforced by host):
-//   - nRow <= 2048, so the entire row fits in at most 2 DRAM tiles.
-//   - chunkSize*2 <= TILE_ELEMS = 1024, so data0 and data1 for one chunk
-//     fit in one CB tile each.
-//   - On step 0: reads row from DRAM into sram_buf (real) and sram_buf_i (imag).
-//   - On subsequent steps: reads from sram_buf written by writer.
+//
+// Runtime args:
+//   0 : dram_input_r_addr
+//   1 : dram_input_i_addr
+//   2 : n
+//   3 : num_steps
+//   4 : num_chunks
+//   5 : chunk_size
+//   6 : sram_buf_r_addr
+//   7 : sync_flag_addr   ← NEW: L1 address of the single uint32 handshake flag
+//                          shared with the writer on RISCV_1.
+//                          Writer sets it to 1 after scattering each step's
+//                          results; reader clears it to 0 before moving on.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -20,6 +27,7 @@ void kernel_main() {
     const uint32_t num_chunks        = get_arg_val<uint32_t>(4);
     const uint32_t chunk_size        = get_arg_val<uint32_t>(5);
     const uint32_t sram_buf_r_addr   = get_arg_val<uint32_t>(6);
+    const uint32_t sync_flag_addr    = get_arg_val<uint32_t>(7);  // NEW
 
     constexpr uint32_t cb_data0_r   = tt::CBIndex::c_0;
     constexpr uint32_t cb_data0_i   = tt::CBIndex::c_1;
@@ -35,8 +43,8 @@ void kernel_main() {
     const uint32_t sram_buf_i_addr = sram_buf_r_addr + sram_buf_bytes;
 
     // Twiddle tables sit above the two data ping-pong buffers
-    const uint32_t sram_tw_r_addr  = sram_buf_i_addr + sram_buf_bytes;
-    const uint32_t sram_tw_i_addr  = sram_tw_r_addr + num_steps * (n / 2u) * sizeof(float);
+    const uint32_t sram_tw_r_addr = sram_buf_i_addr + sram_buf_bytes;
+    const uint32_t sram_tw_i_addr = sram_tw_r_addr + num_steps * (n / 2u) * sizeof(float);
 
     const uint32_t row_tiles = (n * sizeof(float) + tile_bytes - 1) / tile_bytes;
 
@@ -49,21 +57,33 @@ void kernel_main() {
         .page_size         = tile_bytes,
         .data_format       = data_format};
 
+    // Initialise the sync flag to 0 so the writer can set it to 1 when ready.
+    // Both RISCV_0 and RISCV_1 start simultaneously; only RISCV_0 (us) writes
+    // the initial value, so there is no write-after-write hazard here.
+    volatile tt_l1_ptr uint32_t* sync_flag =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_flag_addr);
+    *sync_flag = 0u;
+
     for (uint32_t step = 0; step < num_steps; ++step) {
         const uint32_t half_m         = 1u << step;
         const uint32_t m              = half_m << 1u;
-        const bool     is_first_step  = (step == 0u);
         const uint32_t tw_step_offset = step * (n / 2u);
 
-        if (is_first_step) {
-            // Load entire row from DRAM into SRAM ping-pong buffers
+        if (step == 0u) {
+            // Load the entire row from DRAM into SRAM on the first step only.
             for (uint32_t t = 0; t < row_tiles; ++t) {
                 noc_async_read_tile(t, dram_r_gen, sram_buf_r_addr + t * tile_bytes);
                 noc_async_read_tile(t, dram_i_gen, sram_buf_i_addr + t * tile_bytes);
             }
             noc_async_read_barrier();
+        } else {
+            // For steps 1+, wait until the writer has finished scattering the
+            // previous step's butterfly outputs back into sram_buf.
+            // Without this barrier the reader can race ahead and pick up stale
+            // (or partially-written) values, producing garbage / inf results.
+            while (*sync_flag == 0u) { /* spin */ }
+            *sync_flag = 0u;  // reset for the next step
         }
-        // For step > 0: writer already scattered results into sram_buf_r/i
 
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
             const uint32_t pair_base = chunk * chunk_size;

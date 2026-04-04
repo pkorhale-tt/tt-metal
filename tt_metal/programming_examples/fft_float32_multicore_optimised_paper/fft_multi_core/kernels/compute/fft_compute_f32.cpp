@@ -84,9 +84,9 @@ void kernel_main() {
     for (uint32_t step = 0; step < num_steps; ++step) {
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
 
-            // FIXED: must be inside the loop, not outside.
+            // Must be inside the loop.
             // Calling this only once before the loops corrupts unpacker
-            // state after the first iteration (steps 1-10 get garbage).
+            // state after the first iteration (steps 1+ get garbage).
             copy_tile_to_dst_init_short(cb_data1_r);
 
             cb_wait_front(cb_data1_r, 1);
