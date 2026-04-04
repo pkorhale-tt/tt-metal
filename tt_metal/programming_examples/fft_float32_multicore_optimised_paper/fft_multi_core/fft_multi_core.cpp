@@ -28,6 +28,10 @@ constexpr uint32_t TILE_W     = 32;
 constexpr uint32_t TILE_ELEMS = TILE_H * TILE_W;
 constexpr uint32_t TILE_BYTES = TILE_ELEMS * sizeof(float);
 
+// Each butterfly uses 2 elements per pair (data0, data1).
+// One tile holds TILE_ELEMS floats, so max pairs per tile = TILE_ELEMS/2.
+constexpr uint32_t PAIRS_PER_TILE = TILE_ELEMS / 2;  // = 512
+
 constexpr uint32_t CB_DATA0_R = 0;
 constexpr uint32_t CB_DATA0_I = 1;
 constexpr uint32_t CB_DATA1_R = 2;
@@ -92,10 +96,8 @@ void makeTestInput(uint32_t nRow, std::vector<float>& real, std::vector<float>& 
                 + 0.25f * std::cos(6.0f * PI * i / nRow);
 }
 
-// Reference FFT on CPU for verification
 void cpuFft(std::vector<float>& re, std::vector<float>& im) {
     const uint32_t n = re.size();
-    // bit-reversal
     for (uint32_t i = 1, j = 0; i < n; ++i) {
         uint32_t bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;
@@ -108,14 +110,12 @@ void cpuFft(std::vector<float>& re, std::vector<float>& im) {
         for (uint32_t i = 0; i < n; i += len) {
             float cr = 1.0f, ci = 0.0f;
             for (uint32_t j = 0; j < len / 2; ++j) {
-                float ur = re[i+j],        ui = im[i+j];
-                float vr = re[i+j+len/2] * cr - im[i+j+len/2] * ci;
-                float vi = re[i+j+len/2] * ci + im[i+j+len/2] * cr;
-                re[i+j]         = ur + vr;  im[i+j]         = ui + vi;
-                re[i+j+len/2]   = ur - vr;  im[i+j+len/2]   = ui - vi;
-                float ncr = cr*wr - ci*wi;
-                ci = cr*wi + ci*wr;
-                cr = ncr;
+                float ur = re[i+j], ui = im[i+j];
+                float vr = re[i+j+len/2]*cr - im[i+j+len/2]*ci;
+                float vi = re[i+j+len/2]*ci + im[i+j+len/2]*cr;
+                re[i+j]       = ur+vr; im[i+j]       = ui+vi;
+                re[i+j+len/2] = ur-vr; im[i+j+len/2] = ui-vi;
+                float ncr = cr*wr - ci*wi; ci = cr*wi + ci*wr; cr = ncr;
             }
         }
     }
@@ -142,8 +142,16 @@ int main(int argc, char** argv) {
 
         const uint32_t numStages      = log2u32(nRow);
         const uint32_t halfN          = nRow / 2;
-        const uint32_t chunkSize      = TILE_ELEMS;
-        const uint32_t numChunks      = halfN / chunkSize;
+
+        // KEY FIX: chunkSize = PAIRS_PER_TILE = 512, not TILE_ELEMS = 1024.
+        // A tile holds 1024 floats. Each chunk fills one tile for EACH of
+        // cb_data0_r, cb_data0_i, cb_data1_r, cb_data1_i separately.
+        // So each tile holds chunkSize elements, and chunkSize <= TILE_ELEMS.
+        // We set chunkSize = TILE_ELEMS/2 = 512 so that indices a,b (which
+        // can differ by halfM) both stay within the n elements of the row,
+        // and we need numChunks = halfN / chunkSize chunks to cover all pairs.
+        const uint32_t chunkSize      = PAIRS_PER_TILE;          // 512
+        const uint32_t numChunks      = halfN / chunkSize;        // 2 for n=2048
         const uint32_t rowTiles       = ceilDiv(nRow, TILE_ELEMS);
         const uint32_t rowsThisLaunch = std::min(batchSize, numCores);
 
@@ -176,9 +184,8 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> inputRealPacked(rowsThisLaunch * elemsPerRow, 0u);
         std::vector<uint32_t> inputImagPacked(rowsThisLaunch * elemsPerRow, 0u);
 
-        // Save row 0 input for CPU reference comparison
         std::vector<float> refRe, refIm;
-        makeTestInput(nRow, refRe, refIm);
+        makeTestInput(nRow, refRe, refIm);  // save for CPU reference
 
         for (uint32_t r = 0; r < rowsThisLaunch; ++r) {
             std::vector<float> rowR, rowI;
@@ -323,46 +330,44 @@ int main(int argc, char** argv) {
         // ── CPU reference FFT for row 0 ───────────────────────────────────────
         cpuFft(refRe, refIm);
 
-        // ── Print key frequency bins for row 0 ───────────────────────────────
-        // Input = sin(2pi*i/N) + 0.25*cos(6pi*i/N)
-        // Expected peaks: bin 1 (mag~1024), bin 3 (mag~256), conjugates at N-1, N-3
+        // ── Print key bins ────────────────────────────────────────────────────
         std::cout << "\n=== Row 0: Key frequency bins ===\n";
-        std::cout << "bin |   Wormhole re   |   Wormhole im   |   Wormhole mag  ||"
-                  << "   CPU ref re    |   CPU ref im    |   CPU ref mag\n";
-        std::cout << std::string(120, '-') << "\n";
+        std::cout << "bin  |  WH_re        |  WH_im        |  WH_mag       ||"
+                  << "  CPU_re       |  CPU_im       |  CPU_mag\n";
+        std::cout << std::string(110, '-') << "\n";
 
-        std::vector<uint32_t> checkBins = {0, 1, 2, 3, 4,
-                                           nRow/2,
-                                           nRow-4, nRow-3, nRow-2, nRow-1};
+        std::vector<uint32_t> checkBins = {
+            0u, 1u, 2u, 3u, 4u,
+            nRow/2,
+            nRow-4, nRow-3, nRow-2, nRow-1};
+
         for (uint32_t bin : checkBins) {
-            const uint32_t idx = bin;  // row 0
-            float wre = u32ToFloat(outRawReal[idx]);
-            float wim = u32ToFloat(outRawImag[idx]);
+            float wre  = u32ToFloat(outRawReal[bin]);
+            float wim  = u32ToFloat(outRawImag[bin]);
             float wmag = std::sqrt(wre*wre + wim*wim);
-            float cre = refRe[bin];
-            float cim = refIm[bin];
+            float cre  = refRe[bin];
+            float cim  = refIm[bin];
             float cmag = std::sqrt(cre*cre + cim*cim);
-            std::printf("%-5u | %15.3f | %15.3f | %15.3f || %15.3f | %15.3f | %15.3f\n",
+            std::printf("%-5u| %13.3f | %13.3f | %13.3f || %13.3f | %13.3f | %13.3f\n",
                         bin, wre, wim, wmag, cre, cim, cmag);
         }
 
-        // ── Max error across all bins for row 0 ──────────────────────────────
-        float maxErr = 0.0f;
-        float maxMag = 0.0f;
+        // ── Max error for row 0 ───────────────────────────────────────────────
+        float maxErr = 0.0f, maxMag = 0.0f;
         for (uint32_t i = 0; i < nRow; ++i) {
             float wre = u32ToFloat(outRawReal[i]);
             float wim = u32ToFloat(outRawImag[i]);
-            float cre = refRe[i];
-            float cim = refIm[i];
+            float cre = refRe[i], cim = refIm[i];
             float err = std::sqrt((wre-cre)*(wre-cre) + (wim-cim)*(wim-cim));
             float mag = std::sqrt(cre*cre + cim*cim);
-            maxErr = std::max(maxErr, err);
+            if (std::isfinite(err)) maxErr = std::max(maxErr, err);
             maxMag = std::max(maxMag, mag);
         }
-        std::cout << "\nRow 0 max absolute error vs CPU FFT: " << maxErr << "\n";
-        std::cout << "Row 0 max bin magnitude (CPU):       " << maxMag << "\n";
-        std::cout << "Row 0 relative error:                "
-                  << (maxErr / maxMag * 100.0f) << " %\n";
+        std::cout << "\nRow 0 max absolute error vs CPU: " << maxErr << "\n";
+        std::cout << "Row 0 max bin magnitude (CPU):   " << maxMag << "\n";
+        if (maxMag > 0.0f)
+            std::cout << "Row 0 relative error:            "
+                      << (maxErr / maxMag * 100.0f) << " %\n";
 
         if (!meshDevice->close())
             throw std::runtime_error("meshDevice->close() failed");
