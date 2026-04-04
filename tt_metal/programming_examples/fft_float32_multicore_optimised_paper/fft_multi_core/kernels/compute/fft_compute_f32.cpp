@@ -81,11 +81,15 @@ void kernel_main() {
     constexpr uint32_t cb_f0        = tt::CBIndex::c_22;
     constexpr uint32_t cb_f1        = tt::CBIndex::c_23;
 
-    // Global init: prime the unpacker for the first CB it will see
-    copy_tile_to_dst_init_short(cb_data1_r);
-
     for (uint32_t step = 0; step < num_steps; ++step) {
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
+
+            // Re-init unpacker at the start of every chunk so the
+            // UNPACK RISC-V core knows which CB format to expect.
+            // This MUST be inside the loop — doing it once outside
+            // corrupts state after the first iteration.
+            copy_tile_to_dst_init_short(cb_data1_r);
+
             cb_wait_front(cb_data1_r, 1);
             cb_wait_front(cb_data1_i, 1);
             cb_wait_front(cb_twiddle_r, 1);
@@ -107,17 +111,15 @@ void kernel_main() {
 
             cb_wait_front(cb_data0_r, 1);
             cb_wait_front(cb_data0_i, 1);
+            cb_wait_front(cb_f0, 1);
+            cb_wait_front(cb_f1, 1);
 
             // out1 = data0 - f  (odd output)
-            cb_wait_front(cb_f0, 1);
             maths_sfpu_sub(cb_data0_r, cb_f0, cb_out1_r);
-            cb_wait_front(cb_f1, 1);
             maths_sfpu_sub(cb_data0_i, cb_f1, cb_out1_i);
 
             // out0 = data0 + f  (even output)
-            cb_wait_front(cb_f0, 1);
             maths_sfpu_add(cb_data0_r, cb_f0, cb_out0_r);
-            cb_wait_front(cb_f1, 1);
             maths_sfpu_add(cb_data0_i, cb_f1, cb_out0_i);
 
             cb_pop_front(cb_data0_r, 1);
