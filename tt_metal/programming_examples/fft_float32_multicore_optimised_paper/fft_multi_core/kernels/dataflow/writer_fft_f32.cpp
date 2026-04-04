@@ -18,9 +18,6 @@ void kernel_main() {
     constexpr uint32_t cb_out1_r = tt::CBIndex::c_18;
     constexpr uint32_t cb_out1_i = tt::CBIndex::c_19;
 
-    // NEW: writer -> reader step barrier token
-    constexpr uint32_t cb_step_sync = tt::CBIndex::c_24;
-
     const uint32_t tile_bytes    = get_tile_size(cb_out0_r);
     const DataFormat data_format = get_dataformat(cb_out0_r);
 
@@ -37,14 +34,14 @@ void kernel_main() {
         .data_format       = data_format};
 
     for (uint32_t step = 0; step < num_steps; ++step) {
-        const uint32_t half_m       = 1u << step;
-        const uint32_t m            = half_m << 1u;
-        const bool is_last_step     = (step + 1u == num_steps);
+        const uint32_t half_m     = 1u << step;
+        const uint32_t m          = half_m << 1u;
+        const bool is_last_step   = (step + 1u == num_steps);
 
-        volatile float* sram_r =
-            reinterpret_cast<volatile float*>(sram_buf_r_addr);
-        volatile float* sram_i =
-            reinterpret_cast<volatile float*>(sram_buf_i_addr);
+        volatile tt_l1_ptr float* sram_r =
+            reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_r_addr);
+        volatile tt_l1_ptr float* sram_i =
+            reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_i_addr);
 
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
             const uint32_t pair_base = chunk * chunk_size;
@@ -54,14 +51,14 @@ void kernel_main() {
             cb_wait_front(cb_out1_r, 1);
             cb_wait_front(cb_out1_i, 1);
 
-            const volatile float* out0_r =
-                reinterpret_cast<const volatile float*>(get_read_ptr(cb_out0_r));
-            const volatile float* out0_i =
-                reinterpret_cast<const volatile float*>(get_read_ptr(cb_out0_i));
-            const volatile float* out1_r =
-                reinterpret_cast<const volatile float*>(get_read_ptr(cb_out1_r));
-            const volatile float* out1_i =
-                reinterpret_cast<const volatile float*>(get_read_ptr(cb_out1_i));
+            const volatile tt_l1_ptr float* out0_r =
+                reinterpret_cast<const volatile tt_l1_ptr float*>(get_read_ptr(cb_out0_r));
+            const volatile tt_l1_ptr float* out0_i =
+                reinterpret_cast<const volatile tt_l1_ptr float*>(get_read_ptr(cb_out0_i));
+            const volatile tt_l1_ptr float* out1_r =
+                reinterpret_cast<const volatile tt_l1_ptr float*>(get_read_ptr(cb_out1_r));
+            const volatile tt_l1_ptr float* out1_i =
+                reinterpret_cast<const volatile tt_l1_ptr float*>(get_read_ptr(cb_out1_i));
 
             for (uint32_t p = 0; p < chunk_size; ++p) {
                 const uint32_t global_p = pair_base + p;
@@ -76,25 +73,17 @@ void kernel_main() {
                 sram_i[b] = out1_i[p];
             }
 
-            if (is_last_step && (chunk + 1u == num_chunks)) {
-                uint32_t sram_r_read = sram_buf_r_addr;
-                uint32_t sram_i_read = sram_buf_i_addr;
-
-                noc_async_write_tile(0u, dram_r_gen, sram_r_read);
-                noc_async_write_tile(0u, dram_i_gen, sram_i_read);
-                noc_async_write_barrier();
-            }
-
             cb_pop_front(cb_out0_r, 1);
             cb_pop_front(cb_out0_i, 1);
             cb_pop_front(cb_out1_r, 1);
             cb_pop_front(cb_out1_i, 1);
+        }
 
-            // NEW: after the last chunk of this step, signal reader
-            if (chunk + 1u == num_chunks) {
-                cb_reserve_back(cb_step_sync, 1);
-                cb_push_back(cb_step_sync, 1);
-            }
+        // On the last step write results out to DRAM
+        if (is_last_step) {
+            noc_async_write_tile(0u, dram_r_gen, sram_buf_r_addr);
+            noc_async_write_tile(0u, dram_i_gen, sram_buf_i_addr);
+            noc_async_write_barrier();
         }
     }
 }
