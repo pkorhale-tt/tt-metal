@@ -2,14 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
-
-#if __has_include("compute_kernel_api/cb_api.h")
-#include "compute_kernel_api/cb_api.h"
-#elif __has_include("compute_kernel_api/common.h")
-#include "compute_kernel_api/common.h"
-#else
-#include "compute_kernel_api.h"
-#endif
+#include "api/compute/compute_kernel_api.h"
 
 void kernel_main() {
     const uint32_t num_steps = get_arg_val<uint32_t>(0);

@@ -27,7 +27,7 @@ constexpr float PI = 3.14159265358979323846f;
 constexpr uint32_t TILE_H = 32;
 constexpr uint32_t TILE_W = 32;
 constexpr uint32_t TILE_ELEMS = TILE_H * TILE_W;
-constexpr uint32_t TILE_BYTES = TILE_ELEMS * sizeof(float);
+// constexpr uint32_t TILE_BYTES = TILE_ELEMS * sizeof(float);
 
 constexpr uint32_t CB_DATA0_R = 0;
 constexpr uint32_t CB_DATA0_I = 1;
