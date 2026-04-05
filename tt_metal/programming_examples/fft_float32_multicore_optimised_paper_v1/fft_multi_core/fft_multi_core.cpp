@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <sys/time.h>
 #include <time.h>
 #include <tt-metalium/host_api.hpp>
@@ -155,7 +156,7 @@ int main(int argc, char** argv) {
             .compile_args     = {}});
 
     // --- Build MeshWorkload once (program is moved into it) ---
-    // We keep a raw reference to program before moving for SetRuntimeArgs
+    // Keep a raw reference before moving so SetRuntimeArgs still works
     Program& program_ref = program;
     MeshWorkload workload;
     MeshCoordinateRange rng = MeshCoordinateRange(mesh->shape());
@@ -200,7 +201,6 @@ int main(int argc, char** argv) {
     descale(data_r, data_i, domain_size);
 
     // mesh closes automatically when shared_ptr goes out of scope
-
     free(data_r);
     free(data_i);
     free(twiddle_factors);
@@ -238,12 +238,19 @@ void fft(MeshCommandQueue& cq, TTExecution* d,
                     d->step_results_i_buffer->address()});
     SetRuntimeArgs(*d->program, *d->write_kernel, *d->core, write_args);
 
+    // Wrap raw float* into std::vector<float> for the Mesh API
+    std::vector<float> vec_input_r(input_r,         input_r         + domain_size);
+    std::vector<float> vec_input_i(input_i,         input_i         + domain_size);
+    std::vector<float> vec_twiddle(twiddle_factors,  twiddle_factors + domain_size);
+    std::vector<float> vec_result_r(domain_size, 0.0f);
+    std::vector<float> vec_result_i(domain_size, 0.0f);
+
     struct timeval t0;
 
     gettimeofday(&t0, NULL);
-    EnqueueWriteMeshBuffer(cq, d->in_data_r_dram_buffer, input_r,         false);
-    EnqueueWriteMeshBuffer(cq, d->in_data_i_dram_buffer, input_i,         false);
-    EnqueueWriteMeshBuffer(cq, d->twiddle_dram_buffer,   twiddle_factors,  false);
+    EnqueueWriteMeshBuffer(cq, d->in_data_r_dram_buffer, vec_input_r, false);
+    EnqueueWriteMeshBuffer(cq, d->in_data_i_dram_buffer, vec_input_i, false);
+    EnqueueWriteMeshBuffer(cq, d->twiddle_dram_buffer,   vec_twiddle, false);
     Finish(cq);
     double xfer_on = getElapsedTime(t0);
 
@@ -253,10 +260,14 @@ void fft(MeshCommandQueue& cq, TTExecution* d,
     double exec_t = getElapsedTime(t0);
 
     gettimeofday(&t0, NULL);
-    EnqueueReadMeshBuffer(cq, result_r, d->result_data_r_dram_buffer, false);
-    EnqueueReadMeshBuffer(cq, result_i, d->result_data_i_dram_buffer, false);
+    EnqueueReadMeshBuffer(cq, vec_result_r, d->result_data_r_dram_buffer, false);
+    EnqueueReadMeshBuffer(cq, vec_result_i, d->result_data_i_dram_buffer, false);
     Finish(cq);
     double xfer_off = getElapsedTime(t0);
+
+    // Copy results back into the caller's float arrays
+    std::copy(vec_result_r.begin(), vec_result_r.end(), result_r);
+    std::copy(vec_result_i.begin(), vec_result_i.end(), result_i);
 
     printf("%s FFT size %d: total %.4f s  (xfer_on %.4f  exec %.4f  xfer_off %.4f)\n",
            direction == FFT_FORWARD ? "Forwards" : "Backwards",
