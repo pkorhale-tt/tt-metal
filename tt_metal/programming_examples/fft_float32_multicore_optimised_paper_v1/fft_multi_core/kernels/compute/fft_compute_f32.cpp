@@ -7,13 +7,14 @@
 // #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
 // #include "compute_kernel_api/eltwise_unary/negative.h"
 
+#include "api/compute/eltwise_unary/eltwise_unary.h"
 
 #include <cstdint>
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_binary_sfpu.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/eltwise_unary/negative.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_unary/negative.h"
 
 #define CHUNK_SIZE 2048
 
