@@ -2,15 +2,16 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "tt-metalium/host_api.hpp"
-#include "tt-metalium/device.hpp"
-#include <sys/time.h>
-#include <time.h>
+#include <fmt/ostream.h>
+#include <tt-metalium/host_api.hpp>
+#include <tt-metalium/device.hpp>
+#include <tt-metalium/distributed.hpp>
 
+using namespace tt::tt_metal;
 #define PI 3.14159265358979323846264338327950288
 
 using namespace tt;
-using namespace tt::tt_metal;
+
 
 enum FFTDirection {
     FFT_FORWARD=0,
