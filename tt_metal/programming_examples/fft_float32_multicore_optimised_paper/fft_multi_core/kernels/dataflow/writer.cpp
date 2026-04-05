@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
-
+#error "WRITER DEBUG ACTIVE"
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 

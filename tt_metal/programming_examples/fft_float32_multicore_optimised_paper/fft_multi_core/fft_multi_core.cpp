@@ -345,8 +345,6 @@ int main(int argc, char** argv) {
                 DataMovementConfig{
                     .processor = DataMovementProcessor::RISCV_0,
                     .noc = NOC::RISCV_0_default});
-                    
-            #error "WRITER DEBUG ACTIVE"        
             KernelHandle writerKernel = CreateKernel(
                 fftProg,
                 OVERRIDE_KERNEL_PREFIX
