@@ -97,7 +97,7 @@ Program buildProgram(CoreCoord& core,
 
     reader_out = CreateKernel(
         program,
-        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/dataflow/reader.cpp",
+        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/dataflow/reader_fft_f32.cpp",
         core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
@@ -105,7 +105,7 @@ Program buildProgram(CoreCoord& core,
 
     writer_out = CreateKernel(
         program,
-        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/dataflow/writer.cpp",
+        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/dataflow/writer_fft_f32.cpp",
         core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0,
@@ -113,7 +113,7 @@ Program buildProgram(CoreCoord& core,
 
     compute_out = CreateKernel(
         program,
-        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/compute/compute.cpp",
+        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/compute/fft_compute_f32.cpp",
         core,
         ComputeConfig{
             .math_fidelity    = MathFidelity::HiFi4,
