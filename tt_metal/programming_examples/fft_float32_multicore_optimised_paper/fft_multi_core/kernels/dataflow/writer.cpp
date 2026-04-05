@@ -4,26 +4,6 @@
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 
-inline uint32_t linearToNfacesIndex(uint32_t linearIdx) {
-    const uint32_t row = linearIdx / 32;
-    const uint32_t col = linearIdx % 32;
-
-    const uint32_t faceRow = row / 16;
-    const uint32_t faceCol = col / 16;
-    const uint32_t face = faceRow * 2 + faceCol;
-
-    const uint32_t inFaceRow = row % 16;
-    const uint32_t inFaceCol = col % 16;
-
-    return face * 256 + inFaceRow * 16 + inFaceCol;
-}
-
-inline float readLogicalValueFromTile(
-    const volatile tt_l1_ptr float* tileBase,
-    uint32_t logicalIdx) {
-    return tileBase[linearToNfacesIndex(logicalIdx)];
-}
-
 void kernel_main() {
     const uint32_t dram_output_r_addr = get_arg_val<uint32_t>(0);
     const uint32_t dram_output_i_addr = get_arg_val<uint32_t>(1);
@@ -79,10 +59,10 @@ void kernel_main() {
                 const uint32_t a        = group * m + j;
                 const uint32_t b        = a + half_m;
 
-                sram_r[a] = readLogicalValueFromTile(out0_r, p);
-                sram_i[a] = readLogicalValueFromTile(out0_i, p);
-                sram_r[b] = readLogicalValueFromTile(out1_r, p);
-                sram_i[b] = readLogicalValueFromTile(out1_i, p);
+                sram_r[a] = out0_r[p];
+                sram_i[a] = out0_i[p];
+                sram_r[b] = out1_r[p];
+                sram_i[b] = out1_i[p];
             }
 
             cb_pop_front(cb_out0_r, 1);
@@ -91,10 +71,7 @@ void kernel_main() {
             cb_pop_front(cb_out1_i, 1);
         }
 
-      if (is_last_step) {
-            sram_r[0] = 999.0f;
-            sram_i[0] = -777.0f;
-
+        if (is_last_step) {
             const uint64_t noc_r = get_noc_addr(dram_output_r_addr);
             const uint64_t noc_i = get_noc_addr(dram_output_i_addr);
             noc_async_write(sram_buf_r_addr, noc_r, row_bytes);

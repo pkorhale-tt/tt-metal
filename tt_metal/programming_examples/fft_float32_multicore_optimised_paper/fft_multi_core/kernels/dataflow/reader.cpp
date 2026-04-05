@@ -4,27 +4,6 @@
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 
-inline uint32_t linearToNfacesIndex(uint32_t linearIdx) {
-    const uint32_t row = linearIdx / 32;
-    const uint32_t col = linearIdx % 32;
-
-    const uint32_t faceRow = row / 16;
-    const uint32_t faceCol = col / 16;
-    const uint32_t face = faceRow * 2 + faceCol;
-
-    const uint32_t inFaceRow = row % 16;
-    const uint32_t inFaceCol = col % 16;
-
-    return face * 256 + inFaceRow * 16 + inFaceCol;
-}
-
-inline void writeLogicalValueToTile(
-    volatile tt_l1_ptr float* tileBase,
-    uint32_t logicalIdx,
-    float value) {
-    tileBase[linearToNfacesIndex(logicalIdx)] = value;
-}
-
 void kernel_main() {
     const uint32_t dram_input_r_addr = get_arg_val<uint32_t>(0);
     const uint32_t dram_input_i_addr = get_arg_val<uint32_t>(1);
@@ -41,8 +20,6 @@ void kernel_main() {
     constexpr uint32_t cb_data1_i   = tt::CBIndex::c_3;
     constexpr uint32_t cb_twiddle_r = tt::CBIndex::c_4;
     constexpr uint32_t cb_twiddle_i = tt::CBIndex::c_5;
-
-    constexpr uint32_t TILE_ELEMS = 32 * 32;
 
     const uint32_t row_bytes       = n * sizeof(float);
     const uint32_t sram_buf_i_addr = sram_buf_r_addr + row_bytes;
@@ -107,19 +84,8 @@ void kernel_main() {
                 const uint32_t j        = global_p % half_m;
                 const uint32_t a        = group * m + j;
                 const uint32_t b        = a + half_m;
-
-                writeLogicalValueToTile(dst0_r, p, src_r[a]);
-                writeLogicalValueToTile(dst1_r, p, src_r[b]);
-            }
-            for (uint32_t p = chunk_size; p < TILE_ELEMS; ++p) {
-                writeLogicalValueToTile(dst0_r, p, 0.0f);
-                writeLogicalValueToTile(dst1_r, p, 0.0f);
-            }
-
-            // DEBUG SENTINEL:
-            // Force logical position 0 in cb_data0_r to a very obvious value.
-            if (step == 0u && chunk == 0u) {
-                writeLogicalValueToTile(dst0_r, 0, 1234.0f);
+                dst0_r[p] = src_r[a];
+                dst1_r[p] = src_r[b];
             }
 
             cb_push_back(cb_data0_r, 1);
@@ -141,13 +107,8 @@ void kernel_main() {
                 const uint32_t j        = global_p % half_m;
                 const uint32_t a        = group * m + j;
                 const uint32_t b        = a + half_m;
-
-                writeLogicalValueToTile(dst0_i, p, src_i[a]);
-                writeLogicalValueToTile(dst1_i, p, src_i[b]);
-            }
-            for (uint32_t p = chunk_size; p < TILE_ELEMS; ++p) {
-                writeLogicalValueToTile(dst0_i, p, 0.0f);
-                writeLogicalValueToTile(dst1_i, p, 0.0f);
+                dst0_i[p] = src_i[a];
+                dst1_i[p] = src_i[b];
             }
 
             cb_push_back(cb_data0_i, 1);
@@ -166,12 +127,8 @@ void kernel_main() {
                 reinterpret_cast<const volatile tt_l1_ptr float*>(sram_tw_i_addr) + tw_step_offset;
 
             for (uint32_t p = 0; p < chunk_size; ++p) {
-                writeLogicalValueToTile(tw_r_dst, p, sram_tw_r[pair_base + p]);
-                writeLogicalValueToTile(tw_i_dst, p, sram_tw_i[pair_base + p]);
-            }
-            for (uint32_t p = chunk_size; p < TILE_ELEMS; ++p) {
-                writeLogicalValueToTile(tw_r_dst, p, 0.0f);
-                writeLogicalValueToTile(tw_i_dst, p, 0.0f);
+                tw_r_dst[p] = sram_tw_r[pair_base + p];
+                tw_i_dst[p] = sram_tw_i[pair_base + p];
             }
 
             cb_push_back(cb_twiddle_r, 1);
