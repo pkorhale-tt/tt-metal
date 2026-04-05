@@ -414,7 +414,7 @@ int main(int argc, char** argv) {
             distributed::EnqueueMeshWorkload(cq, fftWorkload, false);
             distributed::Finish(cq);
 
-            std::cout << "FFT kernel execution finished.\n";
+            std::cout << "FFT kernel execution finished ok ok ok .\n";
         }
 
         std::vector<uint32_t> outRawReal;
