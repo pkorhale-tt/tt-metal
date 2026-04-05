@@ -1,19 +1,50 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
 
-// See reader.cpp for full explanation of the two-semaphore NOC handshake.
+// ── Semaphore fix summary ──────────────────────────────────────────────────
 //
-// Writer side of the protocol (end of each non-last step):
-//   1. All SRAM scatter writes for step N are done (scalar stores in loop above).
-//   2. noc_semaphore_set_remote(rdy_noc_addr, 1)
-//      → NOC write to rdy_flag, visible to RISCV_0 (reader).
-//   3. noc_semaphore_wait(ack_flag, 1)
-//      → spin until reader confirms it has started pushing CBs for step N+1.
-//   4. noc_semaphore_set(ack_flag, 0)  → reset ack for next step.
+// Root cause of deadlock:
 //
-// Output CB push order: out0_r, out0_i, out1_r, out1_i
-//   Matches compute kernel push order so the writer's cb_wait_front(out0_r)
-//   is never blocked by a full cb_out1_r.
+// 1. noc_semaphore_set_remote performs a NOC ATOMIC INCREMENT, not a plain
+//    store of 1.  After the reader resets rdy_flag to 0 with a local
+//    noc_semaphore_set() call, the NOC router's internal counter for that
+//    address may still lag.  A subsequent set_remote from the writer then
+//    increments a stale value and the flag can accumulate past 1, causing
+//    noc_semaphore_wait(rdy_flag, 1) in the reader to see 2 and spin
+//    forever (it waits for == 1, not >= 1 on some SDK versions), OR the
+//    reader resets to 0 before the writer has finished its own atomic, so
+//    the flag under-counts.
+//
+// 2. The writer initialized neither rdy_flag nor ack_flag.  On a freshly
+//    dispatched program, L1 content at SYNC_FLAG_ADDR is leftover from the
+//    twiddle-init program.  If that byte happened to be non-zero the writer's
+//    noc_semaphore_wait(ack_flag, 1) at the end of step 0 returns immediately
+//    even though the reader never sent the ack, corrupting the handshake from
+//    step 1 onward.
+//
+// Fix applied here:
+//   • Writer initialises BOTH flags to 0 via noc_semaphore_set_remote to its
+//     own NOC address — this goes through the NOC router and is therefore
+//     coherent with every subsequent NOC semaphore operation on those words.
+//   • All resets (rdy_flag after writer signals, ack_flag after writer
+//     receives) also use noc_semaphore_set_remote(local_noc_addr, 0) instead
+//     of the local noc_semaphore_set().  This keeps every write to the two
+//     words in the NOC domain and avoids the core-local / NOC-coherence gap.
+//
+// The reader mirrors this change (see reader.cpp).
+//
+// Protocol (unchanged):
+//   Writer end-of-step N (not last):
+//     noc_semaphore_set_remote(rdy_noc_addr, 1)    signal reader
+//     noc_semaphore_wait(ack_flag, 1)              wait for reader ack
+//     noc_semaphore_set_remote(ack_noc_local, 0)   NOC-coherent reset
+//
+//   Reader start-of-step N+1:
+//     noc_semaphore_wait(rdy_flag, 1)              wait for writer signal
+//     noc_semaphore_set_remote(rdy_noc_local, 0)   NOC-coherent reset
+//     < push chunks >
+//     noc_semaphore_set_remote(ack_noc_addr, 1)    ack writer
+// ─────────────────────────────────────────────────────────────────────────────
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -36,21 +67,37 @@ void kernel_main() {
     const uint32_t row_bytes       = n * sizeof(float);
     const uint32_t sram_buf_i_addr = sram_buf_r_addr + row_bytes;
 
-    // rdy_flag: we (writer) set this to signal reader that SRAM is ready
+    // rdy_flag @ sync_flag_addr+0 : writer → reader  ("SRAM data committed")
     const uint32_t rdy_flag_addr = sync_flag_addr;
     volatile tt_l1_ptr uint32_t* rdy_flag =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(rdy_flag_addr);
-    const uint64_t rdy_noc_addr = get_noc_addr(rdy_flag_addr);
 
-    // ack_flag: reader sets this to signal us that it has seen the data
+    // ack_flag @ sync_flag_addr+4 : reader → writer  ("reader done, moving on")
     const uint32_t ack_flag_addr = sync_flag_addr + sizeof(uint32_t);
     volatile tt_l1_ptr uint32_t* ack_flag =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ack_flag_addr);
+
+    // NOC addresses for this core's own L1 semaphore words.
+    // Using get_noc_addr() (single-arg) gives the local Tensix NOC XY + offset.
+    // All writes go through the NOC router → fully coherent with noc_semaphore_wait.
+    const uint64_t rdy_noc_local = get_noc_addr(rdy_flag_addr);
+    const uint64_t ack_noc_local = get_noc_addr(ack_flag_addr);
+
+    // NOC address of rdy_flag as seen by the reader (same Tensix core → same addr).
+    const uint64_t rdy_noc_addr = rdy_noc_local;
 
     volatile tt_l1_ptr float* sram_r =
         reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_r_addr);
     volatile tt_l1_ptr float* sram_i =
         reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_i_addr);
+
+    // ── Initialise both semaphore words to 0 via NOC ──────────────────────
+    // Must use set_remote (NOC path) so the init is coherent with every
+    // subsequent noc_semaphore_wait / noc_semaphore_set_remote on these words.
+    noc_semaphore_set_remote(rdy_noc_local, 0);
+    noc_semaphore_set_remote(ack_noc_local, 0);
+    // Barrier ensures the two zeroing writes have landed before we proceed.
+    noc_async_write_barrier();
 
     for (uint32_t step = 0; step < num_steps; ++step) {
         const uint32_t half_m   = 1u << step;
@@ -60,8 +107,8 @@ void kernel_main() {
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
             const uint32_t pair_base = chunk * chunk_size;
 
-            // Wait for compute to push outputs in order: out0_r, out0_i, out1_r, out1_i
-            // This order matches the compute kernel push order — no CB-fill deadlock.
+            // Wait for compute outputs in push order: out0_r, out0_i, out1_r, out1_i.
+            // This matches compute.cpp push order → no CB-fill deadlock.
             cb_wait_front(cb_out0_r, 1);
             cb_wait_front(cb_out0_i, 1);
             cb_wait_front(cb_out1_r, 1);
@@ -76,7 +123,7 @@ void kernel_main() {
             const volatile tt_l1_ptr float* out1_i =
                 reinterpret_cast<const volatile tt_l1_ptr float*>(get_read_ptr(cb_out1_i));
 
-            // Scatter butterfly results back to natural (original) order in SRAM
+            // Scatter butterfly results back to natural order in SRAM.
             for (uint32_t p = 0; p < chunk_size; ++p) {
                 const uint32_t global_p = pair_base + p;
                 const uint32_t group    = global_p / half_m;
@@ -97,23 +144,25 @@ void kernel_main() {
         }
 
         if (is_last_step) {
-            // DMA final results from SRAM to DRAM
+            // DMA final SRAM results → DRAM output buffers.
             const uint64_t noc_r = get_noc_addr(dram_output_r_addr);
             const uint64_t noc_i = get_noc_addr(dram_output_i_addr);
             noc_async_write(sram_buf_r_addr, noc_r, row_bytes);
             noc_async_write(sram_buf_i_addr, noc_i, row_bytes);
             noc_async_write_barrier();
         } else {
-            // Signal reader that all SRAM writes for this step are done.
-            // noc_semaphore_set_remote goes through the NOC router so it is
-            // visible to RISCV_0 (reader) — unlike a plain scalar L1 store.
+            // All SRAM scatter writes are done.  Signal the reader that SRAM
+            // data for step N is committed and it may read pairs for step N+1.
             noc_semaphore_set_remote(rdy_noc_addr, 1);
 
-            // Wait for reader to acknowledge it has seen the signal and started
-            // pushing input CBs for the next step, so we know ack_flag will be
-            // reset before we check it again next iteration.
+            // Wait for reader to acknowledge that it has started consuming the
+            // SRAM data (i.e. has begun pushing input CBs for step N+1).
             noc_semaphore_wait(ack_flag, 1);
-            noc_semaphore_set(ack_flag, 0);
+
+            // Reset ack_flag to 0 via NOC so the reset is coherent with the
+            // reader's next noc_semaphore_set_remote(ack_noc_addr, 1).
+            noc_semaphore_set_remote(ack_noc_local, 0);
+            noc_async_write_barrier();  // ensure reset lands before next iteration
         }
     }
 }
