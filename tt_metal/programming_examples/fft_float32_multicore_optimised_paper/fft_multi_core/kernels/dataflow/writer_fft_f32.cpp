@@ -92,6 +92,11 @@ void kernel_main() {
         }
 
         if (is_last_step) {
+            // DEBUG SENTINEL:
+            // Force very obvious output values before final DRAM write.
+            sram_r[0] = 999.0f;
+            sram_i[0] = -777.0f;
+
             const uint64_t noc_r = get_noc_addr(dram_output_r_addr);
             const uint64_t noc_i = get_noc_addr(dram_output_i_addr);
             noc_async_write(sram_buf_r_addr, noc_r, row_bytes);

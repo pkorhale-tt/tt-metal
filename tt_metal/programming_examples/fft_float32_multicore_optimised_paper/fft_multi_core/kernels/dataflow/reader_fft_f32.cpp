@@ -8,9 +8,9 @@ inline uint32_t linearToNfacesIndex(uint32_t linearIdx) {
     const uint32_t row = linearIdx / 32;
     const uint32_t col = linearIdx % 32;
 
-    const uint32_t faceRow = row / 16;   // 0 or 1
-    const uint32_t faceCol = col / 16;   // 0 or 1
-    const uint32_t face = faceRow * 2 + faceCol;  // 0..3
+    const uint32_t faceRow = row / 16;
+    const uint32_t faceCol = col / 16;
+    const uint32_t face = faceRow * 2 + faceCol;
 
     const uint32_t inFaceRow = row % 16;
     const uint32_t inFaceCol = col % 16;
@@ -66,7 +66,6 @@ void kernel_main() {
             noc_async_read(noc_i, sram_buf_i_addr, row_bytes);
             noc_async_read_barrier();
 
-            // Keep your existing bit-reverse-once scheme.
             volatile tt_l1_ptr float* sr =
                 reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_r_addr);
             volatile tt_l1_ptr float* si =
@@ -92,7 +91,6 @@ void kernel_main() {
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
             const uint32_t pair_base = chunk * chunk_size;
 
-            // -- data0 and data1 real --
             cb_reserve_back(cb_data0_r, 1);
             cb_reserve_back(cb_data1_r, 1);
 
@@ -118,10 +116,15 @@ void kernel_main() {
                 writeLogicalValueToTile(dst1_r, p, 0.0f);
             }
 
+            // DEBUG SENTINEL:
+            // Force logical position 0 in cb_data0_r to a very obvious value.
+            if (step == 0u && chunk == 0u) {
+                writeLogicalValueToTile(dst0_r, 0, 1234.0f);
+            }
+
             cb_push_back(cb_data0_r, 1);
             cb_push_back(cb_data1_r, 1);
 
-            // -- data0 and data1 imaginary --
             cb_reserve_back(cb_data0_i, 1);
             cb_reserve_back(cb_data1_i, 1);
 
@@ -150,7 +153,6 @@ void kernel_main() {
             cb_push_back(cb_data0_i, 1);
             cb_push_back(cb_data1_i, 1);
 
-            // -- twiddle factors --
             cb_reserve_back(cb_twiddle_r, 1);
             cb_reserve_back(cb_twiddle_i, 1);
 
