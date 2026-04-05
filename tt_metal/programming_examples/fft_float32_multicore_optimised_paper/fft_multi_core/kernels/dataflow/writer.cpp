@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
-#error "WRITER DEBUG ACTIVE"
+
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 
@@ -91,9 +91,7 @@ void kernel_main() {
             cb_pop_front(cb_out1_i, 1);
         }
 
-        if (is_last_step) {
-            // DEBUG SENTINEL:
-            // Force very obvious output values before final DRAM write.
+      if (is_last_step) {
             sram_r[0] = 999.0f;
             sram_i[0] = -777.0f;
 
