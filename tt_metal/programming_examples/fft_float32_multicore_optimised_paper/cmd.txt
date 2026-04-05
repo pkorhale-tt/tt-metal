@@ -1,3 +1,7 @@
-cmake --build build --target metal_example_fft_float32_multi_core_optimised_paper -j
+ninja -C /proj_sw/user_dev/pkorhale/fft_metal_clean/build \
+  programming_examples/fft_float32_multicore_optimised_paper/metal_example_fft_float32_multi_core_optimised_paper
 
-ARCH_NAME=wormhole_b0 ./build/programming_examples/fft_float32_multicore_optimised_paper/metal_example_fft_float32_multi_core_optimised_paper 0 tt_metal/programming_examples/fft_float32_multicore_optimised_paper/fft_multi_core/sample_input.txt
+rm -rf /proj_sw/user_dev/pkorhale/fft_metal_clean/build/tt_metal/jit_build/wormhole_b0
+
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+  ./build/programming_examples/fft_float32_multicore_optimised_paper/metal_example_fft_float32_multi_core_optimised_paper
