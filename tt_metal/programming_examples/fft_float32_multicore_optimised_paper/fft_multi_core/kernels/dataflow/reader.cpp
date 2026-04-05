@@ -1,29 +1,15 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
 
-// ── Semaphore fix summary ──────────────────────────────────────────────────
+// ── Correct semaphore protocol (see writer.cpp for full explanation) ───────────
 //
-// See writer.cpp for the full explanation.  Reader-side changes:
+// Reader uses noc_semaphore_set() (local L1 store) for BOTH reset and ack,
+// matching the writer's local-store signals.  noc_semaphore_set_remote is NOT
+// used — that would do an AT_INC which cannot be used to reset to 0.
 //
-//   • Reader NO LONGER initialises the semaphore words.  The writer owns
-//     initialisation (via NOC-coherent noc_semaphore_set_remote to 0) so
-//     both kernels see a consistent zero from the start, regardless of which
-//     baby core begins executing first.
-//
-//   • rdy_flag reset after noc_semaphore_wait now uses
-//     noc_semaphore_set_remote(rdy_noc_local, 0) instead of the local
-//     noc_semaphore_set(), keeping every access to the flag words in the
-//     NOC domain and eliminating the coherence gap.
-//
-//   • noc_async_write_barrier() added after the reset so the zeroing write
-//     has landed in the NOC fabric before the reader begins pushing CBs,
-//     ensuring the writer's next noc_semaphore_set_remote(rdy_noc_addr, 1)
-//     cannot race with the reset.
-//
-// Handshake (unchanged in intent):
-//   Reader step 0   : load DRAM → SRAM, bit-reverse, push chunks.
-//                     No ack sent (writer is free-running for step 0).
-//   Reader step N>0 : wait rdy, NOC-reset rdy, push chunks, send ack.
+// Reader does NOT initialise either flag. Writer owns initialisation before
+// its step loop to avoid the race where reader's zero-write races with the
+// writer's step-0 setup.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <cstdint>
@@ -52,21 +38,16 @@ void kernel_main() {
     const uint32_t sram_tw_r_addr = sram_buf_i_addr + row_bytes;
     const uint32_t sram_tw_i_addr = sram_tw_r_addr + num_steps * (n / 2u) * sizeof(float);
 
-    // rdy_flag @ sync_flag_addr+0 : writer → reader
-    const uint32_t rdy_flag_addr = sync_flag_addr;
+    // rdy_flag @ sync_flag_addr+0 : writer signals, reader polls
     volatile tt_l1_ptr uint32_t* rdy_flag =
-        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(rdy_flag_addr);
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_flag_addr);
 
-    // ack_flag @ sync_flag_addr+4 : reader → writer
+    // ack_flag @ sync_flag_addr+4 : reader signals, writer polls
     const uint32_t ack_flag_addr = sync_flag_addr + sizeof(uint32_t);
+    volatile tt_l1_ptr uint32_t* ack_flag =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ack_flag_addr);
 
-    // Local NOC addresses (same Tensix core → same XY as writer).
-    const uint64_t rdy_noc_local = get_noc_addr(rdy_flag_addr);
-    const uint64_t ack_noc_addr  = get_noc_addr(ack_flag_addr);   // target for ack signal
-
-    // NOTE: We do NOT initialise the flags here.  The writer initialises both
-    // to 0 via NOC-coherent set_remote before its step loop starts.  Relying
-    // on a single owner for init avoids a race between the two baby cores.
+    // No init here — writer initialises both flags before its step loop.
 
     for (uint32_t step = 0; step < num_steps; ++step) {
         const uint32_t half_m         = 1u << step;
@@ -74,7 +55,7 @@ void kernel_main() {
         const uint32_t tw_step_offset = step * (n / 2u);
 
         if (step == 0u) {
-            // ── Step 0: load row from DRAM and bit-reverse permute ──────────
+            // ── Step 0: load from DRAM and bit-reverse permute in SRAM ──────
             const uint64_t noc_r = get_noc_addr(dram_input_r_addr);
             const uint64_t noc_i = get_noc_addr(dram_input_i_addr);
             noc_async_read(noc_r, sram_buf_r_addr, row_bytes);
@@ -99,21 +80,16 @@ void kernel_main() {
                 }
             }
         } else {
-            // ── Steps 1+: wait for writer to confirm SRAM writes are done ───
-            // noc_semaphore_wait polls *rdy_flag until it equals 1.
+            // ── Steps 1+: wait for writer's rdy signal ───────────────────────
             noc_semaphore_wait(rdy_flag, 1);
-
-            // Reset rdy_flag to 0 via NOC so the reset is coherent with the
-            // writer's next noc_semaphore_set_remote(rdy_noc_addr, 1).
-            noc_semaphore_set_remote(rdy_noc_local, 0);
-            noc_async_write_barrier();  // ensure zero has landed before reading SRAM
+            noc_semaphore_set(rdy_flag, 0);   // reset — local store, safe same-Tensix
         }
 
-        // ── Push butterfly pairs and twiddles into CBs ──────────────────────
+        // ── Push butterfly pairs and twiddles into CBs ───────────────────────
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
             const uint32_t pair_base = chunk * chunk_size;
 
-            // ---- real data pair ----
+            // real data pair
             cb_reserve_back(cb_data0_r, 1);
             cb_reserve_back(cb_data1_r, 1);
 
@@ -137,7 +113,7 @@ void kernel_main() {
             cb_push_back(cb_data0_r, 1);
             cb_push_back(cb_data1_r, 1);
 
-            // ---- imaginary data pair ----
+            // imaginary data pair
             cb_reserve_back(cb_data0_i, 1);
             cb_reserve_back(cb_data1_i, 1);
 
@@ -161,7 +137,7 @@ void kernel_main() {
             cb_push_back(cb_data0_i, 1);
             cb_push_back(cb_data1_i, 1);
 
-            // ---- twiddle factors ----
+            // twiddle factors
             cb_reserve_back(cb_twiddle_r, 1);
             cb_reserve_back(cb_twiddle_i, 1);
 
@@ -181,14 +157,13 @@ void kernel_main() {
 
             cb_push_back(cb_twiddle_r, 1);
             cb_push_back(cb_twiddle_i, 1);
-        }  // end chunk loop
+        }
 
-        // After all chunks for this step are pushed, ack the writer so it can
-        // proceed to drain output CBs and scatter results to SRAM for step N+1.
-        // Step 0 needs no ack: the writer is free-running (it has not called
-        // noc_semaphore_wait for step 0).
+        // Ack writer after all chunks are pushed, so it can proceed to drain
+        // output CBs and scatter SRAM for the next step.
+        // Step 0 needs no ack: the writer is not waiting for step 0.
         if (step > 0u) {
-            noc_semaphore_set_remote(ack_noc_addr, 1);
+            noc_semaphore_set(ack_flag, 1);   // local store, safe same-Tensix
         }
     }
 }
