@@ -1,29 +1,5 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
-//
-// Writer kernel for FFT.
-//
-// IMPORTANT — why noc_async_write (not noc_async_write_tile):
-//   noc_async_write_tile applies the hardware tile-format swizzle when
-//   copying L1 → DRAM.  The host reads the output buffer with
-//   EnqueueReadMeshBuffer into a flat vector<uint32_t>, expecting a plain
-//   linear float layout.  Using noc_async_write_tile would swizzle the
-//   values before they reach DRAM, so the host would read them in the wrong
-//   order.  noc_async_write is a plain byte copy and is consistent with how
-//   twiddle_init_f32 loads twiddle data.
-//
-// Because the reader bit-reversed the input before stage 0, the DIT butterfly
-// loop produces naturally-ordered output — no permutation needed here.
-//
-// Runtime args:
-//   0 : dram_output_r_addr
-//   1 : dram_output_i_addr
-//   2 : n
-//   3 : num_steps
-//   4 : num_chunks
-//   5 : chunk_size
-//   6 : sram_buf_r_addr
-//   7 : sync_flag_addr  – same L1 word the reader spins on.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -96,15 +72,12 @@ void kernel_main() {
         }
 
         if (is_last_step) {
-            // Input was bit-reversed before stage 0 → DIT output is in
-            // natural order.  Write as plain bytes — no tile-format swizzle.
             const uint64_t noc_r = get_noc_addr(dram_output_r_addr);
             const uint64_t noc_i = get_noc_addr(dram_output_i_addr);
             noc_async_write(sram_buf_r_addr, noc_r, row_bytes);
             noc_async_write(sram_buf_i_addr, noc_i, row_bytes);
             noc_async_write_barrier();
         } else {
-            // Signal reader that SRAM is ready for the next stage.
             *sync_flag = 1u;
         }
     }
