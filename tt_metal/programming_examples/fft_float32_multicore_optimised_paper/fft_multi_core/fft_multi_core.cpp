@@ -365,7 +365,7 @@ int main(int argc, char** argv) {
         KernelHandle readerKernel = CreateKernel(
             fftProg,
             OVERRIDE_KERNEL_PREFIX
-            "fft_float32_multicore_optimised_paper/fft_multi_core/kernels/dataflow/reader_fft_f32_mc.cpp",
+            "fft_float32_multicore_optimised_paper/fft_multi_core/kernels/dataflow/reader.cpp",
             coreRange,
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0,
@@ -375,7 +375,7 @@ int main(int argc, char** argv) {
         KernelHandle writerKernel = CreateKernel(
             fftProg,
             OVERRIDE_KERNEL_PREFIX
-            "fft_float32_multicore_optimised_paper/fft_multi_core/kernels/dataflow/writer_fft_f32_mc.cpp",
+            "fft_float32_multicore_optimised_paper/fft_multi_core/kernels/dataflow/writer.cpp",
             coreRange,
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_1,
@@ -385,7 +385,7 @@ int main(int argc, char** argv) {
         KernelHandle computeKernel = CreateKernel(
             fftProg,
             OVERRIDE_KERNEL_PREFIX
-            "fft_float32_multicore_optimised_paper/fft_multi_core/kernels/compute/fft_compute_f32.cpp",
+            "fft_float32_multicore_optimised_paper/fft_multi_core/kernels/compute/compute.cpp",
             coreRange,
             ComputeConfig{
                 .math_fidelity    = MathFidelity::HiFi4,
