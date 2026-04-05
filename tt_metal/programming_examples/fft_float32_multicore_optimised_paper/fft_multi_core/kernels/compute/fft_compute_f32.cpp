@@ -5,8 +5,6 @@
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_binary_sfpu.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/eltwise_unary/negative.h"
 
 inline void maths_sfpu_mul(
     uint32_t cb_in_1,
