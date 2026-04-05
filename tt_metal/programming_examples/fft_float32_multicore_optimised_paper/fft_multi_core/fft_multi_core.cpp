@@ -363,7 +363,7 @@ int main(int argc, char** argv) {
             fftWorkload.add_program(deviceRange, std::move(fftProg));
             distributed::EnqueueMeshWorkload(cq, fftWorkload, false);
             distributed::Finish(cq);
-            std::cout << "FFT kernel execution finished.\n";
+            std::cout << "FFT kernel execution finished....\n";
         }
 
         // ── Read back results ────────────────────────────────────────────────
