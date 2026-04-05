@@ -27,19 +27,23 @@ constexpr float PI = 3.14159265358979323846f;
 constexpr uint32_t TILE_H = 32;
 constexpr uint32_t TILE_W = 32;
 constexpr uint32_t TILE_ELEMS = TILE_H * TILE_W;
-// constexpr uint32_t TILE_BYTES = TILE_ELEMS * sizeof(float);
 
 constexpr uint32_t CB_DATA0_R = 0;
 constexpr uint32_t CB_DATA0_I = 1;
 constexpr uint32_t CB_DATA1_R = 2;
 constexpr uint32_t CB_DATA1_I = 3;
-constexpr uint32_t CB_TW_R = 4;
-constexpr uint32_t CB_TW_I = 5;
+constexpr uint32_t CB_TW_R    = 4;
+constexpr uint32_t CB_TW_I    = 5;
 
-constexpr uint32_t CB_OUT0_R = 16;
-constexpr uint32_t CB_OUT0_I = 17;
-constexpr uint32_t CB_OUT1_R = 18;
-constexpr uint32_t CB_OUT1_I = 19;
+constexpr uint32_t CB_OUT0_R  = 16;
+constexpr uint32_t CB_OUT0_I  = 17;
+constexpr uint32_t CB_OUT1_R  = 18;
+constexpr uint32_t CB_OUT1_I  = 19;
+
+constexpr uint32_t CB_INT0    = 20;
+constexpr uint32_t CB_INT1    = 21;
+constexpr uint32_t CB_F0      = 22;
+constexpr uint32_t CB_F1      = 23;
 
 constexpr uint32_t SRAM_DATA_BASE = 0x40000;
 constexpr uint32_t SYNC_FLAG_ADDR = SRAM_DATA_BASE - sizeof(uint32_t);
@@ -69,8 +73,7 @@ inline float u32ToFloat(uint32_t u) {
 }
 
 // Create a DRAM buffer whose page_size equals the total buffer size.
-// This ensures EnqueueWriteMeshBuffer / EnqueueReadMeshBuffer treat the
-// data as a plain byte blob with no tile-format conversion.
+// This keeps DRAM transfers raw/linear for the dataflow kernels.
 std::shared_ptr<distributed::MeshBuffer> createRawDramBuffer(
     const std::shared_ptr<distributed::MeshDevice>& meshDevice,
     uint32_t sizeBytes) {
@@ -201,8 +204,8 @@ int main(int argc, char** argv) {
         const uint32_t chunkSize = halfN / numChunks;
         const uint32_t rowsThisLaunch = std::min(batchSize, numCores);
 
-        if (chunkSize == 0) {
-            throw std::runtime_error("chunkSize == 0");
+        if (chunkSize * 2 > TILE_ELEMS) {
+            throw std::runtime_error("chunkSize*2 > TILE_ELEMS: reduce nRow");
         }
 
         const uint32_t rowBytes = nRow * sizeof(float);
@@ -211,7 +214,9 @@ int main(int argc, char** argv) {
 
         const uint32_t sramDataBytes = rowBytes;
         const uint32_t sramTwBytes = twBufBytes;
-        const uint32_t sramTotal = 2 * sramDataBytes + 2 * sramTwBytes + sizeof(uint32_t);
+        const uint32_t sramScratch = 2 * rowBytes;
+        const uint32_t sramTotal =
+            2 * sramDataBytes + 2 * sramTwBytes + sramScratch + sizeof(uint32_t);
 
         std::cout << "[fft_paper_host]\n"
                   << "  nRow           = " << nRow << "\n"
@@ -228,8 +233,8 @@ int main(int argc, char** argv) {
             throw std::runtime_error("SRAM layout exceeds 1.3MB");
         }
 
-        auto inputRealBuf = createRawDramBuffer(meshDevice, rowBufBytes);
-        auto inputImagBuf = createRawDramBuffer(meshDevice, rowBufBytes);
+        auto inputRealBuf  = createRawDramBuffer(meshDevice, rowBufBytes);
+        auto inputImagBuf  = createRawDramBuffer(meshDevice, rowBufBytes);
         auto outputRealBuf = createRawDramBuffer(meshDevice, rowBufBytes);
         auto outputImagBuf = createRawDramBuffer(meshDevice, rowBufBytes);
 
@@ -311,7 +316,7 @@ int main(int argc, char** argv) {
             Program fftProg = CreateProgram();
             CoreRange coreRange({0, 0}, {rowsThisLaunch - 1, 0});
 
-            const uint32_t cbPageBytes = chunkSize * sizeof(float);
+            const uint32_t cbPageBytes = TILE_ELEMS * sizeof(float);
 
             auto makeCb = [&](uint32_t cbId, uint32_t depthPages) {
                 CircularBufferConfig cfg =
@@ -326,12 +331,16 @@ int main(int argc, char** argv) {
             makeCb(CB_DATA0_I, 2);
             makeCb(CB_DATA1_R, 2);
             makeCb(CB_DATA1_I, 2);
-            makeCb(CB_TW_R, 2);
-            makeCb(CB_TW_I, 2);
-            makeCb(CB_OUT0_R, 2);
-            makeCb(CB_OUT0_I, 2);
-            makeCb(CB_OUT1_R, 2);
-            makeCb(CB_OUT1_I, 2);
+            makeCb(CB_TW_R,    2);
+            makeCb(CB_TW_I,    2);
+            makeCb(CB_OUT0_R,  2);
+            makeCb(CB_OUT0_I,  2);
+            makeCb(CB_OUT1_R,  2);
+            makeCb(CB_OUT1_I,  2);
+            makeCb(CB_INT0,    2);
+            makeCb(CB_INT1,    2);
+            makeCb(CB_F0,      2);
+            makeCb(CB_F1,      2);
 
             KernelHandle readerKernel = CreateKernel(
                 fftProg,
@@ -385,8 +394,7 @@ int main(int argc, char** argv) {
                     cc,
                     {
                         numStages,
-                        numChunks,
-                        chunkSize
+                        numChunks
                     });
 
                 SetRuntimeArgs(
