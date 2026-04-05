@@ -7,6 +7,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <string>
 #include <sys/time.h>
 #include <time.h>
 #include <tt-metalium/host_api.hpp>
@@ -29,12 +30,7 @@ enum FFTDirection {
 };
 
 struct TTExecution {
-    Program*      program;       // kept alive for SetRuntimeArgs
-    MeshWorkload* workload;      // owns the moved program for dispatch
-    CoreCoord*    core;
-    KernelHandle* read_kernel;
-    KernelHandle* write_kernel;
-    KernelHandle* compute_kernel;
+    CoreCoord*  core;
     std::shared_ptr<MeshBuffer> in_data_r_dram_buffer;
     std::shared_ptr<MeshBuffer> in_data_i_dram_buffer;
     std::shared_ptr<MeshBuffer> twiddle_dram_buffer;
@@ -42,17 +38,91 @@ struct TTExecution {
     std::shared_ptr<MeshBuffer> result_data_i_dram_buffer;
     std::shared_ptr<tt::tt_metal::Buffer> step_results_r_buffer;
     std::shared_ptr<tt::tt_metal::Buffer> step_results_i_buffer;
+    std::shared_ptr<MeshDevice> mesh;
+    uint32_t cb_tile_size;
+    uint32_t cb_total_size;
+    std::string kernel_prefix;
 };
 
 // Forward declarations
+CBHandle createCB(Program&, CoreCoord&, uint32_t, uint32_t, uint32_t);
+float* computeTwiddleFactors(int);
+static double getElapsedTime(struct timeval);
 void fft(MeshCommandQueue&, TTExecution*, float*, float*, float*, float*, float*, uint32_t, enum FFTDirection);
 void compare(float*, float*, float*, float*, int);
 void moveorigin(float*, float*, int);
 void descale(float*, float*, int);
 int  checkIfPowerOfTwo(int);
-CBHandle createCB(Program&, CoreCoord&, uint32_t, uint32_t, uint32_t);
-float* computeTwiddleFactors(int);
-static double getElapsedTime(struct timeval);
+
+// ---------------------------------------------------------------------------
+// Builds a fresh Program with all CBs and kernels each time.
+// This is necessary because add_program() moves the program,
+// so we must rebuild for each dispatch.
+// ---------------------------------------------------------------------------
+Program buildProgram(CoreCoord& core,
+                     uint32_t cb_tile_size,
+                     uint32_t cb_total_size,
+                     const std::string& prefix,
+                     KernelHandle& reader_out,
+                     KernelHandle& writer_out,
+                     KernelHandle& compute_out)
+{
+    Program program = CreateProgram();
+
+    // Input CBs
+    createCB(program, core, tt::CBIndex::c_0,  1, cb_tile_size);   // data0 real in
+    createCB(program, core, tt::CBIndex::c_1,  1, cb_tile_size);   // data0 imag in
+    createCB(program, core, tt::CBIndex::c_2,  1, cb_tile_size);   // data1 real in
+    createCB(program, core, tt::CBIndex::c_3,  1, cb_tile_size);   // data1 imag in
+    createCB(program, core, tt::CBIndex::c_4,  1, cb_tile_size);   // twiddle real
+    createCB(program, core, tt::CBIndex::c_5,  1, cb_tile_size);   // twiddle imag
+    createCB(program, core, tt::CBIndex::c_6,  1, cb_tile_size);   // f0
+    createCB(program, core, tt::CBIndex::c_7,  1, cb_tile_size);   // f1
+    // Output CBs to writer
+    createCB(program, core, tt::CBIndex::c_8,  1, cb_total_size);  // out real to writer
+    createCB(program, core, tt::CBIndex::c_9,  1, cb_total_size);  // out imag to writer
+    // Output CBs from compute
+    createCB(program, core, tt::CBIndex::c_16, 1, cb_tile_size);   // data0 real out
+    createCB(program, core, tt::CBIndex::c_17, 1, cb_tile_size);   // data0 imag out
+    createCB(program, core, tt::CBIndex::c_18, 1, cb_tile_size);   // data1 real out
+    createCB(program, core, tt::CBIndex::c_19, 1, cb_tile_size);   // data1 imag out
+    // DDR input CBs
+    createCB(program, core, tt::CBIndex::c_20, 1, cb_total_size);  // DDR real in
+    createCB(program, core, tt::CBIndex::c_21, 1, cb_total_size);  // DDR imag in
+    createCB(program, core, tt::CBIndex::c_22, 1, cb_total_size);  // DDR twiddle in
+    // Intermediate CBs
+    createCB(program, core, tt::CBIndex::c_23, 1, cb_tile_size);   // intermediate0
+    createCB(program, core, tt::CBIndex::c_24, 1, cb_tile_size);   // intermediate1
+    createCB(program, core, tt::CBIndex::c_25, 1, cb_tile_size);   // intermediate2
+
+    reader_out = CreateKernel(
+        program,
+        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/dataflow/reader.cpp",
+        core,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc       = NOC::RISCV_1_default});
+
+    writer_out = CreateKernel(
+        program,
+        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/dataflow/writer.cpp",
+        core,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc       = NOC::RISCV_0_default});
+
+    compute_out = CreateKernel(
+        program,
+        prefix + "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/compute/compute.cpp",
+        core,
+        ComputeConfig{
+            .math_fidelity    = MathFidelity::HiFi4,
+            .fp32_dest_acc_en = false,
+            .math_approx_mode = false,
+            .compile_args     = {}});
+
+    return program;
+}
 
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
@@ -70,12 +140,13 @@ int main(int argc, char** argv) {
     // --- Device setup ---
     auto mesh = MeshDevice::create_unit_mesh(0);
     MeshCommandQueue& cq = mesh->mesh_command_queue();
-    IDevice* device = mesh->get_devices()[0];   // for L1 buffer allocation only
+    IDevice* device = mesh->get_devices()[0];  // for L1 buffer allocation only
 
-    Program   program = CreateProgram();
-    CoreCoord core    = {0, 0};
+    CoreCoord core = {0, 0};
 
     uint32_t problem_mem_size = 4 * domain_size;
+    uint32_t cb_tile_size     = 2048 * 4;
+    uint32_t cb_total_size    = problem_mem_size > cb_tile_size ? problem_mem_size : cb_tile_size;
 
     // --- DRAM MeshBuffers ---
     DeviceLocalBufferConfig dram_local{
@@ -90,32 +161,7 @@ int main(int argc, char** argv) {
     auto result_data_i_dram_buffer = MeshBuffer::create(dram_replicated, dram_local, mesh.get());
     auto twiddle_dram_buffer       = MeshBuffer::create(dram_replicated, dram_local, mesh.get());
 
-    // --- CBs ---
-    uint32_t cb_tile_size  = 2048 * 4;
-    uint32_t cb_total_size = problem_mem_size > cb_tile_size ? problem_mem_size : cb_tile_size;
-
-    createCB(program, core, tt::CBIndex::c_0,  1, cb_tile_size);   // data0 real in
-    createCB(program, core, tt::CBIndex::c_1,  1, cb_tile_size);   // data0 imag in
-    createCB(program, core, tt::CBIndex::c_2,  1, cb_tile_size);   // data1 real in
-    createCB(program, core, tt::CBIndex::c_3,  1, cb_tile_size);   // data1 imag in
-    createCB(program, core, tt::CBIndex::c_4,  1, cb_tile_size);   // twiddle real
-    createCB(program, core, tt::CBIndex::c_5,  1, cb_tile_size);   // twiddle imag
-    createCB(program, core, tt::CBIndex::c_6,  1, cb_tile_size);   // f0
-    createCB(program, core, tt::CBIndex::c_7,  1, cb_tile_size);   // f1
-    createCB(program, core, tt::CBIndex::c_8,  1, cb_total_size);  // out real to writer
-    createCB(program, core, tt::CBIndex::c_9,  1, cb_total_size);  // out imag to writer
-    createCB(program, core, tt::CBIndex::c_16, 1, cb_tile_size);   // data0 real out
-    createCB(program, core, tt::CBIndex::c_17, 1, cb_tile_size);   // data0 imag out
-    createCB(program, core, tt::CBIndex::c_18, 1, cb_tile_size);   // data1 real out
-    createCB(program, core, tt::CBIndex::c_19, 1, cb_tile_size);   // data1 imag out
-    createCB(program, core, tt::CBIndex::c_20, 1, cb_total_size);  // DDR real in
-    createCB(program, core, tt::CBIndex::c_21, 1, cb_total_size);  // DDR imag in
-    createCB(program, core, tt::CBIndex::c_22, 1, cb_total_size);  // DDR twiddle in
-    createCB(program, core, tt::CBIndex::c_23, 1, cb_tile_size);   // intermediate0
-    createCB(program, core, tt::CBIndex::c_24, 1, cb_tile_size);   // intermediate1
-    createCB(program, core, tt::CBIndex::c_25, 1, cb_tile_size);   // intermediate2
-
-    // --- L1 scratch buffers (plain Buffer on the single device) ---
+    // --- L1 scratch buffers ---
     tt::tt_metal::InterleavedBufferConfig l1_config{
         .device      = device,
         .size        = problem_mem_size,
@@ -125,42 +171,20 @@ int main(int argc, char** argv) {
     auto step_results_r_buffer = tt::tt_metal::CreateBuffer(l1_config);
     auto step_results_i_buffer = tt::tt_metal::CreateBuffer(l1_config);
 
-    // --- Kernels ---
-    KernelHandle reader_kernel_id = CreateKernel(
-        program,
-        std::string(OVERRIDE_KERNEL_PREFIX) +
-            "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/dataflow/reader_fft_f32.cpp",
-        core,
-        DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_1,
-            .noc       = NOC::RISCV_1_default});
-
-    KernelHandle writer_kernel_id = CreateKernel(
-        program,
-        std::string(OVERRIDE_KERNEL_PREFIX) +
-            "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/dataflow/writer_fft_f32.cpp",
-        core,
-        DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_0,
-            .noc       = NOC::RISCV_0_default});
-
-    KernelHandle compute_kernel_id = CreateKernel(
-        program,
-        std::string(OVERRIDE_KERNEL_PREFIX) +
-            "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/compute/fft_compute_f32.cpp",
-        core,
-        ComputeConfig{
-            .math_fidelity    = MathFidelity::HiFi4,
-            .fp32_dest_acc_en = false,
-            .math_approx_mode = false,
-            .compile_args     = {}});
-
-    // --- Build MeshWorkload once (program is moved into it) ---
-    // Keep a raw reference before moving so SetRuntimeArgs still works
-    Program& program_ref = program;
-    MeshWorkload workload;
-    MeshCoordinateRange rng = MeshCoordinateRange(mesh->shape());
-    workload.add_program(rng, std::move(program));
+    TTExecution exec = {
+        .core                      = &core,
+        .in_data_r_dram_buffer     = in_data_r_dram_buffer,
+        .in_data_i_dram_buffer     = in_data_i_dram_buffer,
+        .twiddle_dram_buffer       = twiddle_dram_buffer,
+        .result_data_r_dram_buffer = result_data_r_dram_buffer,
+        .result_data_i_dram_buffer = result_data_i_dram_buffer,
+        .step_results_r_buffer     = step_results_r_buffer,
+        .step_results_i_buffer     = step_results_i_buffer,
+        .mesh                      = mesh,
+        .cb_tile_size              = cb_tile_size,
+        .cb_total_size             = cb_total_size,
+        .kernel_prefix             = std::string(OVERRIDE_KERNEL_PREFIX),
+    };
 
     // --- Input data ---
     float* golden_r = (float*)malloc(sizeof(float) * domain_size);
@@ -177,22 +201,6 @@ int main(int argc, char** argv) {
     float* data_i = (float*)malloc(sizeof(float) * domain_size);
     memcpy(data_r, golden_r, sizeof(float) * domain_size);
     memcpy(data_i, golden_i, sizeof(float) * domain_size);
-
-    TTExecution exec = {
-        .program                   = &program_ref,
-        .workload                  = &workload,
-        .core                      = &core,
-        .read_kernel               = &reader_kernel_id,
-        .write_kernel              = &writer_kernel_id,
-        .compute_kernel            = &compute_kernel_id,
-        .in_data_r_dram_buffer     = in_data_r_dram_buffer,
-        .in_data_i_dram_buffer     = in_data_i_dram_buffer,
-        .twiddle_dram_buffer       = twiddle_dram_buffer,
-        .result_data_r_dram_buffer = result_data_r_dram_buffer,
-        .result_data_i_dram_buffer = result_data_i_dram_buffer,
-        .step_results_r_buffer     = step_results_r_buffer,
-        .step_results_i_buffer     = step_results_i_buffer,
-    };
 
     fft(cq, &exec, data_r, data_i, twiddle_factors, data_r, data_i, domain_size, FFT_FORWARD);
     fft(cq, &exec, data_r, data_i, twiddle_factors, data_r, data_i, domain_size, FFT_BACKWARD);
@@ -217,57 +225,69 @@ void fft(MeshCommandQueue& cq, TTExecution* d,
 {
     uint32_t bank_id = 0;
 
-    const std::vector<uint32_t> read_args = {
+    // Rebuild program fresh each call — required because add_program() moves it
+    KernelHandle rk, wk, ck;
+    Program program = buildProgram(
+        *d->core,
+        d->cb_tile_size,
+        d->cb_total_size,
+        d->kernel_prefix,
+        rk, wk, ck);
+
+    SetRuntimeArgs(program, rk, *d->core, {
         d->in_data_r_dram_buffer->address(),
         d->in_data_i_dram_buffer->address(),
         d->twiddle_dram_buffer->address(),
         bank_id, bank_id, bank_id,
-        domain_size
-    };
-    const std::vector<uint32_t> write_args = {
+        domain_size});
+
+    SetRuntimeArgs(program, ck, *d->core, {
+        (uint32_t)direction,
+        domain_size,
+        d->step_results_r_buffer->address(),
+        d->step_results_i_buffer->address()});
+
+    SetRuntimeArgs(program, wk, *d->core, {
         d->result_data_r_dram_buffer->address(),
         d->result_data_i_dram_buffer->address(),
         bank_id, bank_id,
-        domain_size
-    };
+        domain_size});
 
-    SetRuntimeArgs(*d->program, *d->read_kernel,    *d->core, read_args);
-    SetRuntimeArgs(*d->program, *d->compute_kernel, *d->core,
-                   {(uint32_t)direction, domain_size,
-                    d->step_results_r_buffer->address(),
-                    d->step_results_i_buffer->address()});
-    SetRuntimeArgs(*d->program, *d->write_kernel, *d->core, write_args);
+    // Build workload — moves program in
+    MeshWorkload workload;
+    MeshCoordinateRange rng = MeshCoordinateRange(d->mesh->shape());
+    workload.add_program(rng, std::move(program));
 
-    // Wrap raw float* into std::vector<float> for the Mesh API
-    std::vector<float> vec_input_r(input_r,         input_r         + domain_size);
-    std::vector<float> vec_input_i(input_i,         input_i         + domain_size);
-    std::vector<float> vec_twiddle(twiddle_factors,  twiddle_factors + domain_size);
-    std::vector<float> vec_result_r(domain_size, 0.0f);
-    std::vector<float> vec_result_i(domain_size, 0.0f);
+    // Wrap raw pointers into vectors for Mesh API
+    std::vector<float> vec_r (input_r,        input_r        + domain_size);
+    std::vector<float> vec_i (input_i,        input_i        + domain_size);
+    std::vector<float> vec_tw(twiddle_factors, twiddle_factors + domain_size);
+    std::vector<float> out_r(domain_size, 0.0f);
+    std::vector<float> out_i(domain_size, 0.0f);
 
     struct timeval t0;
 
     gettimeofday(&t0, NULL);
-    EnqueueWriteMeshBuffer(cq, d->in_data_r_dram_buffer, vec_input_r, false);
-    EnqueueWriteMeshBuffer(cq, d->in_data_i_dram_buffer, vec_input_i, false);
-    EnqueueWriteMeshBuffer(cq, d->twiddle_dram_buffer,   vec_twiddle, false);
+    EnqueueWriteMeshBuffer(cq, d->in_data_r_dram_buffer, vec_r,  false);
+    EnqueueWriteMeshBuffer(cq, d->in_data_i_dram_buffer, vec_i,  false);
+    EnqueueWriteMeshBuffer(cq, d->twiddle_dram_buffer,   vec_tw, false);
     Finish(cq);
     double xfer_on = getElapsedTime(t0);
 
     gettimeofday(&t0, NULL);
-    EnqueueMeshWorkload(cq, *d->workload, false);
+    EnqueueMeshWorkload(cq, workload, false);
     Finish(cq);
     double exec_t = getElapsedTime(t0);
 
     gettimeofday(&t0, NULL);
-    EnqueueReadMeshBuffer(cq, vec_result_r, d->result_data_r_dram_buffer, false);
-    EnqueueReadMeshBuffer(cq, vec_result_i, d->result_data_i_dram_buffer, false);
+    EnqueueReadMeshBuffer(cq, out_r, d->result_data_r_dram_buffer, false);
+    EnqueueReadMeshBuffer(cq, out_i, d->result_data_i_dram_buffer, false);
     Finish(cq);
     double xfer_off = getElapsedTime(t0);
 
-    // Copy results back into the caller's float arrays
-    std::copy(vec_result_r.begin(), vec_result_r.end(), result_r);
-    std::copy(vec_result_i.begin(), vec_result_i.end(), result_i);
+    // Copy results back into caller's arrays
+    std::copy(out_r.begin(), out_r.end(), result_r);
+    std::copy(out_i.begin(), out_i.end(), result_i);
 
     printf("%s FFT size %d: total %.4f s  (xfer_on %.4f  exec %.4f  xfer_off %.4f)\n",
            direction == FFT_FORWARD ? "Forwards" : "Backwards",
