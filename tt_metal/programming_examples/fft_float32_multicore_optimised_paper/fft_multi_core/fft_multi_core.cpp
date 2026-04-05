@@ -8,6 +8,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <algorithm>
 
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include <tt-metalium/device.hpp>
@@ -26,7 +27,8 @@ constexpr float PI = 3.14159265358979323846f;
 
 constexpr uint32_t TILE_H = 32;
 constexpr uint32_t TILE_W = 32;
-constexpr uint32_t TILE_ELEMS = TILE_H * TILE_W;
+constexpr uint32_t TILE_ELEMS = TILE_H * TILE_W;   // 1024
+constexpr uint32_t TILE_BYTES = TILE_ELEMS * sizeof(float);
 
 constexpr uint32_t CB_DATA0_R = 0;
 constexpr uint32_t CB_DATA0_I = 1;
@@ -72,18 +74,21 @@ inline float u32ToFloat(uint32_t u) {
     return v;
 }
 
-// Create a DRAM buffer whose page_size equals the total buffer size.
-// This keeps DRAM transfers raw/linear for the dataflow kernels.
+// Raw DRAM buffer: one page = entire buffer.
+// This matches the current paper-Figure-3 path where reader/writer use
+// noc_async_read / noc_async_write on plain row-major float arrays in DRAM.
 std::shared_ptr<distributed::MeshBuffer> createRawDramBuffer(
     const std::shared_ptr<distributed::MeshDevice>& meshDevice,
-    uint32_t sizeBytes) {
+    uint32_t sizeBytes)
+{
     const uint32_t rounded = (sizeBytes + 3u) & ~3u;
 
     distributed::DeviceLocalBufferConfig localConfig{
-        .page_size = rounded,
-        .buffer_type = BufferType::DRAM
-    };
-    distributed::ReplicatedBufferConfig replicatedConfig{.size = rounded};
+        .page_size   = rounded,
+        .buffer_type = BufferType::DRAM};
+
+    distributed::ReplicatedBufferConfig replicatedConfig{
+        .size = rounded};
 
     return distributed::MeshBuffer::create(replicatedConfig, localConfig, meshDevice.get());
 }
@@ -93,7 +98,8 @@ void buildTwiddles(
     uint32_t numStages,
     uint32_t direction,
     std::vector<uint32_t>& twR,
-    std::vector<uint32_t>& twI) {
+    std::vector<uint32_t>& twI)
+{
     const uint32_t halfN = nRow / 2;
     const float sign = (direction == 1) ? 1.0f : -1.0f;
 
@@ -204,19 +210,18 @@ int main(int argc, char** argv) {
         const uint32_t chunkSize = halfN / numChunks;
         const uint32_t rowsThisLaunch = std::min(batchSize, numCores);
 
-        if (chunkSize * 2 > TILE_ELEMS) {
-            throw std::runtime_error("chunkSize*2 > TILE_ELEMS: reduce nRow");
+        if (chunkSize == 0) {
+            throw std::runtime_error("chunkSize == 0");
         }
 
         const uint32_t rowBytes = nRow * sizeof(float);
         const uint32_t rowBufBytes = rowsThisLaunch * rowBytes;
+
         const uint32_t twBufBytes = numStages * halfN * sizeof(float);
 
         const uint32_t sramDataBytes = rowBytes;
         const uint32_t sramTwBytes = twBufBytes;
-        const uint32_t sramScratch = 2 * rowBytes;
-        const uint32_t sramTotal =
-            2 * sramDataBytes + 2 * sramTwBytes + sramScratch + sizeof(uint32_t);
+        const uint32_t sramTotal = 2 * sramDataBytes + 2 * sramTwBytes + sizeof(uint32_t);
 
         std::cout << "[fft_paper_host]\n"
                   << "  nRow           = " << nRow << "\n"
@@ -316,31 +321,21 @@ int main(int argc, char** argv) {
             Program fftProg = CreateProgram();
             CoreRange coreRange({0, 0}, {rowsThisLaunch - 1, 0});
 
-            const uint32_t cbPageBytes = TILE_ELEMS * sizeof(float);
-
-            auto makeCb = [&](uint32_t cbId, uint32_t depthPages) {
+            auto makeCb = [&](uint32_t cbId, uint32_t depthTiles) {
                 CircularBufferConfig cfg =
-                    CircularBufferConfig(
-                        depthPages * cbPageBytes,
-                        {{cbId, tt::DataFormat::Float32}})
-                        .set_page_size(cbId, cbPageBytes);
+                    CircularBufferConfig(depthTiles * TILE_BYTES,
+                                         {{cbId, tt::DataFormat::Float32}})
+                        .set_page_size(cbId, TILE_BYTES);
                 CreateCircularBuffer(fftProg, coreRange, cfg);
             };
 
-            makeCb(CB_DATA0_R, 2);
-            makeCb(CB_DATA0_I, 2);
-            makeCb(CB_DATA1_R, 2);
-            makeCb(CB_DATA1_I, 2);
-            makeCb(CB_TW_R,    2);
-            makeCb(CB_TW_I,    2);
-            makeCb(CB_OUT0_R,  2);
-            makeCb(CB_OUT0_I,  2);
-            makeCb(CB_OUT1_R,  2);
-            makeCb(CB_OUT1_I,  2);
-            makeCb(CB_INT0,    2);
-            makeCb(CB_INT1,    2);
-            makeCb(CB_F0,      2);
-            makeCb(CB_F1,      2);
+            makeCb(CB_DATA0_R, 2); makeCb(CB_DATA0_I, 2);
+            makeCb(CB_DATA1_R, 2); makeCb(CB_DATA1_I, 2);
+            makeCb(CB_TW_R,    2); makeCb(CB_TW_I,    2);
+            makeCb(CB_OUT0_R,  2); makeCb(CB_OUT0_I,  2);
+            makeCb(CB_OUT1_R,  2); makeCb(CB_OUT1_I,  2);
+            makeCb(CB_INT0,    2); makeCb(CB_INT1,    2);
+            makeCb(CB_F0,      2); makeCb(CB_F1,      2);
 
             KernelHandle readerKernel = CreateKernel(
                 fftProg,
@@ -449,7 +444,6 @@ int main(int argc, char** argv) {
 
         float maxErr = 0.0f;
         float maxMag = 0.0f;
-
         for (uint32_t i = 0; i < nRow; ++i) {
             const float wre = u32ToFloat(outRawReal[i]);
             const float wim = u32ToFloat(outRawImag[i]);
