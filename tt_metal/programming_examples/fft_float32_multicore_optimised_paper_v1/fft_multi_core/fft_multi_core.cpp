@@ -16,6 +16,7 @@
 
 using namespace tt::tt_metal;
 using namespace tt::tt_metal::distributed;
+using namespace tt;
 
 #ifndef OVERRIDE_KERNEL_PREFIX
 #define OVERRIDE_KERNEL_PREFIX ""
@@ -27,7 +28,8 @@ enum FFTDirection {
 };
 
 struct TTExecution {
-    Program*      program;
+    Program*      program;       // kept alive for SetRuntimeArgs
+    MeshWorkload* workload;      // owns the moved program for dispatch
     CoreCoord*    core;
     KernelHandle* read_kernel;
     KernelHandle* write_kernel;
@@ -37,11 +39,11 @@ struct TTExecution {
     std::shared_ptr<MeshBuffer> twiddle_dram_buffer;
     std::shared_ptr<MeshBuffer> result_data_r_dram_buffer;
     std::shared_ptr<MeshBuffer> result_data_i_dram_buffer;
-    // L1 buffers stay as plain tt_metal::Buffer — allocated on the single device
     std::shared_ptr<tt::tt_metal::Buffer> step_results_r_buffer;
     std::shared_ptr<tt::tt_metal::Buffer> step_results_i_buffer;
 };
 
+// Forward declarations
 void fft(MeshCommandQueue&, TTExecution*, float*, float*, float*, float*, float*, uint32_t, enum FFTDirection);
 void compare(float*, float*, float*, float*, int);
 void moveorigin(float*, float*, int);
@@ -51,6 +53,7 @@ CBHandle createCB(Program&, CoreCoord&, uint32_t, uint32_t, uint32_t);
 float* computeTwiddleFactors(int);
 static double getElapsedTime(struct timeval);
 
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     if (argc != 2) {
         fprintf(stderr, "You must provide the size of the domain as an argument\n");
@@ -63,57 +66,55 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    // --- Device setup (new MeshDevice API) ---
+    // --- Device setup ---
     auto mesh = MeshDevice::create_unit_mesh(0);
     MeshCommandQueue& cq = mesh->mesh_command_queue();
-
-    // We still need a raw IDevice* for L1 buffer allocation and CB creation
-    IDevice* device = mesh->get_devices()[0];
+    IDevice* device = mesh->get_devices()[0];   // for L1 buffer allocation only
 
     Program   program = CreateProgram();
     CoreCoord core    = {0, 0};
 
     uint32_t problem_mem_size = 4 * domain_size;
 
-    // --- DRAM buffers as MeshBuffers ---
-    ReplicatedBufferConfig dram_config{
-        .size      = problem_mem_size,
-        .page_size = problem_mem_size,
+    // --- DRAM MeshBuffers ---
+    DeviceLocalBufferConfig dram_local{
+        .page_size   = problem_mem_size,
         .buffer_type = tt::tt_metal::BufferType::DRAM
     };
+    ReplicatedBufferConfig dram_replicated{.size = problem_mem_size};
 
-    auto in_data_r_dram_buffer     = MeshBuffer::create(dram_config, mesh);
-    auto in_data_i_dram_buffer     = MeshBuffer::create(dram_config, mesh);
-    auto result_data_r_dram_buffer = MeshBuffer::create(dram_config, mesh);
-    auto result_data_i_dram_buffer = MeshBuffer::create(dram_config, mesh);
-    auto twiddle_dram_buffer       = MeshBuffer::create(dram_config, mesh);
+    auto in_data_r_dram_buffer     = MeshBuffer::create(dram_replicated, dram_local, mesh.get());
+    auto in_data_i_dram_buffer     = MeshBuffer::create(dram_replicated, dram_local, mesh.get());
+    auto result_data_r_dram_buffer = MeshBuffer::create(dram_replicated, dram_local, mesh.get());
+    auto result_data_i_dram_buffer = MeshBuffer::create(dram_replicated, dram_local, mesh.get());
+    auto twiddle_dram_buffer       = MeshBuffer::create(dram_replicated, dram_local, mesh.get());
 
-    // --- CBs (unchanged, still created against Program + CoreCoord) ---
+    // --- CBs ---
     uint32_t cb_tile_size  = 2048 * 4;
     uint32_t cb_total_size = problem_mem_size > cb_tile_size ? problem_mem_size : cb_tile_size;
 
-    createCB(program, core, CBIndex::c_0,  1, cb_tile_size);   // data0 real in
-    createCB(program, core, CBIndex::c_1,  1, cb_tile_size);   // data0 imag in
-    createCB(program, core, CBIndex::c_2,  1, cb_tile_size);   // data1 real in
-    createCB(program, core, CBIndex::c_3,  1, cb_tile_size);   // data1 imag in
-    createCB(program, core, CBIndex::c_4,  1, cb_tile_size);   // twiddle real
-    createCB(program, core, CBIndex::c_5,  1, cb_tile_size);   // twiddle imag
-    createCB(program, core, CBIndex::c_6,  1, cb_tile_size);   // f0
-    createCB(program, core, CBIndex::c_7,  1, cb_tile_size);   // f1
-    createCB(program, core, CBIndex::c_8,  1, cb_total_size);  // out real to writer
-    createCB(program, core, CBIndex::c_9,  1, cb_total_size);  // out imag to writer
-    createCB(program, core, CBIndex::c_16, 1, cb_tile_size);   // data0 real out
-    createCB(program, core, CBIndex::c_17, 1, cb_tile_size);   // data0 imag out
-    createCB(program, core, CBIndex::c_18, 1, cb_tile_size);   // data1 real out
-    createCB(program, core, CBIndex::c_19, 1, cb_tile_size);   // data1 imag out
-    createCB(program, core, CBIndex::c_20, 1, cb_total_size);  // DDR real in
-    createCB(program, core, CBIndex::c_21, 1, cb_total_size);  // DDR imag in
-    createCB(program, core, CBIndex::c_22, 1, cb_total_size);  // DDR twiddle in
-    createCB(program, core, CBIndex::c_23, 1, cb_tile_size);   // intermediate0
-    createCB(program, core, CBIndex::c_24, 1, cb_tile_size);   // intermediate1
-    createCB(program, core, CBIndex::c_25, 1, cb_tile_size);   // intermediate2
+    createCB(program, core, tt::CBIndex::c_0,  1, cb_tile_size);   // data0 real in
+    createCB(program, core, tt::CBIndex::c_1,  1, cb_tile_size);   // data0 imag in
+    createCB(program, core, tt::CBIndex::c_2,  1, cb_tile_size);   // data1 real in
+    createCB(program, core, tt::CBIndex::c_3,  1, cb_tile_size);   // data1 imag in
+    createCB(program, core, tt::CBIndex::c_4,  1, cb_tile_size);   // twiddle real
+    createCB(program, core, tt::CBIndex::c_5,  1, cb_tile_size);   // twiddle imag
+    createCB(program, core, tt::CBIndex::c_6,  1, cb_tile_size);   // f0
+    createCB(program, core, tt::CBIndex::c_7,  1, cb_tile_size);   // f1
+    createCB(program, core, tt::CBIndex::c_8,  1, cb_total_size);  // out real to writer
+    createCB(program, core, tt::CBIndex::c_9,  1, cb_total_size);  // out imag to writer
+    createCB(program, core, tt::CBIndex::c_16, 1, cb_tile_size);   // data0 real out
+    createCB(program, core, tt::CBIndex::c_17, 1, cb_tile_size);   // data0 imag out
+    createCB(program, core, tt::CBIndex::c_18, 1, cb_tile_size);   // data1 real out
+    createCB(program, core, tt::CBIndex::c_19, 1, cb_tile_size);   // data1 imag out
+    createCB(program, core, tt::CBIndex::c_20, 1, cb_total_size);  // DDR real in
+    createCB(program, core, tt::CBIndex::c_21, 1, cb_total_size);  // DDR imag in
+    createCB(program, core, tt::CBIndex::c_22, 1, cb_total_size);  // DDR twiddle in
+    createCB(program, core, tt::CBIndex::c_23, 1, cb_tile_size);   // intermediate0
+    createCB(program, core, tt::CBIndex::c_24, 1, cb_tile_size);   // intermediate1
+    createCB(program, core, tt::CBIndex::c_25, 1, cb_tile_size);   // intermediate2
 
-    // --- L1 buffers for inter-step scratch (plain Buffer, allocated on device) ---
+    // --- L1 scratch buffers (plain Buffer on the single device) ---
     tt::tt_metal::InterleavedBufferConfig l1_config{
         .device      = device,
         .size        = problem_mem_size,
@@ -123,7 +124,7 @@ int main(int argc, char** argv) {
     auto step_results_r_buffer = tt::tt_metal::CreateBuffer(l1_config);
     auto step_results_i_buffer = tt::tt_metal::CreateBuffer(l1_config);
 
-    // --- Kernels (path is relative to OVERRIDE_KERNEL_PREFIX) ---
+    // --- Kernels ---
     KernelHandle reader_kernel_id = CreateKernel(
         program,
         std::string(OVERRIDE_KERNEL_PREFIX) +
@@ -148,15 +149,25 @@ int main(int argc, char** argv) {
             "fft_float32_multicore_optimised_paper_v1/fft_multi_core/kernels/compute/compute.cpp",
         core,
         ComputeConfig{
-            .math_fidelity   = MathFidelity::HiFi4,
+            .math_fidelity    = MathFidelity::HiFi4,
             .fp32_dest_acc_en = false,
             .math_approx_mode = false,
             .compile_args     = {}});
 
+    // --- Build MeshWorkload once (program is moved into it) ---
+    // We keep a raw reference to program before moving for SetRuntimeArgs
+    Program& program_ref = program;
+    MeshWorkload workload;
+    MeshCoordinateRange rng = MeshCoordinateRange(mesh->shape());
+    workload.add_program(rng, std::move(program));
+
     // --- Input data ---
     float* golden_r = (float*)malloc(sizeof(float) * domain_size);
     float* golden_i = (float*)malloc(sizeof(float) * domain_size);
-    for (int i = 0; i < domain_size; i++) { golden_r[i] = 0.0f; golden_i[i] = 0.0f; }
+    for (int i = 0; i < domain_size; i++) {
+        golden_r[i] = 0.0f;
+        golden_i[i] = 0.0f;
+    }
     golden_r[domain_size / 2] = (float)domain_size;
     golden_i[domain_size / 2] = (float)domain_size * 2;
 
@@ -167,7 +178,8 @@ int main(int argc, char** argv) {
     memcpy(data_i, golden_i, sizeof(float) * domain_size);
 
     TTExecution exec = {
-        .program                   = &program,
+        .program                   = &program_ref,
+        .workload                  = &workload,
         .core                      = &core,
         .read_kernel               = &reader_kernel_id,
         .write_kernel              = &writer_kernel_id,
@@ -187,21 +199,23 @@ int main(int argc, char** argv) {
     moveorigin(data_r, data_i, domain_size);
     descale(data_r, data_i, domain_size);
 
-    // mesh goes out of scope and closes automatically (shared_ptr)
+    // mesh closes automatically when shared_ptr goes out of scope
 
-    free(data_r);  free(data_i);
+    free(data_r);
+    free(data_i);
     free(twiddle_factors);
-    free(golden_r); free(golden_i);
+    free(golden_r);
+    free(golden_i);
     return 0;
 }
 
 // ---------------------------------------------------------------------------
-
-void fft(MeshCommandQueue& cq, TTExecution* d, float* input_r, float* input_i,
-         float* twiddle_factors, float* result_r, float* result_i,
+void fft(MeshCommandQueue& cq, TTExecution* d,
+         float* input_r, float* input_i, float* twiddle_factors,
+         float* result_r, float* result_i,
          uint32_t domain_size, enum FFTDirection direction)
 {
-    uint32_t bank_id = 0;   // single-bank (page_size == size)
+    uint32_t bank_id = 0;
 
     const std::vector<uint32_t> read_args = {
         d->in_data_r_dram_buffer->address(),
@@ -222,25 +236,22 @@ void fft(MeshCommandQueue& cq, TTExecution* d, float* input_r, float* input_i,
                    {(uint32_t)direction, domain_size,
                     d->step_results_r_buffer->address(),
                     d->step_results_i_buffer->address()});
-    SetRuntimeArgs(*d->program, *d->write_kernel,   *d->core, write_args);
+    SetRuntimeArgs(*d->program, *d->write_kernel, *d->core, write_args);
 
     struct timeval t0;
 
-    // Transfer input data to device
     gettimeofday(&t0, NULL);
-    EnqueueWriteMeshBuffer(cq, d->in_data_r_dram_buffer, input_r,        false);
-    EnqueueWriteMeshBuffer(cq, d->in_data_i_dram_buffer, input_i,        false);
-    EnqueueWriteMeshBuffer(cq, d->twiddle_dram_buffer,   twiddle_factors, false);
+    EnqueueWriteMeshBuffer(cq, d->in_data_r_dram_buffer, input_r,         false);
+    EnqueueWriteMeshBuffer(cq, d->in_data_i_dram_buffer, input_i,         false);
+    EnqueueWriteMeshBuffer(cq, d->twiddle_dram_buffer,   twiddle_factors,  false);
     Finish(cq);
     double xfer_on = getElapsedTime(t0);
 
-    // Execute
     gettimeofday(&t0, NULL);
-    EnqueueMeshWorkload(cq, *d->program, false);
+    EnqueueMeshWorkload(cq, *d->workload, false);
     Finish(cq);
     double exec_t = getElapsedTime(t0);
 
-    // Read results back
     gettimeofday(&t0, NULL);
     EnqueueReadMeshBuffer(cq, result_r, d->result_data_r_dram_buffer, false);
     EnqueueReadMeshBuffer(cq, result_i, d->result_data_i_dram_buffer, false);
@@ -249,35 +260,50 @@ void fft(MeshCommandQueue& cq, TTExecution* d, float* input_r, float* input_i,
 
     printf("%s FFT size %d: total %.4f s  (xfer_on %.4f  exec %.4f  xfer_off %.4f)\n",
            direction == FFT_FORWARD ? "Forwards" : "Backwards",
-           domain_size, xfer_on + exec_t + xfer_off, xfer_on, exec_t, xfer_off);
+           domain_size,
+           xfer_on + exec_t + xfer_off,
+           xfer_on, exec_t, xfer_off);
 }
 
 // ---------------------------------------------------------------------------
-
 void compare(float* a_r, float* a_i, float* b_r, float* b_i, int n) {
     int ok = 0, bad = 0;
     for (int i = 0; i < n; i++) {
         if (a_r[i] != b_r[i] || a_i[i] != b_i[i]) {
-            printf("Mismatch [%d]: (%.2f,%.2f) vs (%.2f,%.2f)\n", i, a_r[i], a_i[i], b_r[i], b_i[i]);
+            printf("Mismatch [%d]: (%.2f,%.2f) vs (%.2f,%.2f)\n",
+                   i, a_r[i], a_i[i], b_r[i], b_i[i]);
             bad++;
-        } else ok++;
+        } else {
+            ok++;
+        }
     }
     printf("Checked %d: %d match, %d mismatch\n", n, ok, bad);
 }
 
 void moveorigin(float* r, float* im, int n) {
-    for (int i = 0; i < n; i++) { r[i] *= (float)pow(-1, i); im[i] *= (float)pow(-1, i); }
+    for (int i = 0; i < n; i++) {
+        float sign = (i % 2 == 0) ? 1.0f : -1.0f;
+        r[i]  *= sign;
+        im[i] *= sign;
+    }
 }
 
 void descale(float* r, float* im, int n) {
-    for (int i = 0; i < n; i++) { r[i] /= n; im[i] = -(im[i] / n); }
+    for (int i = 0; i < n; i++) {
+        r[i]  =  r[i]  / (float)n;
+        im[i] = -(im[i] / (float)n);
+    }
 }
 
-int checkIfPowerOfTwo(int v) { return (v != 0) && ((v & (v - 1)) == 0); }
+int checkIfPowerOfTwo(int v) {
+    return (v != 0) && ((v & (v - 1)) == 0);
+}
 
-CBHandle createCB(Program& program, CoreCoord& core, uint32_t cb_index,
-                  uint32_t num_tiles, uint32_t tile_size) {
-    CircularBufferConfig cfg(num_tiles * tile_size, {{cb_index, tt::DataFormat::Float32}});
+CBHandle createCB(Program& program, CoreCoord& core,
+                  uint32_t cb_index, uint32_t num_tiles, uint32_t tile_size) {
+    CircularBufferConfig cfg(
+        num_tiles * tile_size,
+        {{cb_index, tt::DataFormat::Float32}});
     cfg.set_page_size(cb_index, tile_size);
     return tt_metal::CreateCircularBuffer(program, core, cfg);
 }
@@ -286,8 +312,8 @@ float* computeTwiddleFactors(int n) {
     int    m  = n / 2;
     float* tf = (float*)malloc(sizeof(float) * m * 2);
     for (int i = 0; i < m; i++) {
-        float a   = (2.0f * (float)PI * i) / (float)n;
-        tf[i * 2]     = cosf(a);
+        float a       = (2.0f * (float)PI * (float)i) / (float)n;
+        tf[i * 2]     =  cosf(a);
         tf[i * 2 + 1] = -sinf(a);
     }
     return tf;
@@ -296,5 +322,6 @@ float* computeTwiddleFactors(int n) {
 static double getElapsedTime(struct timeval s) {
     struct timeval now;
     gettimeofday(&now, NULL);
-    return ((now.tv_sec * 1000000 + now.tv_usec) - (s.tv_sec * 1000000 + s.tv_usec)) / 1e6;
+    return ((now.tv_sec  * 1000000 + now.tv_usec) -
+            (s.tv_sec    * 1000000 + s.tv_usec  )) / 1e6;
 }
