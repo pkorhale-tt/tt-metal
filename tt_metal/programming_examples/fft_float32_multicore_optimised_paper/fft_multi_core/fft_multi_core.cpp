@@ -1,19 +1,5 @@
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
-//
-// KEY DESIGN DECISION:
-//   nRow must satisfy: halfN = nRow/2 <= TILE_ELEMS = 1024
-//   So nRow <= 2048, but we use nRow=1024 as default so halfN=512
-//   fits cleanly in one tile with room to spare.
-//
-//   Each CB tile holds TILE_ELEMS=1024 floats.
-//   The reader fills positions [0..chunkSize) with data0 values
-//   and positions [chunkSize..2*chunkSize) with data1 values
-//   in the SAME tile — both halves of the butterfly in one tile.
-//   chunkSize = halfN / numChunks, and chunkSize*2 <= TILE_ELEMS.
-//
-//   For nRow=1024: halfN=512, numChunks=1, chunkSize=512, tile used=1024 ✓
-//   For nRow=2048: halfN=1024, numChunks=2, chunkSize=512, tile used=1024 ✓
 
 #include <cmath>
 #include <cstdint>
@@ -59,9 +45,8 @@ constexpr uint32_t CB_F1      = 23;
 
 constexpr uint32_t SRAM_DATA_BASE = 0x40000;
 
-// One uint32 placed just below SRAM_DATA_BASE for the reader/writer sync flag.
-// The reader (RISCV_0) spins on this word waiting for the writer (RISCV_1)
-// to set it after scattering each butterfly stage's results back into SRAM.
+// Sync flag: one uint32 just below the data area.
+// Writer sets to 1 after scattering each stage; reader spins then clears.
 constexpr uint32_t SYNC_FLAG_ADDR = SRAM_DATA_BASE - sizeof(uint32_t);
 
 inline uint32_t ceilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
@@ -70,13 +55,19 @@ inline uint32_t log2u32(uint32_t x) { uint32_t r = 0; while ((1u << r) < x) ++r;
 inline uint32_t floatToU32(float v) { uint32_t u; std::memcpy(&u, &v, 4); return u; }
 inline float u32ToFloat(uint32_t u) { float v; std::memcpy(&v, &u, 4); return v; }
 
-std::shared_ptr<distributed::MeshBuffer> createDramMeshBuffer(
+// Create a DRAM buffer whose page_size equals the total buffer size.
+// This ensures EnqueueWriteMeshBuffer / EnqueueReadMeshBuffer treat the
+// data as a plain byte blob with no tile-format conversion, consistent
+// with the raw noc_async_read / noc_async_write calls in the kernels.
+std::shared_ptr<distributed::MeshBuffer> createRawDramBuffer(
     const std::shared_ptr<distributed::MeshDevice>& meshDevice,
     uint32_t sizeBytes)
 {
-    const uint32_t rounded = ceilDiv(sizeBytes, TILE_BYTES) * TILE_BYTES;
+    // Round up to float boundary; no tile rounding needed since we bypass
+    // tile DMA in the kernels.
+    const uint32_t rounded = (sizeBytes + 3u) & ~3u;
     distributed::DeviceLocalBufferConfig localConfig{
-        .page_size   = TILE_BYTES,
+        .page_size   = rounded,   // one page = entire buffer = no tile split
         .buffer_type = BufferType::DRAM};
     distributed::ReplicatedBufferConfig replicatedConfig{.size = rounded};
     return distributed::MeshBuffer::create(replicatedConfig, localConfig, meshDevice.get());
@@ -140,7 +131,7 @@ void cpuFft(std::vector<float>& re, std::vector<float>& im) {
 
 int main(int argc, char** argv) {
     try {
-        const int deviceId       = (argc > 1) ? std::stoi(argv[1]) : 0;
+        const int      deviceId  = (argc > 1) ? std::stoi(argv[1]) : 0;
         const uint32_t nRow      = (argc > 2) ? static_cast<uint32_t>(std::stoul(argv[2])) : 1024;
         const uint32_t batchSize = (argc > 3) ? static_cast<uint32_t>(std::stoul(argv[3])) : 8;
         const uint32_t numCores  = (argc > 4) ? static_cast<uint32_t>(std::stoul(argv[4])) : 8;
@@ -159,7 +150,6 @@ int main(int argc, char** argv) {
         const uint32_t halfN          = nRow / 2;
         const uint32_t numChunks      = (halfN * 2 <= TILE_ELEMS) ? 1u : 2u;
         const uint32_t chunkSize      = halfN / numChunks;
-        const uint32_t rowTiles       = ceilDiv(nRow, TILE_ELEMS);
         const uint32_t rowsThisLaunch = std::min(batchSize, numCores);
 
         if (chunkSize * 2 > TILE_ELEMS)
@@ -168,7 +158,6 @@ int main(int argc, char** argv) {
         const uint32_t sramDataBytes = nRow * sizeof(float);
         const uint32_t sramTwBytes   = numStages * halfN * sizeof(float);
         const uint32_t sramScratch   = 2 * sramDataBytes;
-        // +4 for the sync flag word that sits at SYNC_FLAG_ADDR (just below SRAM_DATA_BASE)
         const uint32_t sramTotal     = 2 * sramDataBytes + 2 * sramTwBytes + sramScratch
                                      + sizeof(uint32_t);
 
@@ -178,7 +167,6 @@ int main(int argc, char** argv) {
                   << "  halfN          = " << halfN << "\n"
                   << "  chunkSize      = " << chunkSize << "\n"
                   << "  numChunks      = " << numChunks << "\n"
-                  << "  rowTiles       = " << rowTiles << "\n"
                   << "  rowsThisLaunch = " << rowsThisLaunch << "\n"
                   << "  SRAM per core  = " << sramTotal << " bytes\n"
                   << "  sync_flag_addr = 0x" << std::hex << SYNC_FLAG_ADDR
@@ -187,16 +175,21 @@ int main(int argc, char** argv) {
         if (SRAM_DATA_BASE + sramTotal > 1300000)
             throw std::runtime_error("SRAM layout exceeds 1.3MB");
 
-        // ── DRAM buffers ──────────────────────────────────────────────────────
-        const uint32_t rowBufBytes = rowsThisLaunch * rowTiles * TILE_BYTES;
-        auto inputRealBuf  = createDramMeshBuffer(meshDevice, rowBufBytes);
-        auto inputImagBuf  = createDramMeshBuffer(meshDevice, rowBufBytes);
-        auto outputRealBuf = createDramMeshBuffer(meshDevice, rowBufBytes);
-        auto outputImagBuf = createDramMeshBuffer(meshDevice, rowBufBytes);
+        // ── DRAM buffers (raw, one page = full row) ───────────────────────────
+        // page_size = row byte length so EnqueueWriteMeshBuffer / ReadMeshBuffer
+        // treat the data as a plain byte array.  The kernels use noc_async_read /
+        // noc_async_write (raw byte copy) for DRAM↔SRAM transfers, so the
+        // page_size here must NOT imply any tile-format conversion.
+        const uint32_t rowBytes    = nRow * sizeof(float);
+        const uint32_t rowBufBytes = rowsThisLaunch * rowBytes;
 
-        const uint32_t elemsPerRow = rowTiles * TILE_ELEMS;
-        std::vector<uint32_t> inputRealPacked(rowsThisLaunch * elemsPerRow, 0u);
-        std::vector<uint32_t> inputImagPacked(rowsThisLaunch * elemsPerRow, 0u);
+        auto inputRealBuf  = createRawDramBuffer(meshDevice, rowBufBytes);
+        auto inputImagBuf  = createRawDramBuffer(meshDevice, rowBufBytes);
+        auto outputRealBuf = createRawDramBuffer(meshDevice, rowBufBytes);
+        auto outputImagBuf = createRawDramBuffer(meshDevice, rowBufBytes);
+
+        std::vector<uint32_t> inputRealPacked(rowsThisLaunch * nRow, 0u);
+        std::vector<uint32_t> inputImagPacked(rowsThisLaunch * nRow, 0u);
 
         std::vector<float> refRe, refIm;
         makeTestInput(nRow, refRe, refIm);
@@ -206,8 +199,8 @@ int main(int argc, char** argv) {
             makeTestInput(nRow, rowR, rowI);
             for (uint32_t i = 0; i < nRow; ++i) rowR[i] += 0.01f * r;
             for (uint32_t i = 0; i < nRow; ++i) {
-                inputRealPacked[r * elemsPerRow + i] = floatToU32(rowR[i]);
-                inputImagPacked[r * elemsPerRow + i] = floatToU32(rowI[i]);
+                inputRealPacked[r * nRow + i] = floatToU32(rowR[i]);
+                inputImagPacked[r * nRow + i] = floatToU32(rowI[i]);
             }
         }
 
@@ -219,8 +212,8 @@ int main(int argc, char** argv) {
         buildTwiddles(nRow, numStages, direction, twR, twI);
 
         const uint32_t twBufBytes = numStages * halfN * sizeof(float);
-        auto twRealDramBuf = createDramMeshBuffer(meshDevice, twBufBytes);
-        auto twImagDramBuf = createDramMeshBuffer(meshDevice, twBufBytes);
+        auto twRealDramBuf = createRawDramBuffer(meshDevice, twBufBytes);
+        auto twImagDramBuf = createRawDramBuffer(meshDevice, twBufBytes);
         distributed::EnqueueWriteMeshBuffer(cq, twRealDramBuf, twR, false);
         distributed::EnqueueWriteMeshBuffer(cq, twImagDramBuf, twI, false);
 
@@ -268,20 +261,13 @@ int main(int argc, char** argv) {
                 CreateCircularBuffer(fftProg, coreRange, cfg);
             };
 
-            makeCb(CB_DATA0_R, 2);
-            makeCb(CB_DATA0_I, 2);
-            makeCb(CB_DATA1_R, 2);
-            makeCb(CB_DATA1_I, 2);
-            makeCb(CB_TW_R,    2);
-            makeCb(CB_TW_I,    2);
-            makeCb(CB_OUT0_R,  2);
-            makeCb(CB_OUT0_I,  2);
-            makeCb(CB_OUT1_R,  2);
-            makeCb(CB_OUT1_I,  2);
-            makeCb(CB_INT0,    2);
-            makeCb(CB_INT1,    2);
-            makeCb(CB_F0,      2);
-            makeCb(CB_F1,      2);
+            makeCb(CB_DATA0_R, 2); makeCb(CB_DATA0_I, 2);
+            makeCb(CB_DATA1_R, 2); makeCb(CB_DATA1_I, 2);
+            makeCb(CB_TW_R,    2); makeCb(CB_TW_I,    2);
+            makeCb(CB_OUT0_R,  2); makeCb(CB_OUT0_I,  2);
+            makeCb(CB_OUT1_R,  2); makeCb(CB_OUT1_I,  2);
+            makeCb(CB_INT0,    2); makeCb(CB_INT1,    2);
+            makeCb(CB_F0,      2); makeCb(CB_F1,      2);
 
             KernelHandle readerKernel = CreateKernel(
                 fftProg,
@@ -312,13 +298,14 @@ int main(int argc, char** argv) {
 
             for (uint32_t c = 0; c < rowsThisLaunch; ++c) {
                 CoreCoord cc{c, 0};
-                const uint32_t rowByteOffset = c * rowTiles * TILE_BYTES;
+                // Each row is stored contiguously: row c starts at c * rowBytes.
+                const uint32_t rowByteOffset = c * rowBytes;
 
                 SetRuntimeArgs(fftProg, readerKernel, cc,
                     { inputRealBuf->address()  + rowByteOffset,
                       inputImagBuf->address()  + rowByteOffset,
                       nRow, numStages, numChunks, chunkSize, SRAM_DATA_BASE,
-                      SYNC_FLAG_ADDR });  // arg 7: sync flag
+                      SYNC_FLAG_ADDR });
 
                 SetRuntimeArgs(fftProg, computeKernel, cc,
                     { numStages, numChunks });
@@ -327,7 +314,7 @@ int main(int argc, char** argv) {
                     { outputRealBuf->address() + rowByteOffset,
                       outputImagBuf->address() + rowByteOffset,
                       nRow, numStages, numChunks, chunkSize, SRAM_DATA_BASE,
-                      SYNC_FLAG_ADDR });  // arg 7: sync flag
+                      SYNC_FLAG_ADDR });
             }
 
             distributed::MeshWorkload fftWorkload;
@@ -352,11 +339,8 @@ int main(int argc, char** argv) {
                   << "  CPU_re       |  CPU_im       |  CPU_mag\n";
         std::cout << std::string(110, '-') << "\n";
 
-        std::vector<uint32_t> checkBins = {
-            0u, 1u, 2u, 3u, 4u, nRow/2,
-            nRow-4, nRow-3, nRow-2, nRow-1};
-
-        for (uint32_t bin : checkBins) {
+        for (uint32_t bin : {0u, 1u, 2u, 3u, 4u, nRow/2,
+                              nRow-4, nRow-3, nRow-2, nRow-1}) {
             float wre  = u32ToFloat(outRawReal[bin]);
             float wim  = u32ToFloat(outRawImag[bin]);
             float wmag = std::sqrt(wre*wre + wim*wim);

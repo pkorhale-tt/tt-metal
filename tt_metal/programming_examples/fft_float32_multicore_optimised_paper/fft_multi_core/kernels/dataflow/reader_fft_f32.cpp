@@ -3,14 +3,19 @@
 //
 // Reader kernel for FFT.
 //
-// The hardware butterfly kernel is DIT (decimation-in-time): stage 0
-// processes stride-1 pairs, stage 1 stride-2, ..., stage log2(N)-1
-// stride-N/2.  DIT requires the input to be in bit-reversed order.
-// We therefore bit-reverse the data in SRAM immediately after the
-// initial DRAM load (step 0 only).  This lets every subsequent stage
-// read natural-position outputs from the previous stage and produce
-// the final result in natural (non-reversed) order — no output
-// permutation is needed in the writer.
+// IMPORTANT — why noc_async_read (not noc_async_read_tile):
+//   noc_async_read_tile applies the hardware tile-format transformation
+//   (32×32 swizzle) when copying DRAM → L1.  The input data in DRAM is
+//   stored as a plain linear float array (written by EnqueueWriteMeshBuffer
+//   into a buffer whose page_size equals the row byte length, not TILE_BYTES).
+//   Using noc_async_read_tile would shuffle the values and produce garbage.
+//   noc_async_read is a plain byte copy and is the correct primitive here,
+//   consistent with how twiddle_init_f32 already loads twiddle data.
+//
+// The butterfly loop is DIT (stride grows each stage), so the input must be
+// in bit-reversed index order.  We permute the data in SRAM immediately after
+// the DRAM load (step 0 only), giving naturally-ordered final output — the
+// writer needs no permutation before its DRAM write.
 //
 // Runtime args:
 //   0 : dram_input_r_addr
@@ -20,9 +25,8 @@
 //   4 : num_chunks
 //   5 : chunk_size
 //   6 : sram_buf_r_addr
-//   7 : sync_flag_addr  – L1 address of the uint32 handshake word shared
-//                         with the writer (RISCV_1). Writer sets it to 1
-//                         after scattering each step; reader clears to 0.
+//   7 : sync_flag_addr  – L1 uint32 shared with writer; writer sets to 1
+//                         after scattering each stage, reader clears to 0.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -44,29 +48,14 @@ void kernel_main() {
     constexpr uint32_t cb_twiddle_r = tt::CBIndex::c_4;
     constexpr uint32_t cb_twiddle_i = tt::CBIndex::c_5;
 
-    const uint32_t tile_bytes    = get_tile_size(cb_data0_r);
-    const DataFormat data_format = get_dataformat(cb_data0_r);
+    const uint32_t row_bytes       = n * sizeof(float);
+    const uint32_t sram_buf_i_addr = sram_buf_r_addr + row_bytes;
 
-    const uint32_t sram_buf_bytes  = n * sizeof(float);
-    const uint32_t sram_buf_i_addr = sram_buf_r_addr + sram_buf_bytes;
-
-    // Twiddle tables sit above the two data ping-pong buffers
-    const uint32_t sram_tw_r_addr = sram_buf_i_addr + sram_buf_bytes;
+    // Twiddle tables sit above the two data buffers
+    const uint32_t sram_tw_r_addr = sram_buf_i_addr + row_bytes;
     const uint32_t sram_tw_i_addr = sram_tw_r_addr + num_steps * (n / 2u) * sizeof(float);
 
-    const uint32_t row_tiles = (n * sizeof(float) + tile_bytes - 1) / tile_bytes;
-
-    const InterleavedAddrGenFast<true> dram_r_gen = {
-        .bank_base_address = dram_input_r_addr,
-        .page_size         = tile_bytes,
-        .data_format       = data_format};
-    const InterleavedAddrGenFast<true> dram_i_gen = {
-        .bank_base_address = dram_input_i_addr,
-        .page_size         = tile_bytes,
-        .data_format       = data_format};
-
-    // Initialise the sync flag to 0.  The writer sets it to 1 after each
-    // stage's scatter so we know it is safe to read SRAM for the next stage.
+    // Initialise sync flag — writer sets it to 1 after each stage's scatter.
     volatile tt_l1_ptr uint32_t* sync_flag =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_flag_addr);
     *sync_flag = 0u;
@@ -77,19 +66,18 @@ void kernel_main() {
         const uint32_t tw_step_offset = step * (n / 2u);
 
         if (step == 0u) {
-            // ── Load row from DRAM ────────────────────────────────────────────
-            for (uint32_t t = 0; t < row_tiles; ++t) {
-                noc_async_read_tile(t, dram_r_gen, sram_buf_r_addr + t * tile_bytes);
-                noc_async_read_tile(t, dram_i_gen, sram_buf_i_addr + t * tile_bytes);
-            }
+            // ── Load row from DRAM (raw bytes, no tile-format conversion) ─────
+            // noc_async_read_tile would apply the 32×32 tile swizzle, which
+            // would shuffle the float values.  noc_async_read is a plain byte
+            // copy and preserves the linear float layout written by the host.
+            const uint64_t noc_r = get_noc_addr(dram_input_r_addr);
+            const uint64_t noc_i = get_noc_addr(dram_input_i_addr);
+            noc_async_read(noc_r, sram_buf_r_addr, row_bytes);
+            noc_async_read(noc_i, sram_buf_i_addr, row_bytes);
             noc_async_read_barrier();
 
-            // ── Bit-reverse permutation on SRAM ───────────────────────────────
-            // The butterfly loop is DIT order (stride grows each stage).
-            // DIT requires the input in bit-reversed index order.
-            // Performing the permutation here once means every stage reads
-            // naturally-ordered intermediate results and the final output
-            // is already in natural order — the writer needs no permutation.
+            // ── Bit-reverse permutation ────────────────────────────────────────
+            // DIT butterflies require bit-reversed input order.
             volatile tt_l1_ptr float* sr =
                 reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_r_addr);
             volatile tt_l1_ptr float* si =
@@ -108,8 +96,7 @@ void kernel_main() {
                 }
             }
         } else {
-            // For steps 1+: spin until the writer signals that it has finished
-            // scattering the previous step's results back into sram_buf.
+            // Spin until writer signals that stage (step-1) results are in SRAM.
             while (*sync_flag == 0u) { /* spin */ }
             *sync_flag = 0u;
         }
@@ -125,7 +112,6 @@ void kernel_main() {
                 reinterpret_cast<volatile tt_l1_ptr float*>(get_write_ptr(cb_data0_r));
             volatile tt_l1_ptr float* dst1_r =
                 reinterpret_cast<volatile tt_l1_ptr float*>(get_write_ptr(cb_data1_r));
-
             const volatile tt_l1_ptr float* src_r =
                 reinterpret_cast<const volatile tt_l1_ptr float*>(sram_buf_r_addr);
 
@@ -150,7 +136,6 @@ void kernel_main() {
                 reinterpret_cast<volatile tt_l1_ptr float*>(get_write_ptr(cb_data0_i));
             volatile tt_l1_ptr float* dst1_i =
                 reinterpret_cast<volatile tt_l1_ptr float*>(get_write_ptr(cb_data1_i));
-
             const volatile tt_l1_ptr float* src_i =
                 reinterpret_cast<const volatile tt_l1_ptr float*>(sram_buf_i_addr);
 
@@ -175,7 +160,6 @@ void kernel_main() {
                 reinterpret_cast<volatile tt_l1_ptr float*>(get_write_ptr(cb_twiddle_r));
             volatile tt_l1_ptr float* tw_i_dst =
                 reinterpret_cast<volatile tt_l1_ptr float*>(get_write_ptr(cb_twiddle_i));
-
             const volatile tt_l1_ptr float* sram_tw_r =
                 reinterpret_cast<const volatile tt_l1_ptr float*>(sram_tw_r_addr)
                 + tw_step_offset;

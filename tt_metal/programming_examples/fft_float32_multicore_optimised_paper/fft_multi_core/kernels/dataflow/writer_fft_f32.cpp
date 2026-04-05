@@ -3,11 +3,17 @@
 //
 // Writer kernel for FFT.
 //
-// After scattering each stage's butterfly results back into SRAM, this
-// kernel signals the reader (RISCV_0) that the data is ready for the
-// next stage.  Because the reader bit-reversed the input in SRAM before
-// stage 0, the DIT butterfly loop produces naturally-ordered output —
-// no permutation is needed here before the final DRAM write.
+// IMPORTANT — why noc_async_write (not noc_async_write_tile):
+//   noc_async_write_tile applies the hardware tile-format swizzle when
+//   copying L1 → DRAM.  The host reads the output buffer with
+//   EnqueueReadMeshBuffer into a flat vector<uint32_t>, expecting a plain
+//   linear float layout.  Using noc_async_write_tile would swizzle the
+//   values before they reach DRAM, so the host would read them in the wrong
+//   order.  noc_async_write is a plain byte copy and is consistent with how
+//   twiddle_init_f32 loads twiddle data.
+//
+// Because the reader bit-reversed the input before stage 0, the DIT butterfly
+// loop produces naturally-ordered output — no permutation needed here.
 //
 // Runtime args:
 //   0 : dram_output_r_addr
@@ -37,22 +43,8 @@ void kernel_main() {
     constexpr uint32_t cb_out1_r = tt::CBIndex::c_18;
     constexpr uint32_t cb_out1_i = tt::CBIndex::c_19;
 
-    const uint32_t tile_bytes    = get_tile_size(cb_out0_r);
-    const DataFormat data_format = get_dataformat(cb_out0_r);
-
-    const uint32_t sram_buf_bytes  = n * sizeof(float);
-    const uint32_t sram_buf_i_addr = sram_buf_r_addr + sram_buf_bytes;
-
-    const uint32_t row_tiles = (n * sizeof(float) + tile_bytes - 1) / tile_bytes;
-
-    const InterleavedAddrGenFast<true> dram_r_gen = {
-        .bank_base_address = dram_output_r_addr,
-        .page_size         = tile_bytes,
-        .data_format       = data_format};
-    const InterleavedAddrGenFast<true> dram_i_gen = {
-        .bank_base_address = dram_output_i_addr,
-        .page_size         = tile_bytes,
-        .data_format       = data_format};
+    const uint32_t row_bytes       = n * sizeof(float);
+    const uint32_t sram_buf_i_addr = sram_buf_r_addr + row_bytes;
 
     volatile tt_l1_ptr uint32_t* sync_flag =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_flag_addr);
@@ -104,12 +96,12 @@ void kernel_main() {
         }
 
         if (is_last_step) {
-            // Input was bit-reversed before stage 0, so DIT output is in
-            // natural order.  Write directly to DRAM — no permutation needed.
-            for (uint32_t t = 0; t < row_tiles; ++t) {
-                noc_async_write_tile(t, dram_r_gen, sram_buf_r_addr + t * tile_bytes);
-                noc_async_write_tile(t, dram_i_gen, sram_buf_i_addr + t * tile_bytes);
-            }
+            // Input was bit-reversed before stage 0 → DIT output is in
+            // natural order.  Write as plain bytes — no tile-format swizzle.
+            const uint64_t noc_r = get_noc_addr(dram_output_r_addr);
+            const uint64_t noc_i = get_noc_addr(dram_output_i_addr);
+            noc_async_write(sram_buf_r_addr, noc_r, row_bytes);
+            noc_async_write(sram_buf_i_addr, noc_i, row_bytes);
             noc_async_write_barrier();
         } else {
             // Signal reader that SRAM is ready for the next stage.
