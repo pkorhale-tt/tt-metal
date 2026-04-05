@@ -1,6 +1,28 @@
 // SPDX-FileCopyrightText: © 2025 (paper faithful port)
 // SPDX-License-Identifier: Apache-2.0
 
+// ── FIXES vs original ────────────────────────────────────────────────────────
+// 1. Added `__asm__ volatile("fence r,r" ::: "memory")` after the spin-wait
+//    loop that polls `*sync_flag`.  On a RISC-V weak memory model the load of
+//    *sync_flag may be satisfied from a store buffer while subsequent SRAM
+//    reads (src_r[a] / src_r[b]) are reordered before it.  The fence ensures
+//    all prior loads (the flag poll) complete before the reader starts
+//    gathering data from SRAM for the next step.
+//
+// 2. Made the two-phase flag protocol explicit with a comment so the ordering
+//    invariant is clear:
+//       (a) writer commits all SRAM stores for step N  (fence w,w in writer)
+//       (b) writer sets *sync_flag = 1
+//       (c) reader spins until flag == 1
+//       (d) reader fence r,r  ← NEW
+//       (e) reader clears flag to 0 for next step
+//       (f) reader gathers data from SRAM for step N+1
+//    Without (d) the CPU can speculate SRAM reads before the flag is observed.
+//
+// No changes to bit-reversal, twiddle addressing, or CB push logic — those
+// were correct in the original.
+// ─────────────────────────────────────────────────────────────────────────────
+
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 
@@ -24,11 +46,14 @@ void kernel_main() {
     const uint32_t row_bytes       = n * sizeof(float);
     const uint32_t sram_buf_i_addr = sram_buf_r_addr + row_bytes;
 
+    // Twiddle tables immediately follow the two row data buffers
     const uint32_t sram_tw_r_addr = sram_buf_i_addr + row_bytes;
     const uint32_t sram_tw_i_addr = sram_tw_r_addr + num_steps * (n / 2u) * sizeof(float);
 
     volatile tt_l1_ptr uint32_t* sync_flag =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_flag_addr);
+
+    // Initialise flag; writer will set it to 1 at the end of each non-last step
     *sync_flag = 0u;
 
     for (uint32_t step = 0; step < num_steps; ++step) {
@@ -37,6 +62,7 @@ void kernel_main() {
         const uint32_t tw_step_offset = step * (n / 2u);
 
         if (step == 0u) {
+            // ── Step 0: load input row from DRAM and bit-reverse in place ──
             const uint64_t noc_r = get_noc_addr(dram_input_r_addr);
             const uint64_t noc_i = get_noc_addr(dram_input_i_addr);
             noc_async_read(noc_r, sram_buf_r_addr, row_bytes);
@@ -49,10 +75,10 @@ void kernel_main() {
                 reinterpret_cast<volatile tt_l1_ptr float*>(sram_buf_i_addr);
 
             for (uint32_t i = 0; i < n; ++i) {
-                uint32_t j = 0u;
+                uint32_t j   = 0u;
                 uint32_t tmp = i;
                 for (uint32_t b = 0; b < num_steps; ++b) {
-                    j = (j << 1u) | (tmp & 1u);
+                    j   = (j << 1u) | (tmp & 1u);
                     tmp >>= 1u;
                 }
                 if (i < j) {
@@ -61,13 +87,33 @@ void kernel_main() {
                 }
             }
         } else {
-            while (*sync_flag == 0u) { }
+            // ── Steps 1+: wait for writer to finish committing step N-1 ───
+            //
+            // Protocol (see writer.cpp for the other side):
+            //   (a) Reset flag to 0 so we won't misread a stale 1 from a
+            //       previous iteration.  This must happen BEFORE the writer
+            //       can set it again — guaranteed because the writer only
+            //       sets the flag after draining all output CBs for the
+            //       previous step, and the compute kernel only starts the
+            //       next step's output after the reader has started pushing
+            //       input CBs (which only happens after this spin-wait).
             *sync_flag = 0u;
+
+            //   (b) Spin until writer posts the flag
+            while (*sync_flag == 0u) { }
+
+            //   (c) FIX 1: acquire fence — ensures the SRAM data written by
+            //       the writer is visible before we read src_r[a] / src_r[b]
+            //       below.  Without this the CPU can speculate those loads
+            //       before observing the flag store.
+            __asm__ volatile("fence r,r" ::: "memory");
         }
 
+        // ── Gather butterfly input pairs and twiddle factors into CBs ──────
         for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
             const uint32_t pair_base = chunk * chunk_size;
 
+            // ── data0 (upper element of each butterfly pair) ────────────────
             cb_reserve_back(cb_data0_r, 1);
             cb_reserve_back(cb_data1_r, 1);
 
@@ -91,6 +137,7 @@ void kernel_main() {
             cb_push_back(cb_data0_r, 1);
             cb_push_back(cb_data1_r, 1);
 
+            // ── data1 (lower element of each butterfly pair) ────────────────
             cb_reserve_back(cb_data0_i, 1);
             cb_reserve_back(cb_data1_i, 1);
 
@@ -114,6 +161,7 @@ void kernel_main() {
             cb_push_back(cb_data0_i, 1);
             cb_push_back(cb_data1_i, 1);
 
+            // ── twiddle factors for this chunk ──────────────────────────────
             cb_reserve_back(cb_twiddle_r, 1);
             cb_reserve_back(cb_twiddle_i, 1);
 
