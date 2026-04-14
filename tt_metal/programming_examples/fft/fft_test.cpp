@@ -9,7 +9,7 @@
 //    5. Impulse response: FFT of delta function = constant
 // ============================================================
 
-#include "tt_metal/host_api.hpp"
+#include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/common/constants.hpp"
 #include "fft_host.cpp"   // include host impl directly for single-TU build
 
