@@ -14,7 +14,7 @@
 //  Forward FFT and inverse FFT (is_ifft=true).
 // ============================================================
 
-#include "tt_metal/host_api.hpp"
+#include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/common/constants.hpp"
 #include "tt_metal/detail/util.hpp"
 #include "common/bfloat16.hpp"
