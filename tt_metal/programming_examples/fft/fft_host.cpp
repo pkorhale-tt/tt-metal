@@ -16,8 +16,8 @@
 
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
-#include "tt_metal/api/tt-metalium/util.hpp
-#include "common/bfloat16.hpp"
+#include "tt_metal/api/tt-metalium/util.hpp"
+#include "tt_metal/common/bfloat16.hpp"
 
 #include <cmath>
 #include <vector>
