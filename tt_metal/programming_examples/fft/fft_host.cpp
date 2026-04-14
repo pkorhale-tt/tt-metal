@@ -15,7 +15,7 @@
 // ============================================================
 
 #include "tt_metal/api/tt-metalium/host_api.hpp"
-#include "tt_metal/common/constants.hpp"
+#include "tt_metal/api/tt-metalium/constants.hpp"
 #include "tt_metal/detail/util.hpp"
 #include "common/bfloat16.hpp"
 

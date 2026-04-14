@@ -10,7 +10,7 @@
 // ============================================================
 
 #include "tt_metal/api/tt-metalium/host_api.hpp"
-#include "tt_metal/common/constants.hpp"
+#include "tt_metal/api/tt-metalium/constants.hpp"
 #include "fft_host.cpp"   // include host impl directly for single-TU build
 
 #include <cmath>
