@@ -1,7 +1,9 @@
 // ============================================================
 // fft_host.cpp — TT-Metalium confirmed API
-// Fix: Use set_globally_allocated_address(Buffer&) to give CBs
-//      fixed L1 addresses, then pass those to runtime args.
+// Fix: Don't allocate L1 buffers explicitly.
+// CB addresses are deterministic: they start at L1_UNRESERVED_BASE
+// and are laid out sequentially. We read the base from the HAL
+// and compute offsets matching our CB allocation order.
 // ============================================================
 
 #include "tt-metalium/host_api.hpp"
@@ -11,6 +13,8 @@
 #include "tt-metalium/constants.hpp"
 #include "tt-metalium/kernel_types.hpp"
 #include "tt-metalium/circular_buffer_config.hpp"
+#include "tt-metalium/hal.hpp"
+#include "tt-metalium/hal_types.hpp"
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
 #include "tt-metalium/mesh_command_queue.hpp"
@@ -31,11 +35,19 @@ enum CbId : uint32_t {
     CB_TWIDDLE_R=4, CB_TWIDDLE_I=5, CB_OUT_R=6, CB_OUT_I=7,
     CB_SCRATCH_R=8, CB_SCRATCH_I=9, CB_SYNC=10,
     CB_TMP_R=11, CB_TMP_I=12, CB_WR_R=13, CB_WR_I=14,
-    NUM_CBS=15
 };
 
 static constexpr uint32_t kTileSizeFp32 =
     tt::constants::TILE_HW * tt::constants::TILE_HW * sizeof(float);
+
+// CB sizes in tiles matching allocation order below
+// CBs 0-1 (LHS_R/I):     2 tiles each
+// CBs 2-3 (RHS_R/I):     2 tiles each
+// CBs 4-5 (TWIDDLE_R/I): 2 tiles each
+// CBs 6-7 (OUT_R/I):     2 tiles each
+// CBs 8-9 (SCRATCH_R/I): 1 tile each
+// CBs 10-14:             1 tile each
+static constexpr uint32_t kCbTiles[] = {2,2,2,2,2,2,2,2,1,1,1,1,1,1,1};
 
 std::vector<float> precompute_twiddles(uint32_t N, uint32_t S, bool inv) {
     std::vector<float> tw; tw.reserve(S*(N/2)*2);
@@ -65,18 +77,6 @@ static std::shared_ptr<MeshBuffer> make_mesh_buf(
 
 static uint32_t buf_addr(const std::shared_ptr<MeshBuffer>& mb) {
     return mb->get_device_buffer(MeshCoordinate(0,0))->address();
-}
-
-// ── Create an L1 buffer backing a CB ─────────────────────────
-// This gives the CB a fixed globally-known L1 address that can
-// be passed as a runtime arg to other cores via NOC.
-static std::shared_ptr<Buffer> make_l1_buf(IDevice* dev, uint32_t size) {
-    return CreateBuffer(InterleavedBufferConfig{
-        .device      = dev,
-        .size        = size,
-        .page_size   = size,          // single page = whole buffer
-        .buffer_type = BufferType::L1,
-    });
 }
 
 void run_fft(
@@ -109,24 +109,23 @@ void run_fft(
 
     uint32_t sem_id = CreateSemaphore(prog, cr, 0u);
 
-    // ── Allocate L1 buffers for the two CBs we need addresses for ──
-    // LHS_R/I: local data input (reader writes here for compute)
-    // SCRATCH_R/I: incoming NOC data (writer NOC-writes here)
-    // These need globally-known addresses so the writer kernel can
-    // pass them to peer cores as NOC destination addresses.
-    uint32_t cb_data_size = kTileSizeFp32 * 2;  // 2-tile double-buffer
-    uint32_t cb_scratch_size = kTileSizeFp32;    // 1-tile
+    // ── CB L1 address computation ─────────────────────────────
+    // CBs are allocated sequentially from L1_UNRESERVED_BASE.
+    // We compute each CB's address as cumulative sum of previous CB sizes.
+    // This matches what the runtime does internally.
+    uint32_t cb_base = hal.get_dev_addr(
+        HalProgrammableCoreType::TENSIX, HalL1MemAddrType::UNRESERVED);
 
-    auto l1_lhs_r   = make_l1_buf(device, cb_data_size);
-    auto l1_lhs_i   = make_l1_buf(device, cb_data_size);
-    auto l1_scr_r   = make_l1_buf(device, cb_scratch_size);
-    auto l1_scr_i   = make_l1_buf(device, cb_scratch_size);
+    // Compute cumulative offsets
+    uint32_t cb_offsets[15];
+    cb_offsets[0] = 0;
+    for (int i=1; i<15; i++)
+        cb_offsets[i] = cb_offsets[i-1] + kCbTiles[i-1] * kTileSizeFp32;
 
-    // Store addresses before CBs take ownership
-    uint32_t lhs_r_addr = l1_lhs_r->address();
-    uint32_t lhs_i_addr = l1_lhs_i->address();
-    uint32_t scr_r_addr = l1_scr_r->address();
-    uint32_t scr_i_addr = l1_scr_i->address();
+    uint32_t lhs_r_addr = cb_base + cb_offsets[CB_LHS_R];
+    uint32_t lhs_i_addr = cb_base + cb_offsets[CB_LHS_I];
+    uint32_t scr_r_addr = cb_base + cb_offsets[CB_SCRATCH_R];
+    uint32_t scr_i_addr = cb_base + cb_offsets[CB_SCRATCH_I];
 
     // ── Create CBs ────────────────────────────────────────────
     auto make_cb = [&](uint32_t id, uint32_t ntiles=1) {
@@ -135,26 +134,7 @@ void run_fft(
         return CreateCircularBuffer(prog, cr, c);
     };
 
-    // Globally-addressed CBs (need fixed L1 address for NOC)
-    auto make_cb_global = [&](uint32_t id, uint32_t ntiles,
-                               std::shared_ptr<Buffer>& l1_buf) {
-        CircularBufferConfig c(ntiles*kTileSizeFp32,{{id,tt::DataFormat::Float32}});
-        c.set_page_size(id, kTileSizeFp32);
-        c.set_globally_allocated_address(*l1_buf);
-        AssignGlobalBufferToProgram(l1_buf, prog);
-        return CreateCircularBuffer(prog, cr, c);
-    };
-
-    make_cb_global(CB_LHS_R, 2, l1_lhs_r);
-    make_cb_global(CB_LHS_I, 2, l1_lhs_i);
-    make_cb(CB_RHS_R, 2);   make_cb(CB_RHS_I, 2);
-    make_cb(CB_TWIDDLE_R,2); make_cb(CB_TWIDDLE_I,2);
-    make_cb(CB_OUT_R, 2);   make_cb(CB_OUT_I, 2);
-    make_cb_global(CB_SCRATCH_R, 1, l1_scr_r);
-    make_cb_global(CB_SCRATCH_I, 1, l1_scr_i);
-    make_cb(CB_SYNC);
-    make_cb(CB_TMP_R); make_cb(CB_TMP_I);
-    make_cb(CB_WR_R);  make_cb(CB_WR_I);
+    for (uint32_t id=0; id<15; id++) make_cb(id, kCbTiles[id]);
 
     // ── Kernels ───────────────────────────────────────────────
     std::vector<uint32_t> ct_rw={local_N,cfg.num_cores,S,0u};
