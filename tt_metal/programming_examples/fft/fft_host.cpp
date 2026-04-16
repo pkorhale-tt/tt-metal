@@ -82,20 +82,6 @@ static std::shared_ptr<MeshBuffer> make_mesh_buf(
     return MeshBuffer::create(rep_cfg, dev_cfg, md.get());
 }
 
-// Write std::vector<float> to device (0,0)
-static void mesh_write(MeshCommandQueue& cq,
-                       std::shared_ptr<MeshBuffer> buf,
-                       std::vector<float>& data) {
-    WriteShard(cq, buf, data, MeshCoordinate(0,0), false);
-}
-
-// Read from device (0,0) into std::vector<float>
-static void mesh_read(MeshCommandQueue& cq,
-                      std::vector<float>& data,
-                      std::shared_ptr<MeshBuffer> buf) {
-    ReadShard(cq, data, buf, MeshCoordinate(0,0), true);
-}
-
 // Get the underlying Buffer's L1/DRAM address for runtime args
 static uint32_t buf_addr(const std::shared_ptr<MeshBuffer>& mb) {
     return mb->get_device_buffer(MeshCoordinate(0,0))->address();
