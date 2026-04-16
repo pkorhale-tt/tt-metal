@@ -46,6 +46,17 @@ static float max_err(const std::vector<Complex>& a, const std::vector<Complex>& 
     return e;
 }
 
+// Relative error against the reference's max magnitude. This is the
+// meaningful quantity for a transform: absolute error necessarily grows
+// with |X| (which is O(sqrt(N)) for random input) and with sqrt(logN)
+// stage-accumulation, so a fixed absolute threshold is not stable across N.
+static float rel_err(const std::vector<Complex>& ref, const std::vector<Complex>& got) {
+    float max_abs = 0.0f;
+    for (const auto& c : ref) max_abs = std::max(max_abs, std::abs(c));
+    if (max_abs == 0.0f) max_abs = 1.0f;
+    return max_err(ref, got) / max_abs;
+}
+
 // ── Input generators ──────────────────────────────────────────────────────
 static std::vector<Complex> make_impulse(uint32_t N) {
     std::vector<Complex> x(N, {0.0f, 0.0f});
@@ -98,10 +109,17 @@ static bool run_test(
     ReadShard(cq, out_i, out_i_buf, MeshCoordinate(0, 0), true);
 
     const auto got = unpack_output(out_r, out_i, N);
-    const float err = max_err(ref, got);
-    const bool  pass = err < 1e-3f;
-    std::printf("[%s] N=%-5u FFT | err=%.2e | %.1f ms  %s\n",
-                pass ? "PASS" : "FAIL", N, err, ms, name);
+    const float abs_e = max_err(ref, got);
+    const float rel_e = rel_err(ref, got);
+
+    // Wormhole fp32_dest_acc_en + UnpackToDestFp32 gives ~tf19-class
+    // precision per op. For random input, relative error accumulates
+    // roughly as O(sqrt(logN)) around 1e-4..1e-3. 2e-3 is a safe
+    // "real fp32 path is working" threshold; anything worse means the
+    // compute is silently falling back to bf16 (~1e-2+).
+    const bool pass = rel_e < 2e-3f;
+    std::printf("[%s] N=%-5u FFT | abs=%.2e rel=%.2e | %.1f ms  %s\n",
+                pass ? "PASS" : "FAIL", N, abs_e, rel_e, ms, name);
     return pass;
 }
 
