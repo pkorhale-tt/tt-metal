@@ -79,7 +79,7 @@ static std::shared_ptr<MeshBuffer> make_mesh_buf(
         .page_size   = page_size,
         .buffer_type = BufferType::DRAM,
     };
-    return MeshBuffer::create(rep_cfg, dev_cfg, md);
+    return MeshBuffer::create(rep_cfg, dev_cfg, md.get());
 }
 
 // Write std::vector<float> to device (0,0)
