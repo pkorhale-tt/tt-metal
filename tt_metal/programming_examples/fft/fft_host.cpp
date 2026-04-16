@@ -13,7 +13,6 @@
 #include "tt-metalium/constants.hpp"
 #include "tt-metalium/kernel_types.hpp"
 #include "tt-metalium/circular_buffer_config.hpp"
-#include "tt-metalium/hal.hpp"
 #include "tt-metalium/hal_types.hpp"
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
@@ -113,8 +112,11 @@ void run_fft(
     // CBs are allocated sequentially from L1_UNRESERVED_BASE.
     // We compute each CB's address as cumulative sum of previous CB sizes.
     // This matches what the runtime does internally.
-    uint32_t cb_base = hal.get_dev_addr(
-        HalProgrammableCoreType::TENSIX, HalL1MemAddrType::UNRESERVED);
+    // device->get_dev_addr(virtual_core, DEFAULT_UNRESERVED) gives CB base.
+    // CBs are allocated sequentially from this address.
+    CoreCoord virtual_c0 = device->worker_core_from_logical_core(linear_to_core(0));
+    uint32_t cb_base = static_cast<uint32_t>(
+        device->get_dev_addr(virtual_c0, HalL1MemAddrType::DEFAULT_UNRESERVED));
 
     // Compute cumulative offsets
     uint32_t cb_offsets[15];
