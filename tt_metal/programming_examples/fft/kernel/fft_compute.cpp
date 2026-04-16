@@ -1,340 +1,137 @@
-// ============================================================
-//  fft_compute.cpp  –  TRISC (compute engine)
-//
-//  Executes Cooley-Tukey butterfly for both local and NOC stages.
-//
-//  Butterfly operation (DIT, radix-2):
-//    Given complex pair (a, b) and twiddle W = e^{-j*2*pi*k/N}:
-//      out_a = a + W*b
-//      out_b = a - W*b
-//    Where W*b = (b_r*W_r - b_i*W_i) + j*(b_r*W_i + b_i*W_r)
-//
-//  We use the SFPU (vector unit) throughout since FFT is NOT
-//  a matrix multiply — the FPU (matrix unit) doesn't help here.
-//  This matches Davies paper observation: "vector vs matrix units
-//  comparable" — vector is the right choice for 1D FFT.
-//
-//  For IFFT: same code, but twiddle factors are conjugated
-//  (W_i negated) and output is divided by N (scale after last stage).
-// ============================================================
+// fft_compute.cpp — multi-core 1D FFT compute kernel
+// Includes match existing fft_float32 kernels in this repo.
 
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/eltwise_unary/sfpu_split_include.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary_api.h"
-#include "fft_common.h"
+#include <cstdint>
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/negative.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/copy_dest_values.h"
 
-// ── Complex multiply via SFPU ────────────────────────────────
-// Computes (a_r + j*a_i) * (b_r + j*b_i)
-//   real part = a_r*b_r - a_i*b_i
-//   imag part = a_r*b_i + a_i*b_r
-//
-// Parameters are CB indices.  Result lands in cb_out_r / cb_out_i.
-// Caller must have called cb_reserve_back on output CBs.
-ALWI void complex_mul_sfpu(
-    uint32_t cb_a_r, uint32_t cb_a_i,   // inputs (will be popped)
-    uint32_t cb_b_r, uint32_t cb_b_i,   // inputs (will be popped)
-    uint32_t cb_tmp_r, uint32_t cb_tmp_i,
-    uint32_t cb_out_r, uint32_t cb_out_i)
-{
-    // ── real = a_r*b_r - a_i*b_i ────────────────────────────
+constexpr uint32_t ADD = 0;
+constexpr uint32_t SUB = 1;
+constexpr uint32_t MUL = 2;
+constexpr uint32_t NEG = 3;
 
-    // Step 1: a_r * b_r → cb_out_r (partial)
+// CB indices
+constexpr auto CB_LHS_R     = tt::CBIndex::c_0;
+constexpr auto CB_LHS_I     = tt::CBIndex::c_1;
+constexpr auto CB_RHS_R     = tt::CBIndex::c_2;
+constexpr auto CB_RHS_I     = tt::CBIndex::c_3;
+constexpr auto CB_TWIDDLE_R = tt::CBIndex::c_4;
+constexpr auto CB_TWIDDLE_I = tt::CBIndex::c_5;
+constexpr auto CB_OUT_R     = tt::CBIndex::c_6;
+constexpr auto CB_OUT_I     = tt::CBIndex::c_7;
+constexpr auto CB_SCRATCH_R = tt::CBIndex::c_8;
+constexpr auto CB_SCRATCH_I = tt::CBIndex::c_9;
+constexpr auto CB_SYNC      = tt::CBIndex::c_10;
+constexpr auto CB_TMP_R     = tt::CBIndex::c_11;
+constexpr auto CB_TMP_I     = tt::CBIndex::c_12;
+constexpr auto CB_WR_R      = tt::CBIndex::c_13;
+constexpr auto CB_WR_I      = tt::CBIndex::c_14;
+
+constexpr uint32_t num_local_stages = get_compile_time_arg_val(0);
+constexpr uint32_t num_noc_stages   = get_compile_time_arg_val(1);
+constexpr uint32_t is_ifft          = get_compile_time_arg_val(2);
+constexpr uint32_t total_N          = get_compile_time_arg_val(3);
+
+// Binary FPU op (matrix unit)
+template <uint32_t OP, bool POP1=false, bool POP2=false>
+FORCE_INLINE void mm_op(uint32_t a, uint32_t b, uint32_t out) {
+    if constexpr (POP1) cb_wait_front(a, 1);
+    if constexpr (POP2) cb_wait_front(b, 1);
     tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_a_r);
-    copy_tile(cb_a_r, 0, 0);   // dst[0] = a_r
-
-    mul_tiles_init(cb_a_r, cb_b_r);
-    mul_tiles(cb_a_r, cb_b_r, 0, 0, 0);  // dst[0] = a_r * b_r
+    if constexpr (OP==ADD) { add_tiles_init(a,b); add_tiles(a,b,0,0,0); }
+    else if constexpr (OP==SUB) { sub_tiles_init(a,b); sub_tiles(a,b,0,0,0); }
+    else if constexpr (OP==MUL) { mul_tiles_init(a,b); mul_tiles(a,b,0,0,0); }
     tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_out_r);
-    tile_regs_release();
-
-    // Step 2: a_i * b_i → cb_tmp_r
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_a_i);
-    copy_tile(cb_a_i, 0, 0);
-
-    mul_tiles_init(cb_a_i, cb_b_i);
-    mul_tiles(cb_a_i, cb_b_i, 0, 0, 0);  // dst[0] = a_i * b_i
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_tmp_r);
-    tile_regs_release();
-
-    // Step 3: real = cb_out_r - cb_tmp_r
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_out_r);
-    copy_tile(cb_out_r, 0, 0);
-
-    sub_tiles_init(cb_out_r, cb_tmp_r);
-    sub_tiles(cb_out_r, cb_tmp_r, 0, 0, 0);  // dst[0] = a_r*b_r - a_i*b_i
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_out_r);
-    tile_regs_release();
-
-    // ── imag = a_r*b_i + a_i*b_r ────────────────────────────
-
-    // Step 4: a_r * b_i → cb_out_i (partial)
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_a_r);
-    copy_tile(cb_a_r, 0, 0);
-
-    mul_tiles_init(cb_a_r, cb_b_i);
-    mul_tiles(cb_a_r, cb_b_i, 0, 0, 0);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_out_i);
-    tile_regs_release();
-
-    // Step 5: a_i * b_r → cb_tmp_i
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_a_i);
-    copy_tile(cb_a_i, 0, 0);
-
-    mul_tiles_init(cb_a_i, cb_b_r);
-    mul_tiles(cb_a_i, cb_b_r, 0, 0, 0);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_tmp_i);
-    tile_regs_release();
-
-    // Step 6: imag = cb_out_i + cb_tmp_i
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_out_i);
-    copy_tile(cb_out_i, 0, 0);
-
-    add_tiles_init(cb_out_i, cb_tmp_i);
-    add_tiles(cb_out_i, cb_tmp_i, 0, 0, 0);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_out_i);
-    tile_regs_release();
+    if constexpr (POP1) cb_pop_front(a,1);
+    if constexpr (POP2) cb_pop_front(b,1);
+    cb_reserve_back(out,1); tile_regs_wait(); pack_tile(0,out); tile_regs_release(); cb_push_back(out,1);
 }
 
-// ── Full butterfly: out_a = lhs + W*rhs,  out_b = lhs - W*rhs ──
-// lhs = (cb_lhs_r, cb_lhs_i)
-// rhs = (cb_rhs_r, cb_rhs_i)
-// twiddle = (cb_tw_r, cb_tw_i)
-// outputs land in CB_OUT_R / CB_OUT_I
-//   first half  = out_a (add results)
-//   second half = out_b (sub results)
-// Caller must cb_reserve_back(CB_OUT_R/I, 1) before calling.
-ALWI void butterfly(
-    uint32_t cb_lhs_r, uint32_t cb_lhs_i,
-    uint32_t cb_rhs_r, uint32_t cb_rhs_i,
-    uint32_t cb_tw_r,  uint32_t cb_tw_i,
-    uint32_t cb_tmp_r, uint32_t cb_tmp_i,  // scratch
-    uint32_t cb_wr_r,  uint32_t cb_wr_i,   // W*rhs intermediate
-    uint32_t cb_out_r, uint32_t cb_out_i)
-{
-    // ── Step A: W_r_i = W * rhs ─────────────────────────────
-    cb_reserve_back(cb_wr_r, 1);
-    cb_reserve_back(cb_wr_i, 1);
-
-    complex_mul_sfpu(
-        cb_tw_r,  cb_tw_i,
-        cb_rhs_r, cb_rhs_i,
-        cb_tmp_r, cb_tmp_i,
-        cb_wr_r,  cb_wr_i);
-
-    cb_push_back(cb_wr_r, 1);
-    cb_push_back(cb_wr_i, 1);
-
-    cb_wait_front(cb_wr_r, 1);
-    cb_wait_front(cb_wr_i, 1);
-    cb_wait_front(cb_lhs_r, 1);
-    cb_wait_front(cb_lhs_i, 1);
-
-    // ── Step B: out_a = lhs + W*rhs ─────────────────────────
-    // Real part
+// Negate via SFPU
+template <bool POP=false>
+FORCE_INLINE void neg_op(uint32_t in, uint32_t out) {
+    if constexpr (POP) cb_wait_front(in,1);
     tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_lhs_r);
-    copy_tile(cb_lhs_r, 0, 0);
-    add_tiles_init(cb_lhs_r, cb_wr_r);
-    add_tiles(cb_lhs_r, cb_wr_r, 0, 0, 0);
+    copy_tile_to_dst_init_short(in); copy_tile(in,0,0);
+    negative_tile_init(); negative_tile(0);
     tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_out_r);       // out_a real → first half of output tile
-    tile_regs_release();
-
-    // Imag part
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_lhs_i);
-    copy_tile(cb_lhs_i, 0, 0);
-    add_tiles_init(cb_lhs_i, cb_wr_i);
-    add_tiles(cb_lhs_i, cb_wr_i, 0, 0, 0);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_out_i);
-    tile_regs_release();
-
-    // ── Step C: out_b = lhs - W*rhs ─────────────────────────
-    // Real part
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_lhs_r);
-    copy_tile(cb_lhs_r, 0, 0);
-    sub_tiles_init(cb_lhs_r, cb_wr_r);
-    sub_tiles(cb_lhs_r, cb_wr_r, 0, 0, 0);
-    tile_regs_commit();
-    tile_regs_wait();
-    // Pack into second half of output tile (offset by local_N/2 elements)
-    // In practice: use a second output CB or pack with dst offset.
-    // Here we pack into the same CB at tile index 1 (requires 2-tile CB).
-    pack_tile(0, cb_out_r, 1);
-    tile_regs_release();
-
-    // Imag part
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_lhs_i);
-    copy_tile(cb_lhs_i, 0, 0);
-    sub_tiles_init(cb_lhs_i, cb_wr_i);
-    sub_tiles(cb_lhs_i, cb_wr_i, 0, 0, 0);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_out_i, 1);
-    tile_regs_release();
-
-    // Pop all inputs
-    cb_pop_front(cb_lhs_r, 1);
-    cb_pop_front(cb_lhs_i, 1);
-    cb_pop_front(cb_rhs_r, 1);
-    cb_pop_front(cb_rhs_i, 1);
-    cb_pop_front(cb_tw_r,  1);
-    cb_pop_front(cb_tw_i,  1);
-    cb_pop_front(cb_wr_r,  1);
-    cb_pop_front(cb_wr_i,  1);
+    if constexpr (POP) cb_pop_front(in,1);
+    cb_reserve_back(out,1); tile_regs_wait(); pack_tile(0,out); tile_regs_release(); cb_push_back(out,1);
 }
 
-// ── IFFT scale: multiply by 1/N after last stage ─────────────
-ALWI void scale_by_inv_N(
-    uint32_t cb_r, uint32_t cb_i, float inv_N)
-{
-    cb_wait_front(cb_r, 1);
-    cb_wait_front(cb_i, 1);
-    cb_reserve_back(CB_OUT_R, 1);
-    cb_reserve_back(CB_OUT_I, 1);
-
-    // Load 1/N as a scalar into dst and multiply
-    // Using SFPU mul_unary (multiplies every element by scalar)
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_r);
-    copy_tile(cb_r, 0, 0);
-    mul_unary_tile_init();
-    mul_unary_tile(0, inv_N);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, CB_OUT_R);
-    tile_regs_release();
-
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(cb_i);
-    copy_tile(cb_i, 0, 0);
-    mul_unary_tile_init();
-    mul_unary_tile(0, inv_N);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, CB_OUT_I);
-    tile_regs_release();
-
-    cb_pop_front(cb_r, 1);
-    cb_pop_front(cb_i, 1);
-    cb_push_back(CB_OUT_R, 1);
-    cb_push_back(CB_OUT_I, 1);
+// Complex multiply: (a+bi)*(c+di) = (ac-bd) + (ad+bc)i
+FORCE_INLINE void cmul(uint32_t ar, uint32_t ai, uint32_t br, uint32_t bi,
+                        uint32_t outr, uint32_t outi) {
+    mm_op<MUL>(ar,br,CB_TMP_R);  mm_op<MUL>(ai,bi,CB_TMP_I);
+    mm_op<SUB,true,true>(CB_TMP_R,CB_TMP_I,outr);
+    mm_op<MUL>(ar,bi,CB_TMP_R);  mm_op<MUL>(ai,br,CB_TMP_I);
+    mm_op<ADD,true,true>(CB_TMP_R,CB_TMP_I,outi);
 }
 
-// ── Temporary CBs used inside butterfly ─────────────────────
-// Defined as compile-time constants; must be registered in host.
-constexpr uint32_t CB_TMP_R  = 11;
-constexpr uint32_t CB_TMP_I  = 12;
-constexpr uint32_t CB_WR_R   = 13;  // W*rhs intermediate real
-constexpr uint32_t CB_WR_I   = 14;  // W*rhs intermediate imag
+// Butterfly: out = even + W*odd  (result in CB_OUT_R/I)
+FORCE_INLINE void butterfly(
+    uint32_t er, uint32_t ei,   // even (LHS)
+    uint32_t or_, uint32_t oi,  // odd  (RHS)
+    uint32_t wr, uint32_t wi)   // twiddle
+{
+    cb_wait_front(or_,1); cb_wait_front(oi,1);
+    cb_wait_front(wr,1);  cb_wait_front(wi,1);
+    cmul(or_,oi,wr,wi, CB_WR_R,CB_WR_I);
+    cb_pop_front(or_,1); cb_pop_front(oi,1);
+    cb_pop_front(wr,1);  cb_pop_front(wi,1);
 
-void MAIN {
-    uint32_t num_local_stages = get_compile_time_arg_val(0);
-    uint32_t num_noc_stages   = get_compile_time_arg_val(1);
-    uint32_t is_ifft          = get_compile_time_arg_val(2); // 1=IFFT
-    uint32_t total_N          = get_compile_time_arg_val(3);
-    uint32_t num_total_stages = num_local_stages + num_noc_stages;
+    cb_wait_front(er,1); cb_wait_front(ei,1);
+    cb_wait_front(CB_WR_R,1); cb_wait_front(CB_WR_I,1);
+    mm_op<ADD>(er,CB_WR_R, CB_OUT_R);
+    mm_op<ADD>(ei,CB_WR_I, CB_OUT_I);
+    cb_pop_front(er,1); cb_pop_front(ei,1);
+    cb_pop_front(CB_WR_R,1); cb_pop_front(CB_WR_I,1);
+}
 
-    mm_init();  // required once before any math ops
+void kernel_main() {
+    unary_op_init_common(CB_LHS_R, CB_OUT_R);
+    copy_tile_to_dst_init_short(CB_LHS_R);
 
-    // ── LOCAL STAGES ─────────────────────────────────────────
-    // Data is already in CB_LHS_R/I (loaded by reader in bit-reversed order).
-    // Reader also pushed CB_RHS_R/I and CB_TWIDDLE_R/I for each stage.
-    for (uint32_t s = 0; s < num_local_stages; s++) {
-        cb_wait_front(CB_LHS_R,     1);
-        cb_wait_front(CB_LHS_I,     1);
-        cb_wait_front(CB_RHS_R,     1);
-        cb_wait_front(CB_RHS_I,     1);
-        cb_wait_front(CB_TWIDDLE_R, 1);
-        cb_wait_front(CB_TWIDDLE_I, 1);
+    // Local stages
+    for (uint32_t s=0; s<num_local_stages; s++) {
+        cb_wait_front(CB_LHS_R,1); cb_wait_front(CB_LHS_I,1);
+        cb_wait_front(CB_RHS_R,1); cb_wait_front(CB_RHS_I,1);
+        cb_wait_front(CB_TWIDDLE_R,1); cb_wait_front(CB_TWIDDLE_I,1);
 
-        cb_reserve_back(CB_OUT_R, 1);
-        cb_reserve_back(CB_OUT_I, 1);
-
-        butterfly(
-            CB_LHS_R,     CB_LHS_I,
-            CB_RHS_R,     CB_RHS_I,
-            CB_TWIDDLE_R, CB_TWIDDLE_I,
-            CB_TMP_R,     CB_TMP_I,
-            CB_WR_R,      CB_WR_I,
-            CB_OUT_R,     CB_OUT_I);
-
-        cb_push_back(CB_OUT_R, 1);
-        cb_push_back(CB_OUT_I, 1);
-
-        // Rotate: OUT → LHS for next stage
-        // Writer kernel pops CB_OUT and the next iteration's
-        // cb_wait_front(CB_LHS, 1) blocks until reader re-fills.
-        // (In the single-copy optimization, OUT is directly the
-        //  next stage's LHS — this is the Davies paper optimization.)
+        if constexpr (is_ifft) {
+            // Conjugate twiddle for IFFT
+            neg_op<true>(CB_TWIDDLE_I, CB_TMP_R);
+            cb_wait_front(CB_TMP_R,1);
+            butterfly(CB_LHS_R,CB_LHS_I, CB_RHS_R,CB_RHS_I, CB_TWIDDLE_R,CB_TMP_R);
+            cb_pop_front(CB_TMP_R,1);
+        } else {
+            butterfly(CB_LHS_R,CB_LHS_I, CB_RHS_R,CB_RHS_I, CB_TWIDDLE_R,CB_TWIDDLE_I);
+        }
+        cb_pop_front(CB_TWIDDLE_R,1);
+        if constexpr (!is_ifft) cb_pop_front(CB_TWIDDLE_I,1);
     }
 
-    // ── NOC STAGES ───────────────────────────────────────────
-    // After local stages, CB_OUT has our locally-computed results.
-    // Writer sends those out to peers and fills CB_SCRATCH with
-    // incoming data. Writer then pushes CB_SYNC to unblock us.
-    for (uint32_t s = 0; s < num_noc_stages; s++) {
-        // Wait for writer to confirm all peer data is in CB_SCRATCH
-        cb_wait_front(CB_SYNC, 1);
-        cb_pop_front(CB_SYNC, 1);
+    // NOC stages: wait for CB_SYNC, use SCRATCH as RHS
+    for (uint32_t s=0; s<num_noc_stages; s++) {
+        cb_wait_front(CB_SYNC,1); cb_pop_front(CB_SYNC,1);
 
-        // At this point:
-        //   CB_OUT_R/I  = our local results from previous stage
-        //   CB_SCRATCH_R/I = data received from our butterfly partner core
-        //
-        // We treat CB_OUT as LHS and CB_SCRATCH as RHS (or vice versa
-        // depending on whether our global index is the 'lo' or 'hi' element).
-        // For power-of-2 partitioning: lower-id core always holds LHS.
-        cb_wait_front(CB_OUT_R,     1);
-        cb_wait_front(CB_OUT_I,     1);
-        cb_wait_front(CB_SCRATCH_R, 1);
-        cb_wait_front(CB_SCRATCH_I, 1);
-        cb_wait_front(CB_TWIDDLE_R, 1);
-        cb_wait_front(CB_TWIDDLE_I, 1);
+        cb_wait_front(CB_OUT_R,1);   cb_wait_front(CB_OUT_I,1);
+        cb_wait_front(CB_SCRATCH_R,1); cb_wait_front(CB_SCRATCH_I,1);
+        cb_wait_front(CB_TWIDDLE_R,1); cb_wait_front(CB_TWIDDLE_I,1);
 
-        cb_reserve_back(CB_OUT_R, 1);
-        cb_reserve_back(CB_OUT_I, 1);
-
-        butterfly(
-            CB_OUT_R,     CB_OUT_I,      // LHS = our data
-            CB_SCRATCH_R, CB_SCRATCH_I,  // RHS = received from partner
-            CB_TWIDDLE_R, CB_TWIDDLE_I,
-            CB_TMP_R,     CB_TMP_I,
-            CB_WR_R,      CB_WR_I,
-            CB_OUT_R,     CB_OUT_I);
-
-        cb_push_back(CB_OUT_R, 1);
-        cb_push_back(CB_OUT_I, 1);
-    }
-
-    // ── IFFT: scale by 1/N on last stage ─────────────────────
-    if (is_ifft) {
-        float inv_N = 1.0f / static_cast<float>(total_N);
-        scale_by_inv_N(CB_OUT_R, CB_OUT_I, inv_N);
+        if constexpr (is_ifft) {
+            neg_op<true>(CB_TWIDDLE_I, CB_TMP_R);
+            cb_wait_front(CB_TMP_R,1);
+            butterfly(CB_OUT_R,CB_OUT_I, CB_SCRATCH_R,CB_SCRATCH_I, CB_TWIDDLE_R,CB_TMP_R);
+            cb_pop_front(CB_TMP_R,1);
+        } else {
+            butterfly(CB_OUT_R,CB_OUT_I, CB_SCRATCH_R,CB_SCRATCH_I, CB_TWIDDLE_R,CB_TWIDDLE_I);
+        }
+        cb_pop_front(CB_TWIDDLE_R,1);
+        if constexpr (!is_ifft) cb_pop_front(CB_TWIDDLE_I,1);
     }
 }
