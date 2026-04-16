@@ -1,144 +1,128 @@
-// fft_compute.cpp — multi-core FFT, correct two-output butterfly
-// CB layout:
-//   c_0/1 = even_r/i  (lower half of butterfly pairs)
-//   c_2/3 = odd_r/i   (upper half of butterfly pairs)
-//   c_4/5 = twiddle_r/i
-//   c_6/7 = out0_r/i  (even + W*odd)
-//   c_8/9 = out1_r/i  (even - W*odd)
-//   c_10  = sync (NOC stage signal)
-//   c_11-14 = scratch_r/i, tmp_r/i
+// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// fft_compute.cpp — TRISC / compute
+//
+// For each of the LOG2N stages, wait for EVEN/ODD/TW tiles from the reader,
+// do a radix-2 DIT butterfly on the whole tile (split-complex):
+//
+//     W*odd  :  (odd_r + i*odd_i) * (tw_r + i*tw_i)
+//     out0   =  even + W*odd
+//     out1   =  even - W*odd
+//
+// then push OUT0/OUT1 back to the reader for the scatter step.
+//
+// All tile ops operate on full 32x32 fp32 tiles (TILE_SIZE_FP32).  Unused
+// slots in a short (N<1024) tile are zero-padded by the host and stay zero
+// through every stage, so they don't affect the valid region.
 
 #include <cstdint>
+#include "api/compute/common.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/eltwise_binary.h"
-#include "api/compute/eltwise_unary/negative.h"
-#include "api/compute/eltwise_unary/eltwise_unary.h"
-#include "api/compute/eltwise_binary_sfpu.h"
-#include "api/compute/copy_dest_values.h"
+#include "api/compute/compute_kernel_api.h"
 
-constexpr uint32_t ADD=0, SUB=1, MUL=2, NEG=3;
+constexpr auto CB_EVEN_R    = tt::CBIndex::c_0;
+constexpr auto CB_EVEN_I    = tt::CBIndex::c_1;
+constexpr auto CB_ODD_R     = tt::CBIndex::c_2;
+constexpr auto CB_ODD_I     = tt::CBIndex::c_3;
+constexpr auto CB_TW_R      = tt::CBIndex::c_4;
+constexpr auto CB_TW_I      = tt::CBIndex::c_5;
+constexpr auto CB_OUT0_R    = tt::CBIndex::c_6;
+constexpr auto CB_OUT0_I    = tt::CBIndex::c_7;
+constexpr auto CB_OUT1_R    = tt::CBIndex::c_8;
+constexpr auto CB_OUT1_I    = tt::CBIndex::c_9;
+constexpr auto CB_TMP_R     = tt::CBIndex::c_10;
+constexpr auto CB_TMP_I     = tt::CBIndex::c_11;
+constexpr auto CB_TW_ODD_R  = tt::CBIndex::c_12;
+constexpr auto CB_TW_ODD_I  = tt::CBIndex::c_13;
 
-// CBs
-constexpr auto CB_EVEN_R  = tt::CBIndex::c_0;
-constexpr auto CB_EVEN_I  = tt::CBIndex::c_1;
-constexpr auto CB_ODD_R   = tt::CBIndex::c_2;
-constexpr auto CB_ODD_I   = tt::CBIndex::c_3;
-constexpr auto CB_TW_R    = tt::CBIndex::c_4;
-constexpr auto CB_TW_I    = tt::CBIndex::c_5;
-constexpr auto CB_OUT0_R  = tt::CBIndex::c_6;   // even + W*odd
-constexpr auto CB_OUT0_I  = tt::CBIndex::c_7;
-constexpr auto CB_OUT1_R  = tt::CBIndex::c_8;   // even - W*odd
-constexpr auto CB_OUT1_I  = tt::CBIndex::c_9;
-constexpr auto CB_SYNC    = tt::CBIndex::c_10;
-constexpr auto CB_SCRATCH_R = tt::CBIndex::c_11; // incoming NOC data
-constexpr auto CB_SCRATCH_I = tt::CBIndex::c_12;
-constexpr auto CB_TMP_R   = tt::CBIndex::c_13;
-constexpr auto CB_TMP_I   = tt::CBIndex::c_14;
-constexpr auto CB_TW_ODD_R = tt::CBIndex::c_15; // W*odd result
-constexpr auto CB_TW_ODD_I = tt::CBIndex::c_16;
+constexpr uint32_t LOG2N = get_compile_time_arg_val(0);
 
-constexpr uint32_t num_local_stages = get_compile_time_arg_val(0);
-constexpr uint32_t num_noc_stages   = get_compile_time_arg_val(1);
-constexpr uint32_t is_ifft          = get_compile_time_arg_val(2);
+enum : uint32_t { OP_ADD = 0, OP_SUB = 1, OP_MUL = 2 };
 
-template <uint32_t OP, bool P1=false, bool P2=false>
-FORCE_INLINE void mm_op(uint32_t a, uint32_t b, uint32_t out) {
-    if constexpr (P1) cb_wait_front(a,1);
-    if constexpr (P2) cb_wait_front(b,1);
+// Run a binary tile op (add/sub/mul) on CBs a,b -> CB out. Inputs are expected
+// to already be waited on; out is pushed back (not popped). Inputs are NOT
+// popped here -- caller controls lifetime.
+template <uint32_t OP>
+FORCE_INLINE void binop_push(uint32_t a, uint32_t b, uint32_t out) {
+    if      constexpr (OP == OP_ADD) { add_tiles_init(a, b); }
+    else if constexpr (OP == OP_SUB) { sub_tiles_init(a, b); }
+    else if constexpr (OP == OP_MUL) { mul_tiles_init(a, b); }
+
     tile_regs_acquire();
-    if constexpr (OP==ADD){add_tiles_init(a,b);add_tiles(a,b,0,0,0);}
-    else if constexpr(OP==SUB){sub_tiles_init(a,b);sub_tiles(a,b,0,0,0);}
-    else if constexpr(OP==MUL){mul_tiles_init(a,b);mul_tiles(a,b,0,0,0);}
+    if      constexpr (OP == OP_ADD) { add_tiles(a, b, 0, 0, 0); }
+    else if constexpr (OP == OP_SUB) { sub_tiles(a, b, 0, 0, 0); }
+    else if constexpr (OP == OP_MUL) { mul_tiles(a, b, 0, 0, 0); }
     tile_regs_commit();
-    if constexpr (P1) cb_pop_front(a,1);
-    if constexpr (P2) cb_pop_front(b,1);
-    cb_reserve_back(out,1); tile_regs_wait(); pack_tile(0,out);
-    tile_regs_release(); cb_push_back(out,1);
+
+    cb_reserve_back(out, 1);
+    tile_regs_wait();
+    pack_tile(0, out);
+    tile_regs_release();
+    cb_push_back(out, 1);
 }
 
-template <bool P=false>
-FORCE_INLINE void neg_op(uint32_t in, uint32_t out) {
-    if constexpr (P) cb_wait_front(in,1);
-    tile_regs_acquire();
-    copy_tile_to_dst_init_short(in); copy_tile(in,0,0);
-    negative_tile_init(); negative_tile(0);
-    tile_regs_commit();
-    if constexpr (P) cb_pop_front(in,1);
-    cb_reserve_back(out,1); tile_regs_wait(); pack_tile(0,out);
-    tile_regs_release(); cb_push_back(out,1);
-}
-
-// Complex multiply: (a+bi)*(c+di) → out_r + out_i*j
-FORCE_INLINE void cmul(uint32_t ar,uint32_t ai,uint32_t br,uint32_t bi,
-                        uint32_t outr,uint32_t outi) {
-    mm_op<MUL>(ar,br,CB_TMP_R); mm_op<MUL>(ai,bi,CB_TMP_I);
-    mm_op<SUB,true,true>(CB_TMP_R,CB_TMP_I,outr);
-    mm_op<MUL>(ar,bi,CB_TMP_R); mm_op<MUL>(ai,br,CB_TMP_I);
-    mm_op<ADD,true,true>(CB_TMP_R,CB_TMP_I,outi);
-}
-
-// Full butterfly producing both outputs:
-//   out0 = even + W*odd
-//   out1 = even - W*odd
-FORCE_INLINE void butterfly(
-    uint32_t ev_r, uint32_t ev_i,
-    uint32_t od_r, uint32_t od_i,
-    uint32_t tw_r, uint32_t tw_i)
+// Complex multiply: (ar+ i*ai) * (br + i*bi) -> (outr + i*outi)
+//   outr = ar*br - ai*bi
+//   outi = ar*bi + ai*br
+// Assumes ar/ai/br/bi already waited-on. Does not pop them.
+FORCE_INLINE void cmul(
+    uint32_t ar, uint32_t ai, uint32_t br, uint32_t bi,
+    uint32_t outr, uint32_t outi)
 {
-    // Step 1: W*odd → CB_TW_ODD_R/I
-    cb_wait_front(od_r,1); cb_wait_front(od_i,1);
-    cb_wait_front(tw_r,1); cb_wait_front(tw_i,1);
-    cmul(od_r,od_i, tw_r,tw_i, CB_TW_ODD_R,CB_TW_ODD_I);
-    cb_pop_front(od_r,1); cb_pop_front(od_i,1);
-    cb_pop_front(tw_r,1); cb_pop_front(tw_i,1);
+    // outr = ar*br - ai*bi
+    binop_push<OP_MUL>(ar, br, CB_TMP_R);
+    binop_push<OP_MUL>(ai, bi, CB_TMP_I);
+    cb_wait_front(CB_TMP_R, 1);
+    cb_wait_front(CB_TMP_I, 1);
+    binop_push<OP_SUB>(CB_TMP_R, CB_TMP_I, outr);
+    cb_pop_front(CB_TMP_R, 1);
+    cb_pop_front(CB_TMP_I, 1);
 
-    // Step 2: even + W*odd → out0,  even - W*odd → out1
-    cb_wait_front(ev_r,1); cb_wait_front(ev_i,1);
-    cb_wait_front(CB_TW_ODD_R,1); cb_wait_front(CB_TW_ODD_I,1);
-
-    mm_op<ADD>(ev_r, CB_TW_ODD_R, CB_OUT0_R);
-    mm_op<ADD>(ev_i, CB_TW_ODD_I, CB_OUT0_I);
-    mm_op<SUB>(ev_r, CB_TW_ODD_R, CB_OUT1_R);
-    mm_op<SUB>(ev_i, CB_TW_ODD_I, CB_OUT1_I);
-
-    cb_pop_front(ev_r,1); cb_pop_front(ev_i,1);
-    cb_pop_front(CB_TW_ODD_R,1); cb_pop_front(CB_TW_ODD_I,1);
+    // outi = ar*bi + ai*br
+    binop_push<OP_MUL>(ar, bi, CB_TMP_R);
+    binop_push<OP_MUL>(ai, br, CB_TMP_I);
+    cb_wait_front(CB_TMP_R, 1);
+    cb_wait_front(CB_TMP_I, 1);
+    binop_push<OP_ADD>(CB_TMP_R, CB_TMP_I, outi);
+    cb_pop_front(CB_TMP_R, 1);
+    cb_pop_front(CB_TMP_I, 1);
 }
 
 void kernel_main() {
-    unary_op_init_common(CB_EVEN_R, CB_OUT0_R);
-    copy_tile_to_dst_init_short(CB_EVEN_R);
+    // binary_op_init_common requires a representative (a, b, out) triple.
+    binary_op_init_common(CB_EVEN_R, CB_ODD_R, CB_OUT0_R);
 
-    for (uint32_t s=0; s<num_local_stages; s++) {
-        cb_wait_front(CB_EVEN_R,1); cb_wait_front(CB_EVEN_I,1);
-        cb_wait_front(CB_ODD_R,1);  cb_wait_front(CB_ODD_I,1);
+    for (uint32_t s = 0; s < LOG2N; ++s) {
+        cb_wait_front(CB_EVEN_R, 1);
+        cb_wait_front(CB_EVEN_I, 1);
+        cb_wait_front(CB_ODD_R,  1);
+        cb_wait_front(CB_ODD_I,  1);
+        cb_wait_front(CB_TW_R,   1);
+        cb_wait_front(CB_TW_I,   1);
 
-        if constexpr (is_ifft) {
-            neg_op<true>(CB_TW_I, CB_TMP_R);
-            cb_wait_front(CB_TMP_R,1);
-            butterfly(CB_EVEN_R,CB_EVEN_I, CB_ODD_R,CB_ODD_I, CB_TW_R,CB_TMP_R);
-            cb_pop_front(CB_TMP_R,1);
-        } else {
-            cb_wait_front(CB_TW_R,1); cb_wait_front(CB_TW_I,1);
-            butterfly(CB_EVEN_R,CB_EVEN_I, CB_ODD_R,CB_ODD_I, CB_TW_R,CB_TW_I);
-        }
-    }
+        // W * odd  ->  CB_TW_ODD
+        cmul(CB_ODD_R, CB_ODD_I, CB_TW_R, CB_TW_I, CB_TW_ODD_R, CB_TW_ODD_I);
 
-    // NOC stages: use CB_OUT0 as even, CB_SCRATCH as odd
-    for (uint32_t s=0; s<num_noc_stages; s++) {
-        cb_wait_front(CB_SYNC,1); cb_pop_front(CB_SYNC,1);
+        // After cmul we no longer need odd or twiddle.
+        cb_pop_front(CB_ODD_R, 1);
+        cb_pop_front(CB_ODD_I, 1);
+        cb_pop_front(CB_TW_R,  1);
+        cb_pop_front(CB_TW_I,  1);
 
-        cb_wait_front(CB_OUT0_R,1); cb_wait_front(CB_OUT0_I,1);
-        cb_wait_front(CB_SCRATCH_R,1); cb_wait_front(CB_SCRATCH_I,1);
+        cb_wait_front(CB_TW_ODD_R, 1);
+        cb_wait_front(CB_TW_ODD_I, 1);
 
-        if constexpr (is_ifft) {
-            neg_op<true>(CB_TW_I, CB_TMP_R);
-            cb_wait_front(CB_TMP_R,1);
-            butterfly(CB_OUT0_R,CB_OUT0_I, CB_SCRATCH_R,CB_SCRATCH_I, CB_TW_R,CB_TMP_R);
-            cb_pop_front(CB_TMP_R,1);
-        } else {
-            cb_wait_front(CB_TW_R,1); cb_wait_front(CB_TW_I,1);
-            butterfly(CB_OUT0_R,CB_OUT0_I, CB_SCRATCH_R,CB_SCRATCH_I, CB_TW_R,CB_TW_I);
-        }
+        // out0 = even + W*odd     out1 = even - W*odd
+        binop_push<OP_ADD>(CB_EVEN_R, CB_TW_ODD_R, CB_OUT0_R);
+        binop_push<OP_ADD>(CB_EVEN_I, CB_TW_ODD_I, CB_OUT0_I);
+        binop_push<OP_SUB>(CB_EVEN_R, CB_TW_ODD_R, CB_OUT1_R);
+        binop_push<OP_SUB>(CB_EVEN_I, CB_TW_ODD_I, CB_OUT1_I);
+
+        cb_pop_front(CB_EVEN_R,   1);
+        cb_pop_front(CB_EVEN_I,   1);
+        cb_pop_front(CB_TW_ODD_R, 1);
+        cb_pop_front(CB_TW_ODD_I, 1);
     }
 }

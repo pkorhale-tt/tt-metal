@@ -1,167 +1,129 @@
-# Multi-core 1D FFT for Tenstorrent Wormhole
-## Based on Davies et al. 2025 + bounty issue #21412
+# Single-core radix-2 DIT FFT (fp32, Wormhole)
 
----
+Minimal, correct, tile-engine FFT. **FFT only** (no IFFT).
 
-## File structure
+## Constraints
+
+- `N` is a power of two, `2 <= N <= 1024` (fits in one 32x32 fp32 tile).
+- Single Tensix core.
+
+For larger `N` or multi-core, extend with NOC butterfly stages on top of this
+kernel (notes at the bottom).
+
+## Files
 
 ```
-fft_kernel/
-  kernels/
-    fft_common.h      # CB indices, arg layouts, tile constants
-    fft_reader.cpp    # BRISC-0: DRAM reads, bit-reversal, twiddle loads
-    fft_compute.cpp   # TRISC: butterfly math via SFPU
-    fft_writer.cpp    # BRISC-1: NOC sends, semaphore handshake, DRAM write
-  host/
-    fft_host.cpp      # Program setup, twiddle precompute, dispatch
-    fft_test.cpp      # Correctness + perf tests
+fft/
+  CMakeLists.txt
+  fft_host.cpp       # host program setup + twiddle precompute
+  fft_test.cpp       # correctness test (compares against reference DFT)
+  kernel/
+    fft_common.h     # CB indices, tile constants
+    fft_reader.cpp   # BRISC0: DRAM I/O, persistent state, per-stage shuffle
+    fft_compute.cpp  # TRISC : tile-based radix-2 butterfly via SFPU
+    fft_writer.cpp   # BRISC1: writes final state tile to DRAM
 ```
-
----
 
 ## Algorithm
 
-**Cooley-Tukey DIT radix-2**, partitioned across cores.
+Iterative **Cooley-Tukey DIT radix-2** in place over `log2(N)` stages.
+Input is bit-reversed by the host, output comes out in natural order.
+
+At stage `s` with `stride = 2^s`:
 
 ```
-Total stages = log2(N)
-Local stages = log2(local_N)   = log2(N / num_cores)
-NOC stages   = log2(num_cores)
+for each pair index p in [0, N/2):
+    group = p >> s
+    pos   = p & (stride - 1)
+    lo    = group * 2*stride + pos
+    hi    = lo + stride
+
+    a      = state[lo]
+    b      = state[hi]
+    W      = twiddle[p]      // = exp(-j * 2*pi * pos / (2*stride))
+    state[lo] = a + W*b
+    state[hi] = a - W*b
 ```
 
-**Stage progression:**
-```
-Stage 1..log2(local_N) :  butterfly pairs within one core's L1
-                           → zero NOC traffic
-Stage log2(local_N)+1..log2(N):  butterfly pairs span cores
-                           → NOC unicast + semaphore per stage
-```
+The state is a single fp32 tile (1024 slots, first `N` used). The compute
+engine operates on the whole tile each stage; the reader does the
+stage-dependent gather/scatter on BRISC scalar code.
 
----
-
-## NOC handshake (critical path)
+## Pipeline per stage
 
 ```
-Writer (BRISC-1):                    Peer writer:
-  noc_async_write(data → peer CB)      noc_async_write(data → my CB)
-  noc_async_write_barrier()            noc_async_write_barrier()
-  noc_semaphore_inc(peer_sem, 1)       noc_semaphore_inc(my_sem, 1)
-  noc_semaphore_wait(my_sem, N-1) ←── wait for all N-1 peers
-  noc_semaphore_set(my_sem, 0)         reset
-  cb_push_back(CB_SYNC, 1)            unblock compute
+BRISC0  reader            TRISC  compute          BRISC1  writer
+──────                    ───────                 ──────
+load_twiddle -> CB_TW
+gather state -> CB_EVEN/CB_ODD
+                          wait EVEN/ODD/TW
+                          cmul    odd,tw  -> Wodd
+                          add     even,Wodd -> OUT0
+                          sub     even,Wodd -> OUT1
+                          push OUT0/OUT1
+scatter OUT0/OUT1 -> state
+...
+push CB_SYNC                                      wait SYNC
+                                                  write state -> DRAM
 ```
-
-**Rules that must not be violated:**
-1. `write_barrier` before `semaphore_inc` — data must land before signal
-2. `semaphore_set(0)` before `cb_push_back` — reset before compute races ahead
-3. Use `noc_semaphore_inc` not volatile store — only safe cross-core signal
-
----
 
 ## Memory layout
 
-### Input / Output (DRAM)
-Interleaved complex: `[r0, i0, r1, i1, ..., r_{N-1}, i_{N-1}]`
-fp32: 4 bytes/element, bf16: 2 bytes/element
+- **Input / output DRAM**: two fp32 tiles (real, imag). Host packs the input
+  into them bit-reversed so stage 0 already has contiguous pairs.
+- **Twiddles DRAM**: `log2(N)` tiles per side (real, imag). Tile `s` holds the
+  stage-`s` twiddle factor for each pair index `p` at slot `p`.
+- **L1 / state**: two fp32 tiles (`CB_STATE_R`, `CB_STATE_I`), kept alive for
+  the whole kernel.
 
-### Twiddle factors (DRAM)
-`twiddle[stage][k]` = `[cos(2πk/M), sin(2πk/M)]`
-where `M = 2 * (1 << stage)` (butterfly group size)
-Layout: stage-major, `(stage * N/2 + k) * 2` for real, `+1` for imag
+Rough L1 footprint (fp32, 17 CBs × up to 2 tiles × 4 KB) ≈ 128 KB, well under
+the 1.3 MB limit.
 
-### L1 per core
-```
-CB_LHS_R/I   : local_N elements real/imag (current stage input, LHS)
-CB_RHS_R/I   : local_N elements real/imag (reordered butterfly partner)
-CB_TWIDDLE   : local_N/2 twiddle factors
-CB_OUT_R/I   : butterfly output
-CB_SCRATCH   : incoming NOC data from partner core
-CB_SYNC      : 1-element signal from writer to compute
-CB_TMP/WR    : intermediate butterfly products
-```
+## Build & run
 
-Total L1 usage (fp32, local_N=128):
-```
-  9 CBs × 128 × 4 = ~4.6KB  << 1.3MB limit  ✓
-```
-
----
-
-## IFFT
-
-Identical kernel, two differences:
-1. Twiddle factors conjugated: `sin` term negated in `precompute_twiddles`
-2. After last stage: multiply by `1/N` via `scale_by_inv_N` in compute kernel
-
----
-
-## bf16 vs fp32
-
-| Mode | Tile size | Throughput | Max error |
-|------|-----------|------------|-----------|
-| fp32 | 4KB       | baseline   | ~1e-5     |
-| bf16 | 2KB       | ~2x        | ~1e-2     |
-
-bf16 halves L1 pressure and doubles effective bandwidth for twiddle reads.
-Use fp32 when precision matters (signal processing), bf16 for ML pipelines.
-
----
-
-## Supported sizes
-
-Any `N = 2^k` where `N / num_cores = local_N` is also a power of 2.
-
-| N     | num_cores | local_N | Local stages | NOC stages |
-|-------|-----------|---------|--------------|------------|
-| 64    | 1         | 64      | 6            | 0          |
-| 256   | 4         | 64      | 6            | 2          |
-| 1024  | 8         | 128     | 7            | 3          |
-| 1024  | 32        | 32      | 5            | 5          |
-| 4096  | 32        | 128     | 7            | 5          |
-
----
-
-## Build
+From the tt-metal root:
 
 ```bash
-# From tt-metal root
 ./build_metal.sh
-
-# Compile test
-g++ -std=c++17 -O2 \
-    -I tt_metal/api \
-    host/fft_test.cpp \
-    -L tt_metal/build/lib -ltt_metal \
-    -o fft_test
-
-./fft_test
+./build/programming_examples/fft/metal_example_fft_test
 ```
 
----
+Expected output:
 
-## Known gotchas / future work
+```
+[PASS] N=16    FFT | err=... | ...
+[PASS] N=64    FFT | err=... | ...
+[PASS] N=64    FFT | err=... | ... DC
+[PASS] N=64    FFT | err=... | ... random
+[PASS] N=256   FFT | err=... | ...
+[PASS] N=1024  FFT | err=... | ...
+All tests PASSED.
+```
 
-**Single-copy optimization (Davies paper §4.3)**
-Currently doing 2 reorders per local stage. The single-copy optimization
-(prepare next-stage order during write) halves data movement.
-Requires linker script change to extend bss for second buffer.
+`err` is the max absolute complex error against the reference O(N^2) DFT;
+threshold is `1e-3`.
 
-**128-bit writes**
-Lost when single-copy is applied (both src and dst are non-contiguous).
-Keep 128-bit OR single-copy, not both — single-copy wins on net runtime.
+## Extending to multi-core / larger N
 
-**ThCon intrinsics for reordering**
-`fft_reader.cpp` uses scalar BRISC copies for reorder (clear but slow).
-Replace with `TT_LOADIND` / `TT_SETDMAREG` intrinsics from LLK library
-for ~1ms reduction (Davies paper: 9.38ms → 7.56ms).
+Two independent axes:
 
-**Uneven core count**
-Currently requires `num_cores` to be a power of 2 and to divide N evenly.
-For arbitrary N: zero-pad input to next power of 2.
-For arbitrary core count: requires uneven transposition (Davies §5 future work).
+1. **Larger `N` via multi-tile state on one core**: for `N > 1024` the state
+   no longer fits in a single tile. Split state into `N/1024` tiles, run
+   `log2(1024)` "within-tile" stages using this kernel, then add
+   `log2(N) - 10` "cross-tile" stages that butterfly across tiles. The
+   cross-tile stages are structurally identical to the NOC stages below;
+   they just cross tile boundaries on the same core instead of core
+   boundaries.
 
-**2D FFT**
-Build on top of this 1D primitive:
-  1. FFT across rows (this kernel)
-  2. Matrix transpose (use tt-nn's built-in multicore transpose)
-  3. FFT across columns (this kernel again)
+2. **Multi-core via NOC butterflies**: once `local_N = N / num_cores` is still
+   a power of two and `<= 1024`, run this kernel per core for the first
+   `log2(local_N)` stages. Then `log2(num_cores)` NOC stages where each core:
+   - sends its state tile to its partner core (determined by the stage's
+     stride bit in its core id),
+   - waits for the partner's tile into `CB_SCRATCH_R/I`,
+   - butterflies `state <-> scratch` and keeps its correct half.
+
+   Add those NOC stages in `fft_writer.cpp` (which already owns NOC 1), with
+   a semaphore for the partner handshake.
+
+Both extensions reuse the reader/compute structure unchanged.
