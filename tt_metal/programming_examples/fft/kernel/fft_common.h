@@ -4,23 +4,23 @@
 #pragma once
 
 // ============================================================================
-//  fft_common.h — shared layout for the single-core FFT programming example
+//  fft_common.h — shared layout for the (multi-core) FFT programming example.
 //
-//  Design (FFT-only, no IFFT):
-//    * Entire signal up to N=1024 lives in a single fp32 tile per channel
-//      (real, imag).  The "state" is held in CB_STATE_{R,I}, which the reader
-//      owns across all log2(N) butterfly stages.
-//    * Every CB is sized at a full 32x32 fp32 tile (TILE_SIZE_FP32), so that
-//      compute-engine tile ops (add_tiles / mul_tiles / sub_tiles) operate on
-//      well-defined, consistent-sized data.
-//    * For each stage s:
-//        reader: gather `even[i] = state[pair_lo(i, s)]`
-//                       `odd[i]  = state[pair_hi(i, s)]`
-//                load stage-s twiddle tile from DRAM,
-//                push EVEN/ODD/TW  -> compute
-//        compute: out0 = even + W*odd,  out1 = even - W*odd
-//        reader: scatter out0,out1 back into state at pair_lo/pair_hi.
-//    * writer: after the reader signals CB_SYNC, writes state to DRAM.
+//  Multi-core design (FFT-only, no IFFT):
+//    * The signal of length N (power of two, 2..8192) is sharded across
+//      P = max(1, N/1024) cores arranged on a 1D row.  Each core owns
+//      exactly one 32x32 fp32 tile of state in CB_STATE_{R,I}.
+//    * Stages 0..min(log2N, 10)-1 are "local": butterfly strides < 1024, so
+//      pairs stay inside a single core's tile.  Handled exactly like the
+//      single-core kernel.
+//    * Stages 10..log2N-1 (if any) are "cross-core":
+//        partner_core = my_core XOR (1 << (s-10))
+//      Both cores exchange their full state tile via NoC into CB_RECV_{R,I},
+//      signal each other via a semaphore, then run the same tile butterfly.
+//      The lower core of the pair keeps OUT0 = E+W*O, the upper keeps
+//      OUT1 = E-W*O.
+//    * writer: after the reader signals CB_SYNC, each core writes its own
+//      1-tile shard of the final state to DRAM.
 // ============================================================================
 
 // ── Circular Buffer indices ────────────────────────────────────────────────
@@ -41,8 +41,10 @@ constexpr uint32_t CB_TW_ODD_I  = 13;
 constexpr uint32_t CB_STATE_R   = 14;  // persistent state (reader-owned)
 constexpr uint32_t CB_STATE_I   = 15;
 constexpr uint32_t CB_SYNC      = 16;  // reader -> writer signal
+constexpr uint32_t CB_RECV_R    = 17;  // receive buffer for partner's state
+constexpr uint32_t CB_RECV_I    = 18;  //   (cross-core stages only)
 
-constexpr uint32_t NUM_CBS = 17;
+constexpr uint32_t NUM_CBS = 19;
 
 // ── Tile geometry ──────────────────────────────────────────────────────────
 constexpr uint32_t TILE_HW        = 32;
