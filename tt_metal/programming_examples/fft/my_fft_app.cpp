@@ -53,7 +53,7 @@ int main() {
 
     // Example 1: real input — exactly the PyTorch snippet
     //   torch.fft.fft(torch.tensor([10., 20., 30., 40.]))
-    std::vector<float> signal = {10.f, 20.f, 30.f, 40.f};
+    std::vector<float> signal = {10.f, 20.f, 30.f, 40.f, 50.f, 60.f, 70.f, 80.f};
 
     auto spectrum = fft(md, signal);
     print_spectrum("FFT of [10, 20, 30, 40]", spectrum);
