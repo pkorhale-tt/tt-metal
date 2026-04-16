@@ -80,12 +80,11 @@ bool run_test(
     Device* device, CommandQueue& cq,
     const std::vector<Complex>& input,
     uint32_t num_cores,
-    bool use_bf16,
     bool is_ifft,
     const char* test_name)
 {
     uint32_t N = input.size();
-    uint32_t total_bytes = N * 2 * (use_bf16 ? 2 : 4);
+    uint32_t total_bytes = N * 2 * 4;
 
     // Reference output
     auto ref_out = is_ifft ? reference_idft(input) : reference_dft(input);
@@ -93,58 +92,43 @@ bool run_test(
     // Create DRAM buffers
     auto in_buf = CreateBuffer(device, {
         .size        = total_bytes,
-        .page_size   = use_bf16 ? 2u : 4u,
+        .page_size   = 4u,
         .buffer_type = BufferType::DRAM
     });
     auto out_buf = CreateBuffer(device, {
         .size        = total_bytes,
-        .page_size   = use_bf16 ? 2u : 4u,
+        .page_size   = 4u,
         .buffer_type = BufferType::DRAM
     });
 
     // Upload input
     auto in_flat = complex_to_interleaved(input);
-    if (use_bf16) {
-        auto in_bf16 = to_bf16(in_flat);
-        EnqueueWriteBuffer(cq, in_buf,
-            reinterpret_cast<const void*>(in_bf16.data()), false);
-    } else {
-        EnqueueWriteBuffer(cq, in_buf,
-            reinterpret_cast<const void*>(in_flat.data()), false);
-    }
+    EnqueueWriteBuffer(cq, in_buf,
+        reinterpret_cast<const void*>(in_flat.data()), false);
 
     // Run FFT
     auto t0 = std::chrono::high_resolution_clock::now();
     run_fft(device, cq,
         {.N = N, .num_cores = num_cores,
-         .is_ifft = is_ifft, .use_bf16 = use_bf16},
+         .is_ifft = is_ifft},
         in_buf, out_buf);
     auto t1 = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // Read back output
     std::vector<float> out_flat(N * 2);
-    if (use_bf16) {
-        std::vector<bfloat16> out_bf16(N * 2);
-        EnqueueReadBuffer(cq, out_buf,
-            reinterpret_cast<void*>(out_bf16.data()), true);
-        for (size_t i = 0; i < out_bf16.size(); i++)
-            out_flat[i] = out_bf16[i].to_float();
-    } else {
-        EnqueueReadBuffer(cq, out_buf,
-            reinterpret_cast<void*>(out_flat.data()), true);
-    }
+    EnqueueReadBuffer(cq, out_buf,
+        reinterpret_cast<void*>(out_flat.data()), true);
     auto got = interleaved_to_complex(out_flat);
 
     // Validate
-    float tol    = use_bf16 ? 1e-2f : 1e-4f;
+    float tol    = 1e-4f;
     float err    = max_abs_error(ref_out, got);
     bool  passed = err < tol;
 
-    std::printf("[%s] N=%-5u cores=%-2u %s %s | err=%.2e tol=%.2e | %.2f ms  %s\n",
+    std::printf("[%s] N=%-5u cores=%-2u fp32 %s | err=%.2e tol=%.2e | %.2f ms  %s\n",
         passed ? "PASS" : "FAIL",
         N, num_cores,
-        use_bf16 ? "bf16" : "fp32",
         is_ifft  ? "IFFT" : "FFT ",
         err, tol, ms,
         test_name);
@@ -187,23 +171,19 @@ int main() {
 
     // ── Test 1: Single-core, small N ────────────────────────
     all_pass &= run_test(device, cq, make_impulse(64),
-        1, false, false, "impulse → constant spectrum");
+        1, false, "impulse → constant spectrum");
 
     // ── Test 2: Impulse IFFT ─────────────────────────────────
     // FFT of impulse = all-ones; IFFT of all-ones = impulse/N
     {
         std::vector<Complex> ones(64, {1.0f, 0.0f});
         all_pass &= run_test(device, cq, ones,
-            1, false, true, "all-ones IFFT → impulse");
+            1, true, "all-ones IFFT → impulse");
     }
 
     // ── Test 3: Multi-core FFT, fp32 ────────────────────────
     all_pass &= run_test(device, cq, make_random(1024),
-        8, false, false, "random fp32 multicore");
-
-    // ── Test 4: Multi-core FFT, bf16 ────────────────────────
-    all_pass &= run_test(device, cq, make_random(1024),
-        8, true, false, "random bf16 multicore");
+        8, false, "random fp32 multicore");
 
     // ── Test 5: Round-trip FFT → IFFT ───────────────────────
     {
@@ -244,15 +224,12 @@ int main() {
     {
         auto x = make_sine(256, 10);   // freq bin 10
         all_pass &= run_test(device, cq, x,
-            4, false, false, "sine freq=10, expect peak at bin 10");
+            4, false, "sine freq=10, expect peak at bin 10");
     }
 
     // ── Test 7: Large N, 32 cores ────────────────────────────
     all_pass &= run_test(device, cq, make_random(4096),
-        32, false, false, "large N=4096 fp32 32-core");
-
-    all_pass &= run_test(device, cq, make_random(4096),
-        32, true,  false, "large N=4096 bf16 32-core");
+        32, false, "large N=4096 fp32 32-core");
 
     CloseDevice(device);
 

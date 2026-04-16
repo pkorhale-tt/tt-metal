@@ -20,9 +20,6 @@
 #include "tt_metal/api/tt-metalium/mesh_workload.hpp"
 #include "tt_metal/api/tt-metalium/allocator.hpp"
 #include "tt_metal/api/tt-metalium/hal.hpp"
-#include "tt-metalium/bfloat16.hpp"
-
-#include "tt_metal/api/tt-metalium/bfloat16.hpp"
 
 #include <cmath>
 #include <vector>
@@ -61,14 +58,6 @@ std::vector<float> precompute_twiddles(
     return tw;
 }
 
-// ── Convert float vector to bf16 for upload ─────────────────
-std::vector<bfloat16> to_bf16(const std::vector<float>& v) {
-    std::vector<bfloat16> out;
-    out.reserve(v.size());
-    for (float f : v) out.push_back(bfloat16(f));
-    return out;
-}
-
 // ── Core grid helpers ────────────────────────────────────────
 // Map linear core id → (col, row) on Wormhole n300 grid.
 // Wormhole has usable Tensix cores starting at (1,1) in NOC coords.
@@ -86,7 +75,6 @@ struct FFTConfig {
     uint32_t N;           // total FFT size (power of 2)
     uint32_t num_cores;   // must divide N evenly, power of 2
     bool     is_ifft;     // true = inverse FFT
-    bool     use_bf16;    // true = bfloat16, false = fp32
 };
 
 void run_fft(
@@ -104,7 +92,7 @@ void run_fft(
     uint32_t num_stages     = static_cast<uint32_t>(std::log2(cfg.N));
     uint32_t num_local_stg  = static_cast<uint32_t>(std::log2(local_N));
     uint32_t num_noc_stg    = num_stages - num_local_stg;
-    uint32_t elem_bytes     = cfg.use_bf16 ? 2 : 4;
+    uint32_t elem_bytes     = 4;
     uint32_t buf_bytes      = local_N * elem_bytes;  // per CB, real or imag
 
     // ── Twiddle DRAM buffer ──────────────────────────────────
@@ -117,14 +105,8 @@ void run_fft(
         .buffer_type = BufferType::DRAM,
     });
 
-    if (cfg.use_bf16) {
-        auto tw_bf16 = to_bf16(tw_floats);
-        EnqueueWriteBuffer(cq, twiddle_buf,
-            reinterpret_cast<const void*>(tw_bf16.data()), false);
-    } else {
-        EnqueueWriteBuffer(cq, twiddle_buf,
-            reinterpret_cast<const void*>(tw_floats.data()), false);
-    }
+    EnqueueWriteBuffer(cq, twiddle_buf,
+        reinterpret_cast<const void*>(tw_floats.data()), false);
 
     // ── Build program ────────────────────────────────────────
     Program program = CreateProgram();
@@ -146,12 +128,11 @@ void run_fft(
     //   - Scratch CBs: same size (receives from one partner per stage)
     //   - Sync CB: 1 element (just a signal)
 
-    uint32_t tile_size = cfg.use_bf16 ? TILE_SIZE_BF16 : TILE_SIZE_FP32;
+    uint32_t tile_size = TILE_SIZE_FP32;
 
     auto make_cb = [&](uint32_t cb_id, uint32_t num_tiles = 1) {
         CircularBufferConfig cb_cfg(num_tiles * tile_size,
-            {{cb_id, cfg.use_bf16 ? tt::DataFormat::BFloat16
-                                  : tt::DataFormat::Float32}});
+            {{cb_id, tt::DataFormat::Float32}});
         cb_cfg.set_page_size(cb_id, tile_size);
         return CreateCircularBuffer(program, core_range, cb_cfg);
     };
@@ -177,7 +158,7 @@ void run_fft(
     // ── Kernel compilation ───────────────────────────────────
     // Compile-time args are baked in at JIT compile time.
     std::vector<uint32_t> ct_reader = {
-        local_N, cfg.num_cores, num_stages, cfg.use_bf16 ? 1u : 0u
+        local_N, cfg.num_cores, num_stages, 0u
     };
     std::vector<uint32_t> ct_writer = ct_reader;
     std::vector<uint32_t> ct_compute = {
@@ -212,7 +193,7 @@ void run_fft(
         core_range,
         ComputeConfig{
             .math_fidelity = MathFidelity::HiFi4,
-            .fp32_dest_acc_en = !cfg.use_bf16,
+            .fp32_dest_acc_en = true,
             .compile_args = ct_compute
         });
 
@@ -238,7 +219,7 @@ void run_fft(
             cfg.N,
             num_local_stg,
             num_stages,
-            cfg.use_bf16 ? 1u : 0u
+            0u
         };
         SetRuntimeArgs(program, reader_kernel, my_core, reader_args);
 
@@ -296,20 +277,20 @@ void run_fft(
 // ── Convenience wrapper ──────────────────────────────────────
 void fft(Device* device, CommandQueue& cq,
          uint32_t N, uint32_t num_cores,
-         Buffer& in, Buffer& out, bool use_bf16 = false)
+         Buffer& in, Buffer& out)
 {
     run_fft(device, cq,
         {.N = N, .num_cores = num_cores,
-         .is_ifft = false, .use_bf16 = use_bf16},
+         .is_ifft = false},
         in, out);
 }
 
 void ifft(Device* device, CommandQueue& cq,
           uint32_t N, uint32_t num_cores,
-          Buffer& in, Buffer& out, bool use_bf16 = false)
+          Buffer& in, Buffer& out)
 {
     run_fft(device, cq,
         {.N = N, .num_cores = num_cores,
-         .is_ifft = true, .use_bf16 = use_bf16},
+         .is_ifft = true},
         in, out);
 }
