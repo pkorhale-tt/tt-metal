@@ -1,17 +1,13 @@
 // ============================================================
-// fft_host.cpp – host-side program setup (TT-Metalium layout)
-// Fixes applied vs previous version:
-//   1. Device  → IDevice  (renamed in recent TT-Metal)
-//   2. TILE_SIZE_FP32 → TILE_HW * TILE_HW * sizeof(float)
-//   3. GetCircularBufferL1Address → GetCircularBufferConfig().locally_allocated_address
-//   4. GetSemaphoreAddr → GetSemaphoreAddress
-//   5. buffer.bank_id() removed — not a Buffer member
+// fft_host.cpp – corrected for current TT-Metalium API
+// All fixes derived from actual compiler error messages.
 // ============================================================
 
 #include "tt_metal/api/tt-metalium/host_api.hpp"
 #include "tt_metal/api/tt-metalium/constants.hpp"
 #include "tt_metal/api/tt-metalium/base_types.hpp"
-#include "tt_metal/api/tt-metalium/hal.hpp"
+// CommandQueue lives here in current TT-Metal:
+#include "tt_metal/api/tt-metalium/command_queue.hpp"
 
 #include <cmath>
 #include <vector>
@@ -20,11 +16,6 @@
 using namespace tt;
 using namespace tt::tt_metal;
 using namespace tt::constants;
-
-// ── Device alias ─────────────────────────────────────────────
-// Recent TT-Metal renamed Device → IDevice.
-// This alias lets the code compile on both.
-using Device = IDevice;
 
 // ── CB IDs ───────────────────────────────────────────────────
 enum CbId : uint32_t {
@@ -45,9 +36,6 @@ enum CbId : uint32_t {
     CB_WR_I       = 14,
 };
 
-// ── Tile size ─────────────────────────────────────────────────
-// TILE_SIZE_FP32 was removed from constants.hpp.
-// TILE_HW = 32 is still present; fp32 tile = 32*32*4 = 4096 bytes.
 static constexpr uint32_t kTileSizeFp32 =
     tt::constants::TILE_HW * tt::constants::TILE_HW * sizeof(float);
 
@@ -71,28 +59,25 @@ std::vector<float> precompute_twiddles(
     return tw;
 }
 
-// ── Core grid helper ──────────────────────────────────────────
 CoreCoord linear_to_core(uint32_t id, uint32_t grid_cols = 8) {
     return {static_cast<int>(id % grid_cols),
             static_cast<int>(id / grid_cols)};
 }
 
-// ── FFT config ────────────────────────────────────────────────
 struct FFTConfig {
     uint32_t N;
     uint32_t num_cores;
     bool     is_ifft;
 };
 
-// ── Main program builder ──────────────────────────────────────
 void run_fft(
     IDevice*      device,
     CommandQueue& cq,
     const FFTConfig& cfg,
-    Buffer&       input_buf,
-    Buffer&       output_buf)
+    std::shared_ptr<Buffer> input_buf,
+    std::shared_ptr<Buffer> output_buf)
 {
-    assert((cfg.N & (cfg.N - 1)) == 0 && "N must be power of 2");
+    assert((cfg.N & (cfg.N - 1)) == 0);
     assert((cfg.num_cores & (cfg.num_cores - 1)) == 0);
     assert(cfg.N % cfg.num_cores == 0);
 
@@ -102,10 +87,13 @@ void run_fft(
     uint32_t num_noc_stg   = num_stages - num_local_stg;
 
     // ── Twiddle DRAM buffer ───────────────────────────────────
+    // FIX: CreateBuffer takes InterleavedBufferConfig{device, size, page_size, type}
+    // NOT CreateBuffer(device*, {.size=...})
     auto tw_floats = precompute_twiddles(cfg.N, num_stages, cfg.is_ifft);
     uint32_t tw_bytes = static_cast<uint32_t>(tw_floats.size()) * sizeof(float);
 
-    auto twiddle_buf = CreateBuffer(device, {
+    auto twiddle_buf = CreateBuffer(InterleavedBufferConfig{
+        .device      = device,
         .size        = tw_bytes,
         .page_size   = static_cast<uint32_t>(sizeof(float)),
         .buffer_type = BufferType::DRAM,
@@ -124,6 +112,12 @@ void run_fft(
     CoreRange core_range(cores.front(), cores.back());
 
     // ── Semaphore ─────────────────────────────────────────────
+    // CreateSemaphore returns uint32_t semaphore ID.
+    // To get the L1 address we use the HAL:
+    //   hal.get_dev_addr(HalProgrammableCoreType::TENSIX, HalL1MemAddrType::SEMAPHORE)
+    //   + sem_id * hal.get_alignment(HalMemType::L1)
+    // But for passing to kernels as runtime args, we pass sem_id directly
+    // and let the kernel resolve via get_semaphore(sem_id) on-device.
     uint32_t sem_id = CreateSemaphore(program, core_range, 0u);
 
     // ── Circular buffers ──────────────────────────────────────
@@ -137,22 +131,20 @@ void run_fft(
 
     CBHandle h_lhs_r     = make_cb(CB_LHS_R,     2);
     CBHandle h_lhs_i     = make_cb(CB_LHS_I,     2);
-    /* rhs, twiddle, out */ make_cb(CB_RHS_R, 2); make_cb(CB_RHS_I, 2);
-    make_cb(CB_TWIDDLE_R, 2); make_cb(CB_TWIDDLE_I, 2);
-    make_cb(CB_OUT_R, 2);     make_cb(CB_OUT_I, 2);
+    make_cb(CB_RHS_R,     2);  make_cb(CB_RHS_I,     2);
+    make_cb(CB_TWIDDLE_R, 2);  make_cb(CB_TWIDDLE_I, 2);
+    make_cb(CB_OUT_R,     2);  make_cb(CB_OUT_I,     2);
     CBHandle h_scratch_r = make_cb(CB_SCRATCH_R, 1);
     CBHandle h_scratch_i = make_cb(CB_SCRATCH_I, 1);
     make_cb(CB_SYNC,  1);
-    make_cb(CB_TMP_R, 1); make_cb(CB_TMP_I, 1);
-    make_cb(CB_WR_R,  1); make_cb(CB_WR_I,  1);
+    make_cb(CB_TMP_R, 1);  make_cb(CB_TMP_I, 1);
+    make_cb(CB_WR_R,  1);  make_cb(CB_WR_I,  1);
 
-    // ── Resolve L1 addresses from CBHandles ───────────────────
-    // GetCircularBufferConfig returns a CircularBufferConfig whose
-    // locally_allocated_address holds the L1 base addr (optional<uint32_t>).
-    // This is uniform across all cores in the range.
+    // FIX: .locally_allocated_address → .globally_allocated_address()
+    // (it's a method, not a field, and the name changed)
     auto cb_l1_addr = [&](CBHandle h) -> uint32_t {
-        auto opt = GetCircularBufferConfig(program, h).locally_allocated_address;
-        TT_FATAL(opt.has_value(), "CB not allocated in L1");
+        auto opt = GetCircularBufferConfig(program, h).globally_allocated_address();
+        TT_FATAL(opt.has_value(), "CB not allocated");
         return opt.value();
     };
 
@@ -193,17 +185,15 @@ void run_fft(
     for (uint32_t my_id = 0; my_id < cfg.num_cores; my_id++) {
         CoreCoord my_core = linear_to_core(my_id);
 
-        // GetSemaphoreAddress is the correct spelling in current TT-Metal.
-        uint32_t my_sem_addr =
-            GetSemaphoreAddress(program, my_core, sem_id);
+        // FIX: GetSemaphoreAddress doesn't exist.
+        // Pass sem_id as runtime arg; kernel calls get_semaphore(sem_id)
+        // which resolves to the correct L1 address on-device.
+        // This is the standard pattern used by all TT-Metal examples.
 
-        // ── Reader args ───────────────────────────────────────
-        // No bank_id needed: InterleavedAddrGen inside the kernel takes
-        // only the DRAM base address and handles bank routing itself.
         std::vector<uint32_t> reader_args = {
-            input_buf.address(),    // dram_input_addr
-            0u,                     // padding (was bank_id — unused)
-            twiddle_buf.address(),  // twiddle_dram_addr
+            input_buf->address(),
+            0u,                     // padding (bank_id removed)
+            twiddle_buf->address(),
             0u,                     // padding
             local_N,
             my_id,
@@ -214,38 +204,34 @@ void run_fft(
         };
         SetRuntimeArgs(program, reader_kernel, my_core, reader_args);
 
-        // ── Writer args ───────────────────────────────────────
         std::vector<uint32_t> writer_args = {
-            lhs_r_addr,             // RT_CB_R
-            lhs_i_addr,             // RT_CB_I
-            scratch_r_addr,         // RT_SCRATCH_R
-            scratch_i_addr,         // RT_SCRATCH_I
-            output_buf.address(),   // output DRAM base
-            0u,                     // padding (was bank_id)
+            lhs_r_addr,
+            lhs_i_addr,
+            scratch_r_addr,
+            scratch_i_addr,
+            output_buf->address(),
+            0u,                     // padding
             cfg.num_cores,
             my_id,
-            num_local_stg,          // first_noc_stage = log2(local_N)
-            sem_id,
+            num_local_stg,
+            sem_id,                 // kernel resolves via get_semaphore(sem_id)
         };
 
-        // Peer table: [noc_x, noc_y, scratch_r, scratch_i, sem_addr] per peer
+        // Peer table: [noc_x, noc_y, scratch_r, scratch_i, sem_id]
         for (uint32_t dst = 0; dst < cfg.num_cores; dst++) {
             if (dst == my_id) continue;
             CoreCoord peer_logical = linear_to_core(dst);
             CoreCoord peer_noc     =
                 device->worker_core_from_logical_core(peer_logical);
-            uint32_t peer_sem =
-                GetSemaphoreAddress(program, peer_logical, sem_id);
 
             writer_args.push_back(static_cast<uint32_t>(peer_noc.x));
             writer_args.push_back(static_cast<uint32_t>(peer_noc.y));
-            writer_args.push_back(scratch_r_addr);  // uniform L1 addr
+            writer_args.push_back(scratch_r_addr);
             writer_args.push_back(scratch_i_addr);
-            writer_args.push_back(peer_sem);
+            writer_args.push_back(sem_id);  // each peer resolves its own address
         }
 
         SetRuntimeArgs(program, writer_kernel, my_core, writer_args);
-        // compute_kernel: compile-time args only, no SetRuntimeArgs
     }
 
     EnqueueProgram(cq, program, false);
@@ -255,14 +241,16 @@ void run_fft(
 // ── Convenience wrappers ──────────────────────────────────────
 void fft(IDevice* device, CommandQueue& cq,
          uint32_t N, uint32_t num_cores,
-         Buffer& in, Buffer& out)
+         std::shared_ptr<Buffer> in,
+         std::shared_ptr<Buffer> out)
 {
     run_fft(device, cq, {N, num_cores, false}, in, out);
 }
 
 void ifft(IDevice* device, CommandQueue& cq,
           uint32_t N, uint32_t num_cores,
-          Buffer& in, Buffer& out)
+          std::shared_ptr<Buffer> in,
+          std::shared_ptr<Buffer> out)
 {
     run_fft(device, cq, {N, num_cores, true}, in, out);
 }
