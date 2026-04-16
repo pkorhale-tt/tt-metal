@@ -1,0 +1,180 @@
+================================================================================
+  tt-metal FFT (bf16) — all commands in one place
+  (run from the tt-metal repo root)
+================================================================================
+
+This is the bfloat16 twin of tt_metal/programming_examples/fft/.
+The two folders are independent; you can use either or both side-by-side.
+
+API namespace : fft_example_bf16
+Header to incl: tt_metal/programming_examples/fft_bf16/fft_host.cpp
+
+
+--------------------------------------------------------------------------------
+1.  ONE-TIME SETUP
+--------------------------------------------------------------------------------
+
+source python_env/bin/activate
+python -c "import torch; print(torch.__version__)"
+# pip install torch    # if missing
+
+export ARCH_NAME=wormhole_b0
+export TT_METAL_HOME=$(pwd)
+
+
+--------------------------------------------------------------------------------
+2.  BUILD
+--------------------------------------------------------------------------------
+
+# First time
+cmake -B build -DBUILD_PROGRAMMING_EXAMPLES=ON
+
+# Build all bf16 FFT executables
+cmake --build build \
+      --target metal_example_fft_bf16_test \
+               metal_example_fft_bf16_demo \
+               metal_example_fft_bf16_vs_torch \
+               my_fft_bf16_app \
+               metal_example_fft_bf16_benchmark \
+      -j
+
+# Build individually
+cmake --build build --target metal_example_fft_bf16_test       -j
+cmake --build build --target metal_example_fft_bf16_demo       -j
+cmake --build build --target metal_example_fft_bf16_vs_torch   -j
+cmake --build build --target my_fft_bf16_app                   -j
+cmake --build build --target metal_example_fft_bf16_benchmark  -j
+
+# Rebuild from scratch
+rm -rf build ~/.cache/tt-metal-cache
+cmake -B build -DBUILD_PROGRAMMING_EXAMPLES=ON
+cmake --build build --target metal_example_fft_bf16_test \
+                             metal_example_fft_bf16_demo \
+                             metal_example_fft_bf16_vs_torch \
+                             metal_example_fft_bf16_benchmark -j
+
+
+--------------------------------------------------------------------------------
+3.  RUN THE FULL bf16 TEST SUITE
+--------------------------------------------------------------------------------
+
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_test
+
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_test
+
+
+--------------------------------------------------------------------------------
+4.  USE THE bf16 FFT IN CODE
+--------------------------------------------------------------------------------
+
+# -- 4a. Quickest path: edit the playground file --
+#
+# File:  tt_metal/programming_examples/fft_bf16/my_fft_app.cpp
+cmake --build build --target my_fft_bf16_app -j
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft_bf16/my_fft_bf16_app
+
+
+# -- 4b. Reference demo with worked examples --
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_demo
+
+
+# -- 4c. The API from any C++ file --
+#
+#     #include "tt_metal/programming_examples/fft_bf16/fft_host.cpp"
+#     using namespace fft_example_bf16;
+#
+#     auto md = MeshDevice::create_unit_mesh(0);
+#     std::vector<float> signal = {10.f, 20.f, 30.f, 40.f};
+#     auto spectrum = fft(md, signal);
+#
+#     // or complex input:
+#     std::vector<std::complex<float>> cx = { {1,0}, {0,1}, {-1,0}, {0,-1} };
+#     auto spec2 = fft(md, cx);
+#
+# Requirement: signal.size() is a power of 2 in [2, 65536].
+
+
+--------------------------------------------------------------------------------
+4d. PLAN-CACHE SPEEDUP BENCHMARK (bf16)
+--------------------------------------------------------------------------------
+
+cmake --build build --target metal_example_fft_bf16_benchmark -j
+
+# Default (N=4096, 100 iterations)
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_benchmark
+
+# Largest case
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_benchmark 65536 100
+
+
+--------------------------------------------------------------------------------
+5.  COMPARE bf16 tt-metal FFT  vs.  torch.fft.fft
+--------------------------------------------------------------------------------
+
+# Default: N=1024, seed=42, threshold 2e-1
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py
+
+# Specify N
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 4096
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 65536
+
+# Change RNG seed
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 8192 --seed 7
+
+# Tighten/loosen threshold (bf16's noise floor is around 5e-2..2e-1)
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 1024 --tol 5e-2
+
+# Keep temp .txt files
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 256 --keep
+
+# Custom binary path
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py \
+    --N 4096 \
+    --bin ./build/programming_examples/fft_bf16/metal_example_fft_bf16_vs_torch
+
+
+--------------------------------------------------------------------------------
+6.  LOW-LEVEL UTILITY
+--------------------------------------------------------------------------------
+
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_vs_torch \
+    <N> [seed] [in_path] [out_path]
+
+
+--------------------------------------------------------------------------------
+7.  TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+# Kernel build errors after editing kernel/*.cpp
+TT_METAL_CLEAR_JIT_CACHE=1 ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_test
+
+# Per-core alive-print (visually confirm all cores run)
+cmake --build build --target metal_example_fft_bf16_test -j -- \
+    CXXFLAGS="-DFFT_DPRINT_HELLO=1"
+TT_METAL_DPRINT_CORES=all ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_test
+
+
+--------------------------------------------------------------------------------
+8.  DIFF vs THE FP32 VERSION  (tt_metal/programming_examples/fft/)
+--------------------------------------------------------------------------------
+
+The two folders are intentionally identical in structure. Concrete deltas:
+
+  * tile size:   4096 B  ->  2048 B
+  * DataFormat:  Float32 ->  Float16_b
+  * pack/unpack: float   ->  bf16  (round-to-nearest-even)
+  * test rel-err threshold: 2e-3  ->  5e-2..2.5e-1 (depending on N)
+  * python --tol default:    2e-3 ->  2e-1
+  * binary names: metal_example_fft_*  ->  metal_example_fft_bf16_*
+
+Per-stage math is still fp32 (UnpackToDestFp32 + fp32_dest_acc_en); only
+the storage between stages is bf16.
