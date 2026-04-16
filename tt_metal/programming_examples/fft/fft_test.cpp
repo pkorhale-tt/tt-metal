@@ -1,14 +1,14 @@
 // ============================================================
-// fft_test.cpp — TT-Metalium confirmed API
+// fft_test.cpp — Final correct TT-Metalium API
 // ============================================================
 
 #include "tt-metalium/host_api.hpp"
-#include "tt-metalium/device.hpp"
-#include "tt-metalium/buffer.hpp"
-#include "tt-metalium/constants.hpp"
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
 #include "tt-metalium/mesh_command_queue.hpp"
+#include "tt-metalium/mesh_workload.hpp"
+#include "tt-metalium/mesh_buffer.hpp"
+#include "tt-metalium/constants.hpp"
 
 #include "fft_host.cpp"
 
@@ -75,28 +75,21 @@ bool run_test(std::shared_ptr<MeshDevice> md,
     uint32_t N=input.size(), bytes=N*2*sizeof(float);
     auto ref = is_ifft ? ref_idft(input) : ref_dft(input);
 
-    IDevice* device = md->get_device(0, 0);
-    constexpr uint8_t cq_id = 0;
+    MeshCommandQueue& cq = md->mesh_command_queue();
 
-    auto in_buf = CreateBuffer(InterleavedBufferConfig{
-        .device=device,.size=bytes,.page_size=4u,.buffer_type=BufferType::DRAM});
-    auto out_buf = CreateBuffer(InterleavedBufferConfig{
-        .device=device,.size=bytes,.page_size=4u,.buffer_type=BufferType::DRAM});
+    auto in_buf  = make_mesh_buf(md, bytes, 4u);
+    auto out_buf = make_mesh_buf(md, bytes, 4u);
 
     auto flat = to_flat(input);
-    PushCurrentCommandQueueIdForThread(cq_id);
-    EnqueueWriteBuffer(*device, in_buf, flat.data(), false);
-    PopCurrentCommandQueueIdForThread();
+    WriteShard(cq, in_buf, flat, MeshCoordinate(0,0), false);
 
     auto t0=std::chrono::high_resolution_clock::now();
-    run_fft(md, {N,num_cores,is_ifft}, in_buf, out_buf, cq_id);
+    run_fft(md, {N,num_cores,is_ifft}, in_buf, out_buf);
     double ms=std::chrono::duration<double,std::milli>(
         std::chrono::high_resolution_clock::now()-t0).count();
 
-    std::vector<float> out_flat(N*2);
-    PushCurrentCommandQueueIdForThread(cq_id);
-    EnqueueReadBuffer(*device, out_buf, out_flat.data(), true);
-    PopCurrentCommandQueueIdForThread();
+    std::vector<float> out_flat;
+    ReadShard(cq, out_flat, out_buf, MeshCoordinate(0,0), true);
 
     float err=max_err(ref,from_flat(out_flat));
     bool pass=err<1e-4f;
@@ -106,7 +99,6 @@ bool run_test(std::shared_ptr<MeshDevice> md,
 }
 
 int main() {
-    // create_unit_mesh(device_id) — confirmed single-device constructor
     auto md = MeshDevice::create_unit_mesh(0);
 
     bool all=true;
@@ -116,29 +108,19 @@ int main() {
     all &= run_test(md, make_random(1024), 8, false, "random 8-core");
     all &= run_test(md, make_random(1024), 8, true,  "IFFT 8-core");
 
-    // Round-trip FFT → IFFT
+    // Round-trip
     {
         uint32_t N=1024, bytes=N*2*sizeof(float);
-        IDevice* device=md->get_device(0,0);
-        constexpr uint8_t cq_id=0;
+        MeshCommandQueue& cq=md->mesh_command_queue();
         auto x=make_random(N); auto flat=to_flat(x);
-
-        auto b0=CreateBuffer(InterleavedBufferConfig{.device=device,.size=bytes,.page_size=4u,.buffer_type=BufferType::DRAM});
-        auto b1=CreateBuffer(InterleavedBufferConfig{.device=device,.size=bytes,.page_size=4u,.buffer_type=BufferType::DRAM});
-        auto b2=CreateBuffer(InterleavedBufferConfig{.device=device,.size=bytes,.page_size=4u,.buffer_type=BufferType::DRAM});
-
-        PushCurrentCommandQueueIdForThread(cq_id);
-        EnqueueWriteBuffer(*device, b0, flat.data(), false);
-        PopCurrentCommandQueueIdForThread();
-
-        fft( md, N, 8, b0, b1);
-        ifft(md, N, 8, b1, b2);
-
-        std::vector<float> out(N*2);
-        PushCurrentCommandQueueIdForThread(cq_id);
-        EnqueueReadBuffer(*device, b2, out.data(), true);
-        PopCurrentCommandQueueIdForThread();
-
+        auto b0=make_mesh_buf(md,bytes,4u);
+        auto b1=make_mesh_buf(md,bytes,4u);
+        auto b2=make_mesh_buf(md,bytes,4u);
+        WriteShard(cq,b0,flat,MeshCoordinate(0,0),false);
+        fft( md,N,8,b0,b1);
+        ifft(md,N,8,b1,b2);
+        std::vector<float> out;
+        ReadShard(cq,out,b2,MeshCoordinate(0,0),true);
         float e=max_err(x,from_flat(out)); bool p=e<1e-4f; all&=p;
         std::printf("[%s] round-trip N=1024 | err=%.2e\n",p?"PASS":"FAIL",e);
     }

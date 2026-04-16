@@ -1,19 +1,23 @@
 // ============================================================
-// fft_host.cpp — TT-Metalium confirmed API
+// fft_host.cpp — Final correct TT-Metalium API
 //
-// Confirmed from headers:
-//   MeshDevice::create_unit_mesh(device_id) → shared_ptr<MeshDevice>
-//   mesh_device->mesh_command_queue()       → MeshCommandQueue&
-//   mesh_device->get_device(0,0)            → IDevice*
-//   Synchronize(MeshDevice*, optional<cq_id>) → blocks until done
-//   EnqueueWriteMeshBuffer/EnqueueReadMeshBuffer → MeshBuffer only
+// Confirmed complete API:
+//   MeshDevice::create_unit_mesh(device_id)
+//   mesh_device->mesh_command_queue()          → MeshCommandQueue&
+//   mesh_device->get_device(0,0)               → IDevice* (for CreateBuffer)
+//   MeshWorkload + workload.add_program(MeshCoordinateRange, Program&&)
+//   EnqueueMeshWorkload(MeshCommandQueue&, MeshWorkload&, bool)
+//   mesh_cq.finish()                           → blocks until done
+//   Buffer IO: WriteShard/ReadShard via MeshBuffer
+//     OR: create MeshBuffer wrapping single device
 //
-//   For plain Buffer I/O: use PushCurrentCommandQueueIdForThread +
-//   the IDevice-level enqueue functions via host_api.hpp
-//   (EnqueueWriteBuffer/ReadBuffer on IDevice take thread-local cq_id)
+// For single-device buffer IO we use:
+//   MeshBuffer created with ReplicatedBufferConfig (1 device = trivial)
+//   WriteShard(cq, mesh_buf, vec, MeshCoordinate(0,0))
+//   ReadShard(cq, vec, mesh_buf, MeshCoordinate(0,0))
 //
-//   EnqueueProgram: not in distributed.hpp for plain Program.
-//   Use PushCurrentCommandQueueIdForThread + IDevice path.
+// CreateBuffer(InterleavedBufferConfig{.device=IDevice*,...}) still works
+// for allocation — we just need MeshBuffer wrapper for IO.
 // ============================================================
 
 #include "tt-metalium/host_api.hpp"
@@ -26,6 +30,8 @@
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
 #include "tt-metalium/mesh_command_queue.hpp"
+#include "tt-metalium/mesh_workload.hpp"
+#include "tt-metalium/mesh_buffer.hpp"
 
 #include <cmath>
 #include <vector>
@@ -63,45 +69,50 @@ CoreCoord linear_to_core(uint32_t id, uint32_t cols=8)
 
 struct FFTConfig { uint32_t N, num_cores; bool is_ifft; };
 
-static std::shared_ptr<Buffer> make_dram(IDevice* dev, uint32_t sz, uint32_t pg=4) {
-    return CreateBuffer(InterleavedBufferConfig{
-        .device=dev, .size=sz, .page_size=pg, .buffer_type=BufferType::DRAM});
+// ── MeshBuffer helpers for single-device IO ──────────────────
+// Create a replicated MeshBuffer backed by a plain DRAM allocation.
+static std::shared_ptr<MeshBuffer> make_mesh_buf(
+    std::shared_ptr<MeshDevice> md, uint32_t size, uint32_t page_size=4)
+{
+    ReplicatedBufferConfig rep_cfg{.size = size};
+    DeviceLocalBufferConfig dev_cfg{
+        .page_size   = page_size,
+        .buffer_type = BufferType::DRAM,
+    };
+    return MeshBuffer::create(rep_cfg, dev_cfg, md);
 }
 
-// ── Write/Read helpers using thread-local CQ ─────────────────
-// PushCurrentCommandQueueIdForThread sets the cq used by
-// IDevice-level Enqueue* calls in host_api.hpp.
-static void write_buf(IDevice* dev, std::shared_ptr<Buffer> buf,
-                      const void* data, uint8_t cq_id=0) {
-    PushCurrentCommandQueueIdForThread(cq_id);
-    EnqueueWriteBuffer(*dev, buf, data, false);
-    PopCurrentCommandQueueIdForThread();
+// Write std::vector<float> to device (0,0)
+static void mesh_write(MeshCommandQueue& cq,
+                       std::shared_ptr<MeshBuffer> buf,
+                       std::vector<float>& data) {
+    WriteShard(cq, buf, data, MeshCoordinate(0,0), false);
 }
-static void read_buf(IDevice* dev, std::shared_ptr<Buffer> buf,
-                     void* data, uint8_t cq_id=0) {
-    PushCurrentCommandQueueIdForThread(cq_id);
-    EnqueueReadBuffer(*dev, buf, data, true);   // blocking=true
-    PopCurrentCommandQueueIdForThread();
+
+// Read from device (0,0) into std::vector<float>
+static void mesh_read(MeshCommandQueue& cq,
+                      std::vector<float>& data,
+                      std::shared_ptr<MeshBuffer> buf) {
+    ReadShard(cq, data, buf, MeshCoordinate(0,0), true);
 }
-static void enqueue_prog(IDevice* dev, Program& prog,
-                         bool blocking, uint8_t cq_id=0) {
-    PushCurrentCommandQueueIdForThread(cq_id);
-    EnqueueProgram(*dev, prog, blocking);
-    PopCurrentCommandQueueIdForThread();
+
+// Get the underlying Buffer's L1/DRAM address for runtime args
+static uint32_t buf_addr(const std::shared_ptr<MeshBuffer>& mb) {
+    return mb->get_device_buffer(MeshCoordinate(0,0))->address();
 }
 
 // ── Main FFT builder ──────────────────────────────────────────
 void run_fft(
-    std::shared_ptr<MeshDevice> mesh_device,
+    std::shared_ptr<MeshDevice> md,
     const FFTConfig& cfg,
-    std::shared_ptr<Buffer> input_buf,
-    std::shared_ptr<Buffer> output_buf,
-    uint8_t cq_id = 0)
+    std::shared_ptr<MeshBuffer> input_buf,
+    std::shared_ptr<MeshBuffer> output_buf)
 {
     assert((cfg.N&(cfg.N-1))==0 && (cfg.num_cores&(cfg.num_cores-1))==0);
     assert(cfg.N % cfg.num_cores == 0);
 
-    IDevice* device = mesh_device->get_device(0, 0);
+    IDevice* device = md->get_device(0, 0);
+    MeshCommandQueue& cq = md->mesh_command_queue();
 
     uint32_t local_N = cfg.N/cfg.num_cores;
     uint32_t S       = uint32_t(std::log2(cfg.N));
@@ -109,9 +120,9 @@ void run_fft(
     uint32_t S_noc   = S - S_loc;
 
     // Twiddle buffer
-    auto tw = precompute_twiddles(cfg.N, S, cfg.is_ifft);
-    auto tw_buf = make_dram(device, uint32_t(tw.size()*sizeof(float)), sizeof(float));
-    write_buf(device, tw_buf, tw.data(), cq_id);
+    auto tw_floats = precompute_twiddles(cfg.N, S, cfg.is_ifft);
+    auto tw_buf = make_mesh_buf(md, uint32_t(tw_floats.size()*sizeof(float)), sizeof(float));
+    WriteShard(cq, tw_buf, tw_floats, MeshCoordinate(0,0), false);
 
     // Program
     Program prog = CreateProgram();
@@ -127,9 +138,9 @@ void run_fft(
         return CreateCircularBuffer(prog, cr, c);
     };
     CBHandle h_lr=make_cb(CB_LHS_R,2), h_li=make_cb(CB_LHS_I,2);
-    make_cb(CB_RHS_R,2); make_cb(CB_RHS_I,2);
+    make_cb(CB_RHS_R,2);   make_cb(CB_RHS_I,2);
     make_cb(CB_TWIDDLE_R,2); make_cb(CB_TWIDDLE_I,2);
-    make_cb(CB_OUT_R,2); make_cb(CB_OUT_I,2);
+    make_cb(CB_OUT_R,2);   make_cb(CB_OUT_I,2);
     CBHandle h_sr=make_cb(CB_SCRATCH_R), h_si=make_cb(CB_SCRATCH_I);
     make_cb(CB_SYNC); make_cb(CB_TMP_R); make_cb(CB_TMP_I);
     make_cb(CB_WR_R); make_cb(CB_WR_I);
@@ -157,11 +168,11 @@ void run_fft(
     for (uint32_t my=0; my<cfg.num_cores; my++) {
         CoreCoord mc=linear_to_core(my);
         SetRuntimeArgs(prog,rk,mc,{
-            input_buf->address(),0u,tw_buf->address(),0u,
+            buf_addr(input_buf),0u,buf_addr(tw_buf),0u,
             local_N,my,cfg.N,S_loc,S,0u});
         std::vector<uint32_t> wa={
             lhs_r,lhs_i,scr_r,scr_i,
-            output_buf->address(),0u,
+            buf_addr(output_buf),0u,
             cfg.num_cores,my,S_loc,sem_id};
         for (uint32_t dst=0; dst<cfg.num_cores; dst++) {
             if (dst==my) continue;
@@ -172,15 +183,20 @@ void run_fft(
         SetRuntimeArgs(prog,wk,mc,wa);
     }
 
-    enqueue_prog(device, prog, false, cq_id);
-    // Synchronize(MeshDevice*, optional<cq_id>) is the confirmed Finish equivalent
-    Synchronize(mesh_device.get(), cq_id);
+    // Wrap Program in MeshWorkload and dispatch
+    MeshWorkload workload;
+    // MeshCoordinateRange covering just device (0,0) in a 1x1 mesh
+    workload.add_program(
+        MeshCoordinateRange(MeshCoordinate(0,0), MeshCoordinate(0,0)),
+        std::move(prog));
+    EnqueueMeshWorkload(cq, workload, false);
+    cq.finish();
 }
 
 void fft(std::shared_ptr<MeshDevice> md, uint32_t N, uint32_t nc,
-         std::shared_ptr<Buffer> in, std::shared_ptr<Buffer> out)
+         std::shared_ptr<MeshBuffer> in, std::shared_ptr<MeshBuffer> out)
 { run_fft(md,{N,nc,false},in,out); }
 
 void ifft(std::shared_ptr<MeshDevice> md, uint32_t N, uint32_t nc,
-          std::shared_ptr<Buffer> in, std::shared_ptr<Buffer> out)
+          std::shared_ptr<MeshBuffer> in, std::shared_ptr<MeshBuffer> out)
 { run_fft(md,{N,nc,true},in,out); }
