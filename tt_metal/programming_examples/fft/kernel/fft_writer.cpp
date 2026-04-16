@@ -13,7 +13,7 @@
 // live on this kernel.
 
 #include <cstdint>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 #include "fft_common.h"
 
 void kernel_main() {
