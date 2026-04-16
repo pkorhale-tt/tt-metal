@@ -208,14 +208,20 @@ inline void run_fft(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
+    // Unpack every CB directly to DEST in fp32. Without this, the unpacker
+    // converts Float32 L1 tiles to bf16 on the way into DEST for copy_tile,
+    // which silently truncates every butterfly to bf16 precision.
+    std::vector<UnpackToDestMode> u2d(NUM_CBS, UnpackToDestMode::UnpackToDestFp32);
+
     CreateKernel(
         prog,
         "tt_metal/programming_examples/fft/kernel/fft_compute.cpp",
         cr,
         ComputeConfig{
-            .math_fidelity     = MathFidelity::HiFi4,
-            .fp32_dest_acc_en  = true,
-            .compile_args      = {log2N}});
+            .math_fidelity       = MathFidelity::HiFi4,
+            .fp32_dest_acc_en    = true,
+            .unpack_to_dest_mode = u2d,
+            .compile_args        = {log2N}});
 
     // --- runtime args ------------------------------------------------------
     SetRuntimeArgs(prog, rk, core, {
