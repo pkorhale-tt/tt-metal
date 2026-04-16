@@ -225,32 +225,52 @@ void kernel_main() {
     }
 
     // ── CROSS-CORE stages (LOG2N_LOCAL .. LOG2N-1) ────────────────────────
+    //
+    // Pipeline strategy: the "send our state to stage k's partner" step is
+    // moved out of the top of the stage-k iteration.
+    //   - Stage 0 is primed by an explicit one-time send before the loop.
+    //   - Stage k+1's send is fused with stage k's scatter (both come from
+    //     the same post-butterfly tile, so one extra remote NoC write does
+    //     the trick).
+    // Result: by the time we reach the top of stage k+1, partner's data has
+    // already landed — the semaphore wait is near-instantaneous, and the
+    // NoC transit overlaps with our compute instead of blocking it.
+    //
+    // We also start the twiddle DRAM read BEFORE the semaphore wait so
+    // DRAM latency overlaps the (short) wait as well.
     if constexpr (P > 1) {
-        for (uint32_t k = 0; k < LOG2P; ++k) {
-            const uint32_t s           = LOG2N_LOCAL + k;
-            const uint32_t bit         = 1u << k;
-            const uint32_t partner     = my_core ^ bit;
-            const bool     is_c_even   = (my_core & bit) == 0;
-
-            const uint32_t partner_x = get_arg_val<uint32_t>(6 + partner * 2);
-            const uint32_t partner_y = get_arg_val<uint32_t>(6 + partner * 2 + 1);
-
-            const uint64_t partner_recv_r_addr = get_noc_addr(partner_x, partner_y, recv_r_l1);
-            const uint64_t partner_recv_i_addr = get_noc_addr(partner_x, partner_y, recv_i_l1);
-            const uint64_t partner_sem_addr    = get_noc_addr(partner_x, partner_y, sem_l1);
-
-            noc_async_write(state_r_l1, partner_recv_r_addr, TILE_SIZE_FP32);
-            noc_async_write(state_i_l1, partner_recv_i_addr, TILE_SIZE_FP32);
+        // One-time initial send: prime partner_0's recv buffer.
+        {
+            const uint32_t p0    = my_core ^ 1u;
+            const uint32_t p0_x  = get_arg_val<uint32_t>(6 + p0 * 2);
+            const uint32_t p0_y  = get_arg_val<uint32_t>(6 + p0 * 2 + 1);
+            const uint64_t p0_rr = get_noc_addr(p0_x, p0_y, recv_r_l1);
+            const uint64_t p0_ri = get_noc_addr(p0_x, p0_y, recv_i_l1);
+            const uint64_t p0_sm = get_noc_addr(p0_x, p0_y, sem_l1);
+            noc_async_write(state_r_l1, p0_rr, TILE_SIZE_FP32);
+            noc_async_write(state_i_l1, p0_ri, TILE_SIZE_FP32);
             noc_async_write_barrier();
-            noc_semaphore_inc(partner_sem_addr, 1);
+            noc_semaphore_inc(p0_sm, 1);
+        }
 
-            noc_semaphore_wait(sem_ptr, k + 1);
+        for (uint32_t k = 0; k < LOG2P; ++k) {
+            const uint32_t s         = LOG2N_LOCAL + k;
+            const uint32_t bit       = 1u << k;
+            const bool     is_c_even = (my_core & bit) == 0;
 
-            // Twiddle for this stage.
+            // Kick off twiddle DRAM read early — this overlaps the NoC
+            // semaphore wait below.
             cb_reserve_back(CB_TW_R, 1);
             cb_reserve_back(CB_TW_I, 1);
             noc_async_read_tile(s * P + my_core, tw_r_gen, get_write_ptr(CB_TW_R));
             noc_async_read_tile(s * P + my_core, tw_i_gen, get_write_ptr(CB_TW_I));
+
+            // Wait for partner_k's tile (sent at end of their stage k-1, or
+            // by the initial prime for k=0). Monotonic count so missed/late
+            // increments can't race.
+            noc_semaphore_wait(sem_ptr, k + 1);
+
+            // Finish the twiddle read.
             noc_async_read_barrier();
             cb_push_back(CB_TW_R, 1);
             cb_push_back(CB_TW_I, 1);
@@ -294,14 +314,30 @@ void kernel_main() {
             const uint32_t o1r_l1 = get_read_ptr(CB_OUT1_R);
             const uint32_t o1i_l1 = get_read_ptr(CB_OUT1_I);
 
-            if (is_c_even) {
-                async_local_memcpy(o0r_l1, state_r_l1, TILE_SIZE_FP32, my_noc_x, my_noc_y);
-                async_local_memcpy(o0i_l1, state_i_l1, TILE_SIZE_FP32, my_noc_x, my_noc_y);
+            // The tile we keep as our new state: OUT0 if c_even, else OUT1.
+            const uint32_t src_r = is_c_even ? o0r_l1 : o1r_l1;
+            const uint32_t src_i = is_c_even ? o0i_l1 : o1i_l1;
+
+            // Local scatter (always).
+            async_local_memcpy(src_r, state_r_l1, TILE_SIZE_FP32, my_noc_x, my_noc_y);
+            async_local_memcpy(src_i, state_i_l1, TILE_SIZE_FP32, my_noc_x, my_noc_y);
+
+            // Fused send to next stage's partner (in parallel with local
+            // scatter). Last stage has no next partner.
+            if (k + 1 < LOG2P) {
+                const uint32_t np    = my_core ^ (1u << (k + 1));
+                const uint32_t np_x  = get_arg_val<uint32_t>(6 + np * 2);
+                const uint32_t np_y  = get_arg_val<uint32_t>(6 + np * 2 + 1);
+                const uint64_t np_rr = get_noc_addr(np_x, np_y, recv_r_l1);
+                const uint64_t np_ri = get_noc_addr(np_x, np_y, recv_i_l1);
+                const uint64_t np_sm = get_noc_addr(np_x, np_y, sem_l1);
+                noc_async_write(src_r, np_rr, TILE_SIZE_FP32);
+                noc_async_write(src_i, np_ri, TILE_SIZE_FP32);
+                noc_async_write_barrier();
+                noc_semaphore_inc(np_sm, 1);
             } else {
-                async_local_memcpy(o1r_l1, state_r_l1, TILE_SIZE_FP32, my_noc_x, my_noc_y);
-                async_local_memcpy(o1i_l1, state_i_l1, TILE_SIZE_FP32, my_noc_x, my_noc_y);
+                noc_async_write_barrier();
             }
-            noc_async_write_barrier();
 
             cb_pop_front(CB_OUT0_R, 1);
             cb_pop_front(CB_OUT0_I, 1);
