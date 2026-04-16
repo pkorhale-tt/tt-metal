@@ -53,11 +53,7 @@ int main() {
 
     // Example 1: real input — exactly the PyTorch snippet
     //   torch.fft.fft(torch.tensor([10., 20., 30., 40.]))
-    // std::vector<float> signal = {10.f, 20.f, 30.f, 40.f};
-    std::vector<float> signal = {
-        10.f, 20.f, 30.f, 40.f,
-        73.4f, 12.8f, 55.1f,12.3f
-    };
+    std::vector<float> signal = {10.f, 20.f, 30.f, 40.f};
 
     auto spectrum = fft(md, signal);
     print_spectrum("FFT of [10, 20, 30, 40]", spectrum);
@@ -100,10 +96,3 @@ int main() {
     md.reset();
     return 0;
 }
-
-
-/*
-cmake --build build --target my_fft_app -j 
-ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 ./build/programming_examples/fft/my_fft_app
-*/
-
