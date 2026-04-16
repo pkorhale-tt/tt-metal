@@ -56,7 +56,7 @@ int main() {
     // std::vector<float> signal = {10.f, 20.f, 30.f, 40.f};
     std::vector<float> signal = {
         10.f, 20.f, 30.f, 40.f,
-        73.4f, 12.8f, 55.1f
+        73.4f, 12.8f, 55.1f,12.3f
     };
 
     auto spectrum = fft(md, signal);
