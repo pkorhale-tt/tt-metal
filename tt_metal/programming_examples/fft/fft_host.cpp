@@ -142,13 +142,13 @@ void run_fft(
     std::vector<uint32_t> ct_rw={local_N,cfg.num_cores,S,0u};
     std::vector<uint32_t> ct_c={S_loc,S_noc,cfg.is_ifft?1u:0u,cfg.N};
 
-    auto rk=CreateKernel(prog,"fft_reader.cpp",cr,
+    auto rk=CreateKernel(prog,"kernel/fft_reader.cpp",cr,
         DataMovementConfig{.processor=DataMovementProcessor::RISCV_0,
                            .noc=NOC::RISCV_0_default,.compile_args=ct_rw});
-    auto wk=CreateKernel(prog,"fft_writer.cpp",cr,
+    auto wk=CreateKernel(prog,"kernel/fft_writer.cpp",cr,
         DataMovementConfig{.processor=DataMovementProcessor::RISCV_1,
                            .noc=NOC::RISCV_1_default,.compile_args=ct_rw});
-    CreateKernel(prog,"fft_compute.cpp",cr,
+    CreateKernel(prog,"kernel/fft_compute.cpp",cr,
         ComputeConfig{.math_fidelity=MathFidelity::HiFi4,
                       .fp32_dest_acc_en=true,.compile_args=ct_c});
 
