@@ -1,31 +1,30 @@
 # SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-set(FFT_SRC
-    ${CMAKE_CURRENT_SOURCE_DIR}/fft_test.cpp
-)
-
-add_executable(metal_example_fft_test ${FFT_SRC})
-
 if(NOT TARGET TT::Metalium)
     find_package(TT-Metalium REQUIRED)
 endif()
 
-target_link_libraries(
-    metal_example_fft_test
-    PRIVATE
-        TT::Metalium
-)
+# Correctness + timing harness
+add_executable(metal_example_fft_test ${CMAKE_CURRENT_SOURCE_DIR}/fft_test.cpp)
 
-target_include_directories(
-    metal_example_fft_test
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${PROJECT_SOURCE_DIR}
-)
+# PyTorch-style one-shot FFT demo
+add_executable(metal_example_fft_demo ${CMAKE_CURRENT_SOURCE_DIR}/fft_demo.cpp)
 
-set_target_properties(
-    metal_example_fft_test
-    PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/programming_examples/fft
-)
+# tt-metal FFT dumper, used by compare_with_torch.py
+add_executable(metal_example_fft_vs_torch ${CMAKE_CURRENT_SOURCE_DIR}/fft_vs_torch.cpp)
+
+foreach(tgt metal_example_fft_test metal_example_fft_demo metal_example_fft_vs_torch)
+    target_link_libraries(${tgt} PRIVATE TT::Metalium)
+    target_include_directories(
+        ${tgt}
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}
+    )
+    set_target_properties(
+        ${tgt}
+        PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/programming_examples/fft
+    )
+endforeach()

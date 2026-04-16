@@ -370,4 +370,55 @@ inline std::shared_ptr<MeshBuffer> make_io_buf(
     return make_mesh_buf(md, z.P * kTileSizeFp32, kTileSizeFp32);
 }
 
+// ── PyTorch-style one-shot FFT API ────────────────────────────────────────
+//
+// Usage (C++ equivalent of `torch.fft.fft(signal)`):
+//
+//     std::vector<std::complex<float>> signal = { {10,0}, {20,0}, {30,0}, {40,0} };
+//     auto spectrum = fft_example::fft(md, signal);
+//
+// Requirements: signal.size() is a power of two in [2, 65536]. The returned
+// vector has the same length, with bin k of the discrete Fourier transform
+// at index k.
+
+inline std::vector<std::complex<float>> fft(
+    std::shared_ptr<MeshDevice> md,
+    const std::vector<std::complex<float>>& signal)
+{
+    const uint32_t N = static_cast<uint32_t>(signal.size());
+    assert(N >= 2 && "FFT requires N >= 2");
+    assert((N & (N - 1)) == 0 && "FFT requires N to be a power of two");
+
+    MeshCommandQueue& cq = md->mesh_command_queue();
+
+    const Sizing z = compute_sizing(N);
+    auto [in_r, in_i] = pack_input(signal, z);
+
+    auto in_r_buf  = make_io_buf(md, N);
+    auto in_i_buf  = make_io_buf(md, N);
+    auto out_r_buf = make_io_buf(md, N);
+    auto out_i_buf = make_io_buf(md, N);
+
+    WriteShard(cq, in_r_buf, in_r, MeshCoordinate(0, 0), false);
+    WriteShard(cq, in_i_buf, in_i, MeshCoordinate(0, 0), false);
+
+    run_fft(md, {N}, in_r_buf, in_i_buf, out_r_buf, out_i_buf);
+
+    std::vector<float> out_r, out_i;
+    ReadShard(cq, out_r, out_r_buf, MeshCoordinate(0, 0), true);
+    ReadShard(cq, out_i, out_i_buf, MeshCoordinate(0, 0), true);
+
+    return unpack_output(out_r, out_i, z);
+}
+
+// Overload for real-valued input. Imaginary part is treated as 0.
+inline std::vector<std::complex<float>> fft(
+    std::shared_ptr<MeshDevice> md,
+    const std::vector<float>& signal)
+{
+    std::vector<std::complex<float>> cx(signal.size());
+    for (size_t i = 0; i < signal.size(); ++i) cx[i] = {signal[i], 0.0f};
+    return fft(md, cx);
+}
+
 }  // namespace fft_example
