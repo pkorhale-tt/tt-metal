@@ -210,8 +210,13 @@ inline void run_fft(
 
     // Unpack every CB directly to DEST in fp32. Without this, the unpacker
     // converts Float32 L1 tiles to bf16 on the way into DEST for copy_tile,
-    // which silently truncates every butterfly to bf16 precision.
-    std::vector<UnpackToDestMode> u2d(NUM_CBS, UnpackToDestMode::UnpackToDestFp32);
+    // which silently truncates every butterfly to bf16 precision. The vector
+    // must cover all 32 CB slots (not just the ones we use).
+    constexpr uint32_t kNumCbSlots = 32;
+    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
+    for (uint32_t id = 0; id < NUM_CBS; ++id) {
+        u2d[id] = UnpackToDestMode::UnpackToDestFp32;
+    }
 
     CreateKernel(
         prog,
