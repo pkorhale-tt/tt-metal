@@ -18,7 +18,7 @@ FORCE_INLINE void send_range(
     uint32_t first = local_N, count = 0;
     for (uint32_t i=0; i<local_N; i++) {
         if (((base+i)^stride)/local_N == dst_id) {
-            if (first==local_N) first=i; count++;
+            if (first==local_N) { first=i; } count++;
         }
     }
     off = first*elem_bytes; cnt = count*elem_bytes;
