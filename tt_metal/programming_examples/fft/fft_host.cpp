@@ -51,7 +51,8 @@ enum RtArg : uint32_t {
 enum CtArg : uint32_t { CT_LOCAL_N=0, CT_NUM_CORES=1, CT_NUM_STAGES=2, CT_USE_BF16=3 };
 
 static constexpr uint32_t kTileHW      = tt::constants::TILE_HW;
-static constexpr uint32_t kTileSizeFp32 = kTileHW * kTileHW * sizeof(float);
+static constexpr uint32_t kTileElems    = kTileHW * kTileHW;
+static constexpr uint32_t kTileSizeFp32 = kTileElems * sizeof(float);
 static constexpr uint32_t kCbTiles[]   = {2,2,2,2,2,2,2,2,1,1,1,1,1,1,1};
 
 // ── Twiddle precomputation ────────────────────────────────────
@@ -137,10 +138,13 @@ void run_fft(
 
     uint32_t sem_id = CreateSemaphore(prog, cr, 0u);
 
-    // CBs
+    // CB size based on local_N elements (not full 32x32 tile)
+    // This avoids L1 overflow for small N values.
+    uint32_t cb_elem_bytes = local_N * sizeof(float);  // one channel, fp32
     auto make_cb = [&](uint32_t id, uint32_t n=1) {
-        CircularBufferConfig c(n*kTileSizeFp32,{{id,tt::DataFormat::Float32}});
-        c.set_page_size(id, kTileSizeFp32);
+        uint32_t cb_bytes = n * cb_elem_bytes;
+        CircularBufferConfig c(cb_bytes, {{id, tt::DataFormat::Float32}});
+        c.set_page_size(id, cb_elem_bytes);
         return CreateCircularBuffer(prog, cr, c);
     };
     for (uint32_t id=0; id<15; id++) make_cb(id, kCbTiles[id]);
@@ -152,7 +156,7 @@ void run_fft(
     uint32_t cb_offsets[15];
     cb_offsets[0] = 0;
     for (int i=1; i<15; i++)
-        cb_offsets[i] = cb_offsets[i-1] + kCbTiles[i-1]*kTileSizeFp32;
+        cb_offsets[i] = cb_offsets[i-1] + kCbTiles[i-1]*cb_elem_bytes;
 
     uint32_t lhs_r_addr = cb_base + cb_offsets[CB_LHS_R];
     uint32_t lhs_i_addr = cb_base + cb_offsets[CB_LHS_I];

@@ -24,9 +24,7 @@ using namespace tt::tt_metal;
 using namespace tt::tt_metal::distributed;
 using Complex = std::complex<float>;
 
-static constexpr uint32_t kTileHW      = tt::constants::TILE_HW;  // 32
-static constexpr uint32_t kTileElems   = kTileHW * kTileHW;       // 1024
-static constexpr uint32_t kTileSizeFp32 = kTileElems * sizeof(float);
+// Note: kTileHW and kTileSizeFp32 defined in fft_host.cpp — don't redefine
 
 // ── Reference DFT ────────────────────────────────────────────
 std::vector<Complex> ref_dft(const std::vector<Complex>& x) {
@@ -69,21 +67,16 @@ std::vector<Complex> make_random(uint32_t N, uint32_t seed=42) {
     return x;
 }
 
-// ── Tile-based buffer packing ─────────────────────────────────
-// Input layout: num_cores tiles real (one per core) then num_cores imag.
-// Each tile holds local_N elements in the first local_N positions.
-std::vector<float> pack_input(
-    const std::vector<Complex>& x, uint32_t num_cores)
-{
+// Buffer layout: 2*num_cores tiles, first half real, second half imag.
+// Each tile stores local_N fp32 values in first local_N positions.
+std::vector<float> pack_input(const std::vector<Complex>& x, uint32_t num_cores) {
     uint32_t N       = x.size();
     uint32_t local_N = N / num_cores;
-    // 2 * num_cores tiles total
     std::vector<float> buf(2 * num_cores * kTileElems, 0.0f);
-
-    for (uint32_t c = 0; c < num_cores; c++) {
+    for (uint32_t c=0; c<num_cores; c++) {
         float* tile_r = buf.data() + c * kTileElems;
         float* tile_i = buf.data() + (num_cores + c) * kTileElems;
-        for (uint32_t i = 0; i < local_N; i++) {
+        for (uint32_t i=0; i<local_N; i++) {
             tile_r[i] = x[c * local_N + i].real();
             tile_i[i] = x[c * local_N + i].imag();
         }
@@ -91,18 +84,16 @@ std::vector<float> pack_input(
     return buf;
 }
 
-// Unpack output tiles back into complex vector
 std::vector<Complex> unpack_output(
     const std::vector<float>& buf, uint32_t N, uint32_t num_cores)
 {
     uint32_t local_N = N / num_cores;
     std::vector<Complex> out(N);
-    for (uint32_t c = 0; c < num_cores; c++) {
+    for (uint32_t c=0; c<num_cores; c++) {
         const float* tile_r = buf.data() + c * kTileElems;
         const float* tile_i = buf.data() + (num_cores + c) * kTileElems;
-        for (uint32_t i = 0; i < local_N; i++) {
+        for (uint32_t i=0; i<local_N; i++)
             out[c * local_N + i] = {tile_r[i], tile_i[i]};
-        }
     }
     return out;
 }
@@ -112,13 +103,10 @@ bool run_test(std::shared_ptr<MeshDevice> md,
               uint32_t num_cores, bool is_ifft, const char* name)
 {
     uint32_t N       = input.size();
-    uint32_t local_N = N / num_cores;
     auto ref         = is_ifft ? ref_idft(input) : ref_dft(input);
 
     MeshCommandQueue& cq = md->mesh_command_queue();
-
-    // 2*num_cores tiles per buffer (real + imag)
-    uint32_t buf_bytes = 2 * num_cores * kTileSizeFp32;
+    uint32_t buf_bytes   = 2 * num_cores * kTileSizeFp32;
 
     auto in_buf  = make_mesh_buf(md, buf_bytes, kTileSizeFp32);
     auto out_buf = make_mesh_buf(md, buf_bytes, kTileSizeFp32);
@@ -131,12 +119,14 @@ bool run_test(std::shared_ptr<MeshDevice> md,
     double ms = std::chrono::duration<double,std::milli>(
         std::chrono::high_resolution_clock::now()-t0).count();
 
+    // FIX: ReadShard takes (cq, mesh_buf, vector&, coord, blocking)
+    // i.e. mesh_buf is 2nd arg, vector is 3rd
     std::vector<float> out_flat;
     ReadShard(cq, out_flat, out_buf, MeshCoordinate(0,0), true);
 
-    auto got  = unpack_output(out_flat, N, num_cores);
-    float err = max_err(ref, got);
-    bool  pass = err < 1e-3f;  // relaxed for fp32 accumulation
+    auto  got  = unpack_output(out_flat, N, num_cores);
+    float err  = max_err(ref, got);
+    bool  pass = err < 1e-3f;
 
     std::printf("[%s] N=%-5u cores=%-2u %s | err=%.2e | %.1f ms  %s\n",
         pass?"PASS":"FAIL", N, num_cores,
@@ -145,7 +135,7 @@ bool run_test(std::shared_ptr<MeshDevice> md,
 }
 
 int main() {
-    auto md = MeshDevice::create_unit_mesh(0);
+    auto md  = MeshDevice::create_unit_mesh(0);
     bool all = true;
 
     all &= run_test(md, make_impulse(64),  1, false, "impulse FFT");
@@ -156,22 +146,21 @@ int main() {
 
     // Round-trip
     {
-        auto x = make_random(1024);
-        uint32_t N = 1024, num_cores = 8;
-        uint32_t buf_bytes = 2 * num_cores * kTileSizeFp32;
+        auto x         = make_random(1024);
+        uint32_t N     = 1024, nc = 8;
+        uint32_t bytes = 2 * nc * kTileSizeFp32;
         MeshCommandQueue& cq = md->mesh_command_queue();
-        auto b0 = make_mesh_buf(md,buf_bytes,kTileSizeFp32);
-        auto b1 = make_mesh_buf(md,buf_bytes,kTileSizeFp32);
-        auto b2 = make_mesh_buf(md,buf_bytes,kTileSizeFp32);
-        auto flat = pack_input(x, num_cores);
+        auto b0 = make_mesh_buf(md,bytes,kTileSizeFp32);
+        auto b1 = make_mesh_buf(md,bytes,kTileSizeFp32);
+        auto b2 = make_mesh_buf(md,bytes,kTileSizeFp32);
+        auto flat = pack_input(x, nc);
         WriteShard(cq,b0,flat,MeshCoordinate(0,0),false);
-        fft( md,N,num_cores,b0,b1);
-        ifft(md,N,num_cores,b1,b2);
+        fft( md,N,nc,b0,b1);
+        ifft(md,N,nc,b1,b2);
         std::vector<float> out;
-        ReadShard(cq,b2,out,MeshCoordinate(0,0),true);
-        auto got = unpack_output(out, N, num_cores);
-        float e  = max_err(x, got);
-        bool  p  = e < 1e-3f; all &= p;
+        ReadShard(cq,out,b2,MeshCoordinate(0,0),true);
+        float e = max_err(x, unpack_output(out,N,nc));
+        bool  p = e < 1e-3f; all &= p;
         std::printf("[%s] round-trip N=1024 | err=%.2e\n", p?"PASS":"FAIL", e);
     }
 
