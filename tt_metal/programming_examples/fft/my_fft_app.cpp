@@ -74,8 +74,7 @@ int main() {
         39.8f, 86.5f, 53.2f, 21.9f, 76.6f, 44.2f, 62.9f, 30.5f, 95.2f, 9.8f,
         68.4f, 36.1f, 82.8f, 50.4f, 27.1f, 73.8f, 41.4f, 59.1f, 17.7f, 85.4f,
         53.8f, 22.4f, 77.1f, 45.7f, 93.1f, 30.8f, 66.4f, 34.8f, 81.5f, 12.1f,
-        58.8f, 26.4f, 72.5f, 40.1f, 87.8f, 55.4f, 19.1f, 64.8f, 32.4f, 79.1f,
-        47.8f, 24.5f, 89.2f, 56.8f, 13.5f, 70.1f, 38.8f, 85.5f, 53.1f, 21.7f
+        58.8f, 26.4f, 72.5f, 40.1f, 87.8f, 55.4f, 19.1f, 64.8f, 32.4f, 79.1f
     };
 
     auto spectrum = fft(md, signal);
@@ -121,5 +120,8 @@ int main() {
 }
 
 
-//cmake --build build --target my_fft_app -j 
-//ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 ./build/programming_examples/fft/my_fft_app
+/*
+cmake --build build --target my_fft_app -j 
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 ./build/programming_examples/fft/my_fft_app
+*/
+
