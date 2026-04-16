@@ -1,0 +1,175 @@
+================================================================================
+  tt-metal FFT — all commands in one place
+  (run from the tt-metal repo root, e.g. /proj_sw/user_dev/pkorhale/fft_metal_clean)
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1.  ONE-TIME SETUP
+--------------------------------------------------------------------------------
+
+# Activate the tt-metal python env (needed for the torch comparison script)
+source python_env/bin/activate          # already active if shell prompt shows (python_env)
+
+# Make sure torch is installed in that env
+python -c "import torch; print(torch.__version__)"
+# If missing:
+pip install torch
+
+# Always export ARCH_NAME before running any device binary
+export ARCH_NAME=wormhole_b0
+export TT_METAL_HOME=$(pwd)
+
+
+--------------------------------------------------------------------------------
+2.  BUILD
+--------------------------------------------------------------------------------
+
+# First time: configure with programming examples enabled
+cmake -B build -DBUILD_PROGRAMMING_EXAMPLES=ON
+
+# Build all FFT executables at once
+cmake --build build \
+      --target metal_example_fft_test metal_example_fft_demo metal_example_fft_vs_torch my_fft_app \
+      -j
+
+# Or build individually:
+cmake --build build --target metal_example_fft_test     -j   # correctness harness
+cmake --build build --target metal_example_fft_demo     -j   # PyTorch-style demo
+cmake --build build --target metal_example_fft_vs_torch -j   # torch comparison dumper
+cmake --build build --target my_fft_app                 -j   # YOUR playground
+
+# Rebuild from scratch (clears JIT kernel cache too)
+rm -rf build ~/.cache/tt-metal-cache
+cmake -B build -DBUILD_PROGRAMMING_EXAMPLES=ON
+cmake --build build --target metal_example_fft_test metal_example_fft_demo metal_example_fft_vs_torch -j
+
+
+--------------------------------------------------------------------------------
+3.  RUN THE FULL TEST SUITE  (single + multi-core, N = 16..65536)
+--------------------------------------------------------------------------------
+
+# Runs 15 tests: impulse / DC / random at N = 16, 64, 256, 1024, 2048, 4096,
+# 8192, 16384, 32768, 65536.  Uses 1..64 cores automatically.
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft/metal_example_fft_test
+
+# Without clearing JIT cache (faster second run)
+ARCH_NAME=wormhole_b0 ./build/programming_examples/fft/metal_example_fft_test
+
+
+--------------------------------------------------------------------------------
+4.  USE THE FFT IN CODE  (PyTorch-style one-shot call)
+--------------------------------------------------------------------------------
+
+# -- 4a. Quickest path: edit the ready-made playground file --
+#
+# File to edit:   tt_metal/programming_examples/fft/my_fft_app.cpp
+# Put your signal inside main(), then:
+cmake --build build --target my_fft_app -j
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft/my_fft_app
+
+
+# -- 4b. Reference demo with 4 worked examples --
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft/metal_example_fft_demo
+
+
+# -- 4c. The API from any C++ file --
+#
+#     #include "tt_metal/programming_examples/fft/fft_host.cpp"
+#     using namespace fft_example;
+#
+#     auto md = MeshDevice::create_unit_mesh(0);
+#
+#     std::vector<float> signal = {10.f, 20.f, 30.f, 40.f};   // real input
+#     auto spectrum = fft(md, signal);
+#
+#     // or a complex input:
+#     std::vector<std::complex<float>> cx = { {1,0}, {0,1}, {-1,0}, {0,-1} };
+#     auto spec2 = fft(md, cx);
+#
+# Requirements: signal.size() is a power of 2 in [2, 65536].
+# Equivalent to torch.fft.fft(signal).
+#
+# If you create a brand-new .cpp (not my_fft_app.cpp), register it in
+# tt_metal/programming_examples/fft/CMakeLists.txt by:
+#   1. adding    add_executable(your_target ${CMAKE_CURRENT_SOURCE_DIR}/your.cpp)
+#   2. appending your_target to the foreach(tgt ...) list.
+
+
+--------------------------------------------------------------------------------
+5.  COMPARE tt-metal FFT  vs.  torch.fft.fft
+--------------------------------------------------------------------------------
+
+# Default: N=1024, seed=42, threshold 2e-3
+python tt_metal/programming_examples/fft/compare_with_torch.py
+
+# Specify N (power of 2, up to 65536)
+python tt_metal/programming_examples/fft/compare_with_torch.py --N 4096
+python tt_metal/programming_examples/fft/compare_with_torch.py --N 65536
+
+# Change the RNG seed (determines the random complex input)
+python tt_metal/programming_examples/fft/compare_with_torch.py --N 8192 --seed 7
+
+# Tighten/loosen the pass threshold on relative error
+python tt_metal/programming_examples/fft/compare_with_torch.py --N 1024 --tol 1e-4
+
+# Keep the temporary input/output .txt files (printed at the end)
+python tt_metal/programming_examples/fft/compare_with_torch.py --N 256 --keep
+
+# Point at a custom binary location (default is ./build/programming_examples/fft/metal_example_fft_vs_torch)
+python tt_metal/programming_examples/fft/compare_with_torch.py \
+    --N 4096 \
+    --bin ./build/programming_examples/fft/metal_example_fft_vs_torch
+
+
+# ── What the script prints ──
+#
+#   reference max |X|   : max magnitude of the torch FFT
+#   max abs error       : worst per-bin absolute error
+#   max rel error       : worst per-bin error / reference max  (pass/fail criterion)
+#   mean abs error      : average per-bin absolute error
+#   SNR                 : 10*log10( ||X_torch||^2 / ||X_tt - X_torch||^2 )
+#   worst 5 bins        : the 5 most off bins, with side-by-side values
+#   PASS / FAIL         : rel_err < --tol
+
+
+--------------------------------------------------------------------------------
+6.  LOW-LEVEL UTILITY (only used by the comparison script)
+--------------------------------------------------------------------------------
+
+# Raw dumper: writes input and tt-metal FFT output to text files.
+# Called internally by compare_with_torch.py, but you can run it by hand:
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft/metal_example_fft_vs_torch \
+    <N> [seed] [in_path] [out_path]
+
+# Example:
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft/metal_example_fft_vs_torch \
+    1024 42 /tmp/in.txt /tmp/out.txt
+
+# Each file has N lines of "real imag" (space-separated, scientific notation).
+
+
+--------------------------------------------------------------------------------
+7.  TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+# Kernel build errors after editing .cpp in kernel/:
+TT_METAL_CLEAR_JIT_CACHE=1 ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft/metal_example_fft_test
+
+# "Binary not found" from compare_with_torch.py:
+cmake --build build --target metal_example_fft_vs_torch -j
+
+# ARCH_NAME missing:
+export ARCH_NAME=wormhole_b0
+
+# Want a per-core alive-print from the reader (visually confirms all cores run):
+cmake --build build --target metal_example_fft_test -j -- \
+    CXXFLAGS="-DFFT_DPRINT_HELLO=1"
+TT_METAL_DPRINT_CORES=all ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft/metal_example_fft_test
