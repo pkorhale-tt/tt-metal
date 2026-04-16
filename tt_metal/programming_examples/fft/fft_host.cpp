@@ -56,6 +56,8 @@
 #include <utility>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <unordered_map>
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -370,16 +372,207 @@ inline std::shared_ptr<MeshBuffer> make_io_buf(
     return make_mesh_buf(md, z.P * kTileSizeFp32, kTileSizeFp32);
 }
 
-// ── PyTorch-style one-shot FFT API ────────────────────────────────────────
+// ── Persistent plan: build once, execute many times ───────────────────────
+//
+// A plan captures every device-side resource that depends only on N:
+//   * twiddle buffers (precomputed, uploaded once)
+//   * input / output DRAM buffers (addresses are stable, so runtime args
+//     stay valid across calls)
+//   * the compiled Program wrapped in a MeshWorkload (runtime args bound
+//     once to the persistent buffer addresses)
+//
+// On repeated calls with the same N:
+//   per-call cost  = WriteShard(input) + EnqueueMeshWorkload + ReadShard
+// instead of
+//   per-call cost  = above + program build + CBs + kernels + SetRuntimeArgs
+// which at N=65536 is the difference between ~25 ms and ~2–3 ms.
+
+struct FFTPlan {
+    uint32_t N = 0;
+    Sizing   z{};
+    std::shared_ptr<MeshDevice> md;
+    std::shared_ptr<MeshBuffer> in_r_buf, in_i_buf;
+    std::shared_ptr<MeshBuffer> out_r_buf, out_i_buf;
+    std::shared_ptr<MeshBuffer> tw_r_buf, tw_i_buf;
+    MeshWorkload workload;
+    bool initialized = false;
+};
+
+inline std::shared_ptr<FFTPlan> make_plan(
+    std::shared_ptr<MeshDevice> md, uint32_t N)
+{
+    auto plan = std::make_shared<FFTPlan>();
+    plan->md  = md;
+    plan->N   = N;
+    plan->z   = compute_sizing(N);
+    const Sizing& z = plan->z;
+
+    assert(z.P <= 64);
+
+    MeshCommandQueue& cq = md->mesh_command_queue();
+
+    // Twiddles — precompute once, upload once. Stay resident for plan's life.
+    auto [tw_r_data, tw_i_data] = precompute_twiddles(z);
+    const uint32_t tw_total_bytes =
+        static_cast<uint32_t>(tw_r_data.size() * sizeof(float));
+    plan->tw_r_buf = make_mesh_buf(md, tw_total_bytes, kTileSizeFp32);
+    plan->tw_i_buf = make_mesh_buf(md, tw_total_bytes, kTileSizeFp32);
+    WriteShard(cq, plan->tw_r_buf, tw_r_data, MeshCoordinate(0, 0), false);
+    WriteShard(cq, plan->tw_i_buf, tw_i_data, MeshCoordinate(0, 0), false);
+
+    // Persistent I/O buffers. Their DRAM addresses stay the same across
+    // calls, so runtime args baked into the program remain valid.
+    plan->in_r_buf  = make_io_buf(md, N);
+    plan->in_i_buf  = make_io_buf(md, N);
+    plan->out_r_buf = make_io_buf(md, N);
+    plan->out_i_buf = make_io_buf(md, N);
+
+    // Build program.
+    Program prog = CreateProgram();
+
+    const CoreCoord first{0, 0};
+    const CoreCoord last{z.grid_cols - 1, z.grid_rows - 1};
+    const CoreRange cr(first, last);
+
+    constexpr uint32_t kCbTiles[19] = {2,2,2,2,2,2,2,2,2,2, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    static_assert(sizeof(kCbTiles) / sizeof(kCbTiles[0]) == NUM_CBS);
+
+    for (uint32_t id = 0; id < NUM_CBS; ++id) {
+        CircularBufferConfig c(
+            kCbTiles[id] * kTileSizeFp32,
+            {{id, tt::DataFormat::Float32}});
+        c.set_page_size(id, kTileSizeFp32);
+        CreateCircularBuffer(prog, cr, c);
+    }
+
+    const uint32_t sem_id = CreateSemaphore(prog, cr, 0);
+
+    auto rk = CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft/kernel/fft_reader.cpp",
+        cr,
+        DataMovementConfig{
+            .processor    = DataMovementProcessor::RISCV_0,
+            .noc          = NOC::RISCV_0_default,
+            .compile_args = {z.N, z.log2N, z.P, z.log2P}});
+
+    auto wk = CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft/kernel/fft_writer.cpp",
+        cr,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc       = NOC::RISCV_1_default});
+
+    constexpr uint32_t kNumCbSlots = 32;
+    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
+    for (uint32_t id = 0; id < NUM_CBS; ++id) {
+        u2d[id] = UnpackToDestMode::UnpackToDestFp32;
+    }
+
+    CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft/kernel/fft_compute.cpp",
+        cr,
+        ComputeConfig{
+            .math_fidelity       = MathFidelity::HiFi4,
+            .fp32_dest_acc_en    = true,
+            .unpack_to_dest_mode = u2d,
+            .compile_args        = {z.log2N}});
+
+    std::vector<uint32_t> noc_xy;
+    noc_xy.reserve(2 * z.P);
+    for (uint32_t c = 0; c < z.P; ++c) {
+        const CoreCoord logical  = logical_core_for(c, z);
+        const CoreCoord physical = md->worker_core_from_logical_core(logical);
+        noc_xy.push_back(physical.x);
+        noc_xy.push_back(physical.y);
+    }
+
+    for (uint32_t c = 0; c < z.P; ++c) {
+        const CoreCoord core = logical_core_for(c, z);
+
+        std::vector<uint32_t> reader_args = {
+            buf_addr(plan->in_r_buf),  buf_addr(plan->in_i_buf),
+            buf_addr(plan->tw_r_buf),  buf_addr(plan->tw_i_buf),
+            c, sem_id,
+        };
+        reader_args.insert(reader_args.end(), noc_xy.begin(), noc_xy.end());
+        SetRuntimeArgs(prog, rk, core, reader_args);
+
+        SetRuntimeArgs(prog, wk, core, {
+            buf_addr(plan->out_r_buf), buf_addr(plan->out_i_buf), c,
+        });
+    }
+
+    plan->workload.add_program(
+        MeshCoordinateRange(MeshCoordinate(0, 0), MeshCoordinate(0, 0)),
+        std::move(prog));
+
+    plan->initialized = true;
+    return plan;
+}
+
+// Fast-path: execute a built plan against a new signal.
+inline std::vector<std::complex<float>> execute(
+    FFTPlan& plan,
+    const std::vector<std::complex<float>>& signal)
+{
+    assert(plan.initialized);
+    assert(static_cast<uint32_t>(signal.size()) == plan.N);
+
+    MeshCommandQueue& cq = plan.md->mesh_command_queue();
+
+    auto [in_r, in_i] = pack_input(signal, plan.z);
+
+    WriteShard(cq, plan.in_r_buf, in_r, MeshCoordinate(0, 0), false);
+    WriteShard(cq, plan.in_i_buf, in_i, MeshCoordinate(0, 0), false);
+
+    EnqueueMeshWorkload(cq, plan.workload, false);
+
+    std::vector<float> out_r, out_i;
+    ReadShard(cq, out_r, plan.out_r_buf, MeshCoordinate(0, 0), true);
+    ReadShard(cq, out_i, plan.out_i_buf, MeshCoordinate(0, 0), true);
+
+    return unpack_output(out_r, out_i, plan.z);
+}
+
+// Internal per-device plan cache keyed by N. Keeps plans alive for the life
+// of the process; if you need to reclaim memory call `clear_plan_cache()`.
+namespace detail {
+inline std::unordered_map<uint64_t, std::shared_ptr<FFTPlan>>& plan_cache() {
+    static std::unordered_map<uint64_t, std::shared_ptr<FFTPlan>> c;
+    return c;
+}
+inline uint64_t plan_key(MeshDevice* md, uint32_t N) {
+    return (reinterpret_cast<uint64_t>(md) ^ (uint64_t{N} * 0x9E3779B97F4A7C15ull));
+}
+}  // namespace detail
+
+inline std::shared_ptr<FFTPlan> get_cached_plan(
+    std::shared_ptr<MeshDevice> md, uint32_t N)
+{
+    const uint64_t key = detail::plan_key(md.get(), N);
+    auto& cache = detail::plan_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    auto plan = make_plan(md, N);
+    cache.emplace(key, plan);
+    return plan;
+}
+
+inline void clear_plan_cache() { detail::plan_cache().clear(); }
+
+// ── PyTorch-style one-shot FFT API (now backed by the plan cache) ────────
+//
+// First call for a given N builds the plan (~10–25 ms depending on N).
+// Subsequent calls with the same N skip all device-side setup and only pay
+// for input upload + enqueue + output download (~1–3 ms typically).
 //
 // Usage (C++ equivalent of `torch.fft.fft(signal)`):
 //
 //     std::vector<std::complex<float>> signal = { {10,0}, {20,0}, {30,0}, {40,0} };
 //     auto spectrum = fft_example::fft(md, signal);
-//
-// Requirements: signal.size() is a power of two in [2, 65536]. The returned
-// vector has the same length, with bin k of the discrete Fourier transform
-// at index k.
 
 inline std::vector<std::complex<float>> fft(
     std::shared_ptr<MeshDevice> md,
@@ -389,26 +582,8 @@ inline std::vector<std::complex<float>> fft(
     assert(N >= 2 && "FFT requires N >= 2");
     assert((N & (N - 1)) == 0 && "FFT requires N to be a power of two");
 
-    MeshCommandQueue& cq = md->mesh_command_queue();
-
-    const Sizing z = compute_sizing(N);
-    auto [in_r, in_i] = pack_input(signal, z);
-
-    auto in_r_buf  = make_io_buf(md, N);
-    auto in_i_buf  = make_io_buf(md, N);
-    auto out_r_buf = make_io_buf(md, N);
-    auto out_i_buf = make_io_buf(md, N);
-
-    WriteShard(cq, in_r_buf, in_r, MeshCoordinate(0, 0), false);
-    WriteShard(cq, in_i_buf, in_i, MeshCoordinate(0, 0), false);
-
-    run_fft(md, {N}, in_r_buf, in_i_buf, out_r_buf, out_i_buf);
-
-    std::vector<float> out_r, out_i;
-    ReadShard(cq, out_r, out_r_buf, MeshCoordinate(0, 0), true);
-    ReadShard(cq, out_i, out_i_buf, MeshCoordinate(0, 0), true);
-
-    return unpack_output(out_r, out_i, z);
+    auto plan = get_cached_plan(md, N);
+    return execute(*plan, signal);
 }
 
 // Overload for real-valued input. Imaginary part is treated as 0.

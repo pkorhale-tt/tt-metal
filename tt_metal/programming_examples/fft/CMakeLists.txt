@@ -17,7 +17,10 @@ add_executable(metal_example_fft_vs_torch ${CMAKE_CURRENT_SOURCE_DIR}/fft_vs_tor
 # User playground — edit signal in my_fft_app.cpp and rebuild
 add_executable(my_fft_app ${CMAKE_CURRENT_SOURCE_DIR}/my_fft_app.cpp)
 
-foreach(tgt metal_example_fft_test metal_example_fft_demo metal_example_fft_vs_torch my_fft_app)
+# Plan-cache speedup benchmark: runs fft() N times on same-size signal
+add_executable(metal_example_fft_benchmark ${CMAKE_CURRENT_SOURCE_DIR}/fft_benchmark.cpp)
+
+foreach(tgt metal_example_fft_test metal_example_fft_demo metal_example_fft_vs_torch my_fft_app metal_example_fft_benchmark)
     target_link_libraries(${tgt} PRIVATE TT::Metalium)
     target_include_directories(
         ${tgt}
