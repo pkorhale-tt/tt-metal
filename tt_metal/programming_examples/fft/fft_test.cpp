@@ -25,7 +25,7 @@ using namespace tt::tt_metal::distributed;
 using namespace fft_example;
 using Complex = std::complex<float>;
 
-// ── Reference DFT ─────────────────────────────────────────────────────────
+// ── Reference DFT (O(N^2), double precision internally) ──────────────────
 static std::vector<Complex> ref_dft(const std::vector<Complex>& x) {
     const uint32_t N = static_cast<uint32_t>(x.size());
     std::vector<Complex> X(N, {0.0f, 0.0f});
@@ -38,6 +38,49 @@ static std::vector<Complex> ref_dft(const std::vector<Complex>& x) {
         }
     }
     return X;
+}
+
+// ── Fast reference FFT (O(N logN), double precision internally) ──────────
+// Iterative radix-2 Cooley-Tukey with bit-reversed permutation, accumulating
+// in std::complex<double> so the reference error stays well below anything
+// the device path produces. Used for N > 4096 where the O(N^2) path gets
+// painfully slow (~minutes at N=65536).
+static std::vector<Complex> ref_fft_fast(const std::vector<Complex>& x) {
+    using CD = std::complex<double>;
+    const uint32_t N = static_cast<uint32_t>(x.size());
+
+    uint32_t log2N = 0;
+    while ((1u << log2N) < N) ++log2N;
+
+    std::vector<CD> a(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t r = 0;
+        for (uint32_t b = 0; b < log2N; ++b) r = (r << 1) | ((i >> b) & 1u);
+        a[r] = CD(x[i].real(), x[i].imag());
+    }
+
+    for (uint32_t s = 1; s <= log2N; ++s) {
+        const uint32_t m  = 1u << s;
+        const uint32_t mh = m >> 1;
+        const double   theta = -2.0 * M_PI / static_cast<double>(m);
+        const CD       wm(std::cos(theta), std::sin(theta));
+        for (uint32_t k = 0; k < N; k += m) {
+            CD w(1.0, 0.0);
+            for (uint32_t j = 0; j < mh; ++j) {
+                const CD t = w * a[k + j + mh];
+                const CD u = a[k + j];
+                a[k + j]       = u + t;
+                a[k + j + mh]  = u - t;
+                w *= wm;
+            }
+        }
+    }
+
+    std::vector<Complex> out(N);
+    for (uint32_t i = 0; i < N; ++i)
+        out[i] = Complex(static_cast<float>(a[i].real()),
+                         static_cast<float>(a[i].imag()));
+    return out;
 }
 
 static float max_err(const std::vector<Complex>& a, const std::vector<Complex>& b) {
@@ -83,11 +126,12 @@ static bool run_test(
     const uint32_t N = static_cast<uint32_t>(input.size());
     const Sizing  z  = compute_sizing(N);
 
-    // Reference DFT is O(N^2); skip it for very large N and trust the
-    // smaller-N correctness + the algorithmic invariants.
-    const bool have_ref = (N <= 4096);
-    std::vector<Complex> ref;
-    if (have_ref) ref = ref_dft(input);
+    // Reference choice:
+    //   N <= 4096   : O(N^2) DFT, strongest possible reference for small N.
+    //   N >  4096   : O(N logN) double-precision FFT, numerically solid
+    //                 (reference error << device error) and fast enough.
+    const std::vector<Complex> ref =
+        (N <= 4096) ? ref_dft(input) : ref_fft_fast(input);
 
     MeshCommandQueue& cq = md->mesh_command_queue();
 
@@ -112,22 +156,14 @@ static bool run_test(
 
     const auto got = unpack_output(out_r, out_i, z);
 
-    if (!have_ref) {
-        std::printf("[SKIP] N=%-5u FFT | no O(N^2) reference at this size | "
-                    "%.1f ms  %s  (P=%u cores)\n",
-                    N, ms, name, z.P);
-        return true;
-    }
-
     const float abs_e = max_err(ref, got);
     const float rel_e = rel_err(ref, got);
 
-    // Wormhole fp32 path gives ~tf19-class precision. Allow more slack per
-    // stage for multi-core because each cross-core butterfly adds a NoC
-    // round-trip but same numerical precision; accumulated error still
-    // scales roughly as sqrt(logN).
+    // Wormhole fp32 path is ~tf19 per op. Accumulated error grows roughly
+    // as sqrt(logN); 2e-3 is a safe "real fp32 path is working" threshold
+    // for every supported N (including 65536, where logN=16).
     const bool pass = rel_e < 2e-3f;
-    std::printf("[%s] N=%-5u FFT | abs=%.2e rel=%.2e | %.1f ms  %s  (P=%u)\n",
+    std::printf("[%s] N=%-6u FFT | abs=%.2e rel=%.2e | %.1f ms  %s  (P=%u)\n",
                 pass ? "PASS" : "FAIL", N, abs_e, rel_e, ms, name, z.P);
     return pass;
 }
@@ -145,10 +181,17 @@ int main() {
     all &= run_test(md, make_random(1024),  "random N=1024");
 
     // Multi-core cases (P>1)
-    all &= run_test(md, make_impulse(2048), "impulse N=2048");
-    all &= run_test(md, make_random(2048),  "random N=2048");
-    all &= run_test(md, make_random(4096),  "random N=4096");
-    all &= run_test(md, make_random(8192),  "random N=8192");
+    all &= run_test(md, make_impulse(2048),  "impulse N=2048");
+    all &= run_test(md, make_random(2048),   "random N=2048");
+    all &= run_test(md, make_random(4096),   "random N=4096");
+    all &= run_test(md, make_random(8192),   "random N=8192");
+
+    // Larger multi-core cases (2D grid, P up to 64)
+    all &= run_test(md, make_impulse(16384), "impulse N=16384");
+    all &= run_test(md, make_random(16384),  "random N=16384");
+    all &= run_test(md, make_random(32768),  "random N=32768");
+    all &= run_test(md, make_impulse(65536), "impulse N=65536");
+    all &= run_test(md, make_random(65536),  "random N=65536");
 
     md.reset();
     std::printf("\n%s\n", all ? "All tests PASSED." : "SOME TESTS FAILED.");

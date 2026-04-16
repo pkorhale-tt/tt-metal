@@ -6,15 +6,18 @@ Tile-engine FFT sharded across `P = max(1, N/1024)` Tensix cores on a 1D row.
 ## Constraints
 
 - `N` is a power of two.
-- `2 <= N <= 8192` out of the box (P ∈ {1, 2, 4, 8}).
-- 1D core row at `{0..P-1, 0}`. Extends trivially to a 2D grid (see bottom).
+- `2 <= N <= 65536`, scaling across `P = max(1, N/1024)` Tensix cores.
+- 2D row-major core grid: `cols = min(P, 8)`, `rows = P / cols`.
 
-| N       | P  | Local stages | Cross-core stages |
-|---------|----|--------------|-------------------|
-| ≤ 1024  | 1  | `log2(N)`    | 0                 |
-| 2048    | 2  | 10           | 1                 |
-| 4096    | 4  | 10           | 2                 |
-| 8192    | 8  | 10           | 3                 |
+| N       | P  | Grid | Local stages | Cross-core stages |
+|---------|----|------|--------------|-------------------|
+| ≤ 1024  | 1  | 1×1  | `log2(N)`    | 0                 |
+| 2048    | 2  | 2×1  | 10           | 1                 |
+| 4096    | 4  | 4×1  | 10           | 2                 |
+| 8192    | 8  | 8×1  | 10           | 3                 |
+| 16384   | 16 | 8×2  | 10           | 4                 |
+| 32768   | 32 | 8×4  | 10           | 5                 |
+| 65536   | 64 | 8×8  | 10           | 6                 |
 
 ## Files
 

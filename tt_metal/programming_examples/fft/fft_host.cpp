@@ -4,14 +4,19 @@
 // fft_host.cpp — multi-core radix-2 DIT FFT on Wormhole.
 //
 // Constraints:
-//   * N is a power of two, 2 <= N <= 8192.
+//   * N is a power of two, 2 <= N <= 65536.
 //   * FFT only (no IFFT).
-//   * 1D core row; P = max(1, N/1024) cores.
-//       N <= 1024  => P=1 (pure single-core path, equivalent to original).
-//       N = 2048   => P=2
-//       N = 4096   => P=4
-//       N = 8192   => P=8  (fits a typical Wormhole worker row).
-//     For larger P use a 2D core grid; the per-core addressing stays the same.
+//   * 2D row-major core grid; P = max(1, N/1024) cores.
+//       N <= 1024  => P=1  (1x1)   pure single-core path, as before.
+//       N = 2048   => P=2  (2x1)
+//       N = 4096   => P=4  (4x1)
+//       N = 8192   => P=8  (8x1)
+//       N = 16384  => P=16 (8x2)
+//       N = 32768  => P=32 (8x4)
+//       N = 65536  => P=64 (8x8)   full Wormhole worker grid.
+//     Logical core index c (0..P-1) is row-major: x=c%cols, y=c/cols.
+//     The kernels only use `c` + a NoC-coord lookup table, so the grid
+//     shape is purely a host-side decision.
 //
 // Flow (see kernel/fft_common.h for details):
 //   1. pack_input does a global N-bit bit-reversal and packs the result into
@@ -50,6 +55,7 @@
 #include <complex>
 #include <utility>
 #include <cstdint>
+#include <cstdio>
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -120,6 +126,8 @@ struct Sizing {
     uint32_t log2P;
     uint32_t log2N_local;    // local butterfly stages per core (<=10)
     uint32_t total_tiles;    // tiles across all cores (== P)
+    uint32_t grid_cols;      // 2D grid dimensions, row-major
+    uint32_t grid_rows;
 };
 
 inline Sizing compute_sizing(uint32_t N) {
@@ -130,7 +138,17 @@ inline Sizing compute_sizing(uint32_t N) {
     z.log2P = log2u(z.P);
     z.log2N_local = z.log2N - z.log2P;
     z.total_tiles = z.P;
+
+    // 2D row-major grid. Up to 8 wide (Wormhole worker row), then stack rows.
+    // All P values are powers of two so the grid is always rectangular.
+    z.grid_cols = (z.P < 8u) ? z.P : 8u;
+    z.grid_rows = z.P / z.grid_cols;
     return z;
+}
+
+// Map logical core index c (0..P-1) to its logical CoreCoord in the 2D grid.
+inline CoreCoord logical_core_for(uint32_t c, const Sizing& z) {
+    return CoreCoord{c % z.grid_cols, c / z.grid_cols};
 }
 
 // Pack an N-point complex signal into P contiguous bit-reversed tiles.
@@ -227,8 +245,13 @@ inline void run_fft(
     assert((cfg.N & (cfg.N - 1)) == 0);
 
     const Sizing z = compute_sizing(cfg.N);
-    assert(z.P <= 8 && "This example is capped at P=8 (1D row). For larger N "
-                       "extend to a 2D grid and update the partner-noc lookup.");
+    assert(z.P <= 64 && "This example is capped at P=64 (8x8 Wormhole grid). "
+                        "For larger N you need multi-tile state per core or a "
+                        "multi-device mesh.");
+
+    std::printf(
+        "[run_fft] N=%u  P=%u  grid=%ux%u  local_stages=%u  cross_core_stages=%u\n",
+        z.N, z.P, z.grid_cols, z.grid_rows, z.log2N_local, z.log2P);
 
     MeshCommandQueue& cq = md->mesh_command_queue();
 
@@ -245,7 +268,7 @@ inline void run_fft(
     Program prog = CreateProgram();
 
     const CoreCoord first{0, 0};
-    const CoreCoord last{z.P - 1, 0};
+    const CoreCoord last{z.grid_cols - 1, z.grid_rows - 1};
     const CoreRange cr(first, last);
 
     // Pipelined CBs: EVEN/ODD/TW/OUT get 2 tiles, scratch/state/sync/recv 1.
@@ -303,23 +326,23 @@ inline void run_fft(
 
     // --- runtime args per core --------------------------------------------
     // Build the NoC-coord lookup table once; all cores get the same table,
-    // just parameterised by their own `my_core` index.
+    // just parameterised by their own `my_core` index c = 0..P-1 (row-major).
     std::vector<uint32_t> noc_xy;
     noc_xy.reserve(2 * z.P);
     for (uint32_t c = 0; c < z.P; ++c) {
-        const CoreCoord physical =
-            md->worker_core_from_logical_core(CoreCoord{c, 0});
+        const CoreCoord logical  = logical_core_for(c, z);
+        const CoreCoord physical = md->worker_core_from_logical_core(logical);
         noc_xy.push_back(physical.x);
         noc_xy.push_back(physical.y);
     }
 
     for (uint32_t c = 0; c < z.P; ++c) {
-        const CoreCoord core{c, 0};
+        const CoreCoord core = logical_core_for(c, z);
 
         std::vector<uint32_t> reader_args = {
             buf_addr(in_r_buf),  buf_addr(in_i_buf),
             buf_addr(tw_r_buf),  buf_addr(tw_i_buf),
-            c,                    // my_core
+            c,                    // my_core (logical index)
             sem_id,               // semaphore id
         };
         reader_args.insert(reader_args.end(), noc_xy.begin(), noc_xy.end());

@@ -30,6 +30,17 @@
 #include "api/dataflow/dataflow_api.h"
 #include "fft_common.h"
 
+// Flip to 1 to have every core announce itself from BRISC0. Useful to
+// visually confirm "yes, 64 cores are actually launched" for large N.
+// Requires the test/run to be invoked with the DPRINT env var set, e.g.:
+//   TT_METAL_DPRINT_CORES=all ./metal_example_fft_test
+#ifndef FFT_DPRINT_HELLO
+#define FFT_DPRINT_HELLO 0
+#endif
+#if FFT_DPRINT_HELLO
+#include "debug/dprint.h"
+#endif
+
 // Copy TILE_ELEMS floats from L1 src to L1 dst. Used for state<->EVEN/ODD/OUT
 // scalar scatter/gather and for keeping one of the two compute outputs as the
 // new state in cross-core stages.
@@ -49,6 +60,10 @@ void kernel_main() {
     const uint32_t my_core    = get_arg_val<uint32_t>(4);
     const uint32_t sem_id     = get_arg_val<uint32_t>(5);
     // args 6..6+2P-1 : noc_x[c], noc_y[c] interleaved for c=0..P-1
+
+#if FFT_DPRINT_HELLO
+    DPRINT << "fft: my_core=" << my_core << " alive\n";
+#endif
 
     // Compile-time args
     constexpr uint32_t N             = get_compile_time_arg_val(0);
