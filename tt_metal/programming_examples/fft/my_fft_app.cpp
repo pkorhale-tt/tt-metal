@@ -119,3 +119,7 @@ int main() {
     md.reset();
     return 0;
 }
+
+
+//cmake --build build --target my_fft_app -j 
+//ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 ./build/programming_examples/fft/my_fft_app
