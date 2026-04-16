@@ -20,7 +20,9 @@
 #include "tt_metal/api/tt-metalium/mesh_workload.hpp"
 #include "tt_metal/api/tt-metalium/allocator.hpp"
 #include "tt_metal/api/tt-metalium/hal.hpp"
-#include "tt_metal/common/bfloat16.hpp"
+#include "tt-metalium/bfloat16.hpp"
+
+#include "tt_metal/api/tt-metalium/bfloat16.hpp"
 
 #include <cmath>
 #include <vector>
