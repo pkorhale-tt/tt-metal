@@ -1,11 +1,4 @@
-// ============================================================
-// fft_host.cpp — TT-Metalium API (MeshDevice path)
-// Buffer layout matching kernel expectations:
-//   Input:   tiles [0..C-1] = real per core, [C..2C-1] = imag per core
-//   Output:  same layout
-//   Twiddle: tiles [0..S*C-1] = real, [S*C..2*S*C-1] = imag
-//            where S=num_stages, C=num_cores
-// ============================================================
+// fft_host.cpp
 
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/device.hpp"
@@ -31,64 +24,14 @@ using namespace tt::tt_metal;
 using namespace tt::tt_metal::distributed;
 using namespace tt::constants;
 
-// CB IDs
-enum CbId : uint32_t {
-    CB_LHS_R=0, CB_LHS_I=1, CB_RHS_R=2, CB_RHS_I=3,
-    CB_TWIDDLE_R=4, CB_TWIDDLE_I=5, CB_OUT_R=6, CB_OUT_I=7,
-    CB_SCRATCH_R=8, CB_SCRATCH_I=9, CB_SYNC=10,
-    CB_TMP_R=11, CB_TMP_I=12, CB_WR_R=13, CB_WR_I=14,
-};
-
-// RT arg indices (must match fft_common.h)
-enum RtArg : uint32_t {
-    RT_CB_R=0, RT_CB_I=1, RT_SCRATCH_R=2, RT_SCRATCH_I=3,
-    RT_TWIDDLE_DRAM=4, RT_TWIDDLE_BANK=5,
-    RT_NUM_CORES=6, RT_MY_CORE_ID=7, RT_FIRST_NOC_STG=8, RT_SEM_ID=9,
-    RT_PEER_BASE=10,
-};
-
-// CT arg indices
-enum CtArg : uint32_t { CT_LOCAL_N=0, CT_NUM_CORES=1, CT_NUM_STAGES=2, CT_USE_BF16=3 };
-
-static constexpr uint32_t kTileHW      = tt::constants::TILE_HW;
+static constexpr uint32_t kTileHW       = tt::constants::TILE_HW;
 static constexpr uint32_t kTileElems    = kTileHW * kTileHW;
 static constexpr uint32_t kTileSizeFp32 = kTileElems * sizeof(float);
-static constexpr uint32_t kCbTiles[]   = {2,2,2,2,2,2,2,2,1,1,1,1,1,1,1};
 
-// ── Twiddle precomputation ────────────────────────────────────
-// Returns tiles for all stages, real then imag.
-// Layout: real[stage*C + core_id], imag[S*C + stage*C + core_id]
-// Each tile holds the twiddle factors for that core's elements at that stage.
-std::vector<float> precompute_twiddles_tiled(
-    uint32_t N, uint32_t num_cores, uint32_t num_stages, bool is_ifft)
-{
-    uint32_t local_N   = N / num_cores;
-    uint32_t tile_elems = kTileHW * kTileHW; // elements per tile = 1024
-    // Each core gets one tile per stage
-    uint32_t total_tiles = num_stages * num_cores * 2; // *2 for real+imag
-    std::vector<float> tw(total_tiles * tile_elems, 0.0f);
-
-    for (uint32_t s = 0; s < num_stages; s++) {
-        uint32_t stride = 1u << s;
-        uint32_t M      = 2 * stride;
-        for (uint32_t c = 0; c < num_cores; c++) {
-            uint32_t global_offset = c * local_N;
-            uint32_t tile_r_idx    = s * num_cores + c;
-            uint32_t tile_i_idx    = num_stages * num_cores + tile_r_idx;
-            float* tile_r = tw.data() + tile_r_idx * tile_elems;
-            float* tile_i = tw.data() + tile_i_idx * tile_elems;
-            for (uint32_t i = 0; i < local_N / 2 && i < tile_elems; i++) {
-                uint32_t lo    = i; // simplified: twiddle for element i
-                uint32_t k     = (global_offset + lo) % stride;
-                double   angle = -2.0 * M_PI * k / M;
-                if (is_ifft) angle = -angle;
-                tile_r[i] = float(std::cos(angle));
-                tile_i[i] = float(std::sin(angle));
-            }
-        }
-    }
-    return tw;
-}
+// 17 CBs, each 1 tile (double-buffer even/odd/out with 2 tiles)
+// CB sizes: even/odd/out get 2 tiles for pipelining, rest 1 tile
+static constexpr uint32_t kCbTiles[17] = {2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1};
+static constexpr uint32_t NUM_CBS = 17;
 
 CoreCoord linear_to_core(uint32_t id, uint32_t cols=8)
     { return {int(id%cols), int(id/cols)}; }
@@ -106,104 +49,229 @@ static std::shared_ptr<MeshBuffer> make_mesh_buf(
 static uint32_t buf_addr(const std::shared_ptr<MeshBuffer>& mb)
     { return mb->get_device_buffer(MeshCoordinate(0,0))->address(); }
 
+// Precompute twiddle tiles.
+// Layout: num_stages * num_cores tiles real, then same imag.
+// Tile [s*C + c] holds twiddle factors for core c at stage s.
+// Each tile: local_N/2 valid entries (twiddle for each butterfly pair).
+std::vector<float> precompute_twiddles(
+    uint32_t N, uint32_t num_cores, uint32_t num_stages, bool is_ifft)
+{
+    uint32_t local_N  = N / num_cores;
+    uint32_t total_tiles = 2 * num_stages * num_cores;
+    std::vector<float> tw(total_tiles * kTileElems, 0.0f);
+
+    for (uint32_t s=0; s<num_stages; s++) {
+        uint32_t stride = 1u << s;
+        uint32_t M      = 2 * stride;
+        for (uint32_t c=0; c<num_cores; c++) {
+            uint32_t global_base = c * local_N;
+            float* tile_r = tw.data() + (s*num_cores + c) * kTileElems;
+            float* tile_i = tw.data() + (num_stages*num_cores + s*num_cores + c) * kTileElems;
+            for (uint32_t i=0; i<local_N/2 && i<kTileElems; i++) {
+                // butterfly pair (lo, hi=lo+stride) where lo = grp*2*stride + pos
+                uint32_t grp = i / stride;
+                uint32_t pos = i % stride;
+                uint32_t lo  = grp*(2*stride) + pos;
+                uint32_t k   = (global_base + lo) % M;
+                double angle = -2.0 * M_PI * k / M;
+                if (is_ifft) angle = -angle;
+                tile_r[i] = float(std::cos(angle));
+                tile_i[i] = float(std::sin(angle));
+            }
+        }
+    }
+    return tw;
+}
+
+// Bit-reverse permutation of indices
+static uint32_t bit_rev(uint32_t x, uint32_t bits) {
+    uint32_t r=0;
+    for (uint32_t i=0;i<bits;i++){r=(r<<1)|(x&1);x>>=1;}
+    return r;
+}
+
+// Pack input into DRAM buffer layout:
+// 4 separate buffers: even_r, even_i, odd_r, odd_i
+// Each has num_cores tiles, tile c = elements for core c
+// Even = lower half of each butterfly pair, Odd = upper half
+// For stage 0: even[i] = x[bit_rev(2i, log2N)], odd[i] = x[bit_rev(2i+1, log2N)]
+// Returns flat vector: [even_r tiles | even_i tiles | odd_r tiles | odd_i tiles]
+std::vector<float> pack_input_even_odd(
+    const std::vector<std::complex<float>>& x, uint32_t num_cores)
+{
+    uint32_t N       = x.size();
+    uint32_t local_N = N / num_cores;
+    uint32_t log2N   = 0; { uint32_t n=N; while(n>1){log2N++;n>>=1;} }
+
+    // 4 channels * num_cores tiles
+    std::vector<float> buf(4 * num_cores * kTileElems, 0.0f);
+    float* even_r = buf.data() + 0 * num_cores * kTileElems;
+    float* even_i = buf.data() + 1 * num_cores * kTileElems;
+    float* odd_r  = buf.data() + 2 * num_cores * kTileElems;
+    float* odd_i  = buf.data() + 3 * num_cores * kTileElems;
+
+    for (uint32_t c=0; c<num_cores; c++) {
+        uint32_t base = c * local_N;
+        for (uint32_t i=0; i<local_N/2; i++) {
+            uint32_t lo_rev = bit_rev(base + 2*i,   log2N);
+            uint32_t hi_rev = bit_rev(base + 2*i+1, log2N);
+            even_r[c*kTileElems + i] = x[lo_rev].real();
+            even_i[c*kTileElems + i] = x[lo_rev].imag();
+            odd_r [c*kTileElems + i] = x[hi_rev].real();
+            odd_i [c*kTileElems + i] = x[hi_rev].imag();
+        }
+    }
+    return buf;
+}
+
+// Unpack output: num_cores tiles of out_r, then out_i
+std::vector<std::complex<float>> unpack_output(
+    const std::vector<float>& r_buf,
+    const std::vector<float>& i_buf,
+    uint32_t N, uint32_t num_cores)
+{
+    uint32_t local_N = N / num_cores;
+    std::vector<std::complex<float>> out(N);
+    for (uint32_t c=0; c<num_cores; c++) {
+        const float* tr = r_buf.data() + c * kTileElems;
+        const float* ti = i_buf.data() + c * kTileElems;
+        for (uint32_t i=0; i<local_N; i++)
+            out[c*local_N + i] = {tr[i], ti[i]};
+    }
+    return out;
+}
+
 void run_fft(
     std::shared_ptr<MeshDevice> md,
     const FFTConfig& cfg,
+    // Input: flat [even_r|even_i|odd_r|odd_i] tiles, 4*num_cores tiles total
     std::shared_ptr<MeshBuffer> input_buf,
-    std::shared_ptr<MeshBuffer> output_buf)
+    // Output: [out_r tiles | out_i tiles], 2*num_cores tiles total
+    std::shared_ptr<MeshBuffer> out_r_buf,
+    std::shared_ptr<MeshBuffer> out_i_buf)
 {
     assert((cfg.N&(cfg.N-1))==0 && (cfg.num_cores&(cfg.num_cores-1))==0);
     assert(cfg.N % cfg.num_cores == 0);
 
-    IDevice* device = md->get_device(0, 0);
+    IDevice* device = md->get_device(0,0);
     MeshCommandQueue& cq = md->mesh_command_queue();
 
-    uint32_t local_N  = cfg.N / cfg.num_cores;
-    uint32_t S        = uint32_t(std::log2(cfg.N));
-    uint32_t S_loc    = uint32_t(std::log2(local_N));
-    uint32_t S_noc    = S - S_loc;
+    uint32_t local_N   = cfg.N / cfg.num_cores;
+    uint32_t S         = 0; { uint32_t n=cfg.N; while(n>1){S++;n>>=1;} }
+    uint32_t S_loc     = 0; { uint32_t n=local_N; while(n>1){S_loc++;n>>=1;} }
+    uint32_t S_noc     = S - S_loc;
+    uint32_t num_tiles = cfg.num_cores; // one tile per core per channel
 
     // Twiddle buffer
-    auto tw_data = precompute_twiddles_tiled(cfg.N, cfg.num_cores, S, cfg.is_ifft);
-    uint32_t tw_tile_size = kTileSizeFp32;
-    uint32_t tw_bytes     = uint32_t(tw_data.size() * sizeof(float));
-    auto tw_buf = make_mesh_buf(md, tw_bytes, tw_tile_size);
+    auto tw_data = precompute_twiddles(cfg.N, cfg.num_cores, S, cfg.is_ifft);
+    uint32_t tw_total_tiles = 2 * S * cfg.num_cores;
+    auto tw_buf = make_mesh_buf(md, tw_total_tiles*kTileSizeFp32, kTileSizeFp32);
     WriteShard(cq, tw_buf, tw_data, MeshCoordinate(0,0), false);
+
+    // Split twiddle into separate r/i buffers for reader args
+    // tw_r = first S*C tiles, tw_i = next S*C tiles — same buffer, different offsets
+    uint32_t tw_r_addr = buf_addr(tw_buf);
+    // tw_i starts at offset S*num_cores tiles into the buffer
+    // We pass this as a separate DRAM address to the reader
+    // Since it's interleaved, we use the same buffer base but offset by tile count
+    // Actually we need separate buffers for clean addressing:
+    uint32_t tw_half = S * cfg.num_cores;
+    auto tw_r_buf = make_mesh_buf(md, tw_half*kTileSizeFp32, kTileSizeFp32);
+    auto tw_i_buf = make_mesh_buf(md, tw_half*kTileSizeFp32, kTileSizeFp32);
+    std::vector<float> tw_r_data(tw_data.begin(), tw_data.begin() + tw_half*kTileElems);
+    std::vector<float> tw_i_data(tw_data.begin() + tw_half*kTileElems, tw_data.end());
+    WriteShard(cq, tw_r_buf, tw_r_data, MeshCoordinate(0,0), false);
+    WriteShard(cq, tw_i_buf, tw_i_data, MeshCoordinate(0,0), false);
+
+    // Separate even/odd input buffers from packed input
+    // input_buf contains [even_r|even_i|odd_r|odd_i] each num_cores tiles
+    // We need separate DRAM addresses for each channel
+    uint32_t ch_bytes = num_tiles * kTileSizeFp32;
+    auto even_r_buf = make_mesh_buf(md, ch_bytes, kTileSizeFp32);
+    auto even_i_buf = make_mesh_buf(md, ch_bytes, kTileSizeFp32);
+    auto odd_r_buf  = make_mesh_buf(md, ch_bytes, kTileSizeFp32);
+    auto odd_i_buf  = make_mesh_buf(md, ch_bytes, kTileSizeFp32);
+    // Read input and split (host-side)
+    std::vector<float> input_flat;
+    ReadShard(cq, input_flat, input_buf, MeshCoordinate(0,0), true);
+    std::vector<float> ev_r(input_flat.begin(),                         input_flat.begin()+num_tiles*kTileElems);
+    std::vector<float> ev_i(input_flat.begin()+  num_tiles*kTileElems,  input_flat.begin()+2*num_tiles*kTileElems);
+    std::vector<float> od_r(input_flat.begin()+2*num_tiles*kTileElems,  input_flat.begin()+3*num_tiles*kTileElems);
+    std::vector<float> od_i(input_flat.begin()+3*num_tiles*kTileElems,  input_flat.end());
+    WriteShard(cq, even_r_buf, ev_r, MeshCoordinate(0,0), false);
+    WriteShard(cq, even_i_buf, ev_i, MeshCoordinate(0,0), false);
+    WriteShard(cq, odd_r_buf,  od_r, MeshCoordinate(0,0), false);
+    WriteShard(cq, odd_i_buf,  od_i, MeshCoordinate(0,0), false);
 
     // Program
     Program prog = CreateProgram();
     std::vector<CoreCoord> cores;
-    for (uint32_t i=0; i<cfg.num_cores; i++) cores.push_back(linear_to_core(i));
+    for (uint32_t i=0;i<cfg.num_cores;i++) cores.push_back(linear_to_core(i));
     CoreRange cr(cores.front(), cores.back());
 
     uint32_t sem_id = CreateSemaphore(prog, cr, 0u);
 
-    // CB size based on local_N elements (not full 32x32 tile)
-    // This avoids L1 overflow for small N values.
-    uint32_t cb_elem_bytes = local_N * sizeof(float);  // one channel, fp32
-    auto make_cb = [&](uint32_t id, uint32_t n=1) {
-        uint32_t cb_bytes = n * cb_elem_bytes;
+    // CBs — sized to local_N elements per channel
+    uint32_t cb_elem_bytes = local_N * sizeof(float);
+    for (uint32_t id=0; id<NUM_CBS; id++) {
+        uint32_t cb_bytes = kCbTiles[id] * cb_elem_bytes;
         CircularBufferConfig c(cb_bytes, {{id, tt::DataFormat::Float32}});
         c.set_page_size(id, cb_elem_bytes);
-        return CreateCircularBuffer(prog, cr, c);
-    };
-    for (uint32_t id=0; id<15; id++) make_cb(id, kCbTiles[id]);
+        CreateCircularBuffer(prog, cr, c);
+    }
 
-    // CB base address for NOC scratch passing
+    // CB base for scratch NOC addresses
     CoreCoord vc0 = device->worker_core_from_logical_core(linear_to_core(0));
-    uint32_t cb_base = uint32_t(
-        device->get_dev_addr(vc0, HalL1MemAddrType::DEFAULT_UNRESERVED));
-    uint32_t cb_offsets[15];
-    cb_offsets[0] = 0;
-    for (int i=1; i<15; i++)
-        cb_offsets[i] = cb_offsets[i-1] + kCbTiles[i-1]*cb_elem_bytes;
+    uint32_t cb_base = uint32_t(device->get_dev_addr(vc0, HalL1MemAddrType::DEFAULT_UNRESERVED));
+    uint32_t offsets[NUM_CBS]; offsets[0]=0;
+    for (int i=1;i<(int)NUM_CBS;i++)
+        offsets[i]=offsets[i-1]+kCbTiles[i-1]*cb_elem_bytes;
+    uint32_t scratch_r_addr = cb_base + offsets[11]; // CB_SCRATCH_R
+    uint32_t scratch_i_addr = cb_base + offsets[12]; // CB_SCRATCH_I
 
-    uint32_t lhs_r_addr = cb_base + cb_offsets[CB_LHS_R];
-    uint32_t lhs_i_addr = cb_base + cb_offsets[CB_LHS_I];
-    uint32_t scr_r_addr = cb_base + cb_offsets[CB_SCRATCH_R];
-    uint32_t scr_i_addr = cb_base + cb_offsets[CB_SCRATCH_I];
-
-    // Kernels
-    std::vector<uint32_t> ct_rw = {local_N, cfg.num_cores, S, 0u};
-    std::vector<uint32_t> ct_c  = {S_loc, S_noc, cfg.is_ifft?1u:0u, cfg.N};
+    // Compile-time args: writer=[local_N, num_stages], compute=[S_loc,S_noc,is_ifft,N]
+    std::vector<uint32_t> ct_w = {local_N, S};
+    std::vector<uint32_t> ct_c = {S_loc, S_noc, cfg.is_ifft?1u:0u, cfg.N};
 
     auto rk = CreateKernel(prog,
         "tt_metal/programming_examples/fft/kernel/fft_reader.cpp", cr,
         DataMovementConfig{.processor=DataMovementProcessor::RISCV_0,
-                           .noc=NOC::RISCV_0_default, .compile_args=ct_rw});
+                           .noc=NOC::RISCV_0_default});
     auto wk = CreateKernel(prog,
         "tt_metal/programming_examples/fft/kernel/fft_writer.cpp", cr,
         DataMovementConfig{.processor=DataMovementProcessor::RISCV_1,
-                           .noc=NOC::RISCV_1_default, .compile_args=ct_rw});
+                           .noc=NOC::RISCV_1_default,
+                           .compile_args=ct_w});
     CreateKernel(prog,
         "tt_metal/programming_examples/fft/kernel/fft_compute.cpp", cr,
         ComputeConfig{.math_fidelity=MathFidelity::HiFi4,
                       .fp32_dest_acc_en=true, .compile_args=ct_c});
 
-    // Runtime args
     for (uint32_t my=0; my<cfg.num_cores; my++) {
         CoreCoord mc = linear_to_core(my);
 
-        // Reader: input_addr, unused, twiddle_addr, unused,
-        //         local_N, my_id, total_N, num_local_stg, num_stages, use_bf16
+        // Reader args: even_r, even_i, odd_r, odd_i, tw_r, tw_i,
+        //              num_tiles, num_stages, my_id, num_local_stg
         SetRuntimeArgs(prog, rk, mc, {
-            buf_addr(input_buf), 0u,
-            buf_addr(tw_buf),    0u,
-            local_N, my, cfg.N, S_loc, S, 0u
+            buf_addr(even_r_buf), buf_addr(even_i_buf),
+            buf_addr(odd_r_buf),  buf_addr(odd_i_buf),
+            buf_addr(tw_r_buf),   buf_addr(tw_i_buf),
+            num_tiles, S, my, S_loc
         });
 
-        // Writer
+        // Writer args: dram_out_r, dram_out_i, scratch_r, scratch_i,
+        //              num_cores, my_id, first_noc_stg, sem_id, num_tiles,
+        //              [peer table]
         std::vector<uint32_t> wa = {
-            lhs_r_addr, lhs_i_addr,
-            scr_r_addr, scr_i_addr,
-            buf_addr(output_buf), 0u,
-            cfg.num_cores, my, S_loc, sem_id
+            buf_addr(out_r_buf), buf_addr(out_i_buf),
+            scratch_r_addr, scratch_i_addr,
+            cfg.num_cores, my, S_loc, sem_id, num_tiles
         };
         for (uint32_t dst=0; dst<cfg.num_cores; dst++) {
             if (dst==my) continue;
             CoreCoord pn = device->worker_core_from_logical_core(linear_to_core(dst));
             wa.push_back(uint32_t(pn.x)); wa.push_back(uint32_t(pn.y));
-            wa.push_back(scr_r_addr);     wa.push_back(scr_i_addr);
+            wa.push_back(scratch_r_addr);  wa.push_back(scratch_i_addr);
             wa.push_back(sem_id);
         }
         SetRuntimeArgs(prog, wk, mc, wa);
@@ -211,23 +279,8 @@ void run_fft(
 
     MeshWorkload workload;
     workload.add_program(
-        MeshCoordinateRange(MeshCoordinate(0,0), MeshCoordinate(0,0)),
+        MeshCoordinateRange(MeshCoordinate(0,0),MeshCoordinate(0,0)),
         std::move(prog));
     EnqueueMeshWorkload(cq, workload, false);
     cq.finish();
-}
-
-void fft(std::shared_ptr<MeshDevice> md, uint32_t N, uint32_t nc,
-         std::shared_ptr<MeshBuffer> in, std::shared_ptr<MeshBuffer> out)
-{ run_fft(md,{N,nc,false},in,out); }
-
-void ifft(std::shared_ptr<MeshDevice> md, uint32_t N, uint32_t nc,
-          std::shared_ptr<MeshBuffer> in, std::shared_ptr<MeshBuffer> out)
-{ run_fft(md,{N,nc,true},in,out); }
-
-// Helper for test: make a mesh buffer of given tile count
-std::shared_ptr<MeshBuffer> make_fft_buf(
-    std::shared_ptr<MeshDevice> md, uint32_t num_tiles)
-{
-    return make_mesh_buf(md, num_tiles * kTileSizeFp32, kTileSizeFp32);
 }

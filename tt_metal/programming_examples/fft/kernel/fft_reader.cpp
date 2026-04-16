@@ -1,125 +1,69 @@
 // fft_reader.cpp — BRISC
-// Loads input once, then pushes RHS+twiddles each local stage,
-// twiddles only each NOC stage.
-// Does NOT manage LHS — that's between compute and writer.
+// Loads even/odd split input, twiddles each stage.
+// CB layout: c_0/1=even_r/i, c_2/3=odd_r/i, c_4/5=tw_r/i
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 #include "fft_common.h"
 
 void kernel_main() {
-    uint32_t input_addr    = get_arg_val<uint32_t>(0);
-    uint32_t twiddle_addr  = get_arg_val<uint32_t>(2);
-    uint32_t local_N       = get_arg_val<uint32_t>(4);
-    uint32_t my_id         = get_arg_val<uint32_t>(5);
-    uint32_t total_N       = get_arg_val<uint32_t>(6);
-    uint32_t num_local_stg = get_arg_val<uint32_t>(7);
-    uint32_t num_stages    = get_arg_val<uint32_t>(8);
+    uint32_t even_r_addr   = get_arg_val<uint32_t>(0);
+    uint32_t even_i_addr   = get_arg_val<uint32_t>(1);
+    uint32_t odd_r_addr    = get_arg_val<uint32_t>(2);
+    uint32_t odd_i_addr    = get_arg_val<uint32_t>(3);
+    uint32_t tw_r_addr     = get_arg_val<uint32_t>(4);
+    uint32_t tw_i_addr     = get_arg_val<uint32_t>(5);
+    uint32_t num_tiles     = get_arg_val<uint32_t>(6);  // tiles per channel
+    uint32_t num_stages    = get_arg_val<uint32_t>(7);
+    uint32_t my_id         = get_arg_val<uint32_t>(8);
+    uint32_t num_local_stg = get_arg_val<uint32_t>(9);
 
-    const DataFormat df  = get_dataformat(CB_LHS_R);
-    const uint32_t tsize = get_tile_size(CB_LHS_R);
-    uint32_t num_cores   = total_N / local_N;
-    uint32_t tw_imag_base = num_stages * num_cores;
+    constexpr auto CB_EVEN_R = tt::CBIndex::c_0;
+    constexpr auto CB_EVEN_I = tt::CBIndex::c_1;
+    constexpr auto CB_ODD_R  = tt::CBIndex::c_2;
+    constexpr auto CB_ODD_I  = tt::CBIndex::c_3;
+    constexpr auto CB_TW_R   = tt::CBIndex::c_4;
+    constexpr auto CB_TW_I   = tt::CBIndex::c_5;
 
-    InterleavedAddrGenFast<true> input_gen = {
-        .bank_base_address = input_addr,
-        .page_size         = tsize,
-        .data_format       = df
-    };
-    InterleavedAddrGenFast<true> twiddle_gen = {
-        .bank_base_address = twiddle_addr,
-        .page_size         = tsize,
-        .data_format       = df
-    };
+    const DataFormat df  = get_dataformat(CB_EVEN_R);
+    const uint32_t tsize = get_tile_size(CB_EVEN_R);
 
-    // ── Load input → CB_LHS_R/I (stage 0 seed) ───────────────
-    cb_reserve_back(CB_LHS_R, 1);
-    cb_reserve_back(CB_LHS_I, 1);
-    noc_async_read_tile(my_id,            input_gen, get_write_ptr(CB_LHS_R));
-    noc_async_read_tile(my_id + num_cores, input_gen, get_write_ptr(CB_LHS_I));
-    noc_async_read_barrier();
-    cb_push_back(CB_LHS_R, 1);
-    cb_push_back(CB_LHS_I, 1);
+    InterleavedAddrGenFast<true> even_r_gen = {.bank_base_address=even_r_addr,.page_size=tsize,.data_format=df};
+    InterleavedAddrGenFast<true> even_i_gen = {.bank_base_address=even_i_addr,.page_size=tsize,.data_format=df};
+    InterleavedAddrGenFast<true> odd_r_gen  = {.bank_base_address=odd_r_addr, .page_size=tsize,.data_format=df};
+    InterleavedAddrGenFast<true> odd_i_gen  = {.bank_base_address=odd_i_addr, .page_size=tsize,.data_format=df};
+    InterleavedAddrGenFast<true> tw_r_gen   = {.bank_base_address=tw_r_addr,  .page_size=tsize,.data_format=df};
+    InterleavedAddrGenFast<true> tw_i_gen   = {.bank_base_address=tw_i_addr,  .page_size=tsize,.data_format=df};
 
-    // ── Local stages: push RHS (from CB_LHS snapshot) + twiddles
-    // Reader waits for LHS to be available, snapshots it into RHS,
-    // then immediately releases LHS back (pop) so writer can recycle.
-    // Actually: reader just reads LHS without popping — compute pops it.
-    // But reader needs to BUILD RHS from LHS data.
-    // Solution: reader peeks LHS (wait_front but no pop), builds RHS,
-    // then compute will pop LHS in butterfly.
     for (uint32_t s=0; s<num_local_stg; s++) {
-        uint32_t stride = 1u << s;
-
-        // Wait for LHS data to be present (pushed by initial load or writer recycle)
-        cb_wait_front(CB_LHS_R, 1);
-        cb_wait_front(CB_LHS_I, 1);
-
-        // Build RHS by copying butterfly partners from LHS
-        cb_reserve_back(CB_RHS_R, 1);
-        cb_reserve_back(CB_RHS_I, 1);
-
-        const uint32_t* lhs_r = reinterpret_cast<const uint32_t*>(get_read_ptr(CB_LHS_R));
-        const uint32_t* lhs_i = reinterpret_cast<const uint32_t*>(get_read_ptr(CB_LHS_I));
-        uint32_t*       rhs_r = reinterpret_cast<uint32_t*>(get_write_ptr(CB_RHS_R));
-        uint32_t*       rhs_i = reinterpret_cast<uint32_t*>(get_write_ptr(CB_RHS_I));
-
-        for (uint32_t i=0; i<local_N/2; i++) {
-            uint32_t grp = i / stride;
-            uint32_t pos = i % stride;
-            uint32_t lo  = grp*(2*stride) + pos;
-            uint32_t hi  = lo + stride;
-            rhs_r[lo] = lhs_r[hi];
-            rhs_i[lo] = lhs_i[hi];
-        }
-        cb_push_back(CB_RHS_R, 1);
-        cb_push_back(CB_RHS_I, 1);
-
-        // Load twiddles
-        cb_reserve_back(CB_TWIDDLE_R, 1);
-        cb_reserve_back(CB_TWIDDLE_I, 1);
-        uint32_t tw_r = s * num_cores + my_id;
-        uint32_t tw_i = tw_imag_base + tw_r;
-        noc_async_read_tile(tw_r, twiddle_gen, get_write_ptr(CB_TWIDDLE_R));
-        noc_async_read_tile(tw_i, twiddle_gen, get_write_ptr(CB_TWIDDLE_I));
+        // Twiddles first (matches compute cb_wait order)
+        cb_reserve_back(CB_TW_R,1); cb_reserve_back(CB_TW_I,1);
+        noc_async_read_tile(s * num_tiles + my_id, tw_r_gen, get_write_ptr(CB_TW_R));
+        noc_async_read_tile(s * num_tiles + my_id, tw_i_gen, get_write_ptr(CB_TW_I));
         noc_async_read_barrier();
-        cb_push_back(CB_TWIDDLE_R, 1);
-        cb_push_back(CB_TWIDDLE_I, 1);
+        cb_push_back(CB_TW_R,1); cb_push_back(CB_TW_I,1);
 
-        // Wait for compute to consume LHS (pop it) before writer recycles
-        // Actually the writer waits on CB_OUT then recycles LHS.
-        // We need to wait for the PREVIOUS stage's OUT to have been recycled
-        // before we try to wait_front on CB_LHS again.
-        // Since we already did cb_wait_front(CB_LHS) above, and compute will
-        // pop it, we just need to wait for CB_LHS to be empty before looping.
-        // Use CB_OUT_R as a signal: wait for it to have a tile (compute done),
-        // then the writer will recycle.
-        // SIMPLER: just use a sync tile: writer pushes CB_SYNC after recycling LHS.
-        // For now: wait for CB_LHS to be consumed (count goes to 0).
-        // There's no direct "wait_empty" — instead we'll use a handshake via
-        // a dedicated sync CB. But that adds complexity.
-        // SIMPLEST: after pushing RHS+twiddles, wait for compute to signal via CB_SYNC.
-        // But CB_SYNC is used for NOC sync...
-        // ACTUAL SOLUTION: just don't wait here. The pipeline self-regulates:
-        // - Reader peeks LHS (cb_wait_front without pop)
-        // - Compute pops LHS when it does the butterfly
-        // - Writer then recycles by pushing new LHS
-        // - Reader's next cb_wait_front(CB_LHS) blocks until writer pushes
-        // This is correct! The reader's cb_wait_front at the TOP of the loop
-        // will block until writer pushes the new LHS after recycling.
-        // No extra sync needed.
+        // Even/odd input (stage 0: from DRAM; stage 1+: recycled by writer)
+        if (s == 0) {
+            cb_reserve_back(CB_EVEN_R,1); cb_reserve_back(CB_EVEN_I,1);
+            cb_reserve_back(CB_ODD_R,1);  cb_reserve_back(CB_ODD_I,1);
+            noc_async_read_tile(my_id, even_r_gen, get_write_ptr(CB_EVEN_R));
+            noc_async_read_tile(my_id, even_i_gen, get_write_ptr(CB_EVEN_I));
+            noc_async_read_tile(my_id, odd_r_gen,  get_write_ptr(CB_ODD_R));
+            noc_async_read_tile(my_id, odd_i_gen,  get_write_ptr(CB_ODD_I));
+            noc_async_read_barrier();
+            cb_push_back(CB_EVEN_R,1); cb_push_back(CB_EVEN_I,1);
+            cb_push_back(CB_ODD_R,1);  cb_push_back(CB_ODD_I,1);
+        }
+        // Stage 1+: writer recycles OUT0→EVEN, OUT1→ODD, so reader just pushes twiddles
     }
 
-    // ── NOC stages: twiddles only ────────────────────────────
+    // NOC stages: twiddles only
     for (uint32_t s=num_local_stg; s<num_stages; s++) {
-        cb_reserve_back(CB_TWIDDLE_R, 1);
-        cb_reserve_back(CB_TWIDDLE_I, 1);
-        uint32_t tw_r = s * num_cores + my_id;
-        uint32_t tw_i = tw_imag_base + tw_r;
-        noc_async_read_tile(tw_r, twiddle_gen, get_write_ptr(CB_TWIDDLE_R));
-        noc_async_read_tile(tw_i, twiddle_gen, get_write_ptr(CB_TWIDDLE_I));
+        cb_reserve_back(CB_TW_R,1); cb_reserve_back(CB_TW_I,1);
+        noc_async_read_tile(s * num_tiles + my_id, tw_r_gen, get_write_ptr(CB_TW_R));
+        noc_async_read_tile(s * num_tiles + my_id, tw_i_gen, get_write_ptr(CB_TW_I));
         noc_async_read_barrier();
-        cb_push_back(CB_TWIDDLE_R, 1);
-        cb_push_back(CB_TWIDDLE_I, 1);
+        cb_push_back(CB_TW_R,1); cb_push_back(CB_TW_I,1);
     }
 }

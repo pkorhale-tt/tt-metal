@@ -1,12 +1,12 @@
-// fft_compute.cpp — Cooley-Tukey butterfly, all stages
-// Pipeline per local stage:
-//   Reader pushes: CB_RHS_R, CB_RHS_I, CB_TWIDDLE_R, CB_TWIDDLE_I
-//   LHS comes from CB_LHS_R/I (initial load) or recycled from CB_OUT
-//   Compute reads LHS+RHS+TW, writes CB_OUT
-//   Writer pops CB_OUT, copies back to CB_LHS for next stage
-// Pipeline per NOC stage:
-//   Writer signals CB_SYNC after peer exchange
-//   Compute reads CB_OUT(LHS) + CB_SCRATCH(RHS) + CB_TWIDDLE
+// fft_compute.cpp — multi-core FFT, correct two-output butterfly
+// CB layout:
+//   c_0/1 = even_r/i  (lower half of butterfly pairs)
+//   c_2/3 = odd_r/i   (upper half of butterfly pairs)
+//   c_4/5 = twiddle_r/i
+//   c_6/7 = out0_r/i  (even + W*odd)
+//   c_8/9 = out1_r/i  (even - W*odd)
+//   c_10  = sync (NOC stage signal)
+//   c_11-14 = scratch_r/i, tmp_r/i
 
 #include <cstdint>
 #include "api/compute/tile_move_copy.h"
@@ -16,23 +16,26 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/copy_dest_values.h"
 
-constexpr uint32_t ADD = 0, SUB = 1, MUL = 2, NEG = 3;
+constexpr uint32_t ADD=0, SUB=1, MUL=2, NEG=3;
 
-constexpr auto CB_LHS_R     = tt::CBIndex::c_0;
-constexpr auto CB_LHS_I     = tt::CBIndex::c_1;
-constexpr auto CB_RHS_R     = tt::CBIndex::c_2;
-constexpr auto CB_RHS_I     = tt::CBIndex::c_3;
-constexpr auto CB_TWIDDLE_R = tt::CBIndex::c_4;
-constexpr auto CB_TWIDDLE_I = tt::CBIndex::c_5;
-constexpr auto CB_OUT_R     = tt::CBIndex::c_6;
-constexpr auto CB_OUT_I     = tt::CBIndex::c_7;
-constexpr auto CB_SCRATCH_R = tt::CBIndex::c_8;
-constexpr auto CB_SCRATCH_I = tt::CBIndex::c_9;
-constexpr auto CB_SYNC      = tt::CBIndex::c_10;
-constexpr auto CB_TMP_R     = tt::CBIndex::c_11;
-constexpr auto CB_TMP_I     = tt::CBIndex::c_12;
-constexpr auto CB_WR_R      = tt::CBIndex::c_13;
-constexpr auto CB_WR_I      = tt::CBIndex::c_14;
+// CBs
+constexpr auto CB_EVEN_R  = tt::CBIndex::c_0;
+constexpr auto CB_EVEN_I  = tt::CBIndex::c_1;
+constexpr auto CB_ODD_R   = tt::CBIndex::c_2;
+constexpr auto CB_ODD_I   = tt::CBIndex::c_3;
+constexpr auto CB_TW_R    = tt::CBIndex::c_4;
+constexpr auto CB_TW_I    = tt::CBIndex::c_5;
+constexpr auto CB_OUT0_R  = tt::CBIndex::c_6;   // even + W*odd
+constexpr auto CB_OUT0_I  = tt::CBIndex::c_7;
+constexpr auto CB_OUT1_R  = tt::CBIndex::c_8;   // even - W*odd
+constexpr auto CB_OUT1_I  = tt::CBIndex::c_9;
+constexpr auto CB_SYNC    = tt::CBIndex::c_10;
+constexpr auto CB_SCRATCH_R = tt::CBIndex::c_11; // incoming NOC data
+constexpr auto CB_SCRATCH_I = tt::CBIndex::c_12;
+constexpr auto CB_TMP_R   = tt::CBIndex::c_13;
+constexpr auto CB_TMP_I   = tt::CBIndex::c_14;
+constexpr auto CB_TW_ODD_R = tt::CBIndex::c_15; // W*odd result
+constexpr auto CB_TW_ODD_I = tt::CBIndex::c_16;
 
 constexpr uint32_t num_local_stages = get_compile_time_arg_val(0);
 constexpr uint32_t num_noc_stages   = get_compile_time_arg_val(1);
@@ -65,7 +68,7 @@ FORCE_INLINE void neg_op(uint32_t in, uint32_t out) {
     tile_regs_release(); cb_push_back(out,1);
 }
 
-// Complex multiply (a+bi)*(c+di) → (ac-bd) + (ad+bc)i
+// Complex multiply: (a+bi)*(c+di) → out_r + out_i*j
 FORCE_INLINE void cmul(uint32_t ar,uint32_t ai,uint32_t br,uint32_t bi,
                         uint32_t outr,uint32_t outi) {
     mm_op<MUL>(ar,br,CB_TMP_R); mm_op<MUL>(ai,bi,CB_TMP_I);
@@ -74,71 +77,68 @@ FORCE_INLINE void cmul(uint32_t ar,uint32_t ai,uint32_t br,uint32_t bi,
     mm_op<ADD,true,true>(CB_TMP_R,CB_TMP_I,outi);
 }
 
-// Butterfly: out_r = even_r + (tw*odd).real
-//            out_i = even_i + (tw*odd).imag
-// Pops: odd, tw (even popped by caller after)
-FORCE_INLINE void do_butterfly(
-    uint32_t er,uint32_t ei,
-    uint32_t or_,uint32_t oi,
-    uint32_t wr,uint32_t wi)
+// Full butterfly producing both outputs:
+//   out0 = even + W*odd
+//   out1 = even - W*odd
+FORCE_INLINE void butterfly(
+    uint32_t ev_r, uint32_t ev_i,
+    uint32_t od_r, uint32_t od_i,
+    uint32_t tw_r, uint32_t tw_i)
 {
-    cb_wait_front(or_,1); cb_wait_front(oi,1);
-    cb_wait_front(wr,1);  cb_wait_front(wi,1);
-    cmul(or_,oi,wr,wi,CB_WR_R,CB_WR_I);
-    cb_pop_front(or_,1); cb_pop_front(oi,1);
-    cb_pop_front(wr,1);  cb_pop_front(wi,1);
+    // Step 1: W*odd → CB_TW_ODD_R/I
+    cb_wait_front(od_r,1); cb_wait_front(od_i,1);
+    cb_wait_front(tw_r,1); cb_wait_front(tw_i,1);
+    cmul(od_r,od_i, tw_r,tw_i, CB_TW_ODD_R,CB_TW_ODD_I);
+    cb_pop_front(od_r,1); cb_pop_front(od_i,1);
+    cb_pop_front(tw_r,1); cb_pop_front(tw_i,1);
 
-    cb_wait_front(er,1); cb_wait_front(ei,1);
-    cb_wait_front(CB_WR_R,1); cb_wait_front(CB_WR_I,1);
-    mm_op<ADD>(er,CB_WR_R,CB_OUT_R);
-    mm_op<ADD>(ei,CB_WR_I,CB_OUT_I);
-    cb_pop_front(er,1); cb_pop_front(ei,1);
-    cb_pop_front(CB_WR_R,1); cb_pop_front(CB_WR_I,1);
+    // Step 2: even + W*odd → out0,  even - W*odd → out1
+    cb_wait_front(ev_r,1); cb_wait_front(ev_i,1);
+    cb_wait_front(CB_TW_ODD_R,1); cb_wait_front(CB_TW_ODD_I,1);
+
+    mm_op<ADD>(ev_r, CB_TW_ODD_R, CB_OUT0_R);
+    mm_op<ADD>(ev_i, CB_TW_ODD_I, CB_OUT0_I);
+    mm_op<SUB>(ev_r, CB_TW_ODD_R, CB_OUT1_R);
+    mm_op<SUB>(ev_i, CB_TW_ODD_I, CB_OUT1_I);
+
+    cb_pop_front(ev_r,1); cb_pop_front(ev_i,1);
+    cb_pop_front(CB_TW_ODD_R,1); cb_pop_front(CB_TW_ODD_I,1);
 }
 
 void kernel_main() {
-    unary_op_init_common(CB_LHS_R, CB_OUT_R);
-    copy_tile_to_dst_init_short(CB_LHS_R);
+    unary_op_init_common(CB_EVEN_R, CB_OUT0_R);
+    copy_tile_to_dst_init_short(CB_EVEN_R);
 
-    // ── Local stages ──────────────────────────────────────────
-    // Stage 0: LHS from initial reader load
-    // Stage 1+: LHS recycled from previous OUT by writer
     for (uint32_t s=0; s<num_local_stages; s++) {
-        // Wait for reader to push RHS and twiddles
-        cb_wait_front(CB_RHS_R,1); cb_wait_front(CB_RHS_I,1);
+        cb_wait_front(CB_EVEN_R,1); cb_wait_front(CB_EVEN_I,1);
+        cb_wait_front(CB_ODD_R,1);  cb_wait_front(CB_ODD_I,1);
 
         if constexpr (is_ifft) {
-            neg_op<true>(CB_TWIDDLE_I, CB_TMP_R);
+            neg_op<true>(CB_TW_I, CB_TMP_R);
             cb_wait_front(CB_TMP_R,1);
-            do_butterfly(CB_LHS_R,CB_LHS_I, CB_RHS_R,CB_RHS_I,
-                         CB_TWIDDLE_R,CB_TMP_R);
+            butterfly(CB_EVEN_R,CB_EVEN_I, CB_ODD_R,CB_ODD_I, CB_TW_R,CB_TMP_R);
             cb_pop_front(CB_TMP_R,1);
         } else {
-            cb_wait_front(CB_TWIDDLE_R,1); cb_wait_front(CB_TWIDDLE_I,1);
-            do_butterfly(CB_LHS_R,CB_LHS_I, CB_RHS_R,CB_RHS_I,
-                         CB_TWIDDLE_R,CB_TWIDDLE_I);
+            cb_wait_front(CB_TW_R,1); cb_wait_front(CB_TW_I,1);
+            butterfly(CB_EVEN_R,CB_EVEN_I, CB_ODD_R,CB_ODD_I, CB_TW_R,CB_TW_I);
         }
-        // OUT_R/I now has result.
-        // Writer will pop OUT and push back into LHS for next stage.
     }
 
-    // ── NOC stages ────────────────────────────────────────────
+    // NOC stages: use CB_OUT0 as even, CB_SCRATCH as odd
     for (uint32_t s=0; s<num_noc_stages; s++) {
-        // Wait for writer: peer data in scratch, OUT is valid LHS
         cb_wait_front(CB_SYNC,1); cb_pop_front(CB_SYNC,1);
 
+        cb_wait_front(CB_OUT0_R,1); cb_wait_front(CB_OUT0_I,1);
         cb_wait_front(CB_SCRATCH_R,1); cb_wait_front(CB_SCRATCH_I,1);
 
         if constexpr (is_ifft) {
-            neg_op<true>(CB_TWIDDLE_I, CB_TMP_R);
+            neg_op<true>(CB_TW_I, CB_TMP_R);
             cb_wait_front(CB_TMP_R,1);
-            do_butterfly(CB_OUT_R,CB_OUT_I, CB_SCRATCH_R,CB_SCRATCH_I,
-                         CB_TWIDDLE_R,CB_TMP_R);
+            butterfly(CB_OUT0_R,CB_OUT0_I, CB_SCRATCH_R,CB_SCRATCH_I, CB_TW_R,CB_TMP_R);
             cb_pop_front(CB_TMP_R,1);
         } else {
-            cb_wait_front(CB_TWIDDLE_R,1); cb_wait_front(CB_TWIDDLE_I,1);
-            do_butterfly(CB_OUT_R,CB_OUT_I, CB_SCRATCH_R,CB_SCRATCH_I,
-                         CB_TWIDDLE_R,CB_TWIDDLE_I);
+            cb_wait_front(CB_TW_R,1); cb_wait_front(CB_TW_I,1);
+            butterfly(CB_OUT0_R,CB_OUT0_I, CB_SCRATCH_R,CB_SCRATCH_I, CB_TW_R,CB_TW_I);
         }
     }
 }
