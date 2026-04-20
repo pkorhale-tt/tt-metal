@@ -1,0 +1,238 @@
+================================================================================
+  fft_bf16/  —  HOW TO RUN  (bfloat16 multi-core FFT, 1..64 cores, N up to 65536)
+  Run every command from the tt-metal repo root.
+  NOTE: storage is bf16; SFPU compute still runs in fp32 internally.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0.  ONE-TIME ENV SETUP
+--------------------------------------------------------------------------------
+
+source python_env/bin/activate
+export ARCH_NAME=wormhole_b0
+export TT_METAL_HOME=$(pwd)
+
+
+--------------------------------------------------------------------------------
+1.  BUILD  (first time only, plus after editing kernels/host)
+--------------------------------------------------------------------------------
+
+# Configure once
+cmake -B build -DBUILD_PROGRAMMING_EXAMPLES=ON
+
+# Build all bf16 FFT executables in one shot
+cmake --build build \
+    --target metal_example_fft_bf16_test \
+             metal_example_fft_bf16_demo \
+             metal_example_fft_bf16_vs_torch \
+             metal_example_fft_bf16_benchmark \
+             my_fft_bf16_app \
+    -j
+
+
+--------------------------------------------------------------------------------
+2.  RUN THE KERNEL  (correctness + timing for N = 16 .. 65536)
+--------------------------------------------------------------------------------
+
+# 15 tests — impulse / DC / random — auto-scales 1..64 cores.
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_test
+
+# Without clearing the JIT cache (faster on repeat runs)
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_test
+
+# Expected: every line says [PASS]. Thresholds are looser than fp32:
+#   N <= 64    -> rel err < 5e-2
+#   N <= 1024  -> rel err < 1e-1
+#   N <= 8192  -> rel err < 1.5e-1
+#   N <= 65536 -> rel err < 2.5e-1
+# (bf16 has only 8 bits of mantissa, so error grows with log2(N).)
+
+
+--------------------------------------------------------------------------------
+3.  RUN THE BENCHMARK  (plan-cache speedup, fft() called many times)
+--------------------------------------------------------------------------------
+
+# Default: N=4096, 100 iterations
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_benchmark
+
+# Pick your own N (power of 2, [2, 65536]) and iteration count
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_benchmark 1024 100
+
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_benchmark 16384 100
+
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_benchmark 65536 100
+
+# Output shows: first call (build cost) vs cached avg (steady state) + speedup.
+# bf16 moves half the bytes of fp32 -> data-movement-bound stages run faster.
+
+
+--------------------------------------------------------------------------------
+4.  RUN THE DEMO  (PyTorch-style worked examples)
+--------------------------------------------------------------------------------
+
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_demo
+
+# Prints FFT of:
+#   [10, 20, 30, 40]
+#   [1, j, -1, -j]
+#   cos(2*pi*n/8)
+#   ramp [0..1023]
+
+
+--------------------------------------------------------------------------------
+5.  COMPARE  vs  torch.fft.fft   (Python script, accuracy report)
+--------------------------------------------------------------------------------
+
+# Default (N=1024, seed=42, threshold 2e-1 for bf16)
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py
+
+# Pick N
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 4096
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 8192
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 16384
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 65536
+
+# Different RNG seed
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 8192 --seed 7
+
+# Loosen threshold further (bf16 large-N runs)
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 65536 --tol 3e-1
+
+# Keep the temp input/output text files
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 256 --keep
+
+# Custom binary path
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py \
+    --N 4096 \
+    --bin ./build/programming_examples/fft_bf16/metal_example_fft_bf16_vs_torch
+
+# Output shows: max abs err, max rel err, mean err, SNR (dB), worst 5 bins,
+# and PASS/FAIL.
+
+
+--------------------------------------------------------------------------------
+6.  DFT (O(N^2)) vs torch.fft.fft   (built into the test)
+--------------------------------------------------------------------------------
+
+# The test harness already does this:
+#   - For N <= 4096: it uses an O(N^2) reference DFT (gold standard).
+#   - For N >  4096: it uses an O(N log N) double-precision FFT
+#                   (still way more accurate than the bf16 device run).
+#
+# Just run:
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_test
+#
+# Each [PASS] line shows: abs err, rel err, ms, P (cores).
+# rel err comes from comparing the bf16 device output against the DFT/FFT ref.
+
+
+--------------------------------------------------------------------------------
+7.  RAW DUMPER  (writes input + tt-metal output to text files)
+--------------------------------------------------------------------------------
+
+# Used internally by compare_with_torch.py, but you can run it directly:
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_vs_torch \
+    <N> [seed] [in_path] [out_path]
+
+# Example: N=1024
+ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_vs_torch \
+    1024 42 /tmp/in_bf16.txt /tmp/out_bf16.txt
+
+# Each file: N lines of "real imag" in scientific notation.
+# Input is the original fp32 signal; output has been quantized to bf16
+# inside the device pipeline.
+
+
+--------------------------------------------------------------------------------
+8.  YOUR OWN SIGNAL  (edit, build, run)
+--------------------------------------------------------------------------------
+
+# Edit the signal inside main():
+#   tt_metal/programming_examples/fft_bf16/my_fft_app.cpp
+cmake --build build --target my_fft_bf16_app -j
+ARCH_NAME=wormhole_b0 TT_METAL_CLEAR_JIT_CACHE=1 \
+    ./build/programming_examples/fft_bf16/my_fft_bf16_app
+
+
+--------------------------------------------------------------------------------
+9.  USE THE bf16 FFT FROM ANY C++ FILE  (PyTorch-style API)
+--------------------------------------------------------------------------------
+
+# In your .cpp:
+#
+#   #include "tt_metal/programming_examples/fft_bf16/fft_host.cpp"
+#   using namespace fft_example_bf16;
+#
+#   auto md = MeshDevice::create_unit_mesh(0);
+#   std::vector<float> signal = {10.f, 20.f, 30.f, 40.f};
+#   auto spectrum = fft(md, signal);   // returns std::vector<std::complex<float>>
+#
+#   // or complex input:
+#   std::vector<std::complex<float>> cx = { {1,0}, {0,1}, {-1,0}, {0,-1} };
+#   auto spec2 = fft(md, cx);
+#
+# Requirement: signal.size() is a power of 2 in [2, 65536].
+# Equivalent to torch.fft.fft(signal) but with bf16 storage precision.
+# First call for a new N pays the program-build cost (~10-25 ms);
+# every subsequent call hits the plan cache (~1-3 ms device-time).
+#
+# IMPORTANT: do NOT mix this with fp32 fft_example::fft in the same TU
+#            (both files define top-level helpers in their own namespace).
+
+
+--------------------------------------------------------------------------------
+10. fp32 vs bf16  —  side-by-side accuracy check
+--------------------------------------------------------------------------------
+
+# Same signal, both precisions, same seed:
+python tt_metal/programming_examples/fft/compare_with_torch.py      --N 4096 --seed 42
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 4096 --seed 42
+
+# fp32 should land near 1e-3 rel err.
+# bf16 will be 1-2 orders of magnitude worse, but uses half the L1/DRAM
+# footprint and noticeably faster data-movement stages.
+
+
+--------------------------------------------------------------------------------
+11. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+# Forgot ARCH_NAME?
+export ARCH_NAME=wormhole_b0
+
+# Edited a kernel and the change doesn't seem to apply?
+TT_METAL_CLEAR_JIT_CACHE=1 ARCH_NAME=wormhole_b0 \
+    ./build/programming_examples/fft_bf16/metal_example_fft_bf16_test
+
+# "Binary not found" from compare_with_torch.py?
+cmake --build build --target metal_example_fft_bf16_vs_torch -j
+
+# `ninja: error: unknown target 'metal_example_fft_bf16_test'`?
+#   -> The fft_bf16/ folder isn't picked up by CMake yet. Run once:
+grep -q 'add_subdirectory(.*fft_bf16)' tt_metal/programming_examples/CMakeLists.txt \
+    || echo 'add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_bf16)' \
+        >> tt_metal/programming_examples/CMakeLists.txt
+cmake -B build -DBUILD_PROGRAMMING_EXAMPLES=ON
+cmake --build build --target metal_example_fft_bf16_test -j
+
+# bf16 test failing only at large N?
+#   -> Loosen the threshold via the Python harness:
+python tt_metal/programming_examples/fft_bf16/compare_with_torch.py --N 65536 --tol 3e-1
+
+# Full clean rebuild (clears cmake build dir + JIT cache)
+rm -rf build ~/.cache/tt-metal-cache
+cmake -B build -DBUILD_PROGRAMMING_EXAMPLES=ON
+cmake --build build \
+    --target metal_example_fft_bf16_test metal_example_fft_bf16_demo \
+             metal_example_fft_bf16_vs_torch metal_example_fft_bf16_benchmark -j

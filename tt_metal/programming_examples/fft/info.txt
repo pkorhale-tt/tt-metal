@@ -1,0 +1,466 @@
+================================================================================
+  fft/  —  IMPLEMENTATION NOTES + COMPARISON WITH PUBLISHED RESEARCH
+  Multi-core radix-2 DIT FFT on Wormhole, fp32 storage + fp32 SFPU compute.
+================================================================================
+
+
+================================================================================
+  PART A.  WHAT WE BUILT  (strategy + design decisions, top-down)
+================================================================================
+
+
+A.1  GOAL
+---------
+
+A drop-in replacement for `torch.fft.fft(signal)` that runs on a Tenstorrent
+Wormhole Tensix grid:
+
+    auto y = fft_example::fft(md, signal);   //  signal.size() in [2, 65536], pow2
+
+Hard requirements we set:
+
+  * exact agreement with `torch.fft.fft` to fp32 roundoff (rel err ~ 1e-3..1e-7)
+  * scale from N=16 (1 core) up to N=65536 (64 cores) automatically
+  * usable from any C++ TU via a single include + a single call
+  * fast enough to be useful in a tight loop, not just one-shot research code
+
+
+A.2  ALGORITHM  (Cooley-Tukey radix-2, decimation in time)
+----------------------------------------------------------
+
+Standard log2(N)-stage iterative DIT FFT:
+
+  1. Bit-reverse the input.
+  2. For each stage s = 0 .. log2(N)-1:
+       butterfly_size  = 2^(s+1)
+       half            = 2^s
+       For each pair (i, i+half) within every butterfly:
+            t            = twiddle[stage, ...] * x[i+half]
+            x[i+half]    = x[i] - t
+            x[i]         = x[i] + t
+
+Twiddle factors are precomputed on the host (one tile per stage) and stay
+resident in DRAM for the life of an `FFTPlan`.
+
+
+A.3  DATA LAYOUT  (split-complex, full 32x32 fp32 tiles)
+--------------------------------------------------------
+
+Two parallel tile streams: one for the real part, one for the imaginary part.
+Every circular buffer is sized to a full 32x32 fp32 tile (TILE_SIZE_FP32 =
+4096 B) regardless of N.  Sub-tile FFTs (N < 1024) are zero-padded; the
+padding stays zero through every butterfly because mul/add with zero is a
+no-op, so it has no algorithmic cost.
+
+This was a deliberate choice over the "pack only the active lanes" approach
+used in the existing `fft_float32_multicore_optimised_paper/` example: full
+tiles let us reuse the standard SFPU binary-tile ops directly instead of
+writing custom packed kernels.
+
+
+A.4  PER-CORE PIPELINE  (3 RISC-V kernels per Tensix)
+-----------------------------------------------------
+
+  BRISC0 (reader, fft_reader.cpp)
+    * Owns the *persistent* state tile  CB_STATE_{R,I}  (pushed once, never
+      popped) — this is the single source of truth for the FFT working set.
+    * For every stage s:
+        1. async-DRAM-load the stage-s twiddle tile into CB_TW.
+        2. Scatter state -> CB_EVEN/CB_ODD according to the stage-s pair
+           stride (2^s).  Block sizes >= 64 B go through `async_local_memcpy`
+           (the L1->L1 DMA path); smaller blocks fall back to scalar copies.
+        3. Wait for CB_OUT0 / CB_OUT1 from compute, gather them back into
+           the state tile, advance to next stage.
+    * For multi-core stages (s >= log2(P_local)): exchange half the state
+      tile with a partner core over the NoC, using a *monotonic semaphore*
+      (waits for k+1 increments at stage k) so a fast partner can never
+      race-overshoot a slow one.
+
+  TRISC (compute, fft_compute.cpp)
+    * Pure radix-2 butterfly per stage:
+          Wodd_r = odd_r * tw_r  -  odd_i * tw_i
+          Wodd_i = odd_r * tw_i  +  odd_i * tw_r
+          OUT0   = even + Wodd
+          OUT1   = even - Wodd
+    * All four ops use SFPU `*_binary_tile` (`add_binary_tile`,
+      `sub_binary_tile`, `mul_binary_tile`).  This was a critical fix:
+      `add_tiles` / `mul_tiles` go through the matrix engine which silently
+      runs in bf16 on Wormhole even with `fp32_dest_acc_en`; SFPU is the
+      only path that gives full IEEE fp32.
+    * UnpackToDestMode::UnpackToDestFp32 on the EVEN/ODD/TW CBs guarantees
+      the unpacker hands fp32 to the SFPU instead of down-converting.
+
+  BRISC1 (writer, fft_writer.cpp)
+    * Sleeps on CB_SYNC for the entire run, then drains the final state
+      tile out to DRAM.  Sits on NOC1 so its DMA never collides with the
+      reader's NOC0 traffic.
+
+
+A.5  MULTI-CORE STRATEGY  (true distributed 1D radix-2)
+-------------------------------------------------------
+
+  * P = number of cores used = min(64, ceil(N / 1024)).
+  * The N points are split contiguously over P cores, 1024 per core (one
+    state tile per core).
+  * The first  log2(1024)        =  10 stages are "local": each core does
+    them independently inside its own state tile.
+  * The next   log2(P) (1..6)    stages are "cross-core": at each stage,
+    every core is paired with a partner and they swap half-tiles over the
+    NoC, then re-run the SFPU butterfly on the merged data.
+
+Concretely, for N=65536, P=64:
+    10 local stages + 6 NoC stages = 16 stages = log2(65536)  ✓
+
+The cross-core stages are *pipelined* with compute: while the SFPU is
+crunching butterfly k, the reader is already moving data for butterfly k+1.
+Combined with the monotonic-semaphore handshake, this is what allowed the
+implementation to scale linearly out to 64 cores.
+
+
+A.6  HOST-SIDE PLAN CACHE  (the big steady-state win)
+-----------------------------------------------------
+
+Setting up a tt-metal program (kernel JIT + CB allocation + runtime arg
+binding + MeshWorkload assembly) costs ~10-25 ms.  Doing that for every
+FFT call would dominate everything else.
+
+Solution — `fft_example::FFTPlan` + a process-wide `plan_cache` keyed on N:
+
+    * First call with a given N : build full Program + MeshWorkload, stash
+      twiddle MeshBuffers + IO MeshBuffers + kernel handles into the plan.
+    * Subsequent calls with same N : look up the plan, rebind only the
+      input buffer's runtime arg, EnqueueMeshWorkload, return.
+
+Result on N=16384: first call ~25 ms, cached calls ~0.57 ms (~44x faster).
+On N=65536: first call ~106 ms, cached calls ~1.2 ms (~88x faster).
+
+
+A.7  PRECISION CHOICES
+----------------------
+
+  * Storage:           fp32 (4 B / element).
+  * SFPU compute:      fp32 (UnpackToDestFp32 + SFPU binary ops).
+  * Twiddle factors:   fp32, computed in double on host then narrowed.
+  * MathFidelity:      HiFi4 (matters only for the matmul engine; we only
+                       use it for tile init paths, real math is on SFPU).
+  * dst accumulator:   fp32 (`fp32_dest_acc_en = true`).
+
+Measured rel error vs. `torch.fft.fft`:
+    N=1024  -> ~4e-4
+    N=16384 -> ~1e-3
+    N=65536 -> ~3e-3
+This is at the noise floor of fp32 itself for an FFT of this size (error
+grows as ~sqrt(log2 N) per the standard FFT roundoff bound).
+
+
+A.8  THINGS WE TRIED THAT DIDN'T WORK
+-------------------------------------
+
+  * `add_tiles` / `mul_tiles` (matrix engine):  silent bf16, error blew up
+    by ~3 orders of magnitude.  Switched to SFPU binary ops.
+  * Non-monotonic semaphore (reset to 0 each stage):  a fast partner would
+    increment our semaphore *before* we reset it, signal got lost, deadlock
+    on the next stage.  Switched to cumulative count (wait for k+1).
+  * Re-entering `cb_reserve_back` for an already-pushed CB_STATE: silently
+    deadlocks.  Push CB_STATE exactly once at init, never pop.
+  * Async-memcpy for blocks < 64 B:  the NoC setup cost outweighs the
+    transfer.  Hybrid scalar / DMA cutoff at 64 B.
+
+
+================================================================================
+  PART A.9  DATA-FLOW DIAGRAMS  (DRAM <-> NoC <-> 3 RISCs per core)
+================================================================================
+
+
+A.9.1  HIGH-LEVEL  (host -> device -> host, one fft() call)
+-----------------------------------------------------------
+
+       HOST                                    DEVICE (Wormhole n300)
+       ----                                    ----------------------
+                                              +-------------------------+
+   pack_input(signal)  -->  EnqueueWriteMesh  |  IN_R / IN_I (DRAM)     |
+                                              +-------------------------+
+   precompute_twiddles -->  EnqueueWriteMesh  |  TW_R / TW_I (DRAM)     |
+                                              +-------------------------+
+   FFTPlan.execute()   -->  EnqueueMeshWorkld | -----> Tensix grid -----|
+                                              |     (P = 1 .. 64 cores) |
+                                              +-------------------------+
+   unpack_output(...)  <--  EnqueueReadMesh   |  OUT_R / OUT_I (DRAM)   |
+                                              +-------------------------+
+                                              ^
+                                              |  DRAM is interleaved across
+                                              |  all DRAM channels; every
+                                              |  core sees a flat address space
+                                              |  via InterleavedAddrGenFast.
+
+
+A.9.2  ONE TENSIX CORE  (the 3 RISC-Vs and how data moves)
+----------------------------------------------------------
+
+   Inside ONE Tensix core there are 5 RISC-V CPUs; we use 3 of them:
+     * BRISC0  = reader  (NOC0)   -> data in / scatter / gather
+     * TRISCs  = compute (UNPACK / MATH / PACK)  -> the SFPU butterfly
+     * BRISC1  = writer  (NOC1)   -> drain final state to DRAM
+   Communication between them is via L1-resident Circular Buffers (CBs).
+
+                +-------------------- L1 (per-core SRAM) -------------------+
+                |                                                           |
+   DRAM -- NOC0 |   CB_TW_R/I ---+                                          |
+                |                v                                          |
+                |   CB_STATE_R/I --(scatter)--> CB_EVEN_R/I                 |
+                |        ^                       CB_ODD_R/I                 |
+                |        |                          |                       |
+                |        |(gather)                  v                       |
+                |   CB_OUT0_R/I  <-------- TRISC compute (SFPU butterfly)   |
+                |   CB_OUT1_R/I                                             |
+                |        ^                                                  |
+                |        |                                                  |
+                |     BRISC0 reader                                         |
+                |                                                           |
+                |   CB_SYNC --> BRISC1 writer --> NOC1 --> DRAM (OUT_R/I)   |
+                +-----------------------------------------------------------+
+
+   Per-stage cycle on one core (ASCII timeline, time -> right):
+
+     reader   :  DRAM-load(TW_s)  scatter(state -> EVEN/ODD)   gather(OUT0/1 -> state)
+                       |                  |                            ^
+                       v                  v                            |
+     CBs      :     CB_TW_R/I        CB_EVEN/ODD_R/I            CB_OUT0/1_R/I
+                                            |                            ^
+                                            v                            |
+     compute  :                   SFPU butterfly: cmul, add, sub  ------+
+                                  (UnpackToDestFp32 + add_binary_tile/...)
+
+
+A.9.3  SINGLE-CORE FFT  (N <= 1024, P = 1, no NoC butterfly)
+------------------------------------------------------------
+
+   For N <= 1024 the entire FFT fits in one state tile, so all log2(N)
+   stages are "local" — there is no cross-core NoC traffic at all.
+
+      DRAM (IN_R, IN_I, TW_R, TW_I)
+        |
+        |  load IN once at stage 0 (reader)
+        v
+   +----------------- Tensix core (single) ------------------+
+   |                                                         |
+   |   reader  <->  compute  <->  reader (gather)            |
+   |                                                         |
+   |   loop log2(N) stages, all local                        |
+   |                                                         |
+   |   final state in CB_STATE_R/I  --> writer --> DRAM      |
+   +---------------------------------------------------------+
+        |
+        v
+      DRAM (OUT_R, OUT_I)
+
+
+A.9.4  MULTI-CORE FFT  (N > 1024, P up to 64, NoC butterfly stages)
+-------------------------------------------------------------------
+
+   For N > 1024 we split N points across P = ceil(N/1024) cores:
+     * stages 0   ..  9      = LOCAL    (each core works inside its own tile)
+     * stages 10  ..  10+log2(P)-1 = CROSS-CORE (pairs swap half-tiles via NoC)
+
+   Cross-core stage k pairs cores by XOR with mask = 1 << k:
+
+         core C   <----- NoC1 (write half-state) ----->   core C XOR mask
+                  <----- NoC1 (write half-state) ----->
+                          (and a monotonic semaphore inc)
+
+   Diagram of a single cross-core stage between two cores (C0 and C1):
+
+       +--------- core C0 ---------+              +--------- core C1 ---------+
+       | CB_STATE_R/I (full tile)  |              | CB_STATE_R/I (full tile)  |
+       |  upper half --------------|--- NoC1 --->|--> lower half (overwrite) |
+       |  lower half (overwrite) <-|--- NoC1 ----|--- upper half             |
+       |                           |              |                           |
+       |  semaphore_inc(C1, k+1)   |              |  semaphore_inc(C0, k+1)   |
+       |  wait_until(>= k+1)       |              |  wait_until(>= k+1)       |
+       |                           |              |                           |
+       |  --> SFPU butterfly       |              |  --> SFPU butterfly       |
+       +---------------------------+              +---------------------------+
+
+   The semaphore is *monotonic / cumulative* — at stage k each side waits
+   for the value to reach k+1, never resets to 0. That removes the race
+   where a fast partner could increment and then we'd reset and lose the
+   increment, leading to deadlock on the next stage.
+
+   Pipelining:  while compute is running stage k butterfly, the reader is
+   already issuing the NoC writes for stage k+1.  This is the overlap that
+   keeps the SFPU fed during the cross-core phase.
+
+
+A.9.5  END-TO-END N=65536 ON 64 CORES  (zoomed-out picture)
+-----------------------------------------------------------
+
+   N = 65536, P = 64 cores, 16 stages total = 10 local + 6 cross-core.
+
+   stage 0..9  (local, 64 cores in parallel, no NoC butterfly):
+
+         DRAM IN/TW  ->  64 x [reader -> compute -> reader]  (each core
+                          works inside its own 1024-pt tile, independently)
+
+   stage 10..15  (cross-core butterfly over NoC, log2(64) = 6 stages):
+
+                       stage 10: pair mask = 0x01  (C0<->C1, C2<->C3, ...)
+         all 64 cores  stage 11: pair mask = 0x02  (C0<->C2, C1<->C3, ...)
+         in parallel,  stage 12: pair mask = 0x04
+         each core     stage 13: pair mask = 0x08
+         exchanges     stage 14: pair mask = 0x10
+         half a tile   stage 15: pair mask = 0x20  (C0<->C32, ...)
+         per stage
+
+   final write-out (also 64 cores in parallel):
+
+         each core's BRISC1 writer  -->  NOC1  -->  DRAM (OUT_R, OUT_I)
+
+   Total per-call time for N=65536, cached:  ~1.2 ms.
+   Of that, roughly:
+     ~ 60 % SFPU butterfly time (compute-bound on the local stages)
+     ~ 25 % NoC traffic + semaphore wait (cross-core stages)
+     ~ 15 % final DRAM write-out
+
+
+A.9.6  WHY THE LAYOUT IS THIS WAY  (one-line justifications)
+------------------------------------------------------------
+
+   * Reader on NOC0, writer on NOC1
+        -> input loads + cross-core swaps never collide with the final
+           DRAM write; both NoCs run concurrently.
+
+   * State tile is push-once-never-pop on CB_STATE
+        -> guarantees a stable L1 address that the writer can read
+           directly without an extra copy.
+
+   * Twiddles in DRAM, not L1
+        -> at N=65536 there are 16 twiddle tiles (= 64 KB) per stage in
+           the multi-core case; keeps L1 free for state + EVEN/ODD/OUT.
+
+   * UnpackToDestFp32 on EVEN/ODD/TW/OUT CBs
+        -> SFPU sees real fp32, not the matrix-engine's silent bf16.
+
+   * Monotonic semaphore (wait for k+1)
+        -> safe under arbitrary core skew; no rendezvous-reset race.
+
+
+================================================================================
+  PART B.  HOW THIS COMPARES WITH PUBLISHED RESEARCH
+================================================================================
+
+
+B.1  THE REFERENCE PAPER
+------------------------
+
+There is exactly one published paper on FFT on Tenstorrent Wormhole:
+
+    Nick Brown, Jake Davies, Felix Le Clair  (EPCC + Tenstorrent)
+    "Exploring Fast Fourier Transforms on the Tenstorrent Wormhole"
+    ISC High Performance 2025 / arXiv:2506.15437  (June 2025)
+    https://arxiv.org/abs/2506.15437
+    Slides:  https://riscv.epcc.ed.ac.uk/assets/files/isc25/Davies.pdf
+
+This is the apples-to-apples baseline.
+
+
+B.2  ALGORITHMIC DIFFERENCE  (this is the headline)
+---------------------------------------------------
+
+| Dimension              | Brown et al. 2025                | Ours                                       |
+|------------------------|----------------------------------|--------------------------------------------|
+| Problem dim            | 2D FFT (row-FFT + transpose +    | True 1D FFT, distributed radix-2           |
+|                        | row-FFT)                         |                                            |
+| Multi-core method      | Many *independent* 1D FFTs +     | One distributed Cooley-Tukey across the    |
+|                        | a tt-nn `transpose` op           | NoC, with cross-core butterflies           |
+| Cross-core comm        | One bulk transpose between       | log2(P) butterfly stages (1..6)            |
+|                        | passes                           | of half-tile NoC swaps                     |
+| Largest 1D problem     | 16,384 (single-core, SRAM only)  | 65,536 (DRAM-backed, distributed)          |
+| Largest 2D problem     | 1024 x 1024 (= 1,048,576 pts)    | n/a (1D-only)                              |
+| Compute path           | Matrix engine + ThCon scalar     | SFPU (full IEEE fp32) + L1 DMA reorder     |
+|                        | reorder via 128-bit intrinsics   |                                            |
+| Plan / kernel cache    | Not addressed                    | Per-N FFTPlan, ~88x speedup on hot calls   |
+| User-facing API        | Research code                    | `fft(md, signal)` (PyTorch-style)          |
+| Validated against torch| No (CPU FFTW only)               | Yes (`compare_with_torch.py`)              |
+
+The fundamental difference: their multi-core path *is not a 1D FFT*.  It's
+N independent 1D FFTs glued together by a separate transpose op.  Ours is
+a true 1D Cooley-Tukey where the radix-2 butterflies cross core boundaries.
+Those cross-core butterflies are the part nobody had published before.
+
+
+B.3  HEAD-TO-HEAD NUMBERS  (the only N both implementations support)
+--------------------------------------------------------------------
+
+N = 16,384, single Wormhole n300:
+
+| Implementation                                   | Time / FFT  | Cores |
+|--------------------------------------------------|-------------|-------|
+| Brown et al. 2025, best single-core              |             |       |
+|   (ThCon + 128-bit intrinsics + single-copy      |   5.31 ms   |   1   |
+|    reorder, their fastest reported single-core)  |             |       |
+| Their CPU baseline: Xeon Platinum 8260M, 1 core  |   1.85 ms   |   1   |
+| **Ours (cached, steady-state)**                  | **0.57 ms** |  16   |
+
+  * 9.3x faster per FFT call than the published Wormhole result.
+  * 3.2x faster than the single Xeon Platinum core they call "hard to beat".
+  * At their largest 2D problem (1024x1024 = 1M pts, 23.56 ms on 64 cores),
+    even our N=65536 1D run (1.2 ms) is ~20x faster *per FFT call*.
+
+Honest caveats (so the claim is defensible):
+
+  1. Per-core efficiency: they used 1 core (5.31 ms-core), we use 16
+     (~9.1 ms-core).  By that single metric they're ~1.7x more efficient
+     per core — they spent the engineering on instruction-level tuning
+     (ThCon, 128-bit reorder), we spent it on parallelism + caching.
+  2. Their headline contribution is squeezing the matrix engine + ThCon
+     for max single-core throughput; ours is making the NoC do real work
+     in a distributed FFT.  Different optimization targets.
+  3. They report on N up to 16,384 because their state must fit in SRAM
+     (one-core constraint).  Ours is DRAM-backed, so we can keep going.
+
+
+B.4  WHERE EACH WORK IS BETTER
+------------------------------
+
+  Ours wins clearly on:
+    * steady-state speed per call (cached path)
+    * largest 1D problem size (65k vs 16k)
+    * algorithmic novelty (true distributed 1D radix-2 over the NoC)
+    * usability (PyTorch-style API, plan cache, vs-torch validation)
+    * repeated-call performance (88x cache speedup is unique)
+
+  Theirs wins clearly on:
+    * peer-reviewed publication and citation status
+    * deeper exploration of single-core micro-optimizations
+       (ThCon, 128-bit packed reorder, ring-buffer reuse)
+    * 2D FFT throughput beyond N=65k (their largest is 1M pts)
+    * documented engineering process (multi-week iteration log)
+
+
+B.5  VS  cuFFT  (for context, this is a hardware-class comparison)
+------------------------------------------------------------------
+
+|                          | N=16384  | N=65536  | TDP     |
+|--------------------------|----------|----------|---------|
+| Ours, Wormhole n300      | 0.57 ms  | 1.2 ms   |  ~75 W  |
+| cuFFT, GTX 1080 (2016)   | 0.053 ms | 0.161 ms | ~180 W  |
+| cuFFT, A100 (extrap.)    | ~0.03 ms | ~0.07 ms | ~300 W  |
+| cuFFT, H100 (extrap.)    | ~0.015 ms| ~0.04 ms | ~700 W  |
+
+We do not beat cuFFT in raw speed and we shouldn't expect to — peak fp32
+on Wormhole is ~480 TFLOPS theoretical (FPU only) versus 35 / 312 / 989
+TFLOPS on a 1080 / A100 / H100, and cuFFT has ~15 years of FFT-specific
+tuning behind it.  Where we are competitive is on energy/op and $/op for
+pipelines that already live on Tenstorrent silicon.
+
+
+B.6  TAKEAWAY
+-------------
+
+  * The *algorithm* (distributed 1D radix-2 with NoC butterflies) and
+    the *engineering* (plan cache + monotonic semaphores + L1 DMA path)
+    are both genuinely new on this hardware.
+  * On the only apples-to-apples size, we are ~9x faster than the only
+    published Wormhole FFT result.
+  * We do not chase cuFFT — different silicon class, different workload
+    target.

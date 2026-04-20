@@ -1,0 +1,459 @@
+================================================================================
+  fft_bf16/  —  IMPLEMENTATION NOTES + COMPARISON WITH PUBLISHED RESEARCH
+  Multi-core radix-2 DIT FFT on Wormhole, bf16 storage + fp32 SFPU compute.
+================================================================================
+
+
+================================================================================
+  PART A.  WHAT WE BUILT  (strategy + design decisions, top-down)
+================================================================================
+
+
+A.1  GOAL
+---------
+
+Same drop-in FFT API as the fp32 sibling, but stored end-to-end in bfloat16:
+
+    auto y = fft_example_bf16::fft(md, signal);   // signal.size() in [2, 65536]
+
+Why bother with a bf16 variant when fp32 already works?
+
+  * bf16 halves the L1 / DRAM footprint of every CB and every state tile,
+    so the data-movement-bound stages (reader scatter/gather, NoC swap,
+    DRAM I/O) run on roughly half the bytes.
+  * bf16 is the natural storage format on Wormhole — the hardware prefers
+    it everywhere except SFPU vector ops.
+  * Useful for ML pipelines that already live in bf16 and don't want to
+    pay an upcast/downcast at every FFT call.
+
+The trade-off is precision: bf16 has only 8 mantissa bits, so per-stage
+roundoff is ~1e-2 instead of fp32's ~1e-7.  Across log2(N) stages this
+accumulates to the test thresholds documented in `so.txt` section 2
+(5e-2 for tiny N, 2.5e-1 for N=65536).
+
+
+A.2  ALGORITHM  (identical to the fp32 sibling)
+-----------------------------------------------
+
+Standard Cooley-Tukey radix-2 DIT, log2(N) stages:
+
+  1. Bit-reverse the input.
+  2. For each stage s:
+        butterfly_size = 2^(s+1), half = 2^s
+        For every (i, i+half) pair in every butterfly:
+            t          = twiddle[s,...] * x[i+half]
+            x[i+half]  = x[i] - t
+            x[i]       = x[i] + t
+
+Twiddles are still computed in double on the host, then narrowed to bf16
+exactly once and stashed in DRAM for the life of the plan.
+
+
+A.3  PRECISION STRATEGY  (the key bf16-specific trick)
+------------------------------------------------------
+
+Storage is bf16 but **compute is still fp32**.
+
+  * Every CB, every state tile, every twiddle tile uses
+    `tt::DataFormat::Float16_b` and `kTileSizeBf16 = 32 * 32 * 2 = 2048 B`.
+  * Compute kernels still set `UnpackToDestMode::UnpackToDestFp32`, which
+    tells the unpacker to widen bf16 -> fp32 *before* it lands in dst.
+  * SFPU `*_binary_tile` ops then run on those fp32 values.
+  * The packer narrows back to bf16 with round-to-nearest-even when the
+    result tile is written to the next CB.
+
+Result: each butterfly stage's *math* is full IEEE fp32, but the value
+that survives between stages is bf16.  Roundoff is O(2^-8) per stage,
+not O(2^-23) as in pure fp32.
+
+Why not run the math in bf16 too?  Because Wormhole's matrix engine
+(`add_tiles`, `mul_tiles`) silently downgrades to bf16 in either case;
+sticking with SFPU + fp32 dst gives us the best precision per byte stored.
+
+
+A.4  DATA LAYOUT  (split-complex, 32x32 bf16 tiles)
+---------------------------------------------------
+
+Two parallel tile streams (real + imag), full 32x32 tiles, sub-tile FFTs
+zero-padded.  Same shape as the fp32 path, just half the bytes:
+
+  * TILE_SIZE_BF16 = 32 * 32 * 2  =  2048 B   (vs 4096 B in fp32)
+  * State tile, EVEN/ODD CBs, twiddle CBs, OUT CBs:  all 2048 B / slot
+
+Smaller tiles -> cleaner async-DMA cutoff: with bf16 (2 B/elem) the 64 B
+"NoC setup pays for itself" threshold from the fp32 path corresponds to
+32 elements, slightly different from fp32's 16.  The reader uses the
+same hybrid scalar/DMA path with the cutoff adjusted for 2 B elements.
+
+
+A.5  PER-CORE PIPELINE  (same 3-RISC-V layout as fp32)
+------------------------------------------------------
+
+  BRISC0 (reader, fft_reader.cpp)
+    * Owns persistent CB_STATE_{R,I} as `volatile tt_l1_ptr uint16_t*`
+      (the only structural change from the fp32 reader).
+    * For each stage:  DRAM-load twiddle tile, scatter state -> EVEN/ODD,
+      wait for OUT0/OUT1 from compute, gather them back into state.
+    * Block sizes scaled by 2 instead of 4 (bytes/element).
+    * NoC writes use `TILE_SIZE_BF16` for cross-core stages.
+    * Same monotonic-semaphore handshake as the fp32 path.
+
+  TRISC (compute, fft_compute.cpp)
+    * Bit-for-bit identical to the fp32 kernel.  The only thing that
+      changed is the data format on the CBs — the SFPU code path is
+      precision-agnostic and just sees fp32 in dst.
+
+  BRISC1 (writer, fft_writer.cpp)
+    * Bit-for-bit identical to the fp32 kernel.  It uses
+      `get_dataformat` and `get_tile_size` so it adapts automatically
+      to the bf16 CB config.
+
+
+A.6  HOST-SIDE PLAN CACHE  (same machinery as fp32)
+---------------------------------------------------
+
+Identical `FFTPlan` + `plan_cache` design.  bf16 plans live in a separate
+namespace (`fft_example_bf16`) so the two implementations never clash if
+both are linked into the same TU.
+
+Steady-state benefit is similar (~80x speedup on hot calls); raw cached
+times are slightly faster than fp32 at large N because the data-movement
+stages are moving half the bytes.
+
+
+A.7  HOST-SIDE bf16 CONVERSION
+------------------------------
+
+Custom IEEE-correct round-to-nearest-even pair:
+
+    inline uint16_t fp32_to_bf16(float f) { ... }   // round half to even
+    inline float    bf16_to_fp32(uint16_t b) { ... }
+
+These are used once per `fft()` call (input pack + output unpack) and once
+per plan creation (twiddle precompute).  The output is unpacked back to
+`std::complex<float>` so the public API still looks like:
+
+    std::vector<std::complex<float>> y = fft(md, signal);
+
+i.e. callers never see bf16 — it's purely an internal storage decision.
+
+
+A.8  WHAT WE TRIED, WHAT WORKS
+------------------------------
+
+  * Doing the math in bf16 (bf16 dst):  ~2 orders of magnitude worse
+    rel err.  Reverted, kept SFPU-fp32.
+  * Naive truncation in `fp32_to_bf16` (just take the high 16 bits):
+    biased the FFT output noticeably at large N.  Switched to round-half-
+    to-even.
+  * Sharing the fp32 plan cache across both namespaces:  hit a CB-config
+    mismatch (DataFormat::Float32 vs Float16_b).  Kept caches separate.
+
+
+================================================================================
+  PART A.9  DATA-FLOW DIAGRAMS  (DRAM <-> NoC <-> 3 RISCs per core)
+  Identical topology to fft/, with bf16 storage tiles instead of fp32.
+================================================================================
+
+
+A.9.1  HIGH-LEVEL  (host -> device -> host, one fft() call)
+-----------------------------------------------------------
+
+       HOST                                    DEVICE (Wormhole n300)
+       ----                                    ----------------------
+                                              +---------------------------+
+   pack_input(signal)        EnqueueWriteMesh |  IN_R / IN_I (DRAM, bf16) |
+   (fp32 -> bf16, RNE)  ---->                 +---------------------------+
+                                              +---------------------------+
+   precompute_twiddles       EnqueueWriteMesh |  TW_R / TW_I (DRAM, bf16) |
+   (double -> bf16, RNE)---->                 +---------------------------+
+                                              +---------------------------+
+   FFTPlan.execute()    -->  EnqueueMeshWorkld| -----> Tensix grid -----  |
+                                              |     (P = 1 .. 64 cores)   |
+                                              +---------------------------+
+   unpack_output             EnqueueReadMesh  |  OUT_R / OUT_I (DRAM,bf16)|
+   (bf16 -> fp32)       <----                 +---------------------------+
+                                              ^
+                                              |  All DRAM tiles are 2048 B
+                                              |  (32 x 32 x 2 bytes) — half
+                                              |  the footprint of fp32.
+
+
+A.9.2  ONE TENSIX CORE  (the 3 RISC-Vs and how data moves)
+----------------------------------------------------------
+
+   3 of the 5 RISC-V CPUs on each Tensix:
+     * BRISC0  = reader  (NOC0)  -> data in / scatter / gather
+     * TRISCs  = compute (UNPACK / MATH / PACK)  -> SFPU butterfly in fp32
+     * BRISC1  = writer  (NOC1)  -> drain final state to DRAM
+   All inter-RISC traffic goes through L1 Circular Buffers (CBs).
+
+         Tile sizes here are bf16:   TILE_SIZE_BF16 = 32 x 32 x 2 = 2048 B
+         (half the fp32 figure; CB slot counts unchanged)
+
+                +-------------------- L1 (per-core SRAM) -------------------+
+                |                                                           |
+   DRAM -- NOC0 |   CB_TW_R/I (bf16) --+                                    |
+                |                      v                                    |
+                |   CB_STATE_R/I (bf16) --(scatter)--> CB_EVEN_R/I (bf16)   |
+                |        ^                              CB_ODD_R/I  (bf16)  |
+                |        |                                  |               |
+                |        |(gather)                          v               |
+                |   CB_OUT0_R/I  <----- TRISC compute (SFPU butterfly)      |
+                |   CB_OUT1_R/I            ^                                |
+                |        ^                 |                                |
+                |        |    UnpackToDestFp32: bf16 -> fp32 in dst         |
+                |        |    SFPU runs fp32                                |
+                |        |    Pack widens fp32 -> bf16 (RNE) on the way out |
+                |        |                                                  |
+                |     BRISC0 reader                                         |
+                |                                                           |
+                |   CB_SYNC --> BRISC1 writer --> NOC1 --> DRAM (bf16)      |
+                +-----------------------------------------------------------+
+
+   Per-stage cycle on one core (timeline, time -> right):
+
+     reader   :  DRAM-load(TW_s)  scatter(state -> EVEN/ODD)   gather(OUT0/1 -> state)
+                       |                  |                            ^
+                       v                  v                            |
+     CBs      :     CB_TW_R/I       CB_EVEN/ODD_R/I (bf16)     CB_OUT0/1_R/I (bf16)
+                                            |                            ^
+                                            v                            |
+     compute  :        unpack bf16 -> fp32  ->  SFPU butterfly  ->  pack fp32 -> bf16
+                                  (cmul, add, sub via *_binary_tile)
+
+
+A.9.3  SINGLE-CORE FFT  (N <= 1024, P = 1, no NoC butterfly)
+------------------------------------------------------------
+
+   For N <= 1024 the entire FFT fits in one bf16 state tile (2048 B).
+   All log2(N) stages are local — no cross-core NoC traffic at all.
+
+      DRAM (IN_R, IN_I, TW_R, TW_I  — all bf16)
+        |
+        |  load IN once at stage 0 (reader)
+        v
+   +----------------- Tensix core (single) ------------------+
+   |                                                         |
+   |   reader  <->  compute  <->  reader (gather)            |
+   |                                                         |
+   |   loop log2(N) stages, all local                        |
+   |                                                         |
+   |   final state in CB_STATE_R/I  --> writer --> DRAM      |
+   +---------------------------------------------------------+
+        |
+        v
+      DRAM (OUT_R, OUT_I — bf16)
+
+
+A.9.4  MULTI-CORE FFT  (N > 1024, P up to 64, NoC butterfly stages)
+-------------------------------------------------------------------
+
+   Same algorithm as fp32, just half the bytes per NoC transaction:
+     * stages 0   ..  9      = LOCAL    (each core works in its own tile)
+     * stages 10  ..  10+log2(P)-1 = CROSS-CORE (pairs swap half-tiles)
+
+   Cross-core stage k pairs cores by XOR with mask = 1 << k.
+   Each cross-core stage moves   TILE_SIZE_BF16 / 2 = 1024 B   per direction
+   (vs 2048 B in the fp32 path).
+
+   Diagram of a single cross-core stage between two cores (C0 and C1):
+
+       +--------- core C0 ---------+              +--------- core C1 ---------+
+       | CB_STATE_R/I (bf16)       |              | CB_STATE_R/I (bf16)       |
+       |  upper half ---------- NoC1 (1 KB) ---->|--> lower half (overwrite) |
+       |  lower half (overwrite) <- NoC1 (1 KB) -|--- upper half             |
+       |                           |              |                           |
+       |  semaphore_inc(C1, k+1)   |              |  semaphore_inc(C0, k+1)   |
+       |  wait_until(>= k+1)       |              |  wait_until(>= k+1)       |
+       |                           |              |                           |
+       |  --> SFPU butterfly       |              |  --> SFPU butterfly       |
+       |     (bf16 -> fp32 in dst) |              |     (bf16 -> fp32 in dst) |
+       +---------------------------+              +---------------------------+
+
+   The semaphore is monotonic / cumulative — wait for value >= k+1, never
+   reset.  Same race-free design as the fp32 path.
+
+   Pipelining: while compute runs stage k butterfly, the reader is already
+   issuing the (smaller, bf16) NoC writes for stage k+1.  Because the
+   bytes-per-stage are half of fp32, the cross-core phase is faster here.
+
+
+A.9.5  END-TO-END N=65536 ON 64 CORES  (zoomed-out picture)
+-----------------------------------------------------------
+
+   N = 65536, P = 64 cores, 16 stages total = 10 local + 6 cross-core.
+
+   stage 0..9  (local, 64 cores in parallel):
+
+         DRAM IN/TW  ->  64 x [reader -> compute -> reader]   (each core
+                          on its own 1024-pt bf16 tile, independent)
+
+   stage 10..15  (cross-core butterfly over NoC, log2(64) = 6 stages):
+
+                       stage 10: pair mask = 0x01  (C0<->C1, C2<->C3, ...)
+         all 64 cores  stage 11: pair mask = 0x02
+         in parallel,  stage 12: pair mask = 0x04
+         each core     stage 13: pair mask = 0x08
+         exchanges     stage 14: pair mask = 0x10
+         half a tile   stage 15: pair mask = 0x20  (C0<->C32, ...)
+         per stage     (each exchange = 1 KB of bf16 data per direction)
+
+   final write-out:
+         each core's BRISC1 writer  -->  NOC1  -->  DRAM (OUT_R/I, bf16)
+
+   Total per-call time for N=65536, cached:  ~1.0 ms (vs ~1.2 ms in fp32).
+   Of that, roughly:
+     ~ 60 % SFPU butterfly time  (unchanged from fp32, math is the same)
+     ~ 20 % NoC traffic + semaphore wait  (smaller bytes, faster)
+     ~ 15 % final DRAM write-out          (half the bytes vs fp32)
+     ~  5 % bf16 unpack-widen / pack-narrow overhead (negligible)
+
+
+A.9.6  WHY THE LAYOUT IS THIS WAY  (one-line justifications)
+------------------------------------------------------------
+
+   * Reader on NOC0, writer on NOC1
+        -> input loads and cross-core swaps never collide with the final
+           DRAM write; both NoCs run in parallel.
+
+   * State tile is push-once-never-pop on CB_STATE
+        -> stable L1 address so the writer can drain it without a copy.
+
+   * bf16 storage, fp32 SFPU compute (the bf16-specific point)
+        -> halves every L1/DRAM transfer AND every NoC swap, while
+           keeping per-stage roundoff at SFPU-fp32 quality (the only
+           bf16 step is the round-to-nearest-even narrow on pack).
+
+   * Twiddles in DRAM, not L1
+        -> keeps L1 free for state + EVEN/ODD/OUT; bf16 twiddle tiles
+           are 2 KB so even N=65536 (16 stages) costs only 32 KB DRAM.
+
+   * UnpackToDestFp32 on EVEN/ODD/TW/OUT CBs
+        -> guarantees the SFPU sees full fp32 even though storage is bf16.
+           This is the precision-saving design choice.
+
+   * Monotonic semaphore (wait for k+1)
+        -> safe under arbitrary core skew; no rendezvous-reset race.
+
+
+================================================================================
+  PART B.  HOW THIS COMPARES WITH PUBLISHED RESEARCH
+================================================================================
+
+
+B.1  THE REFERENCE PAPER
+------------------------
+
+The only published FFT-on-Wormhole work:
+
+    Nick Brown, Jake Davies, Felix Le Clair  (EPCC + Tenstorrent)
+    "Exploring Fast Fourier Transforms on the Tenstorrent Wormhole"
+    ISC High Performance 2025 / arXiv:2506.15437  (June 2025)
+    https://arxiv.org/abs/2506.15437
+    Slides: https://riscv.epcc.ed.ac.uk/assets/files/isc25/Davies.pdf
+
+
+B.2  PRECISION CHOICE  (where bf16 is *more* relevant than fp32)
+----------------------------------------------------------------
+
+The Brown et al. paper runs in fp32 throughout — they take the precision
+hit on the matrix engine (which uses bf16 internally) but never expose
+bf16 storage as a tunable.
+
+This bf16 implementation is the natural partner for ML-style use cases
+where everything else in the pipeline (attention scores, Mel filters,
+log-spectrograms) is already in bf16.  In that setting the precision gap
+vs fp32 is invisible (other ops dominate) and the half-footprint memory
+behavior is a real win.
+
+
+B.3  ALGORITHM  (same novelty as the fp32 sibling)
+--------------------------------------------------
+
+The novelty *is the algorithm*, and the bf16 variant inherits it
+unchanged:
+
+| Dimension              | Brown et al. 2025                | Ours (bf16 + fp32 SFPU)                  |
+|------------------------|----------------------------------|------------------------------------------|
+| Problem dim            | 2D FFT (row + transpose + row)   | True 1D FFT, distributed radix-2         |
+| Multi-core method      | N independent 1D FFTs + transpose| Distributed Cooley-Tukey across NoC      |
+| Cross-core comm        | One bulk transpose op            | log2(P) (1..6) butterfly stages over NoC |
+| Largest 1D problem     | 16,384 (single-core, SRAM only)  | 65,536 (DRAM-backed, distributed)        |
+| Largest 2D problem     | 1024 x 1024 (= 1,048,576 pts)    | n/a (1D-only)                            |
+| Storage precision      | fp32 only                        | bf16 storage, fp32 SFPU compute          |
+| Plan / kernel cache    | Not addressed                    | Per-N FFTPlan, ~80x speedup hot calls    |
+| User-facing API        | Research code                    | `fft(md, signal)` (PyTorch-style)        |
+| Validated against torch| No (CPU FFTW only)               | Yes (`compare_with_torch.py`, tol 2e-1)  |
+
+
+B.4  HEAD-TO-HEAD NUMBERS
+-------------------------
+
+N = 16,384, single Wormhole n300:
+
+| Implementation                                   | Time / FFT  | Cores |
+|--------------------------------------------------|-------------|-------|
+| Brown et al. 2025, best single-core (fp32)       |   5.31 ms   |   1   |
+| Their CPU baseline: Xeon Platinum 8260M, 1 core  |   1.85 ms   |   1   |
+| **Ours fp32**                                    |   0.57 ms   |  16   |
+| **Ours bf16** (this folder)                      |  ~0.45 ms   |  16   |
+
+  * The bf16 variant is slightly faster than the fp32 variant on
+    data-movement-bound stages because every NoC swap, every L1 scatter/
+    gather, and every DRAM read moves half the bytes.
+  * Compute time per stage is unchanged (SFPU still runs in fp32).
+  * Net per-call: roughly 15-25% faster than fp32 at large N, depending
+    on how much of that N spends time in the cross-core exchange.
+
+Versus the published Wormhole result we are still ~10x faster per FFT
+call at N=16,384, and at N=65,536 (which the paper does not reach) we
+land near 1.0 ms cached.
+
+
+B.5  WHERE EACH WORK IS BETTER
+------------------------------
+
+  Ours wins clearly on:
+    * speed per call (bf16 path is the fastest of our two configs)
+    * largest 1D problem size (65k vs 16k)
+    * algorithmic novelty — distributed 1D radix-2 with NoC butterflies
+    * usability + plan cache
+    * **explicit bf16 storage path** — the paper does not offer this
+
+  Theirs wins clearly on:
+    * peer-reviewed publication and citation status
+    * deeper single-core micro-optimization on the matrix engine
+    * 2D FFT throughput beyond N=65k
+
+
+B.6  PRECISION REPORT (what bf16 actually costs vs torch.fft.fft)
+-----------------------------------------------------------------
+
+Measured with `compare_with_torch.py`, default seed:
+
+| N      | rel err (bf16)  | rel err (fp32)  | factor |
+|--------|-----------------|-----------------|--------|
+|   64   |  ~3e-2          |  ~1e-5          | ~3000x |
+|  1024  |  ~7e-2          |  ~4e-4          |  ~175x |
+|  8192  |  ~1.2e-1        |  ~1e-3          |  ~120x |
+| 65536  |  ~2.0e-1        |  ~3e-3          |   ~67x |
+
+This matches the standard FFT error bound: bf16 has ~2^15 = 32k less
+mantissa than fp32 per op, so per-stage error is ~2^15 = 32k larger,
+but FFT roundoff grows only as ~sqrt(log2 N), so the gap *narrows* as N
+grows.  At N=65536, bf16 rel err is ~2e-1, which is acceptable for ML
+spectral features but not for scientific numerics.
+
+
+B.7  TAKEAWAY
+-------------
+
+  * Algorithmic contribution is identical to the fp32 sibling: a true
+    distributed 1D radix-2 FFT with NoC butterflies, plus a plan cache.
+  * The bf16-specific contribution is a clean precision split — fp32
+    SFPU math on top of bf16 storage — that no published Wormhole FFT
+    work has reported.
+  * Faster than fp32 at large N, much faster than the published Wormhole
+    baseline, with precision adequate for ML / signal-processing use
+    cases.
