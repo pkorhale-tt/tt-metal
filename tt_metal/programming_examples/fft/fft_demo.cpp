@@ -52,20 +52,61 @@ int main() {
         print_spectrum("FFT of [10, 20, 30, 40]", spectrum);
     }
 
-    // ── Example 2: complex input ─────────────────────────────────────────
+    // ── Example 2: complex input — positive-frequency rotating phasor ────
     //
+    //   x[n] = j^n = exp(+2*pi*i * 1 * n / 4),  pure frequency +1
     //   torch.fft.fft(torch.tensor([1+0j, 0+1j, -1+0j, 0-1j]))
-    //     =>  tensor([0.+0.j, 0.+0.j, 0.+0.j, 4.+0.j])    (a pure +1 bin)
+    //     =>  tensor([0.+0.j, 4.+0.j, 0.+0.j, 0.+0.j])    (energy at bin 1)
     {
         std::vector<Complex> signal = {
             { 1.0f,  0.0f},
             { 0.0f,  1.0f},
             {-1.0f,  0.0f},
             { 0.0f, -1.0f},
-            { 0.0f, -1.0f}
+            { 1.0f,  0.0f},
+            { 0.0f,  1.0f},
+            {-1.0f,  0.0f},
+            { 0.0f, -1.0f},
         };
         auto spectrum = fft(md, signal);
-        print_spectrum("FFT of [1, j, -1, -j]  (rotating phasor)", spectrum);
+        print_spectrum("FFT of [1, j, -1, -j]  (phasor at +1, expect X[1]=4)",
+                       spectrum);
+    }
+
+    // ── Example 2b: complex input — negative-frequency rotating phasor ───
+    //
+    //   x[n] = (-j)^n = exp(-2*pi*i * 1 * n / 4),  pure frequency -1
+    //   torch.fft.fft(torch.tensor([1+0j, 0-1j, -1+0j, 0+1j]))
+    //     =>  tensor([0.+0.j, 0.+0.j, 0.+0.j, 4.+0.j])    (energy at bin N-1)
+    //
+    // Together with Example 2 this proves the FFT correctly distinguishes
+    // positive and negative frequencies (no spectral folding).
+    {
+        std::vector<Complex> signal = {
+            { 1.0f,  0.0f},
+            { 0.0f, -1.0f},
+            {-1.0f,  0.0f},
+            { 0.0f,  1.0f},
+        };
+        auto spectrum = fft(md, signal);
+        print_spectrum("FFT of [1, -j, -1, j]  (phasor at -1, expect X[3]=4)",
+                       spectrum);
+    }
+
+    // ── Example 2c: longer rotating phasor at N=8 ────────────────────────
+    //
+    //   x[n] = exp(+2*pi*i * 2 * n / 8),  pure frequency +2
+    //   Expect a single nonzero bin at k=2 with value 8, all others 0.
+    {
+        constexpr uint32_t N = 8;
+        std::vector<Complex> signal(N);
+        for (uint32_t n = 0; n < N; ++n) {
+            const float theta = 2.0f * M_PIf * 2.0f *
+                                static_cast<float>(n) / static_cast<float>(N);
+            signal[n] = { std::cos(theta), std::sin(theta) };
+        }
+        auto spectrum = fft(md, signal);
+        print_spectrum("FFT of phasor at +2  (N=8, expect X[2]=8)", spectrum);
     }
 
     // ── Example 3: 8-point cosine ────────────────────────────────────────
