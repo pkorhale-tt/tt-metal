@@ -62,6 +62,7 @@ int main() {
             { 0.0f,  1.0f},
             {-1.0f,  0.0f},
             { 0.0f, -1.0f},
+            { 0.0f, -1.0f}
         };
         auto spectrum = fft(md, signal);
         print_spectrum("FFT of [1, j, -1, -j]  (rotating phasor)", spectrum);
