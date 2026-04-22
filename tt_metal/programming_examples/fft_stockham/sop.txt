@@ -1,0 +1,139 @@
+================================================================================
+  fft_stockham/ — Standard Operating Procedure (SOP)
+  Multi-pass Stockham FFT extension; supports N > 65,536 (MVP up to ~1M).
+================================================================================
+
+This file is the run-book. Every command below assumes you are at the repo
+root (`/proj_sw/user_dev/<user>/...` on a typical Wormhole dev box) and that
+your build directory is `./build`.
+
+--------------------------------------------------------------------------------
+0. ONE-TIME ENVIRONMENT SETUP
+--------------------------------------------------------------------------------
+
+  source python_env/bin/activate
+  export TT_METAL_HOME=$PWD
+  export ARCH_NAME=wormhole_b0       # or whatever your card is
+
+--------------------------------------------------------------------------------
+1. BUILD
+--------------------------------------------------------------------------------
+
+  cmake --build build --target metal_example_fft_stockham_test       -j
+  cmake --build build --target metal_example_fft_stockham_benchmark  -j
+  cmake --build build --target metal_example_fft_stockham_demo       -j
+
+(or, if you use ninja directly:)
+
+  ninja -C build metal_example_fft_stockham_test
+  ninja -C build metal_example_fft_stockham_benchmark
+  ninja -C build metal_example_fft_stockham_demo
+
+--------------------------------------------------------------------------------
+2. CORRECTNESS TEST
+--------------------------------------------------------------------------------
+
+Runs the orchestrator at sizes that exercise both the fall-through path
+(N <= 65,536) and the Stockham path (N > 65,536), comparing against a
+double-precision iterative radix-2 reference.
+
+  ./build/programming_examples/fft_stockham/metal_example_fft_stockham_test
+
+Sample expected output:
+
+  [PASS] N=1024     | abs=... rel=... | device=... ms  ref=... ms  random N=1024     (fall-through)
+  [PASS] N=16384    | abs=... rel=... | ...                          random N=16384    (fall-through)
+  [PASS] N=65536    | abs=... rel=... | ...                          impulse N=65536   (fall-through)
+  [PASS] N=131072   | abs=... rel=... | ...                          impulse N=131072  (N1=512  x N2=256)
+  [PASS] N=131072   | abs=... rel=... | ...                          DC      N=131072
+  [PASS] N=131072   | abs=... rel=... | ...                          random  N=131072
+  [PASS] N=262144   | abs=... rel=... | ...                          random  N=262144  (N1=512  x N2=512)
+  [PASS] N=524288   | abs=... rel=... | ...                          random  N=524288  (N1=1024 x N2=512)
+  [PASS] N=1048576  | abs=... rel=... | ...                          random  N=1048576 (N1=1024 x N2=1024)
+
+Pass criterion: relative error < 2e-3 for N <= 65,536, < 5e-3 for the
+Stockham path (two passes of fp32 + per-element fp32 twiddles, so a
+slightly looser budget).
+
+--------------------------------------------------------------------------------
+3. BENCHMARK (cached vs cold latency)
+--------------------------------------------------------------------------------
+
+  # default: N=131072, 100 iterations
+  ./build/programming_examples/fft_stockham/metal_example_fft_stockham_benchmark
+
+  # custom N and iteration count
+  ./build/programming_examples/fft_stockham/metal_example_fft_stockham_benchmark 1048576 50
+  ./build/programming_examples/fft_stockham/metal_example_fft_stockham_benchmark 262144  100
+
+Iter 0 includes the inner kernel's plan build + JIT for both N1 and N2 sub-FFTs.
+Iters 1..N-1 hit the inner plan cache; this is the steady-state latency.
+
+The reported "Cached avg" is the number you should compare across runs and
+against cuFFT / Brown et al.
+
+--------------------------------------------------------------------------------
+4. ONE-SHOT DEMO
+--------------------------------------------------------------------------------
+
+  ./build/programming_examples/fft_stockham/metal_example_fft_stockham_demo
+
+Runs a single FFT on a clean test tone (N=131,072, frequency bin 5) and
+prints the top output bins. Expected result: a single magnitude-N spike
+at bin 5 and near-zero everywhere else.
+
+--------------------------------------------------------------------------------
+5. CALLING THE STOCKHAM FFT FROM YOUR OWN CODE
+--------------------------------------------------------------------------------
+
+  #include "tt_metal/programming_examples/fft_stockham/fft_stockham_host.cpp"
+
+  using namespace tt::tt_metal::distributed;
+  using Complex = std::complex<float>;
+
+  auto md = MeshDevice::create_unit_mesh(0);
+
+  std::vector<Complex> signal = ...;            // power-of-two length
+  std::vector<Complex> X = fft_stockham::fft(md, signal);
+
+  // For N <= 65,536 this short-circuits to fft_example::fft (no overhead).
+  // For N >  65,536 it runs four passes: row-FFT -> twiddle+transpose ->
+  // row-FFT -> reorder.
+
+--------------------------------------------------------------------------------
+6. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+* "FFT requires N to be a power of two"
+    The current Stockham wrapper only accepts power-of-two N. For non-power-
+    of-two sizes use Bluestein / chirp-z (not implemented here).
+
+* "FFT requires N >= 2"
+    Trivial input check; pass at least 2 samples.
+
+* Test FAILs at the largest sizes only
+    Most likely cause: the host-side ref_fft_fast is itself slow at N=1M;
+    if the run is being killed by a timeout, increase it. The fp32 device
+    path is solid up to 1M; rel error at N=1M typically lands around 2e-3.
+
+* "Cached avg" is much larger than expected
+    First call always includes plan build for BOTH inner sizes (N1 and N2).
+    If N1 != N2 you pay both builds in iter 0. Subsequent iters hit cache.
+
+--------------------------------------------------------------------------------
+7. WHAT TO TWEAK FIRST IF YOU NEED IT FASTER
+--------------------------------------------------------------------------------
+
+This is an MVP. Two clear next optimisations, in order of leverage:
+
+  (a) Device-side BATCH FFT: today every sub-FFT is its own enqueue, so the
+      host-overhead is paid N1 + N2 times per Stockham call. A batch
+      kernel dispatched once per pass (64 cores each running their own
+      sub-FFT) would collapse that to 2 dispatches total.
+
+  (b) Device-side twiddle+transpose kernel: pass 2 is currently a host loop.
+      A BRISC-only kernel that reads each tile, multiplies by W_N^(i*j),
+      and writes to the transposed DRAM page would move this onto the chip.
+
+Either change should give roughly an order of magnitude on cached latency at
+N=1M. Together they should put us in the same regime as cuFFT for that size.
