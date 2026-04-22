@@ -355,12 +355,15 @@ inline std::shared_ptr<BatchFFTPlan> get_cached_batch_plan(
 // tile holding bit-reversed input slots [0, sub_N) and zeros after.
 // Returns out_r / out_i in the same layout, natural-order spectrum slots
 // [0, sub_N) and undefined slots after.
+//
+// NOTE: `WriteShard` takes the data vector by non-const reference (same
+// signature as the inner kernel uses), so in_r / in_i must be non-const.
 inline void execute_batch(
     BatchFFTPlan&            plan,
-    const std::vector<float>& in_r,
-    const std::vector<float>& in_i,
-    std::vector<float>&       out_r,
-    std::vector<float>&       out_i)
+    std::vector<float>&      in_r,
+    std::vector<float>&      in_i,
+    std::vector<float>&      out_r,
+    std::vector<float>&      out_i)
 {
     using namespace tt::tt_metal::distributed;
     assert(plan.initialized);
