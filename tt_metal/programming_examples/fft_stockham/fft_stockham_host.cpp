@@ -226,6 +226,12 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
     assert(bp->num_cores * bp->batch_per_core == batch);
     std::tie(bp->grid_cols, bp->grid_rows) = pick_batch_grid(bp->num_cores);
 
+    std::printf(
+        "[batch_fft] sub_N=%u  batch=%u  =>  cores=%u  grid=%ux%u  "
+        "sub-FFTs/core=%u\n",
+        sub_N, batch, bp->num_cores, bp->grid_cols, bp->grid_rows,
+        bp->batch_per_core);
+
     MeshCommandQueue& cq = md->mesh_command_queue();
 
     // ── DRAM buffers ────────────────────────────────────────────────────
