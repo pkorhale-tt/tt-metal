@@ -117,11 +117,20 @@ inline StockhamPlan plan(uint32_t N) {
 
 // ── Pass 1: N1 row-FFTs of length N2 ──────────────────────────────────────
 //
-// Treat the 1D input as (N1, N2) row-major and FFT each row. We use the
-// existing `fft_example::fft` for every row, which hits the inner plan
-// cache after the first row. This is an MVP "host-side batch" — a future
-// device-side batch kernel would amortise the per-call enqueue overhead
-// across all N1 rows in a single dispatch.
+// Cooley-Tukey decomposition for N = N1 * N2 requires the FIRST FFT pass to
+// run over the slow-varying axis of the natural row-major reshape (i.e. it
+// is intrinsically a "column-FFT" of length N2 with stride N1 through the
+// 1D input). To turn it into a row-FFT we can hand to our existing radix-2
+// kernel without touching the kernel, we transpose-on-read here:
+//
+//     packed[i, j]  =  x[j*N1 + i]    for i in [0, N1), j in [0, N2)
+//
+// After this transposed read, FFT-ing each row of `packed` (length N2) is
+// exactly the column-FFT the algorithm calls for.
+//
+// (We use `fft_example::fft` for every row, which hits the inner plan cache
+// after the first row. A future device-side batch dispatch would amortise
+// the per-call host overhead across all N1 rows.)
 
 inline std::vector<Complex> pass1_row_ffts(
     std::shared_ptr<MeshDevice>  md,
@@ -133,9 +142,12 @@ inline std::vector<Complex> pass1_row_ffts(
     std::vector<Complex> row(p.N2);
 
     for (uint32_t i = 0; i < p.N1; ++i) {
-        const Complex* src = x.data()     + static_cast<size_t>(i) * p.N2;
-        Complex*       dst = A.data()     + static_cast<size_t>(i) * p.N2;
-        for (uint32_t j = 0; j < p.N2; ++j) row[j] = src[j];
+        Complex* dst = A.data() + static_cast<size_t>(i) * p.N2;
+
+        // Transposed read: row[j] = x[j*N1 + i].
+        for (uint32_t j = 0; j < p.N2; ++j) {
+            row[j] = x[static_cast<size_t>(j) * p.N1 + i];
+        }
 
         const std::vector<Complex> Yi = fft_example::fft(md, row);
 
