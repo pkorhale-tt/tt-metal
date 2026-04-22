@@ -14,9 +14,12 @@
 //             Dispatched in ONE batched kernel launch via `batch_fft`:
 //             64 cores each run N1/64 sub-FFTs in parallel (Optimisation 1).
 //   * Pass 2: per-element twiddle multiply  W_N^(i*j)  +  transpose to (N2, N1).
-//             Done on the HOST today — kept on host for now; a future
-//             optimisation is a dedicated BRISC-only device kernel that
-//             collapses the ~50–80 ms host work into <5 ms on-chip.
+//             Twiddle multiply runs on device (Optimisation 2): 64 cores in
+//             parallel via a tile-granular complex-multiply kernel on the
+//             SFPU, with the (N1, N2) twiddle table pre-computed once and
+//             cached in DRAM. Transpose stays on the host (cheap memory
+//             shuffle, ~10 ms at N=1M) — the cos/sin work that dominated
+//             the old host pass is gone.
 //   * Pass 3: row-FFT of length N1  (N2 sub-FFTs of length N1) — also
 //             one batched dispatch.
 //   * Final reorder on host: X[k] = D[k % N2, k / N2].
@@ -467,32 +470,260 @@ inline std::vector<Complex> pass1_row_ffts(
     return out_natural;   // row-major (N1, N2) — exactly what pass 2 expects.
 }
 
-// ── Pass 2: per-element twiddle  +  transpose to (N2, N1) ────────────────
+// ╔════════════════════════════════════════════════════════════════════════╗
+// ║          Optimisation 2 — device-side Pass-2 twiddle multiply          ║
+// ╚════════════════════════════════════════════════════════════════════════╝
 //
-//   B[i, j] = A[i, j] * exp(-2*pi*i*i*j / N)         (twiddle)
-//   C[j, i] = B[i, j]                                (transpose)
+// Pass 2 mathematically does:
+//   B[i, j] = A[i, j] * exp(-2*pi*i*i*j / N)         (twiddle multiply)
+//   C[j, i] = B[i, j]                                 (transpose)
 //
-// On host this is a tight O(N) loop with cos/sin per element. At N=1M it
-// completes in ~50–100 ms on a normal x86. A future optimisation is a
-// BRISC-only device kernel that fuses both steps and runs in <5 ms.
+// The cos/sin per element is what made the host implementation slow
+// (~50–80 ms at N=1M, single-threaded). We move ONLY that step to device:
+//   * Twiddles (constant for a given (N1, N2)) are pre-computed once on
+//     the host and uploaded to DRAM as N1 row tiles. Cached for the life
+//     of the plan, so cos/sin is paid exactly once per (N1, N2) pair.
+//   * The kernel does pure tile-granular complex multiply on the SFPU
+//     (full IEEE fp32) — same `cmul` pattern as the inner FFT compute.
+//   * 64 cores in parallel, each handling N1/64 row tiles.
+//
+// The transpose (B → C, just memory shuffling, ~10 ms on host at N=1M)
+// stays on the host. Fusing it into the kernel would require scattered
+// 4-byte NoC writes; the gain isn't worth the kernel complexity yet.
+//
+// DRAM layout:
+//   in_r/in_i_buf[i]  : row i of A, real / imag, N2 fp32 + zero pad
+//   tw_r/tw_i_buf[i]  : row i of T, real / imag, N2 fp32 + zero pad
+//   out_r/out_i_buf[i]: row i of B, real / imag, N2 fp32 + zero pad
+
+struct Pass2Plan {
+    uint32_t N1 = 0, N2 = 0, N = 0;
+    uint32_t num_cores      = 0;
+    uint32_t tiles_per_core = 0;
+    uint32_t grid_cols      = 0;
+    uint32_t grid_rows      = 0;
+
+    std::shared_ptr<MeshDevice> md;
+    std::shared_ptr<MeshBuffer> in_r_buf,  in_i_buf;
+    std::shared_ptr<MeshBuffer> out_r_buf, out_i_buf;
+    std::shared_ptr<MeshBuffer> tw_r_buf,  tw_i_buf;
+    tt::tt_metal::distributed::MeshWorkload workload;
+    bool initialized = false;
+};
+
+// N1 tiles per side, tile i holds T[i, *] = exp(-2*pi*i*i*j/N) for j=[0,N2).
+// Slots [N2, kTileElems) are zero so the SFPU mul against zero-padded input
+// stays zero (we never write outside [0, N2) on the consumer side anyway).
+inline std::pair<std::vector<float>, std::vector<float>> pass2_twiddle_table(
+    uint32_t N1, uint32_t N2)
+{
+    const uint32_t N         = N1 * N2;
+    const size_t   total     = static_cast<size_t>(N1) * kTileElems;
+    const double   tau_over_N = -2.0 * M_PI / static_cast<double>(N);
+
+    std::vector<float> r(total, 0.0f), i(total, 0.0f);
+    for (uint32_t row = 0; row < N1; ++row) {
+        float* tile_r = r.data() + static_cast<size_t>(row) * kTileElems;
+        float* tile_i = i.data() + static_cast<size_t>(row) * kTileElems;
+        for (uint32_t j = 0; j < N2; ++j) {
+            const double angle = tau_over_N *
+                                 static_cast<double>(row) *
+                                 static_cast<double>(j);
+            tile_r[j] = static_cast<float>(std::cos(angle));
+            tile_i[j] = static_cast<float>(std::sin(angle));
+        }
+    }
+    return {std::move(r), std::move(i)};
+}
+
+inline std::shared_ptr<Pass2Plan> make_pass2_plan(
+    std::shared_ptr<MeshDevice> md, uint32_t N1, uint32_t N2)
+{
+    using namespace tt::tt_metal;
+    using namespace tt::tt_metal::distributed;
+
+    auto pp = std::make_shared<Pass2Plan>();
+    pp->md = md;
+    pp->N1 = N1;
+    pp->N2 = N2;
+    pp->N  = N1 * N2;
+
+    assert(N2 <= kTileElems && "Pass-2 device kernel requires N2 <= 1024");
+    assert(is_pow2(N1) && N1 >= 2);
+    assert(is_pow2(N2) && N2 >= 2);
+
+    pp->num_cores      = (N1 < 64u) ? N1 : 64u;
+    pp->tiles_per_core = N1 / pp->num_cores;
+    assert(pp->num_cores * pp->tiles_per_core == N1);
+    std::tie(pp->grid_cols, pp->grid_rows) = pick_batch_grid(pp->num_cores);
+
+    std::printf(
+        "[pass2] N1=%u N2=%u  =>  cores=%u  grid=%ux%u  tiles/core=%u\n",
+        N1, N2, pp->num_cores, pp->grid_cols, pp->grid_rows,
+        pp->tiles_per_core);
+
+    MeshCommandQueue& cq = md->mesh_command_queue();
+
+    const uint32_t io_bytes = N1 * kTileSizeFp32;
+    pp->in_r_buf  = make_mesh_buf(md, io_bytes, kTileSizeFp32);
+    pp->in_i_buf  = make_mesh_buf(md, io_bytes, kTileSizeFp32);
+    pp->out_r_buf = make_mesh_buf(md, io_bytes, kTileSizeFp32);
+    pp->out_i_buf = make_mesh_buf(md, io_bytes, kTileSizeFp32);
+
+    auto [tw_r_data, tw_i_data] = pass2_twiddle_table(N1, N2);
+    pp->tw_r_buf = make_mesh_buf(md, io_bytes, kTileSizeFp32);
+    pp->tw_i_buf = make_mesh_buf(md, io_bytes, kTileSizeFp32);
+    WriteShard(cq, pp->tw_r_buf, tw_r_data, MeshCoordinate(0, 0), false);
+    WriteShard(cq, pp->tw_i_buf, tw_i_data, MeshCoordinate(0, 0), false);
+
+    Program prog = CreateProgram();
+
+    const CoreCoord first{0, 0};
+    const CoreCoord last{pp->grid_cols - 1, pp->grid_rows - 1};
+    const CoreRange cr(first, last);
+
+    // CB indices match pass2_common.h (8 CBs).
+    constexpr uint32_t kPass2NumCbs = 8;
+    constexpr uint32_t kCbTiles[kPass2NumCbs] = {
+        2, 2, 2, 2,    // A_R, A_I, T_R, T_I — 2-tile pipeline
+        2, 2,          // B_R, B_I
+        1, 1           // TMP_R, TMP_I
+    };
+
+    for (uint32_t id = 0; id < kPass2NumCbs; ++id) {
+        CircularBufferConfig c(
+            kCbTiles[id] * kTileSizeFp32,
+            {{id, tt::DataFormat::Float32}});
+        c.set_page_size(id, kTileSizeFp32);
+        CreateCircularBuffer(prog, cr, c);
+    }
+
+    auto rk = CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft_stockham/kernel/pass2_reader.cpp",
+        cr,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc       = NOC::RISCV_0_default});
+
+    auto wk = CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft_stockham/kernel/pass2_writer.cpp",
+        cr,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc       = NOC::RISCV_1_default});
+
+    constexpr uint32_t kNumCbSlots = 32;
+    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
+    for (uint32_t id = 0; id < kPass2NumCbs; ++id) {
+        u2d[id] = UnpackToDestMode::UnpackToDestFp32;
+    }
+
+    auto ck = CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft_stockham/kernel/pass2_compute.cpp",
+        cr,
+        ComputeConfig{
+            .math_fidelity       = MathFidelity::HiFi4,
+            .fp32_dest_acc_en    = true,
+            .unpack_to_dest_mode = u2d});
+
+    for (uint32_t c = 0; c < pp->num_cores; ++c) {
+        const CoreCoord logical = batch_logical_core(c, pp->grid_cols);
+        const uint32_t  base    = c * pp->tiles_per_core;
+
+        SetRuntimeArgs(prog, rk, logical, {
+            buf_addr(pp->in_r_buf), buf_addr(pp->in_i_buf),
+            buf_addr(pp->tw_r_buf), buf_addr(pp->tw_i_buf),
+            base, pp->tiles_per_core,
+        });
+        SetRuntimeArgs(prog, wk, logical, {
+            buf_addr(pp->out_r_buf), buf_addr(pp->out_i_buf),
+            base, pp->tiles_per_core,
+        });
+        SetRuntimeArgs(prog, ck, logical, {pp->tiles_per_core});
+    }
+
+    pp->workload.add_program(
+        MeshCoordinateRange(MeshCoordinate(0, 0), MeshCoordinate(0, 0)),
+        std::move(prog));
+    pp->initialized = true;
+    return pp;
+}
+
+namespace detail {
+inline std::unordered_map<uint64_t, std::shared_ptr<Pass2Plan>>& pass2_plan_cache() {
+    static std::unordered_map<uint64_t, std::shared_ptr<Pass2Plan>> c;
+    return c;
+}
+inline uint64_t pass2_plan_key(MeshDevice* md, uint32_t N1, uint32_t N2) {
+    return reinterpret_cast<uint64_t>(md)
+         ^ (uint64_t{N1} * 0xD1B54A32D192ED03ull)
+         ^ (uint64_t{N2} * 0xAEF17502108EF2D9ull);
+}
+}  // namespace detail
+
+inline std::shared_ptr<Pass2Plan> get_cached_pass2_plan(
+    std::shared_ptr<MeshDevice> md, uint32_t N1, uint32_t N2)
+{
+    const uint64_t key = detail::pass2_plan_key(md.get(), N1, N2);
+    auto& cache = detail::pass2_plan_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    auto pp = make_pass2_plan(md, N1, N2);
+    cache.emplace(key, pp);
+    return pp;
+}
+
+// ── Pass 2: device twiddle multiply + host transpose ─────────────────────
+//
+// A is row-major (N1, N2) on host. We:
+//   1. pack each row into a tile (zero-pad past N2),
+//   2. upload to DRAM,
+//   3. dispatch the pass2 kernel (64 cores in parallel),
+//   4. download B (still in (N1, N2) tile layout),
+//   5. transpose to C in (N2, N1) row-major on host (cheap memory shuffle).
 
 inline std::vector<Complex> pass2_twiddle_transpose(
+    std::shared_ptr<MeshDevice> md,
     const std::vector<Complex>& A,
     const StockhamPlan&         p)
 {
-    std::vector<Complex> C(p.N);
-    const double tau_over_N = -2.0 * M_PI / static_cast<double>(p.N);
+    using namespace tt::tt_metal::distributed;
+    auto plan = get_cached_pass2_plan(md, p.N1, p.N2);
 
+    // Pack A (row-major (N1, N2)) into N1 contiguous tiles.
+    const size_t total_floats = static_cast<size_t>(p.N1) * kTileElems;
+    std::vector<float> in_r(total_floats, 0.0f);
+    std::vector<float> in_i(total_floats, 0.0f);
     for (uint32_t i = 0; i < p.N1; ++i) {
         const Complex* src = A.data() + static_cast<size_t>(i) * p.N2;
+        float* tr = in_r.data() + static_cast<size_t>(i) * kTileElems;
+        float* ti = in_i.data() + static_cast<size_t>(i) * kTileElems;
         for (uint32_t j = 0; j < p.N2; ++j) {
-            const double angle = tau_over_N *
-                                 static_cast<double>(i) *
-                                 static_cast<double>(j);
-            const float  cw = static_cast<float>(std::cos(angle));
-            const float  sw = static_cast<float>(std::sin(angle));
-            const Complex w(cw, sw);
-            C[static_cast<size_t>(j) * p.N1 + i] = src[j] * w;
+            tr[j] = src[j].real();
+            ti[j] = src[j].imag();
+        }
+    }
+
+    MeshCommandQueue& cq = md->mesh_command_queue();
+    WriteShard(cq, plan->in_r_buf, in_r, MeshCoordinate(0, 0), false);
+    WriteShard(cq, plan->in_i_buf, in_i, MeshCoordinate(0, 0), false);
+    EnqueueMeshWorkload(cq, plan->workload, false);
+
+    std::vector<float> out_r, out_i;
+    ReadShard(cq, out_r, plan->out_r_buf, MeshCoordinate(0, 0), true);
+    ReadShard(cq, out_i, plan->out_i_buf, MeshCoordinate(0, 0), true);
+
+    // Transpose B (N1, N2) → C (N2, N1) on host. Pure memory shuffling,
+    // ~10 ms at N=1M; trivial vs. the cos/sin we just eliminated.
+    std::vector<Complex> C(p.N);
+    for (uint32_t i = 0; i < p.N1; ++i) {
+        const float* tr = out_r.data() + static_cast<size_t>(i) * kTileElems;
+        const float* ti = out_i.data() + static_cast<size_t>(i) * kTileElems;
+        for (uint32_t j = 0; j < p.N2; ++j) {
+            C[static_cast<size_t>(j) * p.N1 + i] = {tr[j], ti[j]};
         }
     }
     return C;
@@ -560,7 +791,7 @@ inline std::vector<Complex> fft(
         p.N, p.N1, p.N2, p.N1, p.N2, p.N2, p.N1);
 
     const auto A = pass1_row_ffts        (md, signal, p);
-    const auto C = pass2_twiddle_transpose(    A,      p);
+    const auto C = pass2_twiddle_transpose(md, A,      p);
     const auto D = pass3_row_ffts        (md, C,      p);
     return final_reorder(D, p);
 }
