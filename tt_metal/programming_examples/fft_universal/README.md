@@ -53,8 +53,16 @@ reshape / twiddle / transpose / dispatch logic.
 | Bluestein        | host + device     | host chirps/multiplies, device does 2 FFTs |
 | Every actual FFT | device (1–64 cores) | `fft_stockham::fft` (handles pow2 up to 1M) |
 
-Plans (chirp tables, B_fft for Bluestein, factorizations) are **cached**,
-so second and later calls for the same N skip all host-side prep.
+Plans are **cached** so second and later calls for the same N skip all
+host-side prep:
+
+* **`BluesteinPlan`** — keyed on `N`; holds the chirp `w[n]` and pre-computed
+  `B_fft = FFT_M(b_ext)`.
+* **`CooleyTukeyPlan`** — keyed on `(N1, N2)`; holds the `N1·N2` twiddle table
+  `exp(-2πi · n1 · k2 / N)`. Removes all `cos/sin` from the per-iter hot path.
+* **`fft_stockham`'s batch_fft / pass-2 / Stockham plans** — inherited via
+  delegation (program builds + twiddle DRAM buffers cached per distinct
+  `(sub_N, batch)`).
 
 ## API
 

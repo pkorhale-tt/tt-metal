@@ -41,6 +41,8 @@
 // Caches (globals; single-threaded use):
 //   * bluestein_cache keyed on N keeps the chirp table and B_fft so the second
 //     call for the same N skips all host pre-work.
+//   * ct_plan_cache keyed on (N1, N2) keeps the N1*N2 twiddle table so the
+//     Cooley-Tukey hot path is plain complex-multiply (no cos/sin per iter).
 //   * fft_stockham::fft carries its own program-build cache; we piggy-back.
 
 #pragma once
@@ -179,6 +181,51 @@ inline std::shared_ptr<BluesteinPlan> get_bluestein_plan(
     plan->B_fft = fft_stockham::fft(md, b_ext);
 
     cache[N] = plan;
+    return plan;
+}
+
+// ─── Cooley-Tukey twiddle plan ───────────────────────────────────────────────
+//
+// For a mixed-radix split N = N1·N2 the twiddle factor
+//     T[n1, k2] = exp(-2πi · n1 · k2 / N)
+// is the same for every call and every sibling — cache it per (N1, N2) so
+// the per-call hot path is a plain complex-multiply instead of 2 transcendental
+// evaluations per element. Cache key packs both dims into 64 bits.
+struct CooleyTukeyPlan {
+    uint32_t             N1 = 0u;
+    uint32_t             N2 = 0u;
+    std::vector<Complex> twiddle;  // twiddle[n1 * N2 + k2], size N1 * N2
+};
+
+inline std::unordered_map<uint64_t, std::shared_ptr<CooleyTukeyPlan>>&
+ct_plan_cache() {
+    static std::unordered_map<uint64_t, std::shared_ptr<CooleyTukeyPlan>> m;
+    return m;
+}
+
+inline std::shared_ptr<CooleyTukeyPlan> get_ct_plan(uint32_t N1, uint32_t N2) {
+    const uint64_t key =
+        (static_cast<uint64_t>(N1) << 32) | static_cast<uint64_t>(N2);
+    auto& cache = ct_plan_cache();
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+
+    auto plan = std::make_shared<CooleyTukeyPlan>();
+    plan->N1 = N1;
+    plan->N2 = N2;
+    plan->twiddle.resize(static_cast<size_t>(N1) * N2);
+    const double tau_over_N =
+        -2.0 * M_PI / static_cast<double>(N1) / static_cast<double>(N2);
+    for (uint32_t n1 = 0; n1 < N1; ++n1) {
+        for (uint32_t k2 = 0; k2 < N2; ++k2) {
+            const double a = tau_over_N
+                           * static_cast<double>(n1)
+                           * static_cast<double>(k2);
+            plan->twiddle[static_cast<size_t>(n1) * N2 + k2] =
+                Complex(static_cast<float>(std::cos(a)),
+                        static_cast<float>(std::sin(a)));
+        }
+    }
+    cache[key] = plan;
     return plan;
 }
 
@@ -398,34 +445,20 @@ inline void cooley_tukey_split_batched(
     std::vector<Complex> A;
     batched_siblings_fft(md, count * N1, N2, pass1_in, A);
 
-    // Step 3: per-row twiddle  A[r, n1, k2] *= exp(-2πi · n1 · k2 / N).
-    {
-        const double tau_over_N = -2.0 * M_PI / static_cast<double>(N);
-        for (uint32_t r = 0; r < count; ++r) {
-            for (uint32_t n1 = 0; n1 < N1; ++n1) {
-                const size_t base =
-                    (static_cast<size_t>(r) * N1 + n1) * N2;
-                for (uint32_t k2 = 0; k2 < N2; ++k2) {
-                    const double  a  = tau_over_N
-                                      * static_cast<double>(n1)
-                                      * static_cast<double>(k2);
-                    const Complex tw(static_cast<float>(std::cos(a)),
-                                     static_cast<float>(std::sin(a)));
-                    A[base + k2] *= tw;
-                }
-            }
-        }
-    }
-
-    // Step 4: per-row transpose  C[r, k2, n1] = A[r, n1, k2].
+    // Steps 3+4 fused: twiddle-multiply and transpose in a single pass over A.
+    //   C[r, k2, n1] = A[r, n1, k2] * twiddle[n1, k2]
+    // Twiddle is cached per (N1, N2) — no cos/sin on the hot path.
+    auto ct_plan = get_ct_plan(N1, N2);
+    const Complex* __restrict__ twid = ct_plan->twiddle.data();
     std::vector<Complex> C(total);
     for (uint32_t r = 0; r < count; ++r) {
         for (uint32_t n1 = 0; n1 < N1; ++n1) {
-            const size_t A_base = (static_cast<size_t>(r) * N1 + n1) * N2;
+            const size_t A_base    = (static_cast<size_t>(r) * N1 + n1) * N2;
+            const size_t twid_base = static_cast<size_t>(n1) * N2;
+            const size_t C_row     = static_cast<size_t>(r) * N2;
             for (uint32_t k2 = 0; k2 < N2; ++k2) {
-                const size_t C_idx =
-                    (static_cast<size_t>(r) * N2 + k2) * N1 + n1;
-                C[C_idx] = A[A_base + k2];
+                const Complex v = A[A_base + k2] * twid[twid_base + k2];
+                C[(C_row + k2) * N1 + n1] = v;
             }
         }
     }
