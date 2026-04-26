@@ -129,6 +129,28 @@ Output columns are the same as the other fft benchmarks:
     * cached min / max
     * speedup vs first-call
 
+For pow2 N the benchmark also runs a single-thread fp32 iterative radix-2
+Cooley-Tukey FFT in-process (no external deps, twiddle + bit-reverse tables
+cached outside the timed region), and prints a Table-1-style head-to-head:
+
+    | Version                                      | Cores | Runtime (ms) |
+    |----------------------------------------------|-------|--------------|
+    | CPU fp32 radix-2 (single-thread, in-process) |     1 |         X.YZ |
+    | Wormhole fft_universal (cached, many Tensix) |  many |         A.BC |
+
+This mirrors Table 1 of "Exploring Fast Fourier Transforms on the Tenstorrent
+Wormhole" (Brown, Davies & Le Clair, arXiv:2506.15437). To reproduce the
+paper's specific comparison point:
+
+    ./build/programming_examples/fft_universal/metal_example_fft_universal_benchmark 16384 100
+
+Caveat: the paper's Table 1 uses a SINGLE Tensix core and reports a ~2.8x
+CPU advantage. Our Wormhole number uses many Tensix cores in parallel AND
+includes PCIe + dispatch overhead, so the two numbers are not identical but
+are directly informative. Non-pow2 N prints "CPU: N/A" (the in-process CPU
+FFT is radix-2 only); swap in FFTW or pocketfft if you want a CPU baseline
+for arbitrary N.
+
 -------------------------------------------------------------------------------
  Quick demo
 -------------------------------------------------------------------------------
