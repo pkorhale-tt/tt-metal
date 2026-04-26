@@ -35,6 +35,16 @@ Batched recursion (Opt #2 + #2b):
       * 720  length-5 Bluesteins               -> 2 batched dispatches
     Total: ~9 dispatches, not hundreds.
 
+Host-scratch caching (Opt #4):
+    Each batched dispatch through fft_stockham::batch_fft used to allocate and
+    zero-init 2 * batch * kTileElems floats of host scratch per call - up to
+    16 MB per dispatch for batch=2048 with sub_N=8 (~150 MB allocator+memset
+    churn per N=3600 iteration). The host scratch is now owned by the plan
+    and reused across calls; zero-init happens exactly once at plan build
+    time. The batch-FFT reader/compute only touch the first `sub_N` slots of
+    each tile, so pad positions stay valid for the life of the plan. Same
+    pattern applied to Pass2Plan for the large pow2 Stockham path.
+
 -------------------------------------------------------------------------------
  Build
 -------------------------------------------------------------------------------

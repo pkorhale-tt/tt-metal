@@ -168,6 +168,20 @@ struct BatchFFTPlan {
     std::shared_ptr<MeshBuffer> out_r_buf, out_i_buf;
     std::shared_ptr<MeshBuffer> tw_r_buf,  tw_i_buf;
     tt::tt_metal::distributed::MeshWorkload workload;
+
+    // Host-side scratch buffers (reused across calls to avoid per-call
+    // malloc / memset of batch*kTileElems floats — the dominant host
+    // overhead for small sub_N with large batch. e.g. Bluestein(3) with
+    // batch=2048 would otherwise allocate+zero-init 16 MB per dispatch,
+    // and fft_universal issues ~9 such dispatches per N=3600 iteration.
+    //
+    // The batch-FFT reader and compute only touch the first `sub_N` slots
+    // of each tile; positions [sub_N, kTileElems) are never read. We zero-
+    // initialise once at plan-construction time so padded slots stay zero
+    // across all subsequent calls with the same plan.
+    std::vector<float> in_r_host, in_i_host;
+    std::vector<float> out_r_host, out_i_host;
+
     bool initialized = false;
 };
 
@@ -243,6 +257,13 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
     bp->in_i_buf  = make_mesh_buf(md, io_bytes, kTileSizeFp32);
     bp->out_r_buf = make_mesh_buf(md, io_bytes, kTileSizeFp32);
     bp->out_i_buf = make_mesh_buf(md, io_bytes, kTileSizeFp32);
+
+    // ── Host scratch (reused across calls — see BatchFFTPlan comments) ─
+    const size_t scratch_floats = static_cast<size_t>(batch) * kTileElems;
+    bp->in_r_host.assign(scratch_floats, 0.0f);
+    bp->in_i_host.assign(scratch_floats, 0.0f);
+    bp->out_r_host.assign(scratch_floats, 0.0f);
+    bp->out_i_host.assign(scratch_floats, 0.0f);
 
     auto [tw_r_data, tw_i_data] = batch_twiddles(sub_N, bp->log2_sub_N);
     const uint32_t tw_bytes = static_cast<uint32_t>(tw_r_data.size() * sizeof(float));
@@ -405,11 +426,15 @@ inline void batch_fft(
     auto plan = get_cached_batch_plan(md, sub_N, batch);
     const uint32_t log2_sub_N = plan->log2_sub_N;
 
-    const size_t tile_floats   = kTileElems;
-    const size_t total_floats  = static_cast<size_t>(batch) * tile_floats;
-    std::vector<float> in_r(total_floats, 0.0f);
-    std::vector<float> in_i(total_floats, 0.0f);
-    std::vector<float> out_r, out_i;
+    // Reuse the plan's host scratch. Zero-init was done once at plan-
+    // construction time, and the kernel only reads positions [0, sub_N)
+    // of each tile — we overwrite exactly those positions below, so no
+    // per-call memset of the tile-padded region is required.
+    const size_t tile_floats = kTileElems;
+    std::vector<float>& in_r  = plan->in_r_host;
+    std::vector<float>& in_i  = plan->in_i_host;
+    std::vector<float>& out_r = plan->out_r_host;
+    std::vector<float>& out_i = plan->out_i_host;
 
     // Bit-reverse pack. Tile t holds sub-FFT t.
     for (uint32_t t = 0; t < batch; ++t) {
@@ -508,6 +533,12 @@ struct Pass2Plan {
     std::shared_ptr<MeshBuffer> out_r_buf, out_i_buf;
     std::shared_ptr<MeshBuffer> tw_r_buf,  tw_i_buf;
     tt::tt_metal::distributed::MeshWorkload workload;
+
+    // Host scratch reused across calls (see the BatchFFTPlan note above for
+    // rationale — same "skip the 8–16 MB memset per call" pattern).
+    std::vector<float> in_r_host, in_i_host;
+    std::vector<float> out_r_host, out_i_host;
+
     bool initialized = false;
 };
 
@@ -575,6 +606,13 @@ inline std::shared_ptr<Pass2Plan> make_pass2_plan(
     pp->tw_i_buf = make_mesh_buf(md, io_bytes, kTileSizeFp32);
     WriteShard(cq, pp->tw_r_buf, tw_r_data, MeshCoordinate(0, 0), false);
     WriteShard(cq, pp->tw_i_buf, tw_i_data, MeshCoordinate(0, 0), false);
+
+    // ── Host scratch (reused across calls) ─────────────────────────────
+    const size_t scratch_floats = static_cast<size_t>(N1) * kTileElems;
+    pp->in_r_host.assign(scratch_floats, 0.0f);
+    pp->in_i_host.assign(scratch_floats, 0.0f);
+    pp->out_r_host.assign(scratch_floats, 0.0f);
+    pp->out_i_host.assign(scratch_floats, 0.0f);
 
     Program prog = CreateProgram();
 
@@ -693,10 +731,14 @@ inline std::vector<Complex> pass2_twiddle_transpose(
     using namespace tt::tt_metal::distributed;
     auto plan = get_cached_pass2_plan(md, p.N1, p.N2);
 
-    // Pack A (row-major (N1, N2)) into N1 contiguous tiles.
-    const size_t total_floats = static_cast<size_t>(p.N1) * kTileElems;
-    std::vector<float> in_r(total_floats, 0.0f);
-    std::vector<float> in_i(total_floats, 0.0f);
+    // Reuse the plan's host scratch (pre-zeroed once at plan build time —
+    // the kernel only reads [0, N2) per row, so the padded region stays
+    // zero for the life of the plan and no per-call memset is needed).
+    std::vector<float>& in_r  = plan->in_r_host;
+    std::vector<float>& in_i  = plan->in_i_host;
+    std::vector<float>& out_r = plan->out_r_host;
+    std::vector<float>& out_i = plan->out_i_host;
+
     for (uint32_t i = 0; i < p.N1; ++i) {
         const Complex* src = A.data() + static_cast<size_t>(i) * p.N2;
         float* tr = in_r.data() + static_cast<size_t>(i) * kTileElems;
@@ -712,7 +754,6 @@ inline std::vector<Complex> pass2_twiddle_transpose(
     WriteShard(cq, plan->in_i_buf, in_i, MeshCoordinate(0, 0), false);
     EnqueueMeshWorkload(cq, plan->workload, false);
 
-    std::vector<float> out_r, out_i;
     ReadShard(cq, out_r, plan->out_r_buf, MeshCoordinate(0, 0), true);
     ReadShard(cq, out_i, plan->out_i_buf, MeshCoordinate(0, 0), true);
 
