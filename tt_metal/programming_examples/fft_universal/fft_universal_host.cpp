@@ -39,6 +39,7 @@
 
 #include "../fft_stockham/fft_stockham_host.cpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <complex>
@@ -181,16 +182,23 @@ inline std::vector<Complex> fft(
 // in a single row-major buffer: in[i * len + k] is element k of sub-FFT i.
 //
 //   * len is pow2 and <= kBatchMaxSubN        -> ONE device dispatch via
-//                                                 fft_stockham::batch_fft;
-//                                                 64 cores run count/64 sub-FFTs
-//                                                 each in parallel.
+//                                                 fft_stockham::batch_fft
+//                                                 (64 cores run
+//                                                 padded_count/cores sub-FFTs
+//                                                 each in parallel).
 //   * otherwise                                -> fall back to `count` serial
 //                                                 recursive fft_universal calls
 //                                                 (still correct, still on
 //                                                 Wormhole, just not batched).
 //
+// NOTE: fft_stockham::batch_fft requires BOTH `sub_N` AND `batch` to be pow2.
+// When `count` isn't pow2 we pad up to `next_pow2(count)` with zero-signal
+// sub-FFTs (whose DFTs are all zero, so they're harmless). The wasted work is
+// bounded by 2x in the worst case (count = 2^k + 1) and is vastly outweighed
+// by collapsing `count` serial dispatches into one.
+//
 // This is the workhorse for Cooley-Tukey: whichever side (N1 or N2) is pow2
-// collapses from `count` dispatches to 1, which is the dominant win for the
+// collapses from `count` dispatches to 1, the dominant win on the
 // composite-non-pow2 regime (typical: pow2 × small_odd like 1024 × 7).
 inline void batched_siblings_fft(
     std::shared_ptr<MeshDevice>       md,
@@ -207,8 +215,19 @@ inline void batched_siblings_fft(
     }
 
     if (is_pow2(len) && len <= kBatchMaxSubN) {
-        // Single device dispatch handles every sibling in parallel.
-        fft_stockham::batch_fft(md, len, count, in, out);
+        const uint32_t padded = next_pow2(count);
+        if (padded == count) {
+            fft_stockham::batch_fft(md, len, count, in, out);
+            return;
+        }
+        // Pad with (padded - count) zero sub-FFTs, batch, drop padding.
+        std::vector<Complex> in_padded(static_cast<size_t>(padded) * len,
+                                       Complex{0.0f, 0.0f});
+        std::copy(in.begin(), in.end(), in_padded.begin());
+        std::vector<Complex> out_padded;
+        fft_stockham::batch_fft(md, len, padded, in_padded, out_padded);
+        out.assign(out_padded.begin(),
+                   out_padded.begin() + static_cast<size_t>(count) * len);
         return;
     }
 
