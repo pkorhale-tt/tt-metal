@@ -246,13 +246,16 @@ inline std::shared_ptr<PackedDFTBf16Plan> make_packed_dft_bf16_plan(
     std::vector<float> ti_neg_rm(ti_rm.size());
     for (size_t i = 0; i < ti_rm.size(); ++i) ti_neg_rm[i] = -ti_rm[i];
 
-    const std::vector<float> tr_til_f32     = tilize_nfaces(tr_rm,     32u, 32u);
-    const std::vector<float> ti_til_f32     = tilize_nfaces(ti_rm,     32u, 32u);
-    const std::vector<float> ti_neg_til_f32 = tilize_nfaces(ti_neg_rm, 32u, 32u);
+    // NOTE: WriteShard takes std::vector<DType>& (non-const reference), so
+    // these tile scratch vectors must be non-const locals. Keeping them
+    // const here yields a template-deduction failure against distributed.hpp.
+    std::vector<float> tr_til_f32     = tilize_nfaces(tr_rm,     32u, 32u);
+    std::vector<float> ti_til_f32     = tilize_nfaces(ti_rm,     32u, 32u);
+    std::vector<float> ti_neg_til_f32 = tilize_nfaces(ti_neg_rm, 32u, 32u);
 
-    const std::vector<uint16_t> tr_til     = fp32_to_bf16_vec(tr_til_f32);
-    const std::vector<uint16_t> ti_til     = fp32_to_bf16_vec(ti_til_f32);
-    const std::vector<uint16_t> ti_neg_til = fp32_to_bf16_vec(ti_neg_til_f32);
+    std::vector<uint16_t> tr_til     = fp32_to_bf16_vec(tr_til_f32);
+    std::vector<uint16_t> ti_til     = fp32_to_bf16_vec(ti_til_f32);
+    std::vector<uint16_t> ti_neg_til = fp32_to_bf16_vec(ti_neg_til_f32);
 
     WriteShard(cq, pp->tw_r_buf,     tr_til,     MeshCoordinate(0, 0), false);
     WriteShard(cq, pp->tw_i_buf,     ti_til,     MeshCoordinate(0, 0), false);
