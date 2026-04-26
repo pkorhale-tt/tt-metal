@@ -1,16 +1,17 @@
 // SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// fft_universal_bf16_benchmark.cpp — end-to-end timing for the Phase 1
-// TRUE-bf16 packed direct-DFT path. Phase 1 only supports N in [2, 32].
+// fft_universal_bf16_benchmark.cpp — end-to-end timing for the TRUE-bf16
+// dispatch tree. Accepts any N supported by the current fft() dispatcher
+// (Phase 1: N in [2, 32]; Phase 2a: pow2 N in [64, 1024]).
 //
 // Reports:
 //   * Cold (plan build + JIT) and cached/steady-state per-call latency
 //   * Cached speedup vs cold
 //   * Total wall time actually observed
 //
-// Not reported yet (Phase 2): comparison against CPU FFTW, fp32
-// fft_universal cached timing, and a SNR-vs-iteration sweep.
+// Not reported yet (Phase 2b/2c): CPU baseline comparison, fp32
+// fft_universal cached timing side-by-side, SNR-vs-iteration sweep.
 
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
@@ -43,11 +44,15 @@ int main(int argc, char** argv) {
     const uint32_t N     = (argc > 1) ? static_cast<uint32_t>(std::atoi(argv[1])) : 32u;
     const uint32_t iters = (argc > 2) ? static_cast<uint32_t>(std::atoi(argv[2])) : 100u;
 
-    if (N < 2u || N > fft_universal_bf16::kPackedMaxN) {
+    auto is_pow2 = [](uint32_t n) { return n != 0u && (n & (n - 1u)) == 0u; };
+    const bool in_phase1 = (N >= 2u && N <= fft_universal_bf16::kPackedMaxN);
+    const bool in_phase2a = (is_pow2(N) && N >= 64u && N <= 1024u);
+    if (!in_phase1 && !in_phase2a) {
         std::fprintf(stderr,
-            "fft_universal_bf16 Phase 1 supports N in [2, %u] (got N=%u).\n"
-            "Phase 2 will cover N > 32 via the radix-32 Stockham bf16 kernel.\n",
-            fft_universal_bf16::kPackedMaxN, N);
+            "fft_universal_bf16 currently supports N in [2, 32] (Phase 1) "
+            "and pow2 N in [64, 1024] (Phase 2a). Got N=%u.\n"
+            "Phase 2b will cover pow2 N > 1024; Phase 2c will cover "
+            "primes (Bluestein) and composite non-pow2 (mixed-radix).\n", N);
         return 2;
     }
 

@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // fft_universal_bf16_demo.cpp — minimal usage example for the TRUE-bf16
-// packed direct-DFT path (Phase 1). Defaults to N=32 (maximum Phase 1
-// size). Feeds a pure tone at bin k_in and prints the top output bins —
-// expect a clean spike of magnitude N at bin k_in.
+// dispatch tree. Defaults to N=32 (Phase 1). Supports N in [2, 32]
+// (Phase 1, single-pass) and pow2 N in [64, 1024] (Phase 2a, two-pass CT).
+// Feeds a pure tone at bin k_in and prints the top output bins — expect
+// a clean spike of magnitude N at bin k_in.
 
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
@@ -24,10 +25,13 @@ int main(int argc, char** argv) {
     const uint32_t N    = (argc > 1) ? static_cast<uint32_t>(std::atoi(argv[1])) : 32u;
     const uint32_t k_in = (argc > 2) ? static_cast<uint32_t>(std::atoi(argv[2])) : 5u;
 
-    if (N < 2u || N > fft_universal_bf16::kPackedMaxN) {
+    auto is_pow2 = [](uint32_t n) { return n != 0u && (n & (n - 1u)) == 0u; };
+    const bool in_phase1 = (N >= 2u && N <= fft_universal_bf16::kPackedMaxN);
+    const bool in_phase2a = (is_pow2(N) && N >= 64u && N <= 1024u);
+    if (!in_phase1 && !in_phase2a) {
         std::fprintf(stderr,
-            "fft_universal_bf16 Phase 1 supports N in [2, %u] (got N=%u).\n",
-            fft_universal_bf16::kPackedMaxN, N);
+            "fft_universal_bf16 currently supports N in [2, 32] (Phase 1) "
+            "and pow2 N in [64, 1024] (Phase 2a). Got N=%u.\n", N);
         return 2;
     }
 

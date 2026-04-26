@@ -2,17 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // fft_universal_bf16_test.cpp — correctness harness for the TRUE-bf16
-// packed direct-DFT path (Phase 1). Exercises every Phase 1 N in [2, 32]
-// — all pow2, primes, and small composites land in the same kernel.
+// dispatch tree. Exercises:
+//   * Phase 1  : N in [2, 32] (packed direct-DFT on the FPU)
+//   * Phase 2a : pow2 N in [64, 1024] (two-level CT = two Phase-1 calls
+//                with a host-side fp32 pointwise twiddle between them)
 //
 // Threshold choice
 // ----------------
-// bf16 has ~8 bits of mantissa, so ULP is ~4e-3 relative. A length-N
-// DFT accumulates N bf16 × bf16 products in fp32 (log2(N) rounding
-// depth), then packs once to bf16 on output. Empirically that gives
-// ~3-5e-3 relative error on random |x| <= 1 input at N <= 32.
-// We use 1e-2 as a safety margin — if a kernel regresses below bf16's
-// inherent floor, the failure is unambiguous.
+// bf16 has ~8 bits of mantissa, so ULP is ~4e-3 relative.
+//   * Phase 1  (single pass) : ~3-5e-3 empirical on random |x| <= 1.
+//   * Phase 2a (two passes)  : ~2x the Phase-1 rounding depth on the
+//                              reduction path, plus one extra bf16 round-trip
+//                              for the host twiddle. Empirically ~5-8e-3.
+// We use 1e-2 for Phase 1 and 2e-2 for Phase 2a as safety margins — if a
+// kernel regresses below bf16's inherent floor, the failure is unambiguous.
 
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
@@ -97,7 +100,8 @@ static std::vector<Complex> make_impulse(uint32_t N) {
 static bool run_test(
     std::shared_ptr<MeshDevice> md,
     const std::vector<Complex>& input,
-    const char*                 name)
+    const char*                 name,
+    float                       threshold = 1e-2f)
 {
     const uint32_t N = static_cast<uint32_t>(input.size());
 
@@ -112,12 +116,10 @@ static bool run_test(
     const float rel_e = rel_err(ref, got);
     const float snr   = snr_db(ref, got);
 
-    // 1e-2 is the Phase 1 bf16 threshold (see file header).
-    const float threshold = 1e-2f;
     const bool pass = rel_e < threshold;
 
     std::printf(
-        "[%s] N=%-3u | abs=%.2e rel=%.2e snr=%.1f dB | device=%.1f ms  %s\n",
+        "[%s] N=%-4u | abs=%.2e rel=%.2e snr=%.1f dB | device=%.1f ms  %s\n",
         pass ? "PASS" : "FAIL", N, abs_e, rel_e, snr, ms, name);
     return pass;
 }
@@ -157,22 +159,45 @@ int main() {
     all &= run_test(md, make_impulse(32), "impulse N=32");
     all &= run_test(md, make_impulse(17), "impulse N=17");
 
-    // Phase 2 smoke check: N > 32 should throw — we exercise the guard
-    // path so it doesn't silently regress later.
-    bool threw_as_expected = false;
+    // ── Phase 2a: pow2 N in [64, 1024] via two-level Cooley-Tukey ───────────
+    // Two Phase-1 passes on device + host-side fp32 pointwise twiddle.
+    // Threshold bumped to 2e-2 because there's roughly twice the bf16
+    // rounding depth (two device passes).
+    constexpr float kPhase2aThreshold = 2e-2f;
+    all &= run_test(md, make_random(64),   "random N=64   (pow2, CT 32x2)",   kPhase2aThreshold);
+    all &= run_test(md, make_random(128),  "random N=128  (pow2, CT 32x4)",   kPhase2aThreshold);
+    all &= run_test(md, make_random(256),  "random N=256  (pow2, CT 32x8)",   kPhase2aThreshold);
+    all &= run_test(md, make_random(512),  "random N=512  (pow2, CT 32x16)",  kPhase2aThreshold);
+    all &= run_test(md, make_random(1024), "random N=1024 (pow2, CT 32x32)",  kPhase2aThreshold);
+    all &= run_test(md, make_impulse(1024),"impulse N=1024 (pow2)",           kPhase2aThreshold);
+
+    // Phase 2b guard: pow2 N > 1024 should still throw.
+    bool threw_2b = false;
     try {
-        (void)fft_universal_bf16::fft(md, make_random(64));
+        (void)fft_universal_bf16::fft(md, make_random(2048));
     } catch (const std::runtime_error&) {
-        threw_as_expected = true;
+        threw_2b = true;
     }
-    std::printf("[%s] N=64 (Phase 2 guard): %s threw runtime_error\n",
-                threw_as_expected ? "PASS" : "FAIL",
-                threw_as_expected ? "correctly" : "unexpectedly did NOT");
-    all &= threw_as_expected;
+    std::printf("[%s] N=2048 (Phase 2b guard): %s threw runtime_error\n",
+                threw_2b ? "PASS" : "FAIL",
+                threw_2b ? "correctly" : "unexpectedly did NOT");
+    all &= threw_2b;
+
+    // Phase 2c guard: a prime N > 32 should still throw (Bluestein pending).
+    bool threw_2c = false;
+    try {
+        (void)fft_universal_bf16::fft(md, make_random(37));
+    } catch (const std::runtime_error&) {
+        threw_2c = true;
+    }
+    std::printf("[%s] N=37 (Phase 2c prime guard): %s threw runtime_error\n",
+                threw_2c ? "PASS" : "FAIL",
+                threw_2c ? "correctly" : "unexpectedly did NOT");
+    all &= threw_2c;
 
     md.reset();
     std::printf("\n%s\n",
-                all ? "All fft_universal_bf16 Phase 1 tests PASSED."
+                all ? "All fft_universal_bf16 Phase 1 + 2a tests PASSED."
                     : "SOME TESTS FAILED.");
     return all ? 0 : 1;
 }

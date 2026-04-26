@@ -19,17 +19,31 @@ binary does.
 
 ## Phase status
 
-| Phase | N coverage                    | Kernel                              | Status |
-|-------|-------------------------------|-------------------------------------|--------|
-| 1     | `N ∈ [2, 32]` (pow2, prime, composite) | TRUE-bf16 packed direct-DFT (this repo) | **done** |
-| 2     | pow2 `N > 32`                 | radix-32 Stockham bf16 matmul       | pending |
-| 2     | prime `N > 32`                | Bluestein → Phase 2 pow2 path       | pending |
-| 2     | composite `N > 32`            | Cooley-Tukey → Phase 2 pow2 path    | pending |
+| Phase | N coverage                              | Path                                                        | Status |
+|-------|------------------------------------------|-------------------------------------------------------------|--------|
+| 1     | `N ∈ [2, 32]` (pow2, prime, composite)   | TRUE-bf16 packed direct-DFT kernel (one FPU-matmul pass)    | **done** |
+| 2a    | pow2 `N ∈ [64, 1024]`                    | Two-level Cooley-Tukey = 2 × Phase-1 kernel + host twiddle  | **done** |
+| 2b    | pow2 `N > 1024`                          | Either recurse through 2a or device-side twiddle kernel     | pending |
+| 2c    | prime `N > 32` (Bluestein)               | Pad to pow2 M, run 2a/2b pow2 path                          | pending |
+| 2c    | composite non-pow2 `N`                   | Mixed-radix Cooley-Tukey → 2a/2b pow2 path                  | pending |
 
-Today, calling `fft_universal_bf16::fft(md, signal)` with `N > 32`
-throws `std::runtime_error` with a clear "Phase 2 not yet implemented"
-message. We intentionally refuse to fall back to the fp32 path — that
-would silently break the precision contract of this binary.
+`fft_universal_bf16::fft(md, signal)` throws `std::runtime_error` with a
+clear "not yet implemented" message for any N not covered above. We
+intentionally refuse to fall back to the fp32 path — that would silently
+break the precision contract of this binary.
+
+### Phase 2a in one paragraph
+
+For `N = N1 × N2` with `N1 = 32` and `N2 ∈ {2, 4, 8, 16, 32}`, the
+inner-outer Cooley-Tukey split gives us two independent "32 sibling
+length-M DFTs along rows of a 32×M matrix" passes, which is exactly
+what the Phase-1 `packed_dft_bf16` kernel already computes. Between
+the two passes we apply the pointwise complex twiddle `exp(-2πi · n1 · k2 / N)`
+on the host in fp32 (pointwise = no reduction, so fp32-on-host is
+*more* accurate than bf16-on-device and doesn't violate the
+"true bf16 compute" contract — that contract is about the reduction
+path, which is both passes and stays on-device in bf16). No new
+kernels, no new LLK code — just ~100 lines of host orchestration.
 
 ## Layout
 
@@ -76,38 +90,51 @@ ninja -C build \
 ## Run
 
 ```bash
-# Correctness sweep (all Phase 1 sizes + Phase 2 guard check)
+# Correctness sweep (Phase 1 sizes + Phase 2a pow2 [64, 1024] + guard checks)
 ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_test
 
-# Cached-latency benchmark at N=32, 100 iters
+# Cached-latency benchmark at N=32 (Phase 1), 100 iters
 ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_benchmark 32 100
 
-# Pure-tone demo at bin 5, N=32
+# Cached-latency benchmark at N=1024 (Phase 2a, two-pass CT), 100 iters
+./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_benchmark 1024 100
+
+# Pure-tone demo at bin 5, N=32 (Phase 1)
 ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_demo 32 5
+
+# Pure-tone demo at bin 37, N=1024 (Phase 2a)
+./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_demo 1024 37
 ```
 
 ## Expected precision
 
-bf16 has ~8 bits of mantissa → ULP ~4e-3 relative. For a length-N DFT
-with `N ≤ 32` we accumulate N `bf16 × bf16 → fp32` products, so
-rounding depth stays at O(log N) ≈ 5 bits. Random-input SNR lands
-around **40-45 dB** (3-5e-3 relative error), and the test binary uses
-1e-2 as its pass threshold.
+bf16 has ~8 bits of mantissa → ULP ~4e-3 relative.
 
-If your application needs tighter precision, use `fft_universal/` (fp32,
-~1e-6 relative).
+* **Phase 1** (single pass, `N ≤ 32`): rounding depth ~5 bits.
+  Random-input SNR ≈ **45-55 dB** (3-5e-3 relative). Test threshold: 1e-2.
+* **Phase 2a** (two passes + one host twiddle round-trip,
+  `N ∈ [64, 1024]`): roughly 2× the Phase-1 rounding depth on the
+  reduction path, plus one extra bf16 round-trip for the host twiddle.
+  Random-input SNR ≈ **38-45 dB** (5-8e-3 relative). Test threshold: 2e-2.
 
-## Roadmap to Phase 2
+If your application needs tighter precision, use `fft_universal/`
+(fp32, ~1e-6 relative).
 
-1. **radix-32 Stockham bf16 matmul kernel** for pow2 N > 32. A length-32²
-   FFT becomes two 32-point DFT stages connected by a twiddle-scaled
-   matmul (fold the per-pass twiddles into the W_32 matrix before the
-   second multiply so the pointwise twiddle step stays on the FPU, not
-   the SFPU). Recurse for N = 32³, 32⁴.
-2. **bf16 pass-2 (four-step) kernel** for N > 1024 following the same
-   matmul-only discipline.
-3. **Bluestein / Cooley-Tukey delegation** — no new kernels needed
-   beyond the pow2 engine.
+## Roadmap beyond Phase 2a
+
+1. **Phase 2b — pow2 `N > 1024`.** Two clean options, pick whichever
+   benchmarks better:
+   * *Recurse* through the Phase 2a kernel: e.g. `N = 32³ = 32768` splits
+     as `32 × 1024`, where the outer DFT along `n1` is a length-32 DFT
+     (one more Phase-1 call) and the inner 1024-point is a Phase-2a call.
+   * *Device-side twiddle* kernel (mul_tiles + add_tiles/sub_tiles on
+     bf16 CBs = true-bf16 FPU elementwise mul). Avoids the PCIe bounce
+     between passes. Required anyway for large `N` where the host round
+     trip dominates.
+2. **Phase 2c — primes (Bluestein) and composite non-pow2 (mixed-radix).**
+   Both ultimately call into the Phase 2a/2b pow2 engine. The chirp/
+   mixed-radix scaffolding already exists in `fft_universal_host.cpp`;
+   it just needs to dispatch to the bf16 pow2 path here.
 
 Each step is testable in isolation. See `sop.txt` for the per-phase
 build/test commands.

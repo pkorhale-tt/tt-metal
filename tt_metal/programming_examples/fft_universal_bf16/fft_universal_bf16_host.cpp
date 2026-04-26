@@ -12,23 +12,30 @@
 // that out explicitly in the dispatcher: if a path can't be expressed as
 // FPU matmul, we error rather than silently demoting to fp32.
 //
-// Phase 1 status (this file)
-// --------------------------
+// Phase status (this file)
+// ------------------------
 // Implemented:
-//   * Host scaffolding: fp32 ↔ bf16 conversion, plan cache, dispatch tree.
-//   * TRUE-bf16 packed direct-DFT kernel for N in [2, 32] via FPU matmul.
-//     This is genuine bf16 compute: Float16_b CBs, fp32_dest_acc_en=true,
-//     mm_init + matmul_tiles (bf16 srcA × bf16 srcB → fp32 DST → bf16 CB).
+//   Phase 1  — TRUE-bf16 packed direct-DFT kernel for N in [2, 32] via FPU
+//              matmul. Genuine bf16 compute: Float16_b CBs, fp32_dest_acc_en,
+//              mm_init + matmul_tiles (bf16 srcA × bf16 srcB → fp32 DST → bf16).
+//   Phase 2a — Two-level Cooley-Tukey for pow2 N in [64, 1024], composed from
+//              TWO Phase-1 kernel calls with a host-side fp32 pointwise
+//              twiddle + transpose between them. No new kernels — the reduction
+//              path (both passes) stays on-device in true bf16; the pointwise
+//              step is fp32 on the host because that's strictly more accurate
+//              than bf16 there and costs ~microseconds of PCIe bounce per call.
 //
-// Pending (Phase 2 — NOT in this file yet):
-//   * Radix-32 Stockham bf16 matmul kernel for pow2 N > 32.
-//   * Once Phase 2 lands, Bluestein (prime N) and Cooley-Tukey (composite N)
-//     automatically become bf16 because they delegate their inner pow2 FFT
-//     to the new radix-32 kernel.
+// Pending:
+//   Phase 2b — pow2 N > 1024. Either recurse (32³ = 32768, 32⁴ = 1048576, ...)
+//              or introduce a device-side twiddle+transpose kernel so we can
+//              keep the whole pipeline on-device and hide PCIe.
+//   Phase 2c — Bluestein (prime N) and Cooley-Tukey (composite non-pow2).
+//              Both reduce to a pow2 FFT plus pointwise work, so once Phase 2b
+//              lands these are straight reuse of the pow2 path.
 //
-// For any N > 32 the top-level fft() currently throws with a clear
-// "Phase 2 not yet implemented" message. We refuse to silently fall back
-// to the fp32 path because that would defeat the point of this binary.
+// For any N not covered by Phase 1 / 2a the top-level fft() throws a clear
+// "not yet implemented" message. We refuse to silently fall back to the fp32
+// path because that would defeat the point of this binary.
 //
 // API
 // ---
@@ -455,13 +462,103 @@ inline void packed_direct_dft_bf16_batched(
     }
 }
 
+// ─── Phase 2a: two-level Cooley-Tukey for pow2 N in [64, 1024] ──────────────
+//
+// N = N1 × N2 with N1 = 32 (fixed) and N2 = N / 32 ∈ {2, 4, 8, 16, 32}. The
+// factorisation is the classic "inner/outer" CT split:
+//
+//   n = n1 + N1 · n2,  n1 ∈ [0, N1), n2 ∈ [0, N2)         // input index
+//   k = k2 + N2 · k1,  k1 ∈ [0, N1), k2 ∈ [0, N2)         // output index
+//
+//   A[n1, n2] = x[n1 + N1·n2]                              // host reshape
+//   A'[n1, k2] = Σ_n2 A[n1, n2] · W_{N2}^{n2·k2}           // Pass-1 (device)
+//   B[n1, k2]  = A'[n1, k2] · W_N^{n1·k2}                  // Twiddle (host)
+//   C[k2, n1]  = B[n1, k2]                                 // Transpose (host)
+//   D[k2, k1]  = Σ_n1 C[k2, n1] · W_{N1}^{n1·k1}           // Pass-2 (device)
+//   X[k2 + N2·k1] = D[k2, k1]                              // Host permute
+//
+// Why is Pass-1 / Pass-2 exactly what the Phase-1 packed_dft_bf16 kernel
+// already does? Because each pass is "count × length-M DFTs along rows of
+// a 32×M matrix" which is precisely the sibling-batched direct-DFT the
+// kernel was written for. We just call it twice, with a host-side pointwise
+// complex multiply between the passes. The multiply is pointwise (no
+// reduction), so doing it in fp32 on the host is strictly more accurate
+// than on-device bf16 would be and does NOT break the "true bf16 compute"
+// contract — the contract is about the reduction path (matmul), which stays
+// on-device in bf16.
+//
+// Phase 2b (future) pushes the twiddle + transpose into a device kernel to
+// avoid the PCIe bounce between passes. For N ≤ 1024 the bounce is ~a few
+// KB per pass so the latency impact is in the tens of μs, dominated by
+// dispatch and PCIe overhead anyway.
+inline void pow2_two_level_fft_bf16(
+    std::shared_ptr<MeshDevice>  md,
+    uint32_t                     N,
+    const std::vector<Complex>&  in_natural,
+    std::vector<Complex>&        out_natural)
+{
+    constexpr uint32_t N1 = 32u;
+    const uint32_t N2 = N / N1;
+    assert(N >= 64u && N <= 1024u);
+    assert(is_pow2(N));
+    assert(N2 >= 2u && N2 <= 32u);
+    assert(N == N1 * N2);
+    assert(in_natural.size() == N);
+
+    // Step 1: reshape x into (N1 rows) × (N2 cols) with stride-N1 slicing.
+    // pass1_in sub-FFT r (= n1) = [ x[r], x[r + N1], x[r + 2N1], ... ]
+    std::vector<Complex> pass1_in(N);
+    for (uint32_t n1 = 0; n1 < N1; ++n1) {
+        for (uint32_t n2 = 0; n2 < N2; ++n2) {
+            pass1_in[n1 * N2 + n2] = in_natural[n1 + N1 * n2];
+        }
+    }
+
+    // Step 2: Pass-1 — N1 sibling length-N2 DFTs via true-bf16 FPU matmul.
+    std::vector<Complex> A_prime;
+    packed_direct_dft_bf16_batched(md, /*N=*/N2, /*count=*/N1, pass1_in, A_prime);
+
+    // Step 3: on-host pointwise twiddle + transpose, in fp32 for full
+    // precision on the pointwise path.
+    //   B[n1, k2] = A'[n1, k2] · exp(-2πi · n1 · k2 / N)
+    //   C[k2, n1] = B[n1, k2]
+    // Linearised:
+    //   A' indexed by [n1 * N2 + k2]   (packed_dft output: one sub-FFT per row)
+    //   pass2_in indexed by [k2 * N1 + n1]  (sub-FFT r = k2, length N1)
+    std::vector<Complex> pass2_in(N);
+    const double two_pi_over_N = -2.0 * M_PI / static_cast<double>(N);
+    for (uint32_t n1 = 0; n1 < N1; ++n1) {
+        for (uint32_t k2 = 0; k2 < N2; ++k2) {
+            const double angle = two_pi_over_N * static_cast<double>(n1) * static_cast<double>(k2);
+            const Complex T{static_cast<float>(std::cos(angle)),
+                            static_cast<float>(std::sin(angle))};
+            pass2_in[k2 * N1 + n1] = A_prime[n1 * N2 + k2] * T;
+        }
+    }
+
+    // Step 4: Pass-2 — N2 sibling length-N1=32 DFTs via true-bf16 FPU matmul.
+    std::vector<Complex> D;
+    packed_direct_dft_bf16_batched(md, /*N=*/N1, /*count=*/N2, pass2_in, D);
+
+    // Step 5: output permutation. D[k2, k1] lives at linear index k2*N1 + k1
+    // and lands at X[k2 + N2·k1].
+    out_natural.assign(N, Complex{0.0f, 0.0f});
+    for (uint32_t k2 = 0; k2 < N2; ++k2) {
+        for (uint32_t k1 = 0; k1 < N1; ++k1) {
+            out_natural[k2 + N2 * k1] = D[k2 * N1 + k1];
+        }
+    }
+}
+
 // ─── Top-level dispatcher ────────────────────────────────────────────────────
 //
-// Phase 1: only len in [2, 32] is handled (true-bf16 packed direct-DFT).
-// Every other path hard-errors with an explanatory message. We intentionally
-// refuse to delegate to fft_universal::fft on N > 32, because that would
-// run the fp32 kernels and silently defeat the "true bf16" contract of
-// this binary.
+// Routing:
+//   N == 1                              : identity
+//   N in [2, 32]                        : Phase 1 packed direct-DFT (bf16)
+//   pow2, N in [64, 1024]               : Phase 2a two-level Cooley-Tukey
+//                                         (bf16 matmul passes, fp32 host twiddle)
+//   everything else (incl. pow2 > 1024, : Phase 2b/2c not yet implemented
+//   primes, composite non-pow2)           — hard error, no silent fp32 fallback
 inline std::vector<Complex> fft(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  signal)
@@ -476,18 +573,22 @@ inline std::vector<Complex> fft(
         return out;
     }
 
-    // Phase 2 stubs — all paths still to be implemented as TRUE bf16 FPU
-    // matmul kernels. Do not fall back to fp32; that would silently break
-    // the precision contract of this binary.
+    if (is_pow2(N) && N >= 64u && N <= 1024u) {
+        std::vector<Complex> out;
+        pow2_two_level_fft_bf16(md, N, signal, out);
+        return out;
+    }
+
+    // Phase 2b / 2c — not implemented yet. Refuse to silently fall back to
+    // fp32; that would defeat the point of this binary.
     throw std::runtime_error(
         "fft_universal_bf16::fft: N=" + std::to_string(N) +
-        " not yet implemented (Phase 2). Phase 1 covers N in [2, 32] via the "
-        "true-bf16 packed direct-DFT kernel. Phase 2 will add:\n"
-        "  * radix-32 Stockham bf16 matmul kernel for pow2 N > 32\n"
-        "  * Bluestein (prime N) and Cooley-Tukey (composite N) via the "
-        "pow2 kernel above\n"
-        "Use fft_universal::fft() in the sibling fp32 binary for these sizes "
-        "today.");
+        " not yet implemented.\n"
+        "  Phase 1  (done)    : N in [2, 32]   — packed direct-DFT (bf16 FPU matmul)\n"
+        "  Phase 2a (done)    : pow2 N in [64, 1024] — two-level CT via Phase-1 kernel\n"
+        "  Phase 2b (pending) : pow2 N > 1024 — needs recursive / device-side twiddle\n"
+        "  Phase 2c (pending) : primes (Bluestein) and composite non-pow2 (mixed-radix)\n"
+        "Use fft_universal::fft() in the sibling fp32 binary for these sizes today.");
 }
 
 // Convenience overload for real input.
