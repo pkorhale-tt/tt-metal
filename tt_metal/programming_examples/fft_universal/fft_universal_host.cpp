@@ -461,6 +461,7 @@ inline std::shared_ptr<PackedDFTPlan> make_packed_dft_plan(
             .fp32_dest_acc_en    = true,
             .unpack_to_dest_mode = u2d,
             .compile_args        = {pp->tiles_per_core}});
+    (void)ck;  // compute kernel needs no per-core runtime args
 
     for (uint32_t c = 0; c < pp->num_cores; ++c) {
         const CoreCoord logical = fft_stockham::batch_logical_core(c, pp->grid_cols);
