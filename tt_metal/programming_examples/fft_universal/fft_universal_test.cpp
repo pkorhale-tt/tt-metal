@@ -69,10 +69,6 @@ static std::vector<Complex> make_impulse(uint32_t N) {
     return x;
 }
 
-static std::vector<Complex> make_constant(uint32_t N) {
-    return std::vector<Complex>(N, {1.0f, 0.0f});
-}
-
 static std::vector<Complex> make_random(uint32_t N, uint32_t seed = 42) {
     std::vector<Complex> x(N);
     std::srand(seed);
