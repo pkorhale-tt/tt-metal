@@ -1,0 +1,123 @@
+fft_universal_bf16 — Standard Operating Procedure
+=================================================
+
+WHAT THIS IS
+------------
+TRUE-bf16 sibling of fft_universal. Every multiply on the Tensix is a
+bf16 × bf16 → fp32 FPU matmul. No SFPU butterflies; no "bf16 storage
+with fp32 SFPU compute" trick (that is what fft_bf16/ does — and it is
+why fft_bf16 is NOT true bf16 compute on this hardware).
+
+The hardware rule we are enforcing:
+  * SFPU on Wormhole has no native bf16 math. Any bf16 operand entering
+    the SFPU is upcast to fp32.
+  * FPU (matmul unit) has native bf16 multipliers with fp32 accumulate.
+  * ∴ true bf16 compute is only reachable via matmul_tiles.
+  * ∴ FFT butterflies have to be re-expressed as matmuls. That is the
+    architectural thesis of this whole folder.
+
+PHASE STATUS
+------------
+  Phase 1 (DONE, this commit):
+      * N ∈ [2, 32]: packed direct-DFT as a complex 32×32 matmul.
+        Covers all pow2, all primes, and all composites in that range
+        through a single kernel trio.
+      * Binaries: *_test, *_benchmark, *_demo all working against the
+        Phase 1 path. N > 32 throws with a "Phase 2 not yet implemented"
+        message — intentional, not a bug.
+
+  Phase 2 (PENDING):
+      * pow2 N > 32: radix-32 Stockham bf16 matmul kernel. Runs an
+        N-point FFT as log_32(N) FPU-matmul stages, with the pass-2
+        twiddle folded into the W_32 matrix so the pointwise scaling
+        stays on the FPU path (no SFPU detour).
+      * Bluestein for primes, Cooley-Tukey for composites: both
+        delegate to the Phase 2 pow2 kernel above. No new kernels.
+
+BUILD
+-----
+  cd /proj_sw/user_dev/<user>/<repo>
+  ninja -C build \
+      metal_example_fft_universal_bf16_test \
+      metal_example_fft_universal_bf16_benchmark \
+      metal_example_fft_universal_bf16_demo
+
+RUN
+---
+Phase 1 correctness sweep (pow2, primes, composites ≤ 32, plus Phase 2
+guard). Expect:
+  * [PASS] rel=1e-3 .. 5e-3, SNR 40-45 dB for random inputs
+  * [PASS] on impulse inputs (flat spectrum)
+  * [PASS] "Phase 2 guard" at N=64 that confirms the guard throws
+
+  ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_test
+
+Benchmark — cached-latency timing at N=32:
+  ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_benchmark 32 100
+
+Benchmark — other Phase 1 sizes:
+  ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_benchmark 17 100
+  ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_benchmark 25 100
+
+Demo — pure tone at bin 5, N=32:
+  ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_demo 32 5
+
+EXPECTED OUTPUT SHAPE
+---------------------
+  [packed_dft_bf16] N=32  count=1  =>  num_tiles=1  cores=1  grid=1x1  tiles/core=1  tile-eff=100.0%
+  [PASS] N=32  | abs=2.14e-02 rel=3.76e-03 snr=44.5 dB | device=... ms  random N=32 (pow2)
+  ...
+
+Numbers will vary slightly run-to-run (JIT, first dispatch, thermal) but
+the per-case PASS / FAIL decision is deterministic thanks to the fixed
+rand() seed.
+
+COMMON PITFALLS
+---------------
+1.  UnpackToDestFp32 + matmul = corrupt output.
+    Do NOT set unpack_to_dest_mode on the compute kernel. That mode
+    routes tiles directly to DST and leaves srcA / srcB uninitialised,
+    so matmul_tiles multiplies garbage. The fp32 packed_dft kernel
+    hit this bug once already; the bf16 version documents it and keeps
+    matmul defaults.
+
+2.  CB data format must match the buffer data format.
+    Our DRAM MeshBuffers store bf16 bytes (2 B/elem) and our CBs are
+    Float16_b. If you swap one to Float32 and forget the other, the
+    NoC tile reads silently truncate / zero-extend and the kernel
+    produces garbage without any runtime error.
+
+3.  fp32_dest_acc_en is REQUIRED for multi-matmul accumulation.
+    Two matmul_tiles calls share DST to form one complex output. With
+    fp32_dest_acc_en=false the accumulator is bf16 and the running
+    sum rounds twice, dropping SNR by ~6 dB. Keep it true.
+
+4.  N > 32 does not fall back — it throws.
+    Intentional. If you need N > 32 today, use fft_universal/ (fp32).
+    Once Phase 2 lands, the same API will cover all N.
+
+PRECISION NOTES
+---------------
+  * Per-multiply rounding: 1 bf16 × bf16 product → fp32 (exact in fp32).
+  * Per-accumulate: fp32 running sum. No rounding on the inner dot.
+  * Per output tile: ONE fp32 → bf16 pack at pack_tile().
+  * So total rounding = 2 (input pack + output pack) for any N ≤ 32.
+    That is why SNR holds at ~44 dB even near the top of Phase 1.
+
+DEBUGGING TIPS
+--------------
+  * Run the demo at a single bin first — expected output is a clean
+    spike of magnitude N at bin k_in. If you see spikes at multiple
+    bins or a flat response, the tilize / untilize path is broken.
+  * Random-input rel_err > 1e-2 at small N suggests either the
+    UnpackToDestFp32 trap (see above) or a CB-format mismatch.
+  * If the build compiles but crashes inside mm_init, check that CBs
+    0 / 1 / 2 / 3 are all Float16_b and all have the same 2048 B tile
+    size. mm_init infers srcA / srcB format from whichever CB you hand
+    it — mixing formats is a runtime bug, not a compile-time one.
+
+FUTURE WORK
+-----------
+See README.md § "Roadmap to Phase 2" for the matmul-based Stockham
+kernel design. The short version: fold pass-2 twiddle into W_32 and
+keep everything on the FPU.
