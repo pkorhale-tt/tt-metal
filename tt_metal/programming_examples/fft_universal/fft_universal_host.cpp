@@ -205,13 +205,18 @@ inline std::vector<Complex> bluestein_fft(
 
 // ─── Cooley-Tukey split: N = N1 * N2 ─────────────────────────────────────────
 //
-// Standard mixed-radix decomposition:
-//   1. reshape x to row-major (N1, N2):  A[i, j] = x[i * N2 + j]
-//   2. pass-1: for each row i, A[i, :] = FFT_N2(A[i, :])        -- recurse
-//   3. twiddle: A[i, j] *= exp(-2πi · i · j / N)
-//   4. transpose: C[j, i] = A[i, j]                              (shape N2 x N1)
-//   5. pass-2: for each row j, C[j, :] = FFT_N1(C[j, :])         -- recurse
-//   6. output:  X[k1 * N2 + k2] = C[k2, k1]
+// Mixed-radix decomposition, matching the scheme used by fft_stockham
+// (so the recursion on pow2 sub-FFTs lines up exactly):
+//
+//   index map:   n  = n1 + N1 * n2     (n1 in [0,N1),   n2 in [0,N2))
+//                k  = N2 * k1 + k2     (k1 in [0,N1),   k2 in [0,N2))
+//
+//   1. transposed reshape:  A[i=n1, j=n2] = x[n1 + N1 * n2]
+//   2. pass-1  (length-N2):  for each fixed n1, FFT along n2 axis     -- recurse
+//   3. twiddle:              A[n1, k2] *= exp(-2πi · n1 · k2 / N)
+//   4. transpose:            C[k2, n1] = A[n1, k2]   (shape N2 x N1)
+//   5. pass-2  (length-N1):  for each fixed k2, FFT along n1 axis     -- recurse
+//   6. output permute:       X[N2 * k1 + k2] = C[k2, k1]
 inline std::vector<Complex> cooley_tukey_split(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  x,
@@ -221,20 +226,23 @@ inline std::vector<Complex> cooley_tukey_split(
     const uint32_t N = N1 * N2;
     assert(static_cast<uint32_t>(x.size()) == N);
 
-    // Steps 1-2: row FFTs of length N2.
+    // Steps 1-2: transposed read + length-N2 row FFT.
+    // For each n1 we gather x[n1 + N1 * n2] for n2 in [0, N2), which is a
+    // strided read over the input — this is what puts us in the scheme-(c)
+    // layout that fft_stockham uses too.
     std::vector<Complex> A(N);
     {
         std::vector<Complex> row(N2);
         for (uint32_t i = 0; i < N1; ++i) {
-            const uint32_t base = i * N2;
-            for (uint32_t j = 0; j < N2; ++j) row[j] = x[base + j];
+            for (uint32_t j = 0; j < N2; ++j) row[j] = x[j * N1 + i];
             const std::vector<Complex> Yi = fft(md, row);
+            const uint32_t base = i * N2;
             for (uint32_t j = 0; j < N2; ++j) A[base + j] = Yi[j];
         }
     }
 
-    // Step 3: twiddle multiply. Double-precision angle keeps fp32 fidelity
-    // even at the largest Ns we run.
+    // Step 3: twiddle multiply. A is in (n1, k2) = (i, j) layout now.
+    // Double-precision angle keeps fp32 fidelity even at large Ns.
     {
         const double tau_over_N = -2.0 * M_PI / static_cast<double>(N);
         for (uint32_t i = 0; i < N1; ++i) {
@@ -249,7 +257,7 @@ inline std::vector<Complex> cooley_tukey_split(
         }
     }
 
-    // Step 4: transpose into shape (N2, N1).
+    // Step 4: transpose into shape (N2, N1) row-major — C[k2, n1] = A[n1, k2].
     std::vector<Complex> C(N);
     for (uint32_t i = 0; i < N1; ++i) {
         for (uint32_t j = 0; j < N2; ++j) {
@@ -257,7 +265,7 @@ inline std::vector<Complex> cooley_tukey_split(
         }
     }
 
-    // Step 5: row FFTs of length N1.
+    // Step 5: length-N1 row FFTs along the second axis of C (the n1 axis).
     {
         std::vector<Complex> col(N1);
         for (uint32_t j = 0; j < N2; ++j) {
@@ -268,11 +276,15 @@ inline std::vector<Complex> cooley_tukey_split(
         }
     }
 
-    // Step 6: C already holds X in the right layout.
-    // With Scheme-B indexing (n = N2*n1 + n2, k = k1 + N1*k2) pass-2 stores
-    // the result at C[k2*N1 + k1]. The output at X[k = k1 + N1*k2] is
-    // exactly that same flat index, so C *is* X — no re-permutation needed.
-    return C;
+    // Step 6: permute to output order. With k = N2*k1 + k2 (scheme (c)),
+    // X[N2*k1 + k2] lives at C[k2, k1] = C[k2*N1 + k1].
+    std::vector<Complex> X(N);
+    for (uint32_t k1 = 0; k1 < N1; ++k1) {
+        for (uint32_t k2 = 0; k2 < N2; ++k2) {
+            X[k1 * N2 + k2] = C[k2 * N1 + k1];
+        }
+    }
+    return X;
 }
 
 // ─── Top-level dispatch ──────────────────────────────────────────────────────
