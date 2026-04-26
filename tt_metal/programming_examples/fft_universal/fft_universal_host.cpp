@@ -351,11 +351,23 @@ inline std::shared_ptr<PackedDFTPlan> make_packed_dft_plan(
     constexpr uint32_t kRowsPerTile = 32u;
     const uint32_t raw_num_tiles = (count + kRowsPerTile - 1u) / kRowsPerTile;
 
-    // Distribute tiles across up to 64 cores. Round num_tiles up so it
-    // divides num_cores evenly; extra tiles get zero input (pre-zeroed
-    // scratch buffers) and produce zero outputs which we discard during
-    // unpack. Same strategy as BatchFFTPlan uses for its pow2 padding.
-    uint32_t num_cores      = (raw_num_tiles < 64u) ? raw_num_tiles : 64u;
+    // Distribute tiles across up to 64 cores. fft_stockham::pick_batch_grid
+    // only produces a valid (cols, rows) rectangle when num_cores is either
+    // <= 7 (cols=n, rows=1) OR a multiple of 8 (cols=8, rows=n/8). If we
+    // handed it raw_num_tiles directly it would silently drop cores (e.g.
+    // n=38 → grid=8x4=32, and cores 32..37 receive no kernel placement →
+    // SetRuntimeArgs asserts). Round num_cores up to the next valid shape,
+    // clamp to 64, then pad num_tiles out to num_cores * tiles_per_core.
+    // Extra tiles get zero input (pre-zeroed scratch) → zero output that
+    // we discard at unpack time, same strategy BatchFFTPlan uses for its
+    // pow2 padding.
+    uint32_t num_cores;
+    if (raw_num_tiles <= 7u) {
+        num_cores = raw_num_tiles;
+    } else {
+        num_cores = ((raw_num_tiles + 7u) / 8u) * 8u;   // round up to multiple of 8
+        if (num_cores > 64u) num_cores = 64u;
+    }
     uint32_t tiles_per_core = (raw_num_tiles + num_cores - 1u) / num_cores;
     uint32_t num_tiles      = num_cores * tiles_per_core;
 
