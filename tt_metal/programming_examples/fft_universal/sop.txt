@@ -16,12 +16,24 @@ Dispatch summary (all non-identity paths execute on Wormhole):
                                     are either pow2 (device) or prime (Bluestein
                                     -> device)
 
-Batching optimisation (Cooley-Tukey paths):
-    When either side (N1 or N2) of the split is a power of two <= 1024, that
-    entire pass is fused into ONE batched device dispatch via
-    fft_stockham::batch_fft, which runs all sibling sub-FFTs concurrently
-    across the 64-core grid. Example: for N = 1000 = 8 * 125, pass-2 runs 125
-    length-8 FFTs in a single dispatch instead of 125 serial ones.
+Batched recursion (Opt #2 + #2b):
+    The engine operates on BATCHES of sibling signals at every level, not one
+    signal at a time. A Cooley-Tukey split of (count, N = N1*N2) produces
+    (count * N1) siblings for pass-1 and (count * N2) for pass-2 - so batching
+    width ACCUMULATES as the recursion descends. A batched Bluestein fuses K
+    sibling length-N prime FFTs into exactly 2 device dispatches (pow2 length
+    M = next_pow2(2N-1)) regardless of K.
+
+    Consequence: the total number of device dispatches for any composite N is
+    O(log N) - independent of the number of siblings at any level.
+
+    Example (N = 3600 = 16 * 225, where 225 = 9 * 25, 25 = 5 * 5):
+      * top pass-2:     225 length-16 FFTs     -> 1 batched dispatch
+      * 1200 length-3 Bluesteins (inner)       -> 2 batched dispatches
+      * 1200 length-3 Bluesteins (other inner) -> 2 batched dispatches
+      * 720  length-5 Bluesteins               -> 2 batched dispatches
+      * 720  length-5 Bluesteins               -> 2 batched dispatches
+    Total: ~9 dispatches, not hundreds.
 
 -------------------------------------------------------------------------------
  Build
