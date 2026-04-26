@@ -62,6 +62,16 @@ Packed direct-DFT kernel (Opt #5):
     (no SFPU subtract needed). Uses the FPU matmul_tiles() LLK at HiFi4 with
     fp32_dest_acc_en=true.
 
+    Gotcha (don't set UnpackToDestFp32 on a matmul kernel):
+      The ComputeConfig for this kernel intentionally leaves
+      unpack_to_dest_mode at its default. UnpackToDestFp32 routes unpacked
+      tiles straight into DST (used by SFPU-style kernels like
+      pass2_compute). On a matmul kernel that mode bypasses srcA/srcB,
+      so matmul_tiles() reads uninitialised srcA/srcB registers and the
+      FPU multiplies garbage, producing 1e28 / inf outputs. The standard
+      matmul_single_core example omits unpack_to_dest_mode for exactly
+      this reason; mirror that here.
+
     Why it helps:
       * Tile efficiency jumps from len/1024 (~1-3%) to len/32 (~6-100%).
       * Replaces BOTH small-pow2 batch_fft AND small-prime Bluestein (which

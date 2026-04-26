@@ -458,21 +458,21 @@ inline std::shared_ptr<PackedDFTPlan> make_packed_dft_plan(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
-    constexpr uint32_t kNumCbSlots = 32;
-    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
-    for (uint32_t id = 0; id < kCbCount; ++id) {
-        u2d[id] = UnpackToDestMode::UnpackToDestFp32;
-    }
-
+    // IMPORTANT: do NOT set UnpackToDestFp32 for a matmul kernel. That
+    // mode routes tiles straight into DST (used by some SFPU paths), which
+    // leaves srcA / srcB uninitialised when matmul_tiles tries to read
+    // them → FPU multiplies garbage → 1e28 / inf outputs. The standard
+    // tt-metal matmul_single_core example omits unpack_to_dest_mode for
+    // exactly this reason; keep matmul defaults here and rely on
+    // fp32_dest_acc_en to carry fp32 accumulation.
     auto ck = CreateKernel(
         prog,
         "tt_metal/programming_examples/fft_universal/kernel/packed_dft_compute.cpp",
         cr,
         ComputeConfig{
-            .math_fidelity       = MathFidelity::HiFi4,
-            .fp32_dest_acc_en    = true,
-            .unpack_to_dest_mode = u2d,
-            .compile_args        = {pp->tiles_per_core}});
+            .math_fidelity    = MathFidelity::HiFi4,
+            .fp32_dest_acc_en = true,
+            .compile_args     = {pp->tiles_per_core}});
     (void)ck;  // compute kernel needs no per-core runtime args
 
     for (uint32_t c = 0; c < pp->num_cores; ++c) {
