@@ -268,14 +268,11 @@ inline std::vector<Complex> cooley_tukey_split(
         }
     }
 
-    // Step 6: final ordering.
-    std::vector<Complex> X(N);
-    for (uint32_t k1 = 0; k1 < N1; ++k1) {
-        for (uint32_t k2 = 0; k2 < N2; ++k2) {
-            X[k1 * N2 + k2] = C[k2 * N1 + k1];
-        }
-    }
-    return X;
+    // Step 6: C already holds X in the right layout.
+    // With Scheme-B indexing (n = N2*n1 + n2, k = k1 + N1*k2) pass-2 stores
+    // the result at C[k2*N1 + k1]. The output at X[k = k1 + N1*k2] is
+    // exactly that same flat index, so C *is* X — no re-permutation needed.
+    return C;
 }
 
 // ─── Top-level dispatch ──────────────────────────────────────────────────────
