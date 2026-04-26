@@ -1,0 +1,92 @@
+===============================================================================
+ fft_universal — Standard Operating Procedure
+===============================================================================
+
+Scope
+-----
+fft_universal extends the existing power-of-two FFT family (fft/, fft_bf16/,
+fft_stockham/) to any input length N >= 2. No new device kernels are added;
+every compute path ends on Wormhole via fft_stockham::fft — the host only
+reshapes, dispatches, and stitches results.
+
+Dispatch summary (all non-identity paths execute on Wormhole):
+    N is power of 2 (any size)   : fft_stockham::fft pass-through
+    N is prime    (>= 3)          : Bluestein -> 2 pow2 FFTs on device
+    N is composite non-pow2       : Cooley-Tukey split, recurse until leaves
+                                    are either pow2 (device) or prime (Bluestein
+                                    -> device)
+
+-------------------------------------------------------------------------------
+ Build
+-------------------------------------------------------------------------------
+Top-level programming_examples CMakeLists.txt registers the folder. Build all
+three executables with:
+
+    ninja -C build \
+        metal_example_fft_universal_test \
+        metal_example_fft_universal_benchmark \
+        metal_example_fft_universal_demo
+
+Binaries land in:
+
+    build/programming_examples/fft_universal/
+        metal_example_fft_universal_test
+        metal_example_fft_universal_benchmark
+        metal_example_fft_universal_demo
+
+-------------------------------------------------------------------------------
+ Run correctness tests
+-------------------------------------------------------------------------------
+Validates against a double-precision DFT reference across a mix of sizes:
+
+    ./build/programming_examples/fft_universal/metal_example_fft_universal_test
+
+Sizes covered include:
+    * power-of-two N (fall-through)          : 1024, 16384, 65536, 131072
+    * small composite non-pow2               : 6, 12, 24, 36, 360
+    * highly composite                        : 720, 1000, 1800, 3600
+    * prime N (Bluestein path)                : 5, 7, 11, 17, 97, 101, 1021
+    * composite with a large prime factor    : 2*101 = 202, 3*97 = 291
+    * 2 * prime                               : 2*257, 2*509
+
+-------------------------------------------------------------------------------
+ Run benchmark
+-------------------------------------------------------------------------------
+
+    ./build/programming_examples/fft_universal/metal_example_fft_universal_benchmark [N] [iters]
+
+Defaults: N = 1000, iters = 100. N can be anything >= 2.
+
+Output columns are the same as the other fft benchmarks:
+    * iter 0 wall time (first-call; includes plan build + JIT)
+    * cached average over iters 1..iters-1
+    * cached min / max
+    * speedup vs first-call
+
+-------------------------------------------------------------------------------
+ Quick demo
+-------------------------------------------------------------------------------
+
+    ./build/programming_examples/fft_universal/metal_example_fft_universal_demo
+
+Runs a 1000-point FFT of a pure tone and prints the top magnitude bins so you
+can eyeball correctness.
+
+-------------------------------------------------------------------------------
+ Compare against PyTorch
+-------------------------------------------------------------------------------
+fft_universal mirrors torch.fft.fft semantics (forward, un-normalised). Use
+the Python script from fft/ with any N:
+
+    python3 tt_metal/programming_examples/fft/python/compare_with_torch.py \
+        --binary ./build/programming_examples/fft_universal/metal_example_fft_universal_demo \
+        --N 1000
+
+(Update the binary path to whichever example you're comparing.)
+
+-------------------------------------------------------------------------------
+ When to use which kernel
+-------------------------------------------------------------------------------
+    N = power of two, N <= 65,536          -> fft/            (one dispatch)
+    N = power of two, 65K < N <= 1M         -> fft_stockham/   (3 dispatches)
+    N = anything else, or mixed pipelines   -> fft_universal/  (this folder)
