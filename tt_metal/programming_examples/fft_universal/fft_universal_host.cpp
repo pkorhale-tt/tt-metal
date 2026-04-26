@@ -3,9 +3,10 @@
 //
 // fft_universal_host.cpp — Host-side FFT that accepts ANY N >= 2.
 //
-// Reuses existing device kernels via fft_stockham::fft (which itself routes to
-// fft_example::fft for N <= 65,536 and runs the 4-pass Stockham for larger
-// powers of two). No new device kernels are introduced here.
+// Reuses fft_stockham::fft (which itself routes to fft_example::fft for
+// N <= 65,536 and runs the 4-pass Stockham for larger powers of two), and
+// adds ONE new device kernel (Opt #5, under ./kernel/) for the tile-packed
+// direct DFT that handles every sub-FFT with length <= kPackedMaxN.
 //
 // Dispatch tree (every compute path ends on Wormhole):
 //   * N == 1                -> identity.
@@ -15,6 +16,13 @@
 //                              then recurse.
 //   * N is prime (>=3)      -> Bluestein (chirp-z): one forward + one inverse
 //                              pow2 FFT on the device (M = next pow2 >= 2N-1).
+//
+// Leaf path (batched_siblings_fft):
+//   * len <= 32   -> PACKED DIRECT-DFT kernel (Opt #5): 32 sub-FFTs per
+//                    tile, 4 real 32x32 matmuls per tile on the FPU. One
+//                    dispatch, tile efficiency = len/32 instead of
+//                    len/1024 — eliminates the ~99% PCIe padding waste of
+//                    the old small-leaf paths.
 //
 // Batched-recursion architecture (Opt #2 + #2b, complete):
 //
@@ -49,6 +57,7 @@
 
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
+#include "tt-metalium/tilize_utils.hpp"
 
 #include "../fft_stockham/fft_stockham_host.cpp"
 
@@ -76,6 +85,14 @@ constexpr uint32_t kStockhamMaxPow2 = 1048576u;
 // tile (1024 complex elements). Above this we cannot batch and fall back to
 // serial recursion.
 constexpr uint32_t kBatchMaxSubN = 1024u;
+
+// Maximum sub-FFT length handled by the PACKED DIRECT-DFT kernel (Opt #5).
+// 32 is the natural ceiling: a 32x32 Tensix tile fits 32 sub-FFTs (one per
+// row) and the whole N×N twiddle matrix in a single tile. For len <= this
+// we always route through the packed kernel — tile efficiency jumps from
+// ~1-3% (batch_fft with sub_N << 1024) to (len / 32) ≈ 6-100%, which is
+// the dominant PCIe saving.
+constexpr uint32_t kPackedMaxN = 32u;
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
 inline bool is_pow2(uint32_t n) { return n != 0u && (n & (n - 1u)) == 0u; }
@@ -229,6 +246,346 @@ inline std::shared_ptr<CooleyTukeyPlan> get_ct_plan(uint32_t N1, uint32_t N2) {
     return plan;
 }
 
+// ╔════════════════════════════════════════════════════════════════════════╗
+// ║  Optimisation 5 — PACKED DIRECT-DFT kernel for small sub-FFTs (N<=32)  ║
+// ╚════════════════════════════════════════════════════════════════════════╝
+//
+// Motivation
+// ----------
+// The existing fft_stockham::batch_fft kernel stores ONE sub-FFT per tile.
+// For small sub_N the tile is padded with (1024 - sub_N) zeros, wasting
+// ~99% of every PCIe/DRAM byte for sub_N=8 and ~97% for sub_N=32. Since
+// fft_universal decomposes composite N via Cooley-Tukey down to small-prime
+// leaves, these tiny sub_N leaves dominate the dispatch-bytes budget.
+//
+// This kernel packs 32 sub-FFTs per tile (one sub-FFT per tile row) and
+// computes the direct DFT as a 32x32 complex matmul against a cached
+// twiddle matrix T[n, k] = exp(-2πi · k · n / N).  The 4 real 32x32 matmuls
+// that make up the complex matmul are offered to the Tensix FPU via
+// matmul_tiles(), so compute throughput is O(N²) per sub-FFT but N ≤ 32 so
+// it's trivially fast — the dispatch is bandwidth-bound, not compute-bound.
+//
+// Applicability
+// -------------
+//   * Routed for EVERY len ∈ [2, kPackedMaxN=32] at the batched_siblings_fft
+//     dispatcher, replacing both the batch_fft path (pow2 lengths 2..32)
+//     AND the batched_bluestein path (prime/composite 3..32).
+//   * Above 32, batch_fft already runs at >6% tile efficiency and its
+//     Stockham butterflies beat an O(N²) DFT; we keep those paths.
+//
+// Layout details (keyed with packed_dft_common.h)
+// -----------------------------------------------
+//   Per tile:
+//     row i ∈ [0, 32)   →   one sub-FFT (or zero-padding for i ≥ rows_used)
+//     col k ∈ [0, N)    →   spectrum slot k of that sub-FFT
+//     col k ∈ [N, 32)   →   padded zero
+//
+//   Host scratch uses ROW-MAJOR 32*num_tiles × 32 layout; we call
+//   tilize_nfaces before WriteShard and untilize_nfaces after ReadShard to
+//   convert to / from the Tensix face-interleaved tile format required by
+//   the matmul FPU. tilize_nfaces supports float, so no precision loss.
+//
+//   Twiddle matrix T (single tile per cached N): stored tilized too, with
+//   a separate T_I_neg tile so every on-device matmul adds into DST and no
+//   SFPU subtract is needed.
+
+struct PackedDFTPlan {
+    uint32_t N              = 0;    // DFT length   (<= kPackedMaxN)
+    uint32_t count          = 0;    // number of sub-FFTs as requested by caller
+    uint32_t num_tiles      = 0;    // ceil(count / 32), then padded to divide num_cores
+    uint32_t num_cores      = 0;    // <= 64
+    uint32_t tiles_per_core = 0;    // num_tiles / num_cores
+    uint32_t grid_cols      = 0;
+    uint32_t grid_rows      = 0;
+
+    std::shared_ptr<MeshDevice> md;
+    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> in_r_buf,  in_i_buf;
+    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> out_r_buf, out_i_buf;
+    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> tw_r_buf, tw_i_buf, tw_i_neg_buf;
+    tt::tt_metal::distributed::MeshWorkload workload;
+
+    // Reused host scratch (same pattern as BatchFFTPlan / Pass2Plan): a
+    // 32*num_tiles × 32 row-major float buffer plus its tilized mirror.
+    // Zero-initialised once at plan-construction time; per-call repack
+    // overwrites only the valid [0, N) slots of each active row, so the
+    // padding zeros stay put across calls.
+    std::vector<float> in_r_rm,  in_i_rm;     // row-major (host layout)
+    std::vector<float> in_r_til, in_i_til;    // tilized   (device layout)
+    std::vector<float> out_r_til, out_i_til;
+    std::vector<float> out_r_rm,  out_i_rm;
+
+    bool initialized = false;
+};
+
+// Build the N×N twiddle matrix in ROW-MAJOR 32x32 layout (one tile). The
+// matmul on device computes out[i, k] = Σ_n in[i, n] · T[n, k], so T is
+// indexed T[n, k] = exp(-2πi · k · n / N). Positions outside [0, N)² are
+// zero so padded input slots contribute nothing.
+inline std::pair<std::vector<float>, std::vector<float>> packed_dft_twiddle_rm(uint32_t N) {
+    std::vector<float> tr(32u * 32u, 0.0f), ti(32u * 32u, 0.0f);
+    const double tau_over_N = -2.0 * M_PI / static_cast<double>(N);
+    for (uint32_t n = 0; n < N; ++n) {
+        for (uint32_t k = 0; k < N; ++k) {
+            const double a = tau_over_N * static_cast<double>(n) * static_cast<double>(k);
+            tr[n * 32u + k] = static_cast<float>(std::cos(a));
+            ti[n * 32u + k] = static_cast<float>(std::sin(a));
+        }
+    }
+    return {std::move(tr), std::move(ti)};
+}
+
+inline std::shared_ptr<PackedDFTPlan> make_packed_dft_plan(
+    std::shared_ptr<MeshDevice> md, uint32_t N, uint32_t count)
+{
+    using namespace tt::tt_metal;
+    using namespace tt::tt_metal::distributed;
+
+    auto pp = std::make_shared<PackedDFTPlan>();
+    pp->md    = md;
+    pp->N     = N;
+    pp->count = count;
+
+    assert(N >= 2u && N <= kPackedMaxN);
+    assert(count >= 1u);
+
+    constexpr uint32_t kRowsPerTile = 32u;
+    const uint32_t raw_num_tiles = (count + kRowsPerTile - 1u) / kRowsPerTile;
+
+    // Distribute tiles across up to 64 cores. Round num_tiles up so it
+    // divides num_cores evenly; extra tiles get zero input (pre-zeroed
+    // scratch buffers) and produce zero outputs which we discard during
+    // unpack. Same strategy as BatchFFTPlan uses for its pow2 padding.
+    uint32_t num_cores      = (raw_num_tiles < 64u) ? raw_num_tiles : 64u;
+    uint32_t tiles_per_core = (raw_num_tiles + num_cores - 1u) / num_cores;
+    uint32_t num_tiles      = num_cores * tiles_per_core;
+
+    pp->num_cores      = num_cores;
+    pp->tiles_per_core = tiles_per_core;
+    pp->num_tiles      = num_tiles;
+    std::tie(pp->grid_cols, pp->grid_rows) = fft_stockham::pick_batch_grid(num_cores);
+
+    std::printf(
+        "[packed_dft] N=%u  count=%u  =>  num_tiles=%u  cores=%u  grid=%ux%u  "
+        "tiles/core=%u  tile-eff=%.1f%%\n",
+        N, count, num_tiles, num_cores, pp->grid_cols, pp->grid_rows,
+        tiles_per_core,
+        100.0 * static_cast<double>(N * kRowsPerTile) / 1024.0);
+
+    MeshCommandQueue& cq = md->mesh_command_queue();
+
+    // ── DRAM buffers ────────────────────────────────────────────────────
+    const uint32_t io_bytes = num_tiles * fft_stockham::kTileSizeFp32;
+    pp->in_r_buf  = fft_stockham::make_mesh_buf(md, io_bytes, fft_stockham::kTileSizeFp32);
+    pp->in_i_buf  = fft_stockham::make_mesh_buf(md, io_bytes, fft_stockham::kTileSizeFp32);
+    pp->out_r_buf = fft_stockham::make_mesh_buf(md, io_bytes, fft_stockham::kTileSizeFp32);
+    pp->out_i_buf = fft_stockham::make_mesh_buf(md, io_bytes, fft_stockham::kTileSizeFp32);
+
+    // Single-tile twiddle buffers (one each for T_R, T_I, T_I_neg).
+    const uint32_t tw_bytes = fft_stockham::kTileSizeFp32;
+    pp->tw_r_buf     = fft_stockham::make_mesh_buf(md, tw_bytes, fft_stockham::kTileSizeFp32);
+    pp->tw_i_buf     = fft_stockham::make_mesh_buf(md, tw_bytes, fft_stockham::kTileSizeFp32);
+    pp->tw_i_neg_buf = fft_stockham::make_mesh_buf(md, tw_bytes, fft_stockham::kTileSizeFp32);
+
+    // Build and upload twiddle tiles (row-major → tilize → WriteShard).
+    auto [tr_rm, ti_rm] = packed_dft_twiddle_rm(N);
+    std::vector<float> ti_neg_rm(ti_rm.size());
+    for (size_t i = 0; i < ti_rm.size(); ++i) ti_neg_rm[i] = -ti_rm[i];
+
+    std::vector<float> tr_til     = tilize_nfaces(tr_rm,     32u, 32u);
+    std::vector<float> ti_til     = tilize_nfaces(ti_rm,     32u, 32u);
+    std::vector<float> ti_neg_til = tilize_nfaces(ti_neg_rm, 32u, 32u);
+
+    WriteShard(cq, pp->tw_r_buf,     tr_til,     MeshCoordinate(0, 0), false);
+    WriteShard(cq, pp->tw_i_buf,     ti_til,     MeshCoordinate(0, 0), false);
+    WriteShard(cq, pp->tw_i_neg_buf, ti_neg_til, MeshCoordinate(0, 0), false);
+
+    // ── Host scratch (reused across calls — see PackedDFTPlan comments) ─
+    const size_t rm_floats  = static_cast<size_t>(num_tiles) * 32u * 32u;
+    const size_t til_floats = static_cast<size_t>(num_tiles) * fft_stockham::kTileElems;
+    pp->in_r_rm .assign(rm_floats,  0.0f);
+    pp->in_i_rm .assign(rm_floats,  0.0f);
+    pp->in_r_til.assign(til_floats, 0.0f);
+    pp->in_i_til.assign(til_floats, 0.0f);
+    pp->out_r_til.assign(til_floats, 0.0f);
+    pp->out_i_til.assign(til_floats, 0.0f);
+    pp->out_r_rm .assign(rm_floats,  0.0f);
+    pp->out_i_rm .assign(rm_floats,  0.0f);
+
+    // ── Program ─────────────────────────────────────────────────────────
+    Program prog = CreateProgram();
+
+    const CoreCoord first{0, 0};
+    const CoreCoord last{pp->grid_cols - 1, pp->grid_rows - 1};
+    const CoreRange cr(first, last);
+
+    // CBs: CB_A, CB_B (depth 4 so the reader can queue all 4 matmul pairs
+    // upfront), CB_OUT_R, CB_OUT_I (depth 2, ordinary double-buffer).
+    constexpr uint32_t kCbCount = 4u;
+    constexpr uint32_t kCbTiles[kCbCount] = {4u, 4u, 2u, 2u};
+    for (uint32_t id = 0; id < kCbCount; ++id) {
+        CircularBufferConfig c(
+            kCbTiles[id] * fft_stockham::kTileSizeFp32,
+            {{id, tt::DataFormat::Float32}});
+        c.set_page_size(id, fft_stockham::kTileSizeFp32);
+        CreateCircularBuffer(prog, cr, c);
+    }
+
+    auto rk = CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft_universal/kernel/packed_dft_reader.cpp",
+        cr,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc       = NOC::RISCV_0_default});
+
+    auto wk = CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft_universal/kernel/packed_dft_writer.cpp",
+        cr,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc       = NOC::RISCV_1_default});
+
+    constexpr uint32_t kNumCbSlots = 32;
+    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
+    for (uint32_t id = 0; id < kCbCount; ++id) {
+        u2d[id] = UnpackToDestMode::UnpackToDestFp32;
+    }
+
+    auto ck = CreateKernel(
+        prog,
+        "tt_metal/programming_examples/fft_universal/kernel/packed_dft_compute.cpp",
+        cr,
+        ComputeConfig{
+            .math_fidelity       = MathFidelity::HiFi4,
+            .fp32_dest_acc_en    = true,
+            .unpack_to_dest_mode = u2d,
+            .compile_args        = {pp->tiles_per_core}});
+
+    for (uint32_t c = 0; c < pp->num_cores; ++c) {
+        const CoreCoord logical = fft_stockham::batch_logical_core(c, pp->grid_cols);
+        const uint32_t  base    = c * pp->tiles_per_core;
+
+        SetRuntimeArgs(prog, rk, logical, {
+            fft_stockham::buf_addr(pp->in_r_buf),
+            fft_stockham::buf_addr(pp->in_i_buf),
+            fft_stockham::buf_addr(pp->tw_r_buf),
+            fft_stockham::buf_addr(pp->tw_i_buf),
+            fft_stockham::buf_addr(pp->tw_i_neg_buf),
+            base,
+            pp->tiles_per_core,
+        });
+
+        SetRuntimeArgs(prog, wk, logical, {
+            fft_stockham::buf_addr(pp->out_r_buf),
+            fft_stockham::buf_addr(pp->out_i_buf),
+            base,
+            pp->tiles_per_core,
+        });
+    }
+
+    pp->workload.add_program(
+        MeshCoordinateRange(MeshCoordinate(0, 0), MeshCoordinate(0, 0)),
+        std::move(prog));
+    pp->initialized = true;
+    return pp;
+}
+
+namespace detail_packed {
+inline std::unordered_map<uint64_t, std::shared_ptr<PackedDFTPlan>>& packed_dft_cache() {
+    static std::unordered_map<uint64_t, std::shared_ptr<PackedDFTPlan>> c;
+    return c;
+}
+inline uint64_t packed_dft_key(MeshDevice* md, uint32_t N, uint32_t count) {
+    return reinterpret_cast<uint64_t>(md)
+         ^ (uint64_t{N}     * 0x9E3779B97F4A7C15ull)
+         ^ (uint64_t{count} * 0xBF58476D1CE4E5B9ull);
+}
+}  // namespace detail_packed
+
+inline std::shared_ptr<PackedDFTPlan> get_cached_packed_dft_plan(
+    std::shared_ptr<MeshDevice> md, uint32_t N, uint32_t count)
+{
+    const uint64_t key = detail_packed::packed_dft_key(md.get(), N, count);
+    auto& cache = detail_packed::packed_dft_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    auto pp = make_packed_dft_plan(md, N, count);
+    cache.emplace(key, pp);
+    return pp;
+}
+
+// Host wrapper. Computes `count` independent length-N DFTs via the packed
+// direct-DFT kernel. in/out layout is row-major (count * N complex values).
+inline void packed_direct_dft_batched(
+    std::shared_ptr<MeshDevice>   md,
+    uint32_t                      N,
+    uint32_t                      count,
+    const std::vector<Complex>&   in_natural,
+    std::vector<Complex>&         out_natural)
+{
+    using namespace tt::tt_metal::distributed;
+    assert(in_natural.size() == static_cast<size_t>(count) * N);
+
+    auto plan = get_cached_packed_dft_plan(md, N, count);
+    constexpr uint32_t kRowsPerTile = 32u;
+
+    std::vector<float>& in_r_rm  = plan->in_r_rm;
+    std::vector<float>& in_i_rm  = plan->in_i_rm;
+    std::vector<float>& in_r_til = plan->in_r_til;
+    std::vector<float>& in_i_til = plan->in_i_til;
+    std::vector<float>& out_r_til = plan->out_r_til;
+    std::vector<float>& out_i_til = plan->out_i_til;
+
+    // Pack natural-order input into row-major (32 * num_tiles) × 32. Each
+    // sub-FFT r → row r, positions [0, N); positions [N, 32) stay zero.
+    // Extra rows r ∈ [count, 32 * num_tiles) stay zero from plan init.
+    for (uint32_t r = 0; r < count; ++r) {
+        const Complex* src = in_natural.data() + static_cast<size_t>(r) * N;
+        float* tr = in_r_rm.data() + static_cast<size_t>(r) * 32u;
+        float* ti = in_i_rm.data() + static_cast<size_t>(r) * 32u;
+        for (uint32_t k = 0; k < N; ++k) {
+            tr[k] = src[k].real();
+            ti[k] = src[k].imag();
+        }
+    }
+    // If a previous call used a larger `count` with the SAME plan (rare —
+    // only hits on plan reuse across counts), those rows would still have
+    // stale data in cols [0, N). For our dispatcher, plan keys include
+    // count so this cannot happen — but zero the just-vacated tail anyway
+    // for safety when count hit the plan exactly.
+    // (Left as-is: PackedDFTPlan is keyed on (N, count), so no cross-call
+    // leakage is possible.)
+
+    // Row-major → tilized (matmul expects Tensix face layout).
+    const uint32_t total_rows = plan->num_tiles * kRowsPerTile;
+    in_r_til = tilize_nfaces(in_r_rm, total_rows, 32u);
+    in_i_til = tilize_nfaces(in_i_rm, total_rows, 32u);
+
+    MeshCommandQueue& cq = plan->md->mesh_command_queue();
+    WriteShard(cq, plan->in_r_buf, in_r_til, MeshCoordinate(0, 0), false);
+    WriteShard(cq, plan->in_i_buf, in_i_til, MeshCoordinate(0, 0), false);
+
+    EnqueueMeshWorkload(cq, plan->workload, false);
+
+    ReadShard(cq, out_r_til, plan->out_r_buf, MeshCoordinate(0, 0), true);
+    ReadShard(cq, out_i_til, plan->out_i_buf, MeshCoordinate(0, 0), true);
+
+    std::vector<float>& out_r_rm = plan->out_r_rm;
+    std::vector<float>& out_i_rm = plan->out_i_rm;
+    out_r_rm = untilize_nfaces(out_r_til, total_rows, 32u);
+    out_i_rm = untilize_nfaces(out_i_til, total_rows, 32u);
+
+    // Unpack: sub-FFT r output = row r positions [0, N).
+    out_natural.resize(static_cast<size_t>(count) * N);
+    for (uint32_t r = 0; r < count; ++r) {
+        const float* tr = out_r_rm.data() + static_cast<size_t>(r) * 32u;
+        const float* ti = out_i_rm.data() + static_cast<size_t>(r) * 32u;
+        Complex*     dst = out_natural.data() + static_cast<size_t>(r) * N;
+        for (uint32_t k = 0; k < N; ++k) dst[k] = {tr[k], ti[k]};
+    }
+}
+
 // ─── Forward declarations ────────────────────────────────────────────────────
 inline std::vector<Complex> fft(
     std::shared_ptr<MeshDevice>  md,
@@ -288,6 +645,19 @@ inline void batched_siblings_fft(
 
     if (len == 1u || count == 0u) {
         out = in;
+        return;
+    }
+
+    // Path 0 (Opt #5): any len ∈ [2, 32] goes through the packed direct-DFT
+    // kernel. For these small lengths this is strictly a win vs both the
+    // pow2 batch_fft path (which wastes ~97-99% of every tile on padding
+    // zeros) AND the prime-length Bluestein path (2 dispatches at M up to
+    // 64, each with similarly poor tile efficiency). Pack 32 sub-FFTs per
+    // tile, compute as a complex 32x32 matmul → one dispatch, (len/32)
+    // tile efficiency. Covers every small prime/composite leaf the CT
+    // recursion would otherwise bounce into Bluestein or serial batch_fft.
+    if (len >= 2u && len <= kPackedMaxN) {
+        packed_direct_dft_batched(md, len, count, in, out);
         return;
     }
 

@@ -5,16 +5,17 @@
 Scope
 -----
 fft_universal extends the existing power-of-two FFT family (fft/, fft_bf16/,
-fft_stockham/) to any input length N >= 2. No new device kernels are added;
-every compute path ends on Wormhole via fft_stockham::fft — the host only
-reshapes, dispatches, and stitches results.
+fft_stockham/) to any input length N >= 2. Every compute path ends on
+Wormhole; the host only reshapes, dispatches, and stitches results. It
+reuses fft_stockham's Stockham kernels for pow2 sub-FFTs of length >= 64
+and adds one new packed direct-DFT kernel for small leaves (len <= 32).
 
 Dispatch summary (all non-identity paths execute on Wormhole):
-    N is power of 2 (any size)   : fft_stockham::fft pass-through
-    N is prime    (>= 3)          : Bluestein -> 2 pow2 FFTs on device
-    N is composite non-pow2       : Cooley-Tukey split, recurse until leaves
-                                    are either pow2 (device) or prime (Bluestein
-                                    -> device)
+    len <= 32   (any structure)   : PACKED DIRECT-DFT kernel (Opt #5, below)
+    N is power of 2, len > 32     : fft_stockham::fft / batch_fft
+    N is prime    (>= 37)         : Bluestein -> 2 pow2 FFTs on device
+    N is composite non-pow2       : Cooley-Tukey split, recurse (leaves fall
+                                    into the packed path or batch_fft)
 
 Batched recursion (Opt #2 + #2b):
     The engine operates on BATCHES of sibling signals at every level, not one
@@ -44,6 +45,32 @@ Host-scratch caching (Opt #4):
     time. The batch-FFT reader/compute only touch the first `sub_N` slots of
     each tile, so pad positions stay valid for the life of the plan. Same
     pattern applied to Pass2Plan for the large pow2 Stockham path.
+
+Packed direct-DFT kernel (Opt #5):
+    New device kernel trio under fft_universal/kernel/ — packed_dft_reader,
+    packed_dft_compute, packed_dft_writer — targets every sub-FFT of length
+    len <= 32. Instead of fft_stockham::batch_fft's "one sub-FFT per tile"
+    layout (which for len=8 wastes 99.2% of each tile on padding zeros), we
+    pack 32 sub-FFTs per tile (one sub-FFT per tile row, cols [0,len)
+    valid, [len,32) zero) and compute the direct DFT as a complex 32x32
+    matmul against a cached twiddle matrix T[n,k] = exp(-2*pi*i*k*n/len).
+
+    Complex matmul = 4 real matmuls:
+        out_R = in_R * T_R  +  in_I * (-T_I)     (accumulate into DST(0))
+        out_I = in_R * T_I  +  in_I * T_R         (accumulate into DST(0))
+    The host pre-negates T_I once so every matmul on device ADDS into DST
+    (no SFPU subtract needed). Uses the FPU matmul_tiles() LLK at HiFi4 with
+    fp32_dest_acc_en=true.
+
+    Why it helps:
+      * Tile efficiency jumps from len/1024 (~1-3%) to len/32 (~6-100%).
+      * Replaces BOTH small-pow2 batch_fft AND small-prime Bluestein (which
+        was 2 dispatches at M up to 64, each worse than the packed path).
+      * For N = 3600 the inner-most Bluestein leaves (len=3, len=5) were the
+        biggest PCIe hog — they're now single-dispatch, ~30x less PCIe bytes.
+
+    Cache: keyed on (MeshDevice, N, count). Same host-scratch-reuse pattern
+    as Opt #4 (buffers live on the plan, zero-init once).
 
 -------------------------------------------------------------------------------
  Build

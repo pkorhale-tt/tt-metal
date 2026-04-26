@@ -1,8 +1,9 @@
 # fft_universal — FFT for ANY N (not just powers of two)
 
 `fft_universal::fft(md, signal)` computes the DFT of a complex signal of any
-length N >= 2. Internally it reuses the existing power-of-two kernels from
-`fft/` and `fft_stockham/` — no new device kernels are introduced.
+length N >= 2. Internally it reuses `fft_stockham/` for pow2 sub-FFTs of
+length ≥ 64 and adds ONE new device kernel — the **packed direct-DFT
+kernel** under `./kernel/` — for every sub-FFT of length ≤ 32.
 
 ## How it decides what to do
 
@@ -19,6 +20,11 @@ length N >= 2. Internally it reuses the existing power-of-two kernels from
         │ N is prime (>= 3)     → Bluestein (chirp-z)  │
         │                          pads to pow2 M,     │
         │                          one pow2 FFT + IFFT │
+        │                                               │
+        │ Every leaf of length ≤ 32 (pow2 or not, prime │
+        │ or composite) short-circuits through the      │
+        │ PACKED DIRECT-DFT kernel — 32 sub-FFTs per    │
+        │ tile, complex 32×32 matmul, ONE dispatch.     │
         └─────────────────────────────────────────────┘
 ```
 
@@ -56,8 +62,13 @@ reshape / twiddle / transpose / dispatch logic.
 Plans are **cached** so second and later calls for the same N skip all
 host-side prep:
 
+* **`PackedDFTPlan`** (Opt #5) — keyed on `(N, count)`; holds the `N×N`
+  twiddle tile (plus its negated-imag mirror for sign-free accumulation)
+  and reusable host/device scratch buffers. Every sub-FFT leaf of length
+  ≤ 32 goes through this plan in one dispatch.
 * **`BluesteinPlan`** — keyed on `N`; holds the chirp `w[n]` and pre-computed
-  `B_fft = FFT_M(b_ext)`.
+  `B_fft = FFT_M(b_ext)`. Only used for prime N ≥ 37 now (smaller primes
+  go through the packed DFT).
 * **`CooleyTukeyPlan`** — keyed on `(N1, N2)`; holds the `N1·N2` twiddle table
   `exp(-2πi · n1 · k2 / N)`. Removes all `cos/sin` from the per-iter hot path.
 * **`fft_stockham`'s batch_fft / pass-2 / Stockham plans** — inherited via
