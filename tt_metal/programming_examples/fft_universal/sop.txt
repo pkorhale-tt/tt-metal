@@ -16,6 +16,13 @@ Dispatch summary (all non-identity paths execute on Wormhole):
                                     are either pow2 (device) or prime (Bluestein
                                     -> device)
 
+Batching optimisation (Cooley-Tukey paths):
+    When either side (N1 or N2) of the split is a power of two <= 1024, that
+    entire pass is fused into ONE batched device dispatch via
+    fft_stockham::batch_fft, which runs all sibling sub-FFTs concurrently
+    across the 64-core grid. Example: for N = 1000 = 8 * 125, pass-2 runs 125
+    length-8 FFTs in a single dispatch instead of 125 serial ones.
+
 -------------------------------------------------------------------------------
  Build
 -------------------------------------------------------------------------------

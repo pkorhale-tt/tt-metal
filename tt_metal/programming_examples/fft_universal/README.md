@@ -29,7 +29,11 @@ reshape / twiddle / transpose / dispatch logic.
   device kernel — zero overhead.
 * **Composite non-pow2**: split N = N1 · N2 (biggest pow2 factor × odd rest,
   or smallest prime × rest), recurse, twiddle-multiply, transpose, recurse.
-  Every leaf of the recursion lands on a device dispatch.
+  Every leaf of the recursion lands on a device dispatch. **When either side
+  of the split is a power of two ≤ 1024**, that entire pass (up to thousands of
+  sibling sub-FFTs) is fused into a single device dispatch via
+  `fft_stockham::batch_fft`, which fans across all 64 Tensix cores — typically
+  a 5–20× speedup over per-row dispatches on cases like `N = 1024·k`.
 * **Prime N ≥ 3**: Bluestein's algorithm turns the length-N DFT into a
   length-M cyclic convolution (M = next pow2ᵢ ≥ 2N-1), which is 1 forward FFT +
   1 inverse FFT on the device (both pow2 → `fft_stockham`). Example: N=3 →

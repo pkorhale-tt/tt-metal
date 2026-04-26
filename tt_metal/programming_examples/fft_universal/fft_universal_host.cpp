@@ -19,8 +19,11 @@
 // Cost summary:
 //   * pow2 N                -> same as fft_stockham (no extra overhead).
 //   * composite N           -> pow2 sub-FFTs plus O(N) host twiddle + transpose.
-//                              One dispatch per row for now — batching of
-//                              equal-length recursive calls is a follow-up.
+//                              Whenever a side of the split (N1 or N2) is pow2
+//                              and fits in a tile (<= 1024), that entire pass
+//                              runs in ONE batched device dispatch across all
+//                              64 cores via fft_stockham::batch_fft. The other
+//                              side (non-pow2) still recurses serially.
 //   * prime N               -> ~2x the cost of a length-M Stockham FFT plus
 //                              two O(N) host passes (pre/post-multiply).
 //
@@ -54,6 +57,11 @@ using tt::tt_metal::distributed::MeshDevice;
 // Largest power-of-two that fft_stockham::fft currently accepts. Bluestein
 // requires M = next_pow2(2N - 1) <= this ceiling, i.e. prime N <= 524,288.
 constexpr uint32_t kStockhamMaxPow2 = 1048576u;
+
+// fft_stockham::batch_fft requires each sub-FFT to fit in a single Tensix
+// tile (1024 complex elements). Above this we cannot batch and fall back to
+// serial recursion.
+constexpr uint32_t kBatchMaxSubN = 1024u;
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
 inline bool is_pow2(uint32_t n) { return n != 0u && (n & (n - 1u)) == 0u; }
@@ -167,6 +175,56 @@ inline std::vector<Complex> fft(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  signal);
 
+// ─── Batched sibling sub-FFTs (Opt #2) ───────────────────────────────────────
+//
+// Compute `count` independent FFTs of length `len`, all laid out back-to-back
+// in a single row-major buffer: in[i * len + k] is element k of sub-FFT i.
+//
+//   * len is pow2 and <= kBatchMaxSubN        -> ONE device dispatch via
+//                                                 fft_stockham::batch_fft;
+//                                                 64 cores run count/64 sub-FFTs
+//                                                 each in parallel.
+//   * otherwise                                -> fall back to `count` serial
+//                                                 recursive fft_universal calls
+//                                                 (still correct, still on
+//                                                 Wormhole, just not batched).
+//
+// This is the workhorse for Cooley-Tukey: whichever side (N1 or N2) is pow2
+// collapses from `count` dispatches to 1, which is the dominant win for the
+// composite-non-pow2 regime (typical: pow2 × small_odd like 1024 × 7).
+inline void batched_siblings_fft(
+    std::shared_ptr<MeshDevice>       md,
+    uint32_t                          count,
+    uint32_t                          len,
+    const std::vector<Complex>&       in,
+    std::vector<Complex>&             out)
+{
+    assert(in.size() == static_cast<size_t>(count) * len);
+
+    if (len == 1u || count == 0u) {
+        out = in;
+        return;
+    }
+
+    if (is_pow2(len) && len <= kBatchMaxSubN) {
+        // Single device dispatch handles every sibling in parallel.
+        fft_stockham::batch_fft(md, len, count, in, out);
+        return;
+    }
+
+    // Serial fallback: sibling sub-FFTs aren't directly batch-able
+    // (non-pow2 length or bigger than a tile). Each recursive call still
+    // lands on Wormhole via Bluestein or nested Cooley-Tukey.
+    out.resize(static_cast<size_t>(count) * len);
+    std::vector<Complex> tmp(len);
+    for (uint32_t i = 0; i < count; ++i) {
+        const size_t base = static_cast<size_t>(i) * len;
+        for (uint32_t k = 0; k < len; ++k) tmp[k] = in[base + k];
+        const std::vector<Complex> Yi = fft(md, tmp);
+        for (uint32_t k = 0; k < len; ++k) out[base + k] = Yi[k];
+    }
+}
+
 // ─── Bluestein forward FFT ───────────────────────────────────────────────────
 inline std::vector<Complex> bluestein_fft(
     std::shared_ptr<MeshDevice>  md,
@@ -226,20 +284,20 @@ inline std::vector<Complex> cooley_tukey_split(
     const uint32_t N = N1 * N2;
     assert(static_cast<uint32_t>(x.size()) == N);
 
-    // Steps 1-2: transposed read + length-N2 row FFT.
-    // For each n1 we gather x[n1 + N1 * n2] for n2 in [0, N2), which is a
-    // strided read over the input — this is what puts us in the scheme-(c)
-    // layout that fft_stockham uses too.
-    std::vector<Complex> A(N);
-    {
-        std::vector<Complex> row(N2);
-        for (uint32_t i = 0; i < N1; ++i) {
-            for (uint32_t j = 0; j < N2; ++j) row[j] = x[j * N1 + i];
-            const std::vector<Complex> Yi = fft(md, row);
-            const uint32_t base = i * N2;
-            for (uint32_t j = 0; j < N2; ++j) A[base + j] = Yi[j];
-        }
+    // Step 1: transposed reshape into (N1, N2) row-major. Row i of the
+    // packed buffer is the length-N2 strided slice {x[i], x[N1+i], x[2N1+i], ...}.
+    std::vector<Complex> pass1_in(N);
+    for (uint32_t i = 0; i < N1; ++i) {
+        const size_t base = static_cast<size_t>(i) * N2;
+        for (uint32_t j = 0; j < N2; ++j) pass1_in[base + j] = x[j * N1 + i];
     }
+
+    // Step 2: N1 sibling sub-FFTs of length N2.
+    //   - If N2 is pow2 and <= 1024: ONE batched device dispatch (64-core fan-out).
+    //   - Else: N1 serial recursive fft(md, ...) calls (still on Wormhole via
+    //     Bluestein or a nested Cooley-Tukey split).
+    std::vector<Complex> A;
+    batched_siblings_fft(md, N1, N2, pass1_in, A);
 
     // Step 3: twiddle multiply. A is in (n1, k2) = (i, j) layout now.
     // Double-precision angle keeps fp32 fidelity even at large Ns.
@@ -265,23 +323,17 @@ inline std::vector<Complex> cooley_tukey_split(
         }
     }
 
-    // Step 5: length-N1 row FFTs along the second axis of C (the n1 axis).
-    {
-        std::vector<Complex> col(N1);
-        for (uint32_t j = 0; j < N2; ++j) {
-            const uint32_t base = j * N1;
-            for (uint32_t i = 0; i < N1; ++i) col[i] = C[base + i];
-            const std::vector<Complex> Zj = fft(md, col);
-            for (uint32_t i = 0; i < N1; ++i) C[base + i] = Zj[i];
-        }
-    }
+    // Step 5: N2 sibling sub-FFTs of length N1. Same batching rule as pass-1
+    // — if N1 is pow2 and <= 1024, the whole pass collapses to ONE dispatch.
+    std::vector<Complex> D;
+    batched_siblings_fft(md, N2, N1, C, D);
 
     // Step 6: permute to output order. With k = N2*k1 + k2 (scheme (c)),
-    // X[N2*k1 + k2] lives at C[k2, k1] = C[k2*N1 + k1].
+    // X[N2*k1 + k2] lives at D[k2, k1] = D[k2*N1 + k1].
     std::vector<Complex> X(N);
     for (uint32_t k1 = 0; k1 < N1; ++k1) {
         for (uint32_t k2 = 0; k2 < N2; ++k2) {
-            X[k1 * N2 + k2] = C[k2 * N1 + k1];
+            X[k1 * N2 + k2] = D[k2 * N1 + k1];
         }
     }
     return X;
