@@ -17,10 +17,15 @@ add_executable(metal_example_fft_universal_benchmark
 add_executable(metal_example_fft_universal_demo
     ${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_demo.cpp)
 
+# PyTorch comparison harness (pairs with compare_with_torch.py).
+add_executable(metal_example_fft_universal_vs_torch
+    ${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_vs_torch.cpp)
+
 foreach(tgt
     metal_example_fft_universal_test
     metal_example_fft_universal_benchmark
-    metal_example_fft_universal_demo)
+    metal_example_fft_universal_demo
+    metal_example_fft_universal_vs_torch)
     target_link_libraries(${tgt} PRIVATE TT::Metalium)
     target_include_directories(${tgt} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
