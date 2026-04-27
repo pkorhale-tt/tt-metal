@@ -20,10 +20,14 @@ add_executable(metal_example_fft_universal_bf16_benchmark
 add_executable(metal_example_fft_universal_bf16_demo
     ${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_bf16_demo.cpp)
 
+add_executable(metal_example_fft_universal_bf16_precision
+    ${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_bf16_precision.cpp)
+
 foreach(tgt
     metal_example_fft_universal_bf16_test
     metal_example_fft_universal_bf16_benchmark
-    metal_example_fft_universal_bf16_demo)
+    metal_example_fft_universal_bf16_demo
+    metal_example_fft_universal_bf16_precision)
     target_link_libraries(${tgt} PRIVATE TT::Metalium)
     target_include_directories(${tgt} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
