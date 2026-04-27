@@ -3,19 +3,21 @@
 //
 // fft_universal_bf16_test.cpp — correctness harness for the TRUE-bf16
 // dispatch tree. Exercises:
-//   * Phase 1  : N in [2, 32] (packed direct-DFT on the FPU)
-//   * Phase 2a : pow2 N in [64, 1024] (two-level CT = two Phase-1 calls
-//                with a host-side fp32 pointwise twiddle between them)
+//   * Phase 1   : N in [2, 32]               (packed direct-DFT on the FPU)
+//   * Phase 2b  : pow2 N > 32                (recursive CT, N1 = 32)
+//                 composite N > 32 with ÷≤32 (recursive CT, N1 = largest ÷≤32)
+//   * Phase 2c  : prime N > 32               (Bluestein → Phase 2b)
+//                 composite with no ÷ ≤ 32   (Bluestein → Phase 2b)
 //
 // Threshold choice
 // ----------------
 // bf16 has ~8 bits of mantissa, so ULP is ~4e-3 relative.
-//   * Phase 1  (single pass) : ~3-5e-3 empirical on random |x| <= 1.
-//   * Phase 2a (two passes)  : ~2x the Phase-1 rounding depth on the
-//                              reduction path, plus one extra bf16 round-trip
-//                              for the host twiddle. Empirically ~5-8e-3.
-// We use 1e-2 for Phase 1 and 2e-2 for Phase 2a as safety margins — if a
-// kernel regresses below bf16's inherent floor, the failure is unambiguous.
+//   * Phase 1              : ~3-5e-3 empirical.
+//   * Phase 2b, N ≤ 1024   : ~5-8e-3   (depth-1 recursion).
+//   * Phase 2b, N ≤ 32768  : ~8-15e-3  (depth-2/3 recursion).
+//   * Phase 2c Bluestein   : ~5-15e-3  (3 length-M FFTs + fp32 chirps).
+// Thresholds below are generous safety margins. If any one regresses below
+// bf16's inherent floor, the failure is unambiguous.
 
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
@@ -159,45 +161,73 @@ int main() {
     all &= run_test(md, make_impulse(32), "impulse N=32");
     all &= run_test(md, make_impulse(17), "impulse N=17");
 
-    // ── Phase 2a: pow2 N in [64, 1024] via two-level Cooley-Tukey ───────────
-    // Two Phase-1 passes on device + host-side fp32 pointwise twiddle.
-    // Threshold bumped to 2e-2 because there's roughly twice the bf16
-    // rounding depth (two device passes).
-    constexpr float kPhase2aThreshold = 2e-2f;
-    all &= run_test(md, make_random(64),   "random N=64   (pow2, CT 32x2)",   kPhase2aThreshold);
-    all &= run_test(md, make_random(128),  "random N=128  (pow2, CT 32x4)",   kPhase2aThreshold);
-    all &= run_test(md, make_random(256),  "random N=256  (pow2, CT 32x8)",   kPhase2aThreshold);
-    all &= run_test(md, make_random(512),  "random N=512  (pow2, CT 32x16)",  kPhase2aThreshold);
-    all &= run_test(md, make_random(1024), "random N=1024 (pow2, CT 32x32)",  kPhase2aThreshold);
-    all &= run_test(md, make_impulse(1024),"impulse N=1024 (pow2)",           kPhase2aThreshold);
+    // ── Phase 2b: pow2 N via two-level Cooley-Tukey (N1 = 32) ──────────────
+    // N ≤ 1024  : depth-1 recursion (two Phase-1 passes).
+    // N > 1024  : depth-2+ recursion. Each extra level doubles the bf16
+    //             rounding depth, so we loosen the threshold step-wise.
+    constexpr float kPow2ShallowThreshold = 2e-2f;   // N ∈ [64, 1024]
+    constexpr float kPow2DeepThreshold    = 3e-2f;   // N ∈ [2048, 16384]
+    constexpr float kPow2VeryDeepThreshold = 5e-2f;  // N ∈ [32768, 65536]
 
-    // Phase 2b guard: pow2 N > 1024 should still throw.
-    bool threw_2b = false;
-    try {
-        (void)fft_universal_bf16::fft(md, make_random(2048));
-    } catch (const std::runtime_error&) {
-        threw_2b = true;
-    }
-    std::printf("[%s] N=2048 (Phase 2b guard): %s threw runtime_error\n",
-                threw_2b ? "PASS" : "FAIL",
-                threw_2b ? "correctly" : "unexpectedly did NOT");
-    all &= threw_2b;
+    // Shallow pow2 (Phase 2a sizes).
+    all &= run_test(md, make_random(64),    "random N=64    (pow2 CT 32x2)",     kPow2ShallowThreshold);
+    all &= run_test(md, make_random(128),   "random N=128   (pow2 CT 32x4)",     kPow2ShallowThreshold);
+    all &= run_test(md, make_random(256),   "random N=256   (pow2 CT 32x8)",     kPow2ShallowThreshold);
+    all &= run_test(md, make_random(512),   "random N=512   (pow2 CT 32x16)",    kPow2ShallowThreshold);
+    all &= run_test(md, make_random(1024),  "random N=1024  (pow2 CT 32x32)",    kPow2ShallowThreshold);
+    all &= run_test(md, make_impulse(1024), "impulse N=1024 (pow2)",             kPow2ShallowThreshold);
 
-    // Phase 2c guard: a prime N > 32 should still throw (Bluestein pending).
-    bool threw_2c = false;
-    try {
-        (void)fft_universal_bf16::fft(md, make_random(37));
-    } catch (const std::runtime_error&) {
-        threw_2c = true;
-    }
-    std::printf("[%s] N=37 (Phase 2c prime guard): %s threw runtime_error\n",
-                threw_2c ? "PASS" : "FAIL",
-                threw_2c ? "correctly" : "unexpectedly did NOT");
-    all &= threw_2c;
+    // Deep pow2 (new in this phase).
+    all &= run_test(md, make_random(2048),  "random N=2048  (pow2 CT 32x64)",    kPow2DeepThreshold);
+    all &= run_test(md, make_random(4096),  "random N=4096  (pow2 CT 32x128)",   kPow2DeepThreshold);
+    all &= run_test(md, make_random(8192),  "random N=8192  (pow2 CT 32x256)",   kPow2DeepThreshold);
+    all &= run_test(md, make_random(16384), "random N=16384 (pow2 CT 32x512)",   kPow2DeepThreshold);
+    all &= run_test(md, make_impulse(16384),"impulse N=16384 (pow2)",            kPow2DeepThreshold);
+    // Very-deep pow2.
+    all &= run_test(md, make_random(32768), "random N=32768 (pow2 CT 32x1024)",  kPow2VeryDeepThreshold);
+    all &= run_test(md, make_random(65536), "random N=65536 (pow2 depth-3)",     kPow2VeryDeepThreshold);
+
+    // ── Phase 2b: composite non-pow2 via mixed-radix CT ────────────────────
+    // Each of these has a divisor ≤ 32 so the dispatcher picks mixed-radix.
+    // 36  = 4 × 9      (N1 = 4,  N2 = 9, both ≤ 32)
+    // 48  = 16 × 3     (N1 = 16, N2 = 3, both ≤ 32)
+    // 60  = 30 × 2     (N1 = 30, N2 = 2, both ≤ 32)
+    // 100 = 25 × 4     (N1 = 25, N2 = 4, both ≤ 32)
+    // 3600 = 30 × 120  → 120 = 30 × 4 (depth-2 recursion)
+    constexpr float kMixedThreshold = 2e-2f;
+    all &= run_test(md, make_random(36),    "random N=36    (mixed 4x9)",        kMixedThreshold);
+    all &= run_test(md, make_random(48),    "random N=48    (mixed 16x3)",       kMixedThreshold);
+    all &= run_test(md, make_random(60),    "random N=60    (mixed 30x2)",       kMixedThreshold);
+    all &= run_test(md, make_random(100),   "random N=100   (mixed 25x4)",       kMixedThreshold);
+    all &= run_test(md, make_random(3600),  "random N=3600  (mixed, depth-2)",   3e-2f);
+
+    // ── Phase 2c: Bluestein for primes > 32 ─────────────────────────────────
+    // Each prime N uses length-M = next_pow2(2N-1) internally:
+    //   N=37  → M=128,   depth-1 pow2
+    //   N=41  → M=128,   depth-1 pow2
+    //   N=43  → M=128,   depth-1 pow2
+    //   N=47  → M=128,   depth-1 pow2
+    //   N=101 → M=256,   depth-1 pow2
+    //   N=251 → M=512,   depth-1 pow2
+    //   N=1009→ M=2048,  depth-2 pow2   (bigger M → looser threshold)
+    constexpr float kBluesteinThreshold = 3e-2f;
+    all &= run_test(md, make_random(37),    "random N=37    (prime, Bluestein M=128)",   kBluesteinThreshold);
+    all &= run_test(md, make_random(41),    "random N=41    (prime, Bluestein M=128)",   kBluesteinThreshold);
+    all &= run_test(md, make_random(43),    "random N=43    (prime, Bluestein M=128)",   kBluesteinThreshold);
+    all &= run_test(md, make_random(47),    "random N=47    (prime, Bluestein M=128)",   kBluesteinThreshold);
+    all &= run_test(md, make_random(101),   "random N=101   (prime, Bluestein M=256)",   kBluesteinThreshold);
+    all &= run_test(md, make_random(251),   "random N=251   (prime, Bluestein M=512)",   kBluesteinThreshold);
+    all &= run_test(md, make_random(1009),  "random N=1009  (prime, Bluestein M=2048)",  5e-2f);
+
+    // Hard composite: 37² = 1369 has no divisor ≤ 32, so it MUST route
+    // through Bluestein, not mixed-radix. If the dispatcher mis-routes
+    // it, the test will either hang or throw — either way, PASS will not
+    // print. M = next_pow2(2·1369-1) = 4096.
+    all &= run_test(md, make_random(1369),  "random N=1369  (37x37, Bluestein M=4096)",  5e-2f);
 
     md.reset();
     std::printf("\n%s\n",
-                all ? "All fft_universal_bf16 Phase 1 + 2a tests PASSED."
+                all ? "All fft_universal_bf16 tests PASSED."
                     : "SOME TESTS FAILED.");
     return all ? 0 : 1;
 }

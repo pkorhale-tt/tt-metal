@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // fft_universal_bf16_demo.cpp — minimal usage example for the TRUE-bf16
-// dispatch tree. Defaults to N=32 (Phase 1). Supports N in [2, 32]
-// (Phase 1, single-pass) and pow2 N in [64, 1024] (Phase 2a, two-pass CT).
+// dispatch tree. Defaults to N=32. Accepts any N ≥ 2 the fft() dispatcher
+// understands (pow2, composite with small factors, prime via Bluestein).
 // Feeds a pure tone at bin k_in and prints the top output bins — expect
 // a clean spike of magnitude N at bin k_in.
 
@@ -25,13 +25,9 @@ int main(int argc, char** argv) {
     const uint32_t N    = (argc > 1) ? static_cast<uint32_t>(std::atoi(argv[1])) : 32u;
     const uint32_t k_in = (argc > 2) ? static_cast<uint32_t>(std::atoi(argv[2])) : 5u;
 
-    auto is_pow2 = [](uint32_t n) { return n != 0u && (n & (n - 1u)) == 0u; };
-    const bool in_phase1 = (N >= 2u && N <= fft_universal_bf16::kPackedMaxN);
-    const bool in_phase2a = (is_pow2(N) && N >= 64u && N <= 1024u);
-    if (!in_phase1 && !in_phase2a) {
+    if (N < 2u || k_in >= N) {
         std::fprintf(stderr,
-            "fft_universal_bf16 currently supports N in [2, 32] (Phase 1) "
-            "and pow2 N in [64, 1024] (Phase 2a). Got N=%u.\n", N);
+            "Need N >= 2 and 0 <= k_in < N. Got N=%u, k_in=%u.\n", N, k_in);
         return 2;
     }
 
