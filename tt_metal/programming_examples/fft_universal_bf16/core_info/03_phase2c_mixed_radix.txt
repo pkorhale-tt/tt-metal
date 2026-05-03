@@ -1,0 +1,188 @@
+================================================================================
+       SCENARIO: PHASE 2c -- mixed-radix CT (composite N > 32 with divisor <= 32)
+================================================================================
+
+Path:    fft(N) -> mixed_radix_fft_bf16(N)
+            N1 = largest_divisor_le_32(N)
+            -> two_level_fft_bf16(N, N1)
+            -> 2 dispatches: PASS-1 (N2-sub-FFTs) and PASS-2 (N1-sub-FFTs)
+Kernel:  packed_dft_bf16_compute  (FPU bf16 matmul)
+Cores:   per-dispatch, depends on `count` of that dispatch
+
+--------------------------------------------------------------------------------
+HOW MIXED-RADIX SHAPES THE DISPATCHES
+--------------------------------------------------------------------------------
+
+Mixed-radix is the SAME 5-step shape as Phase 2b pow2, but N1 is
+chosen as the LARGEST divisor of N in [2, 32] instead of fixed at 32.
+That keeps N2 = N/N1 SMALL (often <= 32 in one shot) so the
+recursion terminates quickly.
+
+  N      | N1 (largest div <= 32) | N2 = N/N1 | recursion?
+  -------+-------------------------+-----------+-----------
+     36  |      6                  |    6      |   no (N2 <= 32)
+     48  |     16                  |    3      |   no
+     60  |     30                  |    2      |   no
+     72  |     24                  |    3      |   no
+    100  |     25                  |    4      |   no
+    144  |     16                  |    9      |   no
+    240  |     30                  |    8      |   no
+    360  |     30                  |   12      |   no
+    720  |     30                  |   24      |   no
+   3600  |     30                  |  120      |   YES (N2 > 32)
+  ...
+
+--------------------------------------------------------------------------------
+EXAMPLE A: N = 60   (N1 = 30, N2 = 2)
+--------------------------------------------------------------------------------
+
+  PASS-1: packed_dft_bf16(N=2, count=30)        <-- N2 <= 32, batched
+    raw_num_tiles = ceil(30/32) = 1
+    num_cores     = 1
+    grid          = 1 x 1
+
+    Single tile: 30 length-2 sub-FFTs in rows 0..29 (each row uses
+    only 2 of 32 slots). Tile-fill = 2/32 = 6.25%; sub-FFT-fill =
+    30/32 = 94%.
+
+  PASS-2: packed_dft_bf16(N=30, count=2)
+    raw_num_tiles = 1
+    num_cores     = 1
+    grid          = 1 x 1
+
+    Single tile: 2 length-30 sub-FFTs in rows 0..1 (each row uses
+    30/32 slots). Tile-fill = 30/32 = 94%; sub-FFT-fill = 2/32.
+
+  Total: 2 dispatches, 1 core each.
+
+GRID for both passes:
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |##0,0#| .    | .    | .    | .    | .    | .    | .    |
+  ...     (rest idle)
+
+--------------------------------------------------------------------------------
+EXAMPLE B: N = 100   (N1 = 25, N2 = 4)
+--------------------------------------------------------------------------------
+
+  PASS-1: packed_dft_bf16(N=4, count=25)
+    raw_num_tiles = 1, num_cores = 1, grid = 1 x 1
+    Single tile: 25 length-4 sub-FFTs (rows 0..24). Tile-fill = 4/32.
+
+  PASS-2: packed_dft_bf16(N=25, count=4)
+    raw_num_tiles = 1, num_cores = 1, grid = 1 x 1
+    Single tile: 4 length-25 sub-FFTs (rows 0..3). Tile-fill = 25/32.
+
+  Total: 2 dispatches, 1 core each.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: N = 720   (N1 = 30, N2 = 24)
+--------------------------------------------------------------------------------
+
+  PASS-1: packed_dft_bf16(N=24, count=30)
+    raw_num_tiles = ceil(30/32) = 1
+    num_cores     = 1
+    grid          = 1 x 1
+    Single tile: 30 length-24 sub-FFTs. Tile-fill = 24/32 = 75%.
+
+  PASS-2: packed_dft_bf16(N=30, count=24)
+    raw_num_tiles = 1
+    num_cores     = 1
+    grid          = 1 x 1
+    Single tile: 24 length-30 sub-FFTs. Tile-fill = 30/32 = 94%.
+
+  Total: 2 dispatches, 1 core each.
+
+--------------------------------------------------------------------------------
+EXAMPLE D: N = 3600   (N1 = 30, N2 = 120)   -- depth-2 recursion
+--------------------------------------------------------------------------------
+
+  N2 = 120 > 32  -> PASS-1 RECURSES per sibling.
+
+  PASS-1: 30 calls to fft(120) (each sibling is its own recursion)
+    fft(120) -> mixed_radix(120)
+              N1=24, N2=5
+              PASS-1.1: packed_dft(N=5, count=24)  [1 dispatch, 1 core]
+              PASS-1.2: packed_dft(N=24, count=5)  [1 dispatch, 1 core]
+              -> 2 dispatches per sibling
+    => 30 * 2 = 60 dispatches.
+
+  PASS-2: packed_dft_bf16(N=30, count=120)
+    raw_num_tiles = ceil(120/32) = 4
+    num_cores     = 4
+    grid          = 4 x 1
+
+    GRID:
+       row=0  |#0,0##|#1,0##|#2,0##|#3,0##| .  | .  | .  | .  |
+       (rest idle)
+
+    core 0 -> tile 0 (sub-FFTs 0..31)
+    core 1 -> tile 1 (sub-FFTs 32..63)
+    core 2 -> tile 2 (sub-FFTs 64..95)
+    core 3 -> tile 3 (sub-FFTs 96..119 + 8 zero rows)
+
+  Total: 61 dispatches.
+
+  Caching dramatically helps here: there are only 3 distinct (N, count)
+  pairs (5/24, 24/5, 30/120), so only 3 plans get built across the 61
+  dispatches.
+
+--------------------------------------------------------------------------------
+EXAMPLE E: N = 14400 = 120 * 120   (deeper recursion)
+--------------------------------------------------------------------------------
+
+  N1 = 30, N2 = 480
+
+  PASS-1: 30 calls to fft(480)
+    fft(480) -> mixed_radix(480)  N1=30, N2=16
+              PASS-1.1: packed_dft(16, 30)   [1 dispatch, 1 core]
+              PASS-1.2: packed_dft(30, 16)   [1 dispatch, 1 core]
+              -> 2 dispatches
+    => 30 * 2 = 60 dispatches
+
+  PASS-2: packed_dft_bf16(N=30, count=480)
+    raw_num_tiles = ceil(480/32) = 15
+    num_cores     = 16 (rounded up from 15)
+    grid          = 8 x 2
+
+    GRID:
+       row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+       row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+       (rows 2-7 idle)
+
+    15 useful tiles + 1 padded zero tile -> ~94% utilisation.
+
+  Total: 61 dispatches.
+
+--------------------------------------------------------------------------------
+WHAT EACH ACTIVE CORE DOES
+--------------------------------------------------------------------------------
+
+Identical to all other Phases (same kernel):
+  4 FPU bf16 matmuls per tile, 32 sub-FFTs per tile.
+
+The phase code just decides which (N_inner, count_inner) pairs to
+dispatch with; the kernel doesn't change.
+
+--------------------------------------------------------------------------------
+DISPATCH / CORE TABLE FOR COMPOSITE N
+--------------------------------------------------------------------------------
+
+  N      | N1   | N2   | PASS-1                | PASS-2                | Total
+         |      |      | (dispatches, cores)   | (dispatches, cores)   |
+  -------+------+------+-----------------------+-----------------------+-------
+     36  |   6  |   6  | (1, 1)                | (1, 1)                |   2
+     48  |  16  |   3  | (1, 1)                | (1, 1)                |   2
+     60  |  30  |   2  | (1, 1)                | (1, 1)                |   2
+     72  |  24  |   3  | (1, 1)                | (1, 1)                |   2
+    100  |  25  |   4  | (1, 1)                | (1, 1)                |   2
+    240  |  30  |   8  | (1, 1)                | (1, 1)                |   2
+    360  |  30  |  12  | (1, 1)                | (1, 1)                |   2
+    720  |  30  |  24  | (1, 1)                | (1, 1)                |   2
+   1080  |  27  |  40  | 27 * 2 = 54 (each 1c) | (1, 2)                |  55
+   3600  |  30  | 120  | 30 * 2 = 60           | (1, 4)                |  61
+  10800  |  30  | 360  | 30 * 2 = 60           | (1, 12)               |  61
+  14400  |  30  | 480  | 30 * 2 = 60           | (1, 16)               |  61
+
+================================================================================

@@ -1,0 +1,214 @@
+================================================================================
+       SCENARIO: PHASE 2b -- pow2 N > 32 (recursive two-level CT, N1 = 32)
+================================================================================
+
+Path:    fft(N) -> pow2_fft_bf16(N) -> two_level_fft_bf16(N, N1=32)
+            -> 2 dispatches (PASS-1, PASS-2), both packed_dft_bf16
+            (PASS-1 may RECURSE into fft() if N2 > 32)
+Kernel:  packed_dft_bf16_compute  (FPU bf16 matmul)
+Cores:   per-dispatch, depends on `count` of that dispatch (Rule above)
+
+--------------------------------------------------------------------------------
+PASS TIMELINE
+--------------------------------------------------------------------------------
+
+The two passes are SEQUENTIAL (Pass-2 needs Pass-1's output via the
+host twiddle). Within each dispatch, work is distributed across cores.
+
+TIME ----------------------------------------------------------------->
+
+  PASS-1                 HOST                   PASS-2
++------------+         +-------+              +------------+
+| packed_dft | --read->| twid+ | --write----> | packed_dft |
+| _bf16      |         | trans |              | _bf16      |
+| (N2, 32)   |         | (fp32)|              | (32, N2)   |
++------------+         +-------+              +------------+
+     ^                                              ^
+     | PASS-1 if N2 <= 32:                          | PASS-2 always:
+     |   1 dispatch                                 |   1 dispatch
+     |   count = 32                                 |   count = N2
+     | PASS-1 if N2 > 32:                           |
+     |   per-sibling recursion                      |
+     |   (32 separate fft(N2) calls)                |
+
+If N2 > 32, PASS-1 itself becomes 32 calls to fft(N2), each of which
+recurses through two_level_fft_bf16 again.
+
+--------------------------------------------------------------------------------
+EXAMPLE A: N = 64    (N1 = 32, N2 = 2)    -- depth 1 recursion
+--------------------------------------------------------------------------------
+
+  N2 = 2  <=  32  -> PASS-1 batches in one dispatch.
+
+  PASS-1: packed_dft_bf16(N=2, count=32)
+    raw_num_tiles = ceil(32/32) = 1
+    num_cores     = 1
+    tiles/core    = 1
+    grid          = 1 x 1
+
+    GRID:  only (0,0) active. Single tile holds 32 length-2 sub-FFTs
+           (rows 0..31, each with 2 useful samples + 30 zero pad).
+           Tile-fill = 2/32 = 6.25%.
+
+  PASS-2: packed_dft_bf16(N=32, count=2)
+    raw_num_tiles = ceil(2/32) = 1
+    num_cores     = 1
+    grid          = 1 x 1
+
+    GRID:  only (0,0) active. Single tile holds 2 length-32 sub-FFTs
+           (rows 0..1) + 30 zero rows. Tile-fill: rows are 100%
+           filled (N=32) but only 2/32 sub-FFTs are useful.
+
+  Total: 2 dispatches, 1 core each.
+
+--------------------------------------------------------------------------------
+EXAMPLE B: N = 1024    (N1 = 32, N2 = 32)    -- depth 1, optimal
+--------------------------------------------------------------------------------
+
+  N2 = 32  <=  32  -> PASS-1 batches.
+
+  PASS-1: packed_dft_bf16(N=32, count=32)
+    raw_num_tiles = ceil(32/32) = 1
+    num_cores     = 1
+    grid          = 1 x 1
+
+    Single tile FULLY USED: 32 length-32 sub-FFTs in 32 rows of N=32
+    samples each. Tile-fill = 100%. Sub-FFT-fill = 100%.
+
+  PASS-2: packed_dft_bf16(N=32, count=32)
+    Same shape: 1 core, 1 tile, fully packed.
+
+  Total: 2 dispatches, 1 core each, 100% tile efficiency.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: N = 2048    (N1 = 32, N2 = 64)    -- depth 2
+--------------------------------------------------------------------------------
+
+  N2 = 64  >  32  -> PASS-1 RECURSES per sibling.
+
+  PASS-1: 32 separate fft(64) calls (siblings cannot batch because each
+          is a real FFT recursion through two_level_fft_bf16).
+    For each sibling r in 0..31:
+      fft(64) -> Example A (2 dispatches, 1 core each)
+    => 32 * 2 = 64 dispatches just for PASS-1.
+
+  PASS-2: packed_dft_bf16(N=32, count=64)
+    raw_num_tiles = ceil(64/32) = 2
+    num_cores     = 2
+    grid          = 2 x 1
+
+    GRID:
+       row=0  |#0,0##|#1,0##| .  | .  | .  | .  | .  | .  |
+
+    core 0 -> tile 0  (sub-FFTs  0..31)
+    core 1 -> tile 1  (sub-FFTs 32..63)
+
+  Total: 65 dispatches, mostly 1-core each (only PASS-2 uses 2 cores).
+
+  -- This is why depth-2 pow2 is dispatch-heavy in the bf16 pipeline.
+     Steady state still works because all plans (N=2, N=32) are
+     cached after the first call.
+
+--------------------------------------------------------------------------------
+EXAMPLE D: N = 32768    (N1 = 32, N2 = 1024)   -- depth 2
+--------------------------------------------------------------------------------
+
+  N2 = 1024 > 32 -> PASS-1 recurses.
+
+  PASS-1: 32 calls to fft(1024)
+    Each fft(1024) = Example B (2 dispatches, 1 core each, 100% fill)
+    => 32 * 2 = 64 dispatches.
+
+  PASS-2: packed_dft_bf16(N=32, count=1024)
+    raw_num_tiles = ceil(1024/32) = 32
+    num_cores     = 32
+    grid          = 8 x 4
+
+    GRID:
+       row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+       row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+       row=2  |#0,2##|#1,2##|#2,2##|#3,2##|#4,2##|#5,2##|#6,2##|#7,2##|
+       row=3  |#0,3##|#1,3##|#2,3##|#3,3##|#4,3##|#5,3##|#6,3##|#7,3##|
+       row=4  | .    | .    | .    | .    | .    | .    | .    | .    |
+       ...    (rows 4-7 idle)
+
+    32 cores, each does 1 tile = 32 length-32 sub-FFTs.
+
+  Total: 65 dispatches.
+  Depth-2 means PASS-1 fans out across 32 calls; each is a small
+  but fully-packed depth-1 FFT.
+
+--------------------------------------------------------------------------------
+EXAMPLE E: N = 65536    (N1 = 32, N2 = 2048)   -- depth 3
+--------------------------------------------------------------------------------
+
+  N2 = 2048 > 32 -> PASS-1 recurses.
+
+  PASS-1: 32 calls to fft(2048) = Example C (65 dispatches each)
+    => 32 * 65 = 2080 dispatches just for PASS-1.
+
+  PASS-2: packed_dft_bf16(N=32, count=2048)
+    raw_num_tiles = ceil(2048/32) = 64
+    num_cores     = 64       <-- FULL GRID
+    tiles/core    = 1
+    grid          = 8 x 8
+
+    GRID: full 8x8 grid.
+
+  Total: 2081 dispatches.
+
+  -- This is the dispatch-explosion case for the bf16 pipeline.
+     Caching makes it fast in steady state but the first call is slow.
+     The fp32 pipeline does the same N=65536 in 3 dispatches (six-step).
+
+--------------------------------------------------------------------------------
+WHAT EACH ACTIVE CORE DOES
+--------------------------------------------------------------------------------
+
+Identical to Phase 1 (same kernel):
+
+  For each tile in [base, base + tiles_per_core):
+    Reader: read in_R, in_I, T_R, T_I, T_I_neg from DRAM (all bf16)
+    Compute: 4 matmul_tiles (FPU bf16, fp32 accumulator)
+    Writer: write out_R, out_I to DRAM (bf16)
+
+The kernel doesn't know it's PASS-1 vs PASS-2 -- the host wires up
+different (N, count) for each pass and uses the appropriate cached
+plan.
+
+--------------------------------------------------------------------------------
+DISPATCHES & CORE-COUNT TABLE FOR POW2 N > 32
+--------------------------------------------------------------------------------
+
+  N      | N2  | depth | PASS-1               | PASS-2                | Total
+         |     |       | (dispatches, cores)  | (dispatches, cores)   | dispatches
+  -------+-----+-------+----------------------+-----------------------+------------
+     64  |   2 |   1   | (1, 1)               | (1, 1)                |   2
+    128  |   4 |   1   | (1, 1)               | (1, 1)                |   2
+    256  |   8 |   1   | (1, 1)               | (1, 1)                |   2
+    512  |  16 |   1   | (1, 1)               | (1, 1)                |   2
+   1024  |  32 |   1   | (1, 1) 100% fill     | (1, 1) 100% fill      |   2
+   2048  |  64 |   2   | 32 * 2 = 64 (1 core ea)| (1, 2)              |  65
+   4096  | 128 |   2   | 32 * 2 = 64          | (1, 4)                |  65
+   8192  | 256 |   2   | 32 * 2 = 64          | (1, 8)                |  65
+  16384  | 512 |   2   | 32 * 2 = 64          | (1, 16)               |  65
+  32768  |1024 |   2   | 32 * 2 = 64 (each 100% fill)| (1, 32)        |  65
+  65536  |2048 |   3   | 32 * 65 = 2080       | (1, 64) FULL GRID     | 2081
+ 131072  |4096 |   3   | 32 * 65 = 2080       | (1, 64)               | 2081
+ ...
+
+--------------------------------------------------------------------------------
+WHY PASS-1 SIBLINGS CAN'T BATCH WHEN N2 > 32
+--------------------------------------------------------------------------------
+
+  packed_dft_bf16 only handles N <= 32. For N2 > 32 we cannot pack
+  the sub-FFTs into a single dispatch (a 32x32 tile has only 32 slots
+  per row). So we recurse: each sibling is its own fft() call that
+  re-enters two_level_fft_bf16.
+
+  -- This is the cost of the "1-kernel" design. The fp32 pipeline gets
+     around it by having batch_fft (which IS a bf16-incompatible
+     SFPU-fp32 kernel) for arbitrary pow2 sub_N. We don't have that
+     option in true bf16 because the SFPU has no native bf16 multiply.
+
+================================================================================

@@ -789,4 +789,55 @@ inline std::vector<Complex> fft(
     return fft(md, cx);
 }
 
+// ─── Inverse FFT via the conjugate trick ─────────────────────────────────────
+//
+//   IFFT(X) = conj( FFT( conj(X) ) ) / N
+//
+// Reuses the entire forward dispatch tree (Phase 1 packed_dft_bf16, Phase
+// 2b pow2 recursion, Phase 2c mixed-radix, Phase 2c Bluestein) without
+// touching a single device kernel. Conjugation and 1/N scaling are
+// pointwise host operations in fp32 — no reduction, so there's no bf16
+// precision loss added by the inverse step beyond the forward FFT's.
+//
+// PackedDFTBf16Plan is keyed by (N, count), not direction, so all plans
+// warm by the first forward call are reused immediately.
+//
+// The same identity is already used internally inside bluestein_fft_bf16
+// (Step 4, the IFFT-of-M); this just exposes the pattern as a public API.
+//
+// Round-trip precision matches single-direction precision (both add one
+// bf16 rounding cycle to each FPU matmul). For N <= 1024 the round trip
+// is ~45-55 dB SNR; for larger N depth-dependent recursion gives
+// ~35-50 dB.
+inline std::vector<Complex> ifft(
+    std::shared_ptr<MeshDevice>  md,
+    const std::vector<Complex>&  spectrum)
+{
+    const uint32_t N = static_cast<uint32_t>(spectrum.size());
+    if (N == 1u) return spectrum;
+    assert(N >= 1u && "IFFT requires N >= 1");
+
+    std::vector<Complex> conj_in(N);
+    for (uint32_t k = 0; k < N; ++k) conj_in[k] = std::conj(spectrum[k]);
+
+    const std::vector<Complex> fwd = fft(md, conj_in);
+
+    const float inv_N = 1.0f / static_cast<float>(N);
+    std::vector<Complex> out(N);
+    for (uint32_t k = 0; k < N; ++k) out[k] = std::conj(fwd[k]) * inv_N;
+    return out;
+}
+
+// Convenience overload for real-valued spectrum input.
+inline std::vector<Complex> ifft(
+    std::shared_ptr<MeshDevice>  md,
+    const std::vector<float>&    real_spectrum)
+{
+    std::vector<Complex> cx(real_spectrum.size());
+    for (size_t i = 0; i < real_spectrum.size(); ++i) {
+        cx[i] = Complex(real_spectrum[i], 0.0f);
+    }
+    return ifft(md, cx);
+}
+
 }  // namespace fft_universal_bf16

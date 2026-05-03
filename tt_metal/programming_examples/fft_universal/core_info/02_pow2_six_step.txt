@@ -1,0 +1,189 @@
+================================================================================
+       SCENARIO: pow2 1024 < N <= 65536  (six-step Stockham)
+================================================================================
+
+Path:    fft(N) -> fft_stockham::fft(N) -> 3 sequential dispatches:
+            Pass-1:  batch_fft(sub_N=N2, batch=N1)
+            Pass-2:  pass2     (twiddle + transpose)
+            Pass-3:  batch_fft(sub_N=N1, batch=N2)
+Kernels: batch_fft_compute  (SFPU fp32)
+         pass2_compute      (SFPU fp32)
+Cores:   UP TO 64 in parallel WITHIN EACH PASS, 3 passes SEQUENTIAL
+
+--------------------------------------------------------------------------------
+PASS TIMELINE
+--------------------------------------------------------------------------------
+
+TIME -------------------------------------------------------------->
+
+  Pass-1                    Pass-2                    Pass-3
++-------------+           +-------------+           +-------------+
+| batch_fft   |           | pass2       |           | batch_fft   |
+| (sub=N2,    |  --wait-->| twiddle +   |  --wait-->| (sub=N1,    |
+|  batch=N1)  |           | transpose   |           |  batch=N2)  |
+| 64 cores    |           | 64 cores    |           | 64 cores    |
++-------------+           +-------------+           +-------------+
+       ^                         ^                         ^
+       |                         |                         |
+   ONE EnqueueMesh-          ONE EnqueueMesh-          ONE EnqueueMesh-
+   Workload                  Workload                  Workload
+
+Between passes the host must call ReadShard on the output buffer
+of the previous dispatch and WriteShard the input of the next.
+Passes never overlap in time.
+
+--------------------------------------------------------------------------------
+CORE COUNT FORMULA (each pass independently)
+--------------------------------------------------------------------------------
+
+PASS-1 (batch_fft):    num_cores = min(N1, 64),   batch/core = N1 / num_cores
+PASS-2 (pass2):        num_cores = min(N1, 64),   tiles/core = N1 / num_cores
+PASS-3 (batch_fft):    num_cores = min(N2, 64),   batch/core = N2 / num_cores
+
+For balanced six-step splits (N1 ~= N2 ~= sqrt(N)) all three passes
+saturate the same number of cores.
+
+--------------------------------------------------------------------------------
+EXAMPLE A: N = 4096   (N1 = 64, N2 = 64)
+--------------------------------------------------------------------------------
+
+PASS-1: batch_fft(sub_N=64, batch=64)
+    num_cores      = min(64, 64) = 64           <-- FULL GRID
+    batch_per_core = 64 / 64     = 1
+    grid           = 8 x 8
+
+PASS-2: pass2(N1=64, N2=64)
+    num_cores      = min(64, 64) = 64           <-- FULL GRID
+    tiles_per_core = 64 / 64     = 1
+    grid           = 8 x 8
+
+PASS-3: batch_fft(sub_N=64, batch=64)
+    num_cores      = 64                          <-- FULL GRID
+    batch_per_core = 1
+    grid           = 8 x 8
+
+--------- FULL GRID (all 3 passes use this same shape) -----------
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+  row=2  |#0,2##|#1,2##|#2,2##|#3,2##|#4,2##|#5,2##|#6,2##|#7,2##|
+  row=3  |#0,3##|#1,3##|#2,3##|#3,3##|#4,3##|#5,3##|#6,3##|#7,3##|
+  row=4  |#0,4##|#1,4##|#2,4##|#3,4##|#4,4##|#5,4##|#6,4##|#7,4##|
+  row=5  |#0,5##|#1,5##|#2,5##|#3,5##|#4,5##|#5,5##|#6,5##|#7,5##|
+  row=6  |#0,6##|#1,6##|#2,6##|#3,6##|#4,6##|#5,6##|#6,6##|#7,6##|
+  row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+         +------+------+------+------+------+------+------+------+
+
+Per-pass per-core workload (Pass-1 / Pass-3):
+  core 0  -> sub-FFT 0   (one length-64 Stockham, 6 stages)
+  core 1  -> sub-FFT 1
+  core 2  -> sub-FFT 2
+  ...
+  core 63 -> sub-FFT 63
+
+Per-pass per-core workload (Pass-2):
+  core c handles 1 twiddle tile (row N1=c of the N1xN2 grid):
+    for j in [0, N2):
+      C[c, j] = A[c, j] * exp(-2*pi*i*c*j / N)
+
+--------------------------------------------------------------------------------
+EXAMPLE B: N = 16384   (N1 = 128, N2 = 128)
+--------------------------------------------------------------------------------
+
+PASS-1: batch_fft(sub_N=128, batch=128)
+    num_cores      = min(128, 64) = 64
+    batch_per_core = 128 / 64     = 2           <-- 2 sub-FFTs per core
+    grid           = 8 x 8
+
+PASS-2: pass2(N1=128, N2=128)
+    num_cores      = min(128, 64) = 64
+    tiles_per_core = 128 / 64     = 2           <-- 2 twiddle tiles per core
+    grid           = 8 x 8
+
+PASS-3: batch_fft(sub_N=128, batch=128)
+    num_cores      = 64
+    batch_per_core = 2
+    grid           = 8 x 8
+
+  core 0  -> sub-FFTs 0,1
+  core 1  -> sub-FFTs 2,3
+  core 2  -> sub-FFTs 4,5
+  ...
+  core 63 -> sub-FFTs 126,127
+
+--------------------------------------------------------------------------------
+EXAMPLE C: N = 65536   (N1 = 256, N2 = 256)   -- max for six-step
+--------------------------------------------------------------------------------
+
+PASS-1: batch_fft(sub_N=256, batch=256)
+    num_cores      = 64
+    batch_per_core = 256 / 64 = 4               <-- 4 sub-FFTs per core
+    grid           = 8 x 8
+
+PASS-2: pass2(N1=256, N2=256)
+    num_cores      = 64
+    tiles_per_core = 256 / 64 = 4
+
+PASS-3: batch_fft(sub_N=256, batch=256)
+    num_cores      = 64
+    batch_per_core = 4
+
+  core 0  -> sub-FFTs 0,1,2,3   (each is 8-stage Stockham of length 256)
+  core 1  -> sub-FFTs 4,5,6,7
+  ...
+  core 63 -> sub-FFTs 252,253,254,255
+
+WITHIN ONE CORE the 4 sub-FFTs run sequentially (a simple for-loop
+in the compute kernel). ACROSS cores all 64 cores progress in lockstep.
+
+--------------------------------------------------------------------------------
+WHAT EACH ACTIVE CORE DOES (every six-step example)
+--------------------------------------------------------------------------------
+
+Pass-1 / Pass-3 active cores (batch_fft_compute kernel):
+  for k in [0, batch_per_core):
+      tile = read input tile (base + k) from DRAM
+      for s in [0, log2(sub_N)):
+          twiddle_tile = read stage-s twiddle tile (cached in DRAM)
+          in-place radix-2 butterflies on `tile`         [SFPU fp32]
+      write output tile (base + k) to DRAM
+
+Pass-2 active cores (pass2_compute kernel):
+  for k in [0, tiles_per_core):
+      A_tile = read row (base + k) of the N1xN2 grid    [from Pass-1 DRAM]
+      T_tile = read row (base + k) of the precomputed twiddle table
+      B_tile = A_tile * T_tile  (complex elementwise)   [SFPU fp32]
+      write B_tile to DRAM
+
+--------------------------------------------------------------------------------
+CORE UTILISATION SUMMARY
+--------------------------------------------------------------------------------
+
+  N      | N1, N2     | cores/pass | batch/core | grid  | utilisation
+  -------+------------+------------+-------------+-------+-------------
+  2048   |  64,  32   |    32      |     1       | 8 x 4 |  50%
+  2048   |  32,  64   |    32      |     1       | 8 x 4 |  50%   (factoring varies)
+  4096   |  64,  64   |    64      |     1       | 8 x 8 | 100%
+  8192   | 128,  64   |    64      |     2 (P1)  | 8 x 8 | 100%
+  8192   |  64, 128   |    64      |     1 (P1)  | 8 x 8 | 100%
+ 16384   | 128, 128   |    64      |     2       | 8 x 8 | 100%
+ 32768   | 256, 128   |    64      |     4 (P1)  | 8 x 8 | 100%
+ 65536   | 256, 256   |    64      |     4       | 8 x 8 | 100%
+
+(Exact factor pair depends on pick_factors; the picker prefers
+balanced N1 ~ N2.)
+
+--------------------------------------------------------------------------------
+WHY 3 SEQUENTIAL DISPATCHES (NOT FUSED)
+--------------------------------------------------------------------------------
+
+* Pass-2 needs the FULL output of Pass-1 (twiddle table is row-indexed
+  by N1 across all N2 columns). A streaming fused kernel would need
+  cross-core NoC traffic at every tile.
+* Each pass uses a DIFFERENT compute kernel binary (batch_fft vs pass2).
+* The host swaps DRAM pointers between dispatches; this is cheap
+  compared to the compute work.
+
+================================================================================

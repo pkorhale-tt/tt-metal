@@ -1,0 +1,179 @@
+================================================================================
+       SCENARIO: PATH C -- Bluestein chirp-Z, prime N > 32
+================================================================================
+
+Path:    fft(N) -> batched_siblings_fft(1, N) -> PATH C
+            -> batched_bluestein(count=1, N)
+            -> 5 stages: HOST chirp -> DEVICE FFT(M)
+                         -> HOST mul -> DEVICE FFT(M) -> HOST chirp
+Kernels invoked DEVICE-side:
+   2 x batched_siblings_fft(1, M)  where M = next_pow2(2N - 1)
+   Each maps to PATH A (if M <= 1024) or PATH B (if M > 1024)
+Cores: depends on M, see below
+
+--------------------------------------------------------------------------------
+THE BLUESTEIN PIPELINE -- 5 STEPS
+--------------------------------------------------------------------------------
+
+  Step 1 [HOST  fp32]: A[n] = x[n] * w[n]   (n in [0, N), zeros after to M)
+  Step 2 [DEVICE]    : A_fft = FFT_M(A)     <-- DISPATCHES happen here
+  Step 3 [HOST  fp32]: A_fft *= B_fft       (B_fft cached in plan)
+  Step 4 [DEVICE]    : c = inverse-FFT_M(A_fft) via conjugate trick
+                            (1 more FFT_M dispatch)
+  Step 5 [HOST  fp32]: out[k] = c[k] * w[k] / M  (k in [0, N))
+
+Steps 2 and 4 are the only DEVICE work and they DOMINATE runtime.
+
+--------------------------------------------------------------------------------
+CORE USAGE = WHATEVER FFT_M USES
+--------------------------------------------------------------------------------
+
+The Bluestein wrapper itself doesn't pick cores. It calls
+batched_siblings_fft(1, M) twice and inherits its core layout.
+
+Two regimes:
+
+REGIME 1: M <= 1024       -> PATH A (single batch_fft dispatch)
+                              num_cores = min(batch=1, 64) = 1
+                              -> ONLY 1 CORE active per FFT_M call
+
+REGIME 2: M > 1024        -> PATH B (per-row Stockham, count=1)
+                              -> three sequential dispatches (P1, P2, P3)
+                              -> 64 cores per dispatch
+
+--------------------------------------------------------------------------------
+EXAMPLE A: N = 37 (prime, M = next_pow2(73) = 128)
+--------------------------------------------------------------------------------
+
+  M = 128  <=  1024  -> REGIME 1
+
+  Step 2: batched_siblings_fft(1, 128)
+            -> ONE batch_fft(sub_N=128, batch=1) dispatch
+            -> num_cores = 1, grid = 1 x 1
+            -> ONLY core (0,0) active
+
+  Step 4: same shape, ONE batch_fft dispatch
+            -> ONLY core (0,0) active
+
+GRID for each of the 2 dispatches:
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |##0,0#| .    | .    | .    | .    | .    | .    | .    |
+  ...     (rest idle)
+
+Total: 2 dispatches, 1 core each -> very low utilisation
+       (Bluestein for small primes is single-core bound)
+
+--------------------------------------------------------------------------------
+EXAMPLE B: N = 257 (prime, M = next_pow2(513) = 1024)
+--------------------------------------------------------------------------------
+
+  M = 1024  <=  1024  -> REGIME 1 (just barely)
+
+  Step 2: batched_siblings_fft(1, 1024)
+            -> ONE batch_fft(sub_N=1024, batch=1)
+            -> num_cores = 1                        <-- still only 1 core
+
+  Step 4: same -> 1 core
+
+Same 2-dispatch / 1-core picture as Example A.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: N = 521 (prime, M = next_pow2(1041) = 2048)
+--------------------------------------------------------------------------------
+
+  M = 2048  >  1024  -> REGIME 2 (six-step kicks in)
+
+  Step 2: batched_siblings_fft(1, 2048)
+            -> per-row Stockham, count=1
+            -> fft_stockham::fft(2048)
+               N1 = 64, N2 = 32 (or 32, 64)
+
+            3 sequential dispatches:
+              P1: batch_fft(sub_N=N2, batch=N1) -> 32-64 cores
+              P2: pass2(N1, N2)                 -> 32-64 cores
+              P3: batch_fft(sub_N=N1, batch=N2) -> 32-64 cores
+
+  Step 4: same 3-dispatch structure
+
+Total: 6 dispatches, with 32-64 cores each. Much better utilisation.
+
+--------------------------------------------------------------------------------
+EXAMPLE D: N = 4099 (prime, M = next_pow2(8197) = 16384)
+--------------------------------------------------------------------------------
+
+  M = 16384 -> REGIME 2 (six-step)
+
+  Step 2: per-row Stockham
+            fft_stockham::fft(16384) -> N1=128, N2=128
+            3 dispatches: each 64 cores
+              P1: batch_fft(sub_N=128, batch=128) -> 64 cores, 2 sub/core
+              P2: pass2(128, 128)                 -> 64 cores
+              P3: batch_fft(sub_N=128, batch=128) -> 64 cores, 2 sub/core
+
+  Step 4: same -> 3 dispatches, 64 cores each
+
+GRID for each of the 6 dispatches:
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+  ...                              all 64 active
+  row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+         +------+------+------+------+------+------+------+------+
+
+Total: 6 dispatches, full grid. Strong utilisation.
+
+--------------------------------------------------------------------------------
+WHY M = next_pow2(2N - 1)?
+--------------------------------------------------------------------------------
+
+Bluestein's algorithm reduces a length-N DFT (any N, including primes)
+to a CYCLIC CONVOLUTION of length M >= 2N - 1, which is then computed
+using two FFTs of length M. M is rounded up to the next power of 2 so
+the inner FFTs hit our fast pow2 path.
+
+Padding cost: M / N can be up to ~4x; this is the price of supporting
+prime N. The plan caches B_fft so the convolution kernel is FFT-d only
+ONCE per N (build cost), not on every call.
+
+--------------------------------------------------------------------------------
+DISPATCH / CORE TABLE FOR PRIMES
+--------------------------------------------------------------------------------
+
+  N    | M = next_pow2(2N-1) | Regime | Cores per dispatch | Total dispatches
+  -----+---------------------+--------+--------------------+-----------------
+    37 |    128              | REG 1  |        1           |      2
+    61 |    128              | REG 1  |        1           |      2
+   127 |    256              | REG 1  |        1           |      2
+   257 |   1024              | REG 1  |        1           |      2
+   521 |   2048              | REG 2  |       64           |      6
+  1009 |   2048              | REG 2  |       64           |      6
+  4099 |  16384              | REG 2  |       64           |      6
+  8191 |  16384              | REG 2  |       64           |      6
+ 65537 | 262144              | REG 2  |       64           |      6 (large N1, N2)
+
+REGIME 1 primes are BAD utilisation (1 core).
+REGIME 2 primes are FULL utilisation (64 cores per dispatch).
+
+--------------------------------------------------------------------------------
+PER-CORE WORK (when REGIME 2)
+--------------------------------------------------------------------------------
+
+Identical to 02_pow2_six_step.txt or 03_pow2_four_step.txt depending
+on M -- Bluestein just reuses the pow2 dispatcher twice.
+
+--------------------------------------------------------------------------------
+HOST-SIDE COST (Steps 1, 3, 5)
+--------------------------------------------------------------------------------
+
+Steps 1 and 5: O(N) chirp multiplications  (small, fp32)
+Step 3:        O(M) elementwise multiplication
+Conjugate trick: O(M) negation + O(M) division
+
+These run on the CPU and are fast for the N values where Bluestein is
+needed (max prime supported = ~4099 -> M = 16384 -> 16K complex muls).
+
+================================================================================

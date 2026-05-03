@@ -1,0 +1,213 @@
+================================================================================
+       SCENARIO: PHASE 2c -- Bluestein chirp-Z (prime N > 32 OR no div <= 32)
+================================================================================
+
+Path:    fft(N) -> bluestein_fft_bf16(N)
+            M = next_pow2(2N - 1)
+            -> 5 stages: HOST chirp -> 3x DEVICE FFT(M) -> HOST chirp
+            (each FFT(M) goes through Phase 2b pow2)
+Kernel:  packed_dft_bf16_compute  (FPU bf16 matmul, called transitively)
+Cores:   per-dispatch, depends on M and the resulting Phase 2b shapes
+
+--------------------------------------------------------------------------------
+WHEN THIS PATH FIRES
+--------------------------------------------------------------------------------
+
+  N is prime AND > 32                       (e.g. 37, 41, 43, ..., 4099)
+  OR
+  N is composite but no prime factor <= 32  (e.g. 1369 = 37^2, 1849 = 43^2)
+
+In both cases mixed-radix can't help because there's no factor in
+[2, 32], so we fall back to Bluestein.
+
+--------------------------------------------------------------------------------
+THE BLUESTEIN PIPELINE (5 STAGES)
+--------------------------------------------------------------------------------
+
+  Step 1 [HOST  fp32]: build chirp c[n] = exp(-i pi n^2 / N)
+                       a[n]    = x[n] * c[n]   (n in [0, N), zero-pad to M)
+                       b[n]    = conj(c[n])    (n in [0, N))
+                       b[M-n]  = conj(c[n])    (n >= 1)
+
+  Step 2 [DEVICE]    : A = fft(a)   -> Phase 2b pow2 (length-M FFT)
+                       B = fft(b)   -> Phase 2b pow2 (length-M FFT)
+
+  Step 3 [HOST  fp32]: P[k]      = A[k] * B[k]
+                       P_conj[k] = conj(P[k])      (pre-conj for inverse trick)
+
+  Step 4 [DEVICE]    : P_fft = fft(P_conj) -> Phase 2b pow2 (THIRD length-M FFT)
+                       p[k] = conj(P_fft[k]) / M
+
+  Step 5 [HOST  fp32]: X[k] = c[k] * p[k]    for k in [0, N)
+
+Total DEVICE work: 3 length-M FFTs, all routed through Phase 2b pow2.
+Cores per FFT(M) = whatever the Phase 2b shape gives for length M.
+
+--------------------------------------------------------------------------------
+M VALUES FOR COMMON BLUESTEIN N
+--------------------------------------------------------------------------------
+
+  N    | M = next_pow2(2N - 1) | log2(M) | Phase 2b depth for M
+  -----+-----------------------+---------+---------------------
+    37 |    128                |    7    |  1 (N2 = 4)
+    41 |    128                |    7    |  1
+    43 |    128                |    7    |  1
+    47 |    128                |    7    |  1
+    61 |    128                |    7    |  1
+   127 |    256                |    8    |  1 (N2 = 8)
+   257 |   1024                |   10    |  1 (N2 = 32) <-- 100% fill
+   521 |   2048                |   11    |  2 (N2 = 64)
+  1009 |   2048                |   11    |  2
+  1369 |   4096                |   12    |  2 (N2 = 128)
+  4099 |  16384                |   14    |  2 (N2 = 512)
+  65537 | 262144               |   18    |  3 (N2 = 8192)
+
+--------------------------------------------------------------------------------
+EXAMPLE A: N = 37    (M = 128, depth-1 Phase 2b)
+--------------------------------------------------------------------------------
+
+  Each FFT(128) goes through Phase 2b pow2 with N1=32, N2=4.
+  Phase 2b shape: (see 02_phase2b_pow2.txt EXAMPLE A-equivalent)
+
+  Per FFT(128):
+    PASS-1: packed_dft(N=4, count=32)   raw=1 -> 1 core, grid 1x1
+    PASS-2: packed_dft(N=32, count=4)   raw=1 -> 1 core, grid 1x1
+
+  Total per FFT(128): 2 dispatches, 1 core each.
+
+  Bluestein invokes fft(128) THREE times:
+  Total: 3 * 2 = 6 dispatches, ALL on 1 core.
+
+GRID for every dispatch:
+       row=0  |##0,0#| .  | .  | .  | .  | .  | .  | .  |
+       (rest idle)
+
+Very low utilisation (1/64 cores) but very fast in absolute terms.
+
+--------------------------------------------------------------------------------
+EXAMPLE B: N = 257   (M = 1024, depth-1 Phase 2b, OPTIMAL)
+--------------------------------------------------------------------------------
+
+  Each FFT(1024) -> Phase 2b N1=32, N2=32 (Example B of 02_phase2b)
+
+  Per FFT(1024):
+    PASS-1: packed_dft(N=32, count=32)  100% tile-fill, 1 core
+    PASS-2: packed_dft(N=32, count=32)  100% tile-fill, 1 core
+
+  Total per FFT(1024): 2 dispatches, 1 core each, MAX EFFICIENCY/CORE.
+
+  Bluestein: 3 FFTs * 2 dispatches = 6 dispatches.
+
+Still single-core but each core's tile is 100% packed -- best
+single-core throughput.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: N = 521   (M = 2048, depth-2 Phase 2b)
+--------------------------------------------------------------------------------
+
+  Each FFT(2048) -> Phase 2b depth-2, N1=32, N2=64
+
+  Per FFT(2048):
+    PASS-1: 32 calls to fft(64) (each = 2 dispatches, 1 core)
+            -> 64 dispatches total
+    PASS-2: packed_dft(N=32, count=64) -> 2 cores, grid 2x1
+
+  Total per FFT(2048): 65 dispatches.
+  Bluestein: 3 * 65 = 195 dispatches.
+
+GRID for PASS-2:
+       row=0  |#0,0##|#1,0##| .  | .  | .  | .  | .  | .  |
+       (rest idle)
+
+GRID for PASS-1 sub-dispatches: all 1-core (1x1 grid).
+
+--------------------------------------------------------------------------------
+EXAMPLE D: N = 1369 = 37 * 37    (composite, no div<=32, M = 4096)
+--------------------------------------------------------------------------------
+
+  Each FFT(4096) -> Phase 2b depth-2, N1=32, N2=128
+
+  Per FFT(4096):
+    PASS-1: 32 calls to fft(128) = 32 * (Example A-shape)
+            Each fft(128) = 2 dispatches, 1 core each
+            -> 64 dispatches
+    PASS-2: packed_dft(N=32, count=128) -> 4 cores, grid 4x1
+
+  Total per FFT(4096): 65 dispatches.
+  Bluestein: 3 * 65 = 195 dispatches.
+
+GRID for PASS-2:
+       row=0  |#0,0##|#1,0##|#2,0##|#3,0##| .  | .  | .  | .  |
+       (rest idle)
+
+--------------------------------------------------------------------------------
+EXAMPLE E: N = 4099   (large prime, M = 16384, depth-2)
+--------------------------------------------------------------------------------
+
+  Each FFT(16384) -> Phase 2b N1=32, N2=512
+
+  Per FFT(16384):
+    PASS-1: 32 calls to fft(512) (each = 2 dispatches, 1 core)
+            -> 64 dispatches
+    PASS-2: packed_dft(N=32, count=512) -> 16 cores, grid 8x2
+
+  Total per FFT(16384): 65 dispatches.
+  Bluestein: 3 * 65 = 195 dispatches.
+
+GRID for PASS-2 of one FFT(16384):
+       row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+       row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+       (rows 2-7 idle)
+
+  16 cores, each 1 tile.
+
+--------------------------------------------------------------------------------
+WHAT EACH ACTIVE CORE DOES
+--------------------------------------------------------------------------------
+
+Same as every other Phase: packed_dft_bf16 kernel running 4 FPU
+bf16 matmul_tiles per tile.
+
+Bluestein adds NO new device kernel work. The "Bluestein-ness"
+is entirely host-side:
+  - Building the chirp (O(N) cos/sin in fp32)
+  - Pointwise multiplies (O(M) complex muls in fp32)
+  - The conjugate trick for IFFT (O(M) negations + division)
+
+For small N (37, 41, ...) the host work is negligible. For larger
+N (~4099) the host loops are still under 100 microseconds.
+
+--------------------------------------------------------------------------------
+CORE / DISPATCH TABLE FOR BLUESTEIN N
+--------------------------------------------------------------------------------
+
+  N    | M     | per-FFT(M)      | Bluestein total        | Best per-pass cores
+  -----+-------+-----------------+-------------------------+-------------------
+    37 |   128 | 2 disp, 1 core  |   6 disp, 1 core ea     |   1
+    41 |   128 | 2 disp, 1 core  |   6 disp, 1 core ea     |   1
+   127 |   256 | 2 disp, 1 core  |   6 disp, 1 core ea     |   1
+   257 |  1024 | 2 disp, 1 core  |   6 disp, 1 core ea     |   1 (100% fill)
+   521 |  2048 | 65 disp         | 195 disp                |   2 (PASS-2)
+  1009 |  2048 | 65 disp         | 195 disp                |   2
+  1369 |  4096 | 65 disp         | 195 disp                |   4
+  4099 | 16384 | 65 disp         | 195 disp                |  16
+ 65537 |262144 | depth-3, 2081   | 6243 disp               |  64 (full grid)
+
+(The "PER-FFT(M)" dispatch count assumes Phase 2b depth as marked in
+the M table above.)
+
+--------------------------------------------------------------------------------
+KEY INSIGHT: BLUESTEIN UTILISATION IS DETERMINED BY M, NOT N
+--------------------------------------------------------------------------------
+
+Once you know M = next_pow2(2N - 1), the dispatch count and core
+shape are exactly that of fft(M), times 3.
+
+So Bluestein for a small prime (N=37, M=128) is dispatch-LIGHT but
+core-LOW (only 1 core busy). Bluestein for a moderate prime (N=4099,
+M=16384) is dispatch-MEDIUM and uses 16 cores in the dominant pass.
+
+Only very large primes (>~10K) start to hit the FULL grid because
+they require depth-3 Phase 2b for the inner FFT(M).
+
+================================================================================

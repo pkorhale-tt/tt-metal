@@ -1,0 +1,168 @@
+================================================================================
+       SCENARIO: pow2 N > 65536  (four-step Stockham, large N)
+================================================================================
+
+Path:    fft(N) -> fft_stockham::fft(N) -> 3 sequential dispatches:
+            Pass-1:  batch_fft(sub_N=N2, batch=N1)
+            Pass-2:  pass2     (twiddle + transpose)
+            Pass-3:  batch_fft(sub_N=N1, batch=N2)
+Kernels: batch_fft_compute  (SFPU fp32)
+         pass2_compute      (SFPU fp32)
+Cores:   UP TO 64 in parallel WITHIN EACH PASS, 3 passes SEQUENTIAL
+
+The three-pass STRUCTURE is identical to the six-step path. The only
+difference is the larger N forces large N1, N2 ~= sqrt(N), so the
+batch-per-core count grows beyond a handful.
+
+--------------------------------------------------------------------------------
+PASS TIMELINE  (same shape as six-step)
+--------------------------------------------------------------------------------
+
+TIME -------------------------------------------------------------->
+
+  Pass-1                Pass-2                Pass-3
++----------+          +----------+          +----------+
+| batch_fft|          | pass2    |          | batch_fft|
+| (N2,N1)  |  --wait->| twiddle  |  --wait->| (N1,N2)  |
+| 64 cores |          | 64 cores |          | 64 cores |
++----------+          +----------+          +----------+
+
+64 cores active in every pass, each core processes many sub-FFTs
+or twiddle tiles in a sequential loop.
+
+--------------------------------------------------------------------------------
+EXAMPLE A: N = 131072    (N1 = 512, N2 = 256  OR  256, 512)
+--------------------------------------------------------------------------------
+
+PASS-1: batch_fft(sub_N=N2=256, batch=N1=512)
+    num_cores      = min(512, 64) = 64
+    batch_per_core = 512 / 64     = 8           <-- 8 sub-FFTs per core
+    grid           = 8 x 8
+
+PASS-2: pass2(N1=512, N2=256)
+    num_cores      = min(512, 64) = 64
+    tiles_per_core = 512 / 64     = 8
+
+PASS-3: batch_fft(sub_N=N1=512, batch=N2=256)
+    num_cores      = min(256, 64) = 64
+    batch_per_core = 256 / 64     = 4
+
+  P1: core 0  -> sub-FFTs 0..7    (each: length-256 Stockham, 8 stages)
+      core 1  -> sub-FFTs 8..15
+      ...
+      core 63 -> sub-FFTs 504..511
+
+  P3: core 0  -> sub-FFTs 0..3    (each: length-512 Stockham, 9 stages)
+      ...
+      core 63 -> sub-FFTs 252..255
+
+--------------------------------------------------------------------------------
+EXAMPLE B: N = 1,048,576   (1 M, the published benchmark size)
+--------------------------------------------------------------------------------
+
+Typical factor pair: N1 = 1024, N2 = 1024.
+
+PASS-1: batch_fft(sub_N=1024, batch=1024)
+    num_cores      = min(1024, 64) = 64
+    batch_per_core = 1024 / 64     = 16          <-- 16 sub-FFTs per core
+    grid           = 8 x 8
+
+PASS-2: pass2(N1=1024, N2=1024)
+    num_cores      = 64
+    tiles_per_core = 16
+
+PASS-3: batch_fft(sub_N=1024, batch=1024)
+    num_cores      = 64
+    batch_per_core = 16
+
+------ FULL GRID, all 3 passes ------
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+  row=2  |#0,2##|#1,2##|#2,2##|#3,2##|#4,2##|#5,2##|#6,2##|#7,2##|
+  row=3  |#0,3##|#1,3##|#2,3##|#3,3##|#4,3##|#5,3##|#6,3##|#7,3##|
+  row=4  |#0,4##|#1,4##|#2,4##|#3,4##|#4,4##|#5,4##|#6,4##|#7,4##|
+  row=5  |#0,5##|#1,5##|#2,5##|#3,5##|#4,5##|#5,5##|#6,5##|#7,5##|
+  row=6  |#0,6##|#1,6##|#2,6##|#3,6##|#4,6##|#5,6##|#6,6##|#7,6##|
+  row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+         +------+------+------+------+------+------+------+------+
+
+Per core:
+  P1: 16 length-1024 sub-FFTs, each 10 butterfly stages on a single tile
+      (sub_N == kTileElems, so the full tile is used = 100% tile fill)
+  P2: 16 twiddle multiplies on 16 tiles (1024 fp32 elements each)
+  P3: 16 length-1024 sub-FFTs
+
+Total per core across 3 passes:
+  3 * 16 * (1 tile of compute) per FFT = 48 tile-level ops per core
+  Distributed across 64 cores in parallel each pass.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: N = 16,777,216 (16 M)  -- N1 = 4096, N2 = 4096 hypothetical
+--------------------------------------------------------------------------------
+
+Note: N2 must satisfy sub_N <= 1024 (single tile per sub-FFT).
+For very large N the picker chooses N2 close to 1024 and grows N1.
+
+PASS-1: batch_fft(sub_N=1024, batch=16384)
+    num_cores      = 64
+    batch_per_core = 16384 / 64 = 256             <-- 256 sub-FFTs per core
+    grid           = 8 x 8
+
+PASS-2: pass2(N1=16384, N2=1024)
+    num_cores      = 64
+    tiles_per_core = 256
+
+PASS-3: batch_fft(sub_N=N1=16384, batch=N2=1024)
+    NOTE: this exceeds sub_N <= 1024 limit, so for very large N the
+    framework recurses into another six-step on the inner length.
+    Practical limit of single dispatch: N <= 1 M.
+
+--------------------------------------------------------------------------------
+WHAT EACH ACTIVE CORE DOES
+--------------------------------------------------------------------------------
+
+Same as six-step (kernels are identical):
+
+  Pass-1 / Pass-3 (batch_fft_compute):
+    for k in [0, batch_per_core):
+      tile = read tile (base + k) from DRAM
+      for s in [0, log2(sub_N)):
+          run radix-2 butterflies stage s        [SFPU fp32]
+      write tile (base + k) to DRAM
+
+  Pass-2 (pass2_compute):
+    for k in [0, tiles_per_core):
+      A_tile, T_tile = read from DRAM
+      B_tile = A_tile * T_tile (complex elementwise)  [SFPU fp32]
+      write B_tile to DRAM
+
+--------------------------------------------------------------------------------
+CORE / WORK SCALING TABLE
+--------------------------------------------------------------------------------
+
+  N        | N1 x N2     | cores/pass | batch_per_core (P1, P2, P3)
+  ---------+-------------+------------+-----------------------------
+   131072  |  256 x 512  |    64      |   8,   8,  4
+   262144  |  512 x 512  |    64      |   8,   8,  8
+   524288  | 1024 x 512  |    64      |  16,  16,  8
+  1048576  | 1024 x 1024 |    64      |  16,  16, 16
+  2097152  | 2048 x 1024 |    64      |  32,  32, 16
+  4194304  | 2048 x 2048 |    64      |  32,  32, 32
+
+(Picker prefers near-square factor pairs; exact split varies.)
+
+--------------------------------------------------------------------------------
+KEY DIFFERENCE FROM SIX-STEP
+--------------------------------------------------------------------------------
+
+* Six-step: typically 1-4 sub-FFTs per core per pass (small N1, N2).
+* Four-step: 8+ sub-FFTs per core per pass (larger N1, N2).
+* Same 64 cores, same kernels; just more sequential work per core.
+
+Both are GOOD utilisation: 64/64 cores busy, every core's tile is
+fully loaded (sub_N=1024 means tile-fill = 100%).
+
+================================================================================

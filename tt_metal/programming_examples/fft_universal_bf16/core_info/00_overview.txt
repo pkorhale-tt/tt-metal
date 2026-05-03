@@ -1,0 +1,205 @@
+================================================================================
+       fft_universal_bf16 -- CORE WORKLOAD OVERVIEW (READ THIS FIRST)
+================================================================================
+
+This directory contains one .txt file per dispatch scenario from
+flowchart.txt, showing exactly how the 64 Tensix worker cores are
+selected, what each core does, and how work is distributed.
+
+FILES IN THIS DIRECTORY:
+  00_overview.txt              <-- you are here
+  01_phase1_packed_dft.txt     N in [2, 32]            : Phase 1 packed direct-DFT
+  02_phase2b_pow2.txt          pow2 N > 32             : two-level CT, N1=32
+  03_phase2c_mixed_radix.txt   composite N w/ div<=32  : two-level CT mixed-radix
+  04_phase2c_bluestein.txt     prime N > 32 (or hard)  : Bluestein chirp-Z
+
+--------------------------------------------------------------------------------
+KEY FACT: ONE KERNEL, ONE CORE-SELECTION RULE
+--------------------------------------------------------------------------------
+
+Unlike fft_universal (fp32) which has THREE device kernels (batch_fft,
+pass2, packed_dft) and TWO core-selection rules, fft_universal_bf16
+has exactly:
+
+   * ONE device kernel:      packed_dft_bf16_compute
+   * ONE core-selection rule: same multiple-of-8 rule used by
+                              fft_universal/PATH 0 (PackedDFTPlan)
+
+Every dispatch from every Phase ends up calling packed_dft_bf16. This
+is also what makes the bf16 pipeline "true bf16": the SFPU has no
+native bf16 multiplier on Wormhole, so we deliberately AVOID any SFPU
+op (no batch_fft / pass2 paths exist here).
+
+--------------------------------------------------------------------------------
+THE 64-CORE WORKER GRID (Wormhole, same as fp32 pipeline)
+--------------------------------------------------------------------------------
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  | (0,0)| (1,0)| (2,0)| (3,0)| (4,0)| (5,0)| (6,0)| (7,0)|
+         +------+------+------+------+------+------+------+------+
+  row=1  | (0,1)| (1,1)| (2,1)| (3,1)| (4,1)| (5,1)| (6,1)| (7,1)|
+         +------+------+------+------+------+------+------+------+
+  ...                              (8 x 8 = 64 cores)
+         +------+------+------+------+------+------+------+------+
+  row=7  | (0,7)| (1,7)| (2,7)| (3,7)| (4,7)| (5,7)| (6,7)| (7,7)|
+         +------+------+------+------+------+------+------+------+
+
+  Linear ID `c` -> (col, row):  ( c % grid_cols, c / grid_cols )
+
+--------------------------------------------------------------------------------
+THE ONE CORE-SELECTION RULE (used by every Phase)
+--------------------------------------------------------------------------------
+
+Code (fft_universal_bf16_host.cpp:250-271):
+
+    constexpr uint32_t kRowsPerTile = 32u;        // 32 sub-FFTs per tile
+    raw_num_tiles = ceil(count / 32);
+
+    if raw_num_tiles <= 7:
+        num_cores = raw_num_tiles                  // 1..7 directly
+    else:
+        num_cores = ceil(raw_num_tiles / 8) * 8    // round up to multiple of 8
+        num_cores = min(num_cores, 64)
+
+    tiles_per_core = ceil(raw_num_tiles / num_cores)
+    num_tiles      = num_cores * tiles_per_core    // padded with zero tiles
+
+  Allowed num_cores values: 1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32, 40, 48, 56, 64
+
+--------------------------------------------------------------------------------
+GRID RECTANGLE (pick_batch_grid -- shared with fp32 pipeline)
+--------------------------------------------------------------------------------
+
+  num_cores | grid (cols x rows) | active rows
+  ----------+--------------------+-------------
+       1    |       1 x 1        | (0,0) only
+       2    |       2 x 1        | row 0, cols 0..1
+       3    |       3 x 1        | row 0, cols 0..2
+       4    |       4 x 1        | row 0, cols 0..3
+       5    |       5 x 1        | row 0, cols 0..4
+       6    |       6 x 1        | row 0, cols 0..5
+       7    |       7 x 1        | row 0, cols 0..6
+       8    |       8 x 1        | row 0 (full)
+      16    |       8 x 2        | rows 0..1
+      24    |       8 x 3        | rows 0..2
+      32    |       8 x 4        | rows 0..3
+      40    |       8 x 5        | rows 0..4
+      48    |       8 x 6        | rows 0..5
+      56    |       8 x 7        | rows 0..6
+      64    |       8 x 8        | FULL grid
+
+--------------------------------------------------------------------------------
+PER-CORE WORK DISTRIBUTION
+--------------------------------------------------------------------------------
+
+For c in [0, num_cores):
+    logical_core = ( c % grid_cols, c / grid_cols )
+    base         = c * tiles_per_core
+    SetRuntimeArgs(reader, logical_core, { ..., base, tiles_per_core, ... })
+    SetRuntimeArgs(writer, logical_core, { ..., base, tiles_per_core, ... })
+
+Each core processes a contiguous range of TILES:
+    core c handles tiles [c*tiles_per_core, (c+1)*tiles_per_core)
+    each TILE packs 32 sub-FFTs (rows of the 32x32 tile)
+
+EXAMPLE: count=2048 -> raw_num_tiles=64 -> num_cores=64, tiles/core=1
+
+    core 0  -> tile 0  (sub-FFTs 0..31)
+    core 1  -> tile 1  (sub-FFTs 32..63)
+    ...
+    core 63 -> tile 63 (sub-FFTs 2016..2047)
+
+EXAMPLE: count=4096 -> raw_num_tiles=128 -> num_cores=64, tiles/core=2
+
+    core 0  -> tiles 0,1   (sub-FFTs 0..63)
+    core 1  -> tiles 2,3   (sub-FFTs 64..127)
+    ...
+    core 63 -> tiles 126,127 (sub-FFTs 4032..4095)
+
+--------------------------------------------------------------------------------
+THREADS PER ACTIVE CORE
+--------------------------------------------------------------------------------
+
+    +----------------------------------------------------------+
+    |                       ONE TENSIX                          |
+    |                                                            |
+    |   BRISC0 (RISCV_0)   <-- packed_dft_bf16_reader.cpp        |
+    |   BRISC1 (RISCV_1)   <-- packed_dft_bf16_writer.cpp        |
+    |   TRISC0/1/2         <-- packed_dft_bf16_compute.cpp       |
+    |                                                            |
+    |   FPU  (matrix unit, bf16-mul / fp32-accum) <-- USED      |
+    |   SFPU (vector, native fp32)                <-- NOT USED  |
+    |   ~1.5 MB L1                                              |
+    +----------------------------------------------------------+
+
+The reader pulls bf16 tiles from DRAM into Float16_b CBs. The compute
+runs `mm_init` + 4 `matmul_tiles` per tile (real complex multiply).
+The writer pushes bf16 output tiles back to DRAM.
+
+--------------------------------------------------------------------------------
+WHAT MAKES IT "TRUE BF16"
+--------------------------------------------------------------------------------
+
+  CB data format    : tt::DataFormat::Float16_b   (= bf16)
+  Tile size in DRAM : 2048 bytes (vs 4096 for fp32)
+  matmul_tiles      : reads bf16 srcA x bf16 srcB
+                      accumulates into fp32 DST register
+                      (fp32_dest_acc_en = true)
+  Pack to CB        : DST fp32 -> bf16 output CB
+  MathFidelity      : HiFi4 (this matters for fp32 matmul, not bf16;
+                       for bf16 matmul it's the natural single-pass)
+
+CONTRAST WITH fp32 pipeline:
+  fp32 matmul under HiFi4 = 4 bf16-decomposed passes
+  bf16 matmul under HiFi4 = 1 native bf16 pass
+  -> bf16 matmul is ~4x cheaper on the FPU per matmul.
+
+--------------------------------------------------------------------------------
+WHAT EACH PHASE ULTIMATELY DOES
+--------------------------------------------------------------------------------
+
+Every phase reduces to one or more calls to the SAME function:
+    packed_direct_dft_bf16_batched(md, N_inner, count_inner, in, out)
+
+The phase just decides what (N_inner, count_inner) to call with:
+
+  Phase 1            : packed_dft(N_user, count=1)
+  Phase 2b pow2      : packed_dft(N2, count=32)            [pass-1, if N2<=32]
+                       packed_dft(32, count=N2)            [pass-2, always]
+                       (recurse if N2 > 32)
+  Phase 2c mixed     : packed_dft(N2, count=N1)            [pass-1, if N2<=32]
+                       packed_dft(N1, count=N2)            [pass-2, always]
+                       (recurse if N2 > 32)
+  Phase 2c Bluestein : 3 calls to fft(M)                   (M is pow2)
+                       each one goes through Phase 2b above
+
+So core utilisation depends entirely on `count` per dispatch. See the
+per-phase files for concrete grids.
+
+--------------------------------------------------------------------------------
+KEY CODE LOCATIONS
+--------------------------------------------------------------------------------
+
+  Core selection (only one rule):
+      fft_universal_bf16_host.cpp:250-271
+
+  Per-core runtime args:
+      fft_universal_bf16_host.cpp:383-403
+
+  Top-level dispatcher:
+      fft_universal_bf16_host.cpp:744-778
+
+  Phase implementations:
+      packed_direct_dft_bf16_batched : line 441
+      two_level_fft_bf16             : line 539
+      pow2_fft_bf16                  : line 616
+      mixed_radix_fft_bf16           : line 633
+      bluestein_fft_bf16             : line 666
+
+  Single device kernel:
+      kernel/packed_dft_bf16_compute.cpp
+      kernel/packed_dft_bf16_reader.cpp
+      kernel/packed_dft_bf16_writer.cpp
+
+================================================================================

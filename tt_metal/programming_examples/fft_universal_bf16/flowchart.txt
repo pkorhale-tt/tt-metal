@@ -1,0 +1,429 @@
+================================================================================
+              fft_universal_bf16 (TRUE bf16) -- DETAILED FLOWCHART
+================================================================================
+
+Every on-device multiply runs on the Tensix FPU in bf16 x bf16 with fp32
+accumulation (matmul_tiles, MathFidelity::HiFi4, fp32_dest_acc_en=true).
+NO SFPU compute on this path -- the SFPU has no native bf16 multiplier on
+Wormhole, so any SFPU op would silently upcast to fp32, breaking the
+"true bf16 compute" contract.
+
+KEY DIFFERENCE FROM fft_universal (fp32):
+  fp32 pipeline:    3 device kernels  (batch_fft, pass2, packed_dft)
+  bf16 pipeline:    1 device kernel   (packed_dft_bf16) -- used everywhere
+
+All host orchestration glue (twiddle multiply, transpose, chirp, FFT
+of A and B, conjugate trick) is fp32 on the CPU. The reduction-critical
+arithmetic (the matmuls) is bf16 on the FPU.
+
+--------------------------------------------------------------------------------
+TOP-LEVEL ENTRY POINT
+--------------------------------------------------------------------------------
+
+                    +------------------------------+
+                    |  USER: fft_universal_bf16::  |
+                    |        fft(md, signal)        |
+                    |  N = signal.size()            |
+                    +--------------+---------------+
+                                   |
+                                   v
+                    +------------------------------+
+                    |  N == 1 ?                    |
+                    +------+---------------+-------+
+                           | yes           | no
+                           v               v
+                    +-------------+   +---------------------+
+                    | return      |   |  N in [2, 32] ?     |
+                    | signal      |   +----+------------+---+
+                    | (identity)  |        | yes        | no
+                    +-------------+        v            v
+                                   +-------------+   +---------------------+
+                                   | PHASE 1     |   |  is_pow2(N) ?       |
+                                   | packed_dft_ |   +----+------------+---+
+                                   | bf16        |        | yes        | no
+                                   | direct DFT  |        v            v
+                                   |             |   +-----------+ +-----------+
+                                   | One FPU     |   | PHASE 2b  | | largest_  |
+                                   | matmul      |   | pow2 N>32 | | divisor_  |
+                                   | dispatch    |   |           | | le_32     |
+                                   | (count=1)   |   | two_level | | (N) >= 2? |
+                                   +-------------+   | _fft_bf16 | +--+----+---+
+                                                     | (N1=32)   |    |    |
+                                                     +-----------+    |    |
+                                                                 yes  v    v no
+                                                              +-----------+  +-----------+
+                                                              | PHASE 2c  |  | PHASE 2c  |
+                                                              | mixed-    |  | Bluestein |
+                                                              | radix CT  |  |           |
+                                                              | two_level |  | 3x length-|
+                                                              | _fft_bf16 |  | M pow2    |
+                                                              | (N1=largest|  | FFTs      |
+                                                              |  div<=32) |  +-----------+
+                                                              +-----------+
+
+--------------------------------------------------------------------------------
+THE ONE DEVICE KERNEL: packed_dft_bf16_compute
+--------------------------------------------------------------------------------
+
+This is the only on-device math kernel in the whole bf16 pipeline.
+Every dispatch from every Phase ends up calling this kernel.
+
+  Inputs (all bf16, Float16_b CBs):
+     in_R     : 32x32 tile, real part of `count` length-N input rows
+     in_I     : 32x32 tile, imag part
+     T_R      : 32x32 tile, real part of NxN twiddle matrix
+     T_I      : 32x32 tile, imag part
+     T_I_neg  : 32x32 tile, -T_I (for the subtract in complex mul)
+
+  Compute (FPU matmul, MathFidelity::HiFi4, fp32_dest_acc):
+     // out_R = in_R * T_R + in_I * T_I_neg
+     mm_init(); matmul_tiles(in_R, T_R)        ; DST  = in_R x T_R
+                matmul_tiles(in_I, T_I_neg)    ; DST += in_I x (-T_I)
+     pack DST -> CB_OUT_R  (back to bf16)
+
+     // out_I = in_R * T_I + in_I * T_R
+     mm_init(); matmul_tiles(in_R, T_I)        ; DST  = in_R x T_I
+                matmul_tiles(in_I, T_R)        ; DST += in_I x T_R
+     pack DST -> CB_OUT_I  (back to bf16)
+
+  Outputs (bf16):
+     out_R, out_I tiles
+
+  4 FPU matmuls per tile = per 32 packed sub-FFTs.
+
+--------------------------------------------------------------------------------
+PHASE 1 -- DIRECT PACKED DFT (N in [2, 32])
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              | packed_direct_dft_bf16_batched(N,1)  |
+              | called by top-level for N <= 32      |
+              +-----------------+--------------------+
+                                |
+                                v
+              +--------------------------------------+
+              | get_cached_packed_dft_bf16_plan      |
+              |   raw_num_tiles = ceil(count / 32)   |
+              |   num_cores = round_to_8(raw)        |
+              |     (or =raw if raw <= 7)            |
+              |   tiles_per_core = ceil(raw/cores)   |
+              +-----------------+--------------------+
+                                |
+                                v
+        +-------------------------------------------------------+
+        | HOST: pack count sub-FFTs into row-major fp32         |
+        |   row r in [0, count): in_R[r*32 + k] = signal[r,k]   |
+        |                        for k in [0, N)                 |
+        |   tilize fp32 -> tile bytes                            |
+        |   convert fp32 -> bf16 (uint16_t)                      |
+        |   WriteShard bf16 tiles to DRAM                        |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | DEVICE: EnqueueMeshWorkload                           |
+        |   1 dispatch, num_cores cores, tiles_per_core tiles   |
+        |   each.                                                |
+        |   Per tile: 4 FPU bf16 matmuls (complex mul)          |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | HOST: ReadShard bf16 tiles from DRAM                  |
+        |   convert bf16 -> fp32                                 |
+        |   untilize -> row-major                                |
+        |   strip to count x N output                            |
+        +---------------------+---------------------------------+
+                              |
+                              v
+                       +-------------+
+                       |  RETURN out |
+                       +-------------+
+
+--------------------------------------------------------------------------------
+PHASE 2b -- POW2 N > 32  (recursive two-level CT, N1 = 32)
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              | pow2_fft_bf16(N)                     |
+              | -> two_level_fft_bf16(N, N1=32)      |
+              +-----------------+--------------------+
+                                |
+                                v
+        +-------------------------------------------------------+
+        | STEP 1 [HOST fp32]   stride-N1 reshape                |
+        |   pass1_in[n1*N2 + n2] = x[n1 + N1*n2]                |
+        |   (N1 sub-FFTs, each length N2 = N/32)                |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 2 [DEVICE/RECURSE]   PASS-1                      |
+        |   N1 = 32 sibling length-N2 FFTs                       |
+        |     If N2 <= 32:                                       |
+        |       packed_direct_dft_bf16_batched(N2, count=32)    |
+        |         -> 1 packed_dft dispatch                       |
+        |     Else:                                              |
+        |       for r in 0..31:                                  |
+        |         A_prime[r] = fft(md, pass1_in[r])              |
+        |       (each fft() recurses -> Phase 2b again)          |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 3 [HOST fp32]   pointwise twiddle + transpose    |
+        |   B[n1, k2] = A_prime[n1, k2] * exp(-2pi i n1 k2 / N) |
+        |   pass2_in[k2*N1 + n1] = B[n1, k2]                    |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 4 [DEVICE]   PASS-2                              |
+        |   N2 sibling length-N1 FFTs (N1 = 32, ALWAYS <= 32)   |
+        |   packed_direct_dft_bf16_batched(N1=32, count=N2)     |
+        |     -> 1 packed_dft dispatch                           |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 5 [HOST fp32]   output permutation               |
+        |   out[k2 + N2*k1] = D[k2*N1 + k1]                     |
+        +-------------------------------------------------------+
+
+  Recursion depth: ceil(log_32(N))
+    N=64..1024     -> depth 1 (one two_level call, leaf packed_dft)
+    N=2048..32768  -> depth 2
+    N=65536..2^20  -> depth 3 (one two_level call recurses through)
+
+--------------------------------------------------------------------------------
+PHASE 2c -- MIXED-RADIX (composite non-pow2 N > 32 with divisor <= 32)
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              | mixed_radix_fft_bf16(N)              |
+              | N1 = largest_divisor_le_32(N)        |
+              | -> two_level_fft_bf16(N, N1)         |
+              +-----------------+--------------------+
+
+  Same 5-step shape as Phase 2b pow2, but N1 chosen as the largest
+  divisor of N in [2, 32]. Pass-2 is ALWAYS length N1 <= 32 -> direct
+  packed_dft. Pass-1 length N2 may itself recurse via fft().
+
+  Examples:
+    N = 36   = 6 x 6     -> N1=6, N2=6     (pass-1 -> packed_dft)
+    N = 60   = 6 x 10    -> N1=6, N2=10    (pass-1 -> packed_dft)
+    N = 100  = 4 x 25    -> N1=4, N2=25    (pass-1 -> packed_dft)
+    N = 720  = 24 x 30   -> N1=24, N2=30   (pass-1 -> packed_dft)
+    N = 3600 = 30 x 120  -> N1=30, N2=120  (pass-1 recurses on 120)
+                              fft(120) -> mixed_radix(120)
+                                -> two_level(120, N1=24)
+                                -> packed_dft sub-passes
+
+--------------------------------------------------------------------------------
+PHASE 2c -- BLUESTEIN (prime N > 32, OR hard composites e.g. N = 1369)
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              | bluestein_fft_bf16(N)                |
+              | M = next_pow2(2N - 1)                |
+              +-----------------+--------------------+
+                                |
+                                v
+        +-------------------------------------------------------+
+        | STEP 1 [HOST fp32]   build chirp + a, b               |
+        |   c[n] = exp(-i pi n^2 / N)            n in [0, N)    |
+        |   a[n] = x[n] * c[n], zero-pad to M                    |
+        |   b[n] = conj(c[n]); b[M-n] = conj(c[n])  for n>=1    |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 2 [DEVICE/RECURSE]                               |
+        |   A = fft(md, a)   -> fft(M)  -> Phase 2b pow2        |
+        |   B = fft(md, b)   -> fft(M)  -> Phase 2b pow2        |
+        |   (TWO length-M bf16 FFTs)                             |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 3 [HOST fp32]   pointwise mul + pre-conjugate    |
+        |   P[k]      = A[k] * B[k]                              |
+        |   P_conj[k] = conj(P[k])    (prep for conjugate trick) |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 4 [DEVICE/RECURSE]                               |
+        |   P_fft = fft(md, P_conj) -> fft(M) -> Phase 2b pow2  |
+        |   p[k] = conj(P_fft[k]) / M                            |
+        |   (THIRD length-M bf16 FFT)                            |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 5 [HOST fp32]   final chirp                      |
+        |   X[k] = c[k] * p[k]    for k in [0, N)               |
+        +-------------------------------------------------------+
+
+  Bluestein cost: 3 length-M pow2 FFTs (each goes through Phase 2b),
+  plus O(N) host chirp + O(M) host pointwise.
+
+--------------------------------------------------------------------------------
+RECURSION EXAMPLES -- HOW FULL FFTs TRAVERSE THIS GRAPH
+--------------------------------------------------------------------------------
+
+EXAMPLE 1: N = 8 (small, Phase 1)
+    fft(8) -> packed_direct_dft_bf16_batched(8, 1)
+              -> 1 dispatch, 1 core, 1 tile (only 8/32 row-fill)
+    Total dispatches: 1
+
+
+EXAMPLE 2: N = 64 (pow2, Phase 2b, depth 1)
+    fft(64) -> pow2_fft_bf16(64)
+                -> two_level_fft_bf16(64, N1=32)
+                  N2 = 64/32 = 2
+                  PASS-1: packed_dft_bf16(N=2, count=32)  [N2 <= 32]
+                  HOST:   twiddle + transpose
+                  PASS-2: packed_dft_bf16(N=32, count=2)
+    Total dispatches: 2
+
+
+EXAMPLE 3: N = 1024 (pow2, Phase 2b, depth 1)
+    fft(1024) -> pow2_fft_bf16(1024)
+                  -> two_level_fft_bf16(1024, N1=32)
+                    N2 = 32
+                    PASS-1: packed_dft_bf16(N=32, count=32)
+                    HOST:   twiddle + transpose
+                    PASS-2: packed_dft_bf16(N=32, count=32)
+    Total dispatches: 2
+
+
+EXAMPLE 4: N = 2048 (pow2, Phase 2b, depth 2)
+    fft(2048) -> pow2_fft_bf16(2048)
+                  -> two_level_fft_bf16(2048, N1=32)
+                    N2 = 64
+                    PASS-1: 32 sub-FFTs of length 64 (N2 > 32)
+                       for r in 0..31:
+                         fft(md, sub_in_r)  ->  fft(64)
+                           -> two_level_fft_bf16(64, N1=32)
+                             [Example 2: 2 dispatches]
+                       => 32 * 2 = 64 dispatches  (one per sibling)
+                    HOST: twiddle + transpose
+                    PASS-2: packed_dft_bf16(N=32, count=64)
+                            [1 dispatch]
+    Total dispatches: 65 (one per sibling sub-FFT, plus the outer pass-2)
+
+
+EXAMPLE 5: N = 65536 (pow2, Phase 2b, depth 3)
+    fft(65536) -> two_level(65536, N1=32)
+                    N2 = 2048
+                    PASS-1: 32 sub-FFTs of length 2048 (recursive)
+                              each fft(2048) -> 65 dispatches (Example 4)
+                              => 32 * 65 = 2080 dispatches
+                    PASS-2: 1 dispatch (length-32 packed_dft, count=2048)
+    Total dispatches: 2081  (steady state, all plans cached)
+
+
+EXAMPLE 6: N = 60 (composite, mixed-radix)
+    fft(60) -> mixed_radix_fft_bf16(60)
+                N1 = largest_divisor_le_32(60) = 30  -- wait, 30<=32, yes
+                  Actually = 30 (60 / 2 = 30; check 32 doesn't divide 60;
+                   30 divides 60 -> 30 picked)
+                -> two_level(60, 30)
+                  N2 = 2
+                  PASS-1: packed_dft(N=2, count=30)   [1 dispatch]
+                  PASS-2: packed_dft(N=30, count=2)   [1 dispatch]
+    Total dispatches: 2
+
+
+EXAMPLE 7: N = 37 (prime, Bluestein)
+    fft(37) -> bluestein_fft_bf16(37)
+                M = next_pow2(73) = 128
+                A = fft(128) -> Phase 2b pow2
+                                 -> two_level(128, N1=32)  N2=4
+                                 -> 2 dispatches
+                B = fft(128) -> 2 dispatches
+                P_fft = fft(128) -> 2 dispatches
+    Total dispatches: 6
+
+
+EXAMPLE 8: N = 1369 = 37*37 (composite, no divisor <=32, Bluestein)
+    fft(1369) -> largest_divisor_le_32(1369) = 1 (smallest factor 37 > 32)
+              -> bluestein_fft_bf16(1369)
+                M = next_pow2(2737) = 4096
+                3x fft(4096) -> Phase 2b pow2
+                                 -> two_level(4096, N1=32)  N2=128
+                                 -> recurses on 128 (per sibling)
+                                 -> 32 * (Example 2 dispatches) + 1
+                                 = 32 * 2 + 1 = 65 dispatches per FFT
+                Total: 3 * 65 = 195 dispatches
+
+--------------------------------------------------------------------------------
+ALL DISPATCHED KERNELS IN fft_universal_bf16
+--------------------------------------------------------------------------------
+
+  ONE kernel:
+    packed_dft_bf16_compute.cpp
+    Used by:  EVERY phase
+    Compute:  FPU matmul (matmul_tiles)
+              MathFidelity::HiFi4, fp32_dest_acc_en=true
+              Operands: bf16 (Float16_b) -> DST fp32 -> pack to bf16
+    Per tile: 4 matmul_tiles calls (complex mul = 4 real matmuls)
+    Note:     bf16 matmul is ONE FPU pass per matmul (vs 4 passes for
+              fp32 matmul under HiFi4). So bf16 is ~4x cheaper per
+              matmul on the FPU.
+
+--------------------------------------------------------------------------------
+CACHING INFRASTRUCTURE
+--------------------------------------------------------------------------------
+
+  PackedDFTBf16Plan cache       keyed by (md*, N, count)
+     Stores:  kernel program, CB config, twiddle tiles in DRAM,
+              host scratch buffers (fp32 mirrors + bf16 byte buffers)
+     One plan per (N, count) pair.
+
+  No Bluestein-plan cache yet (chirp is recomputed each call).
+  No CT-plan cache yet (twiddle is recomputed each call).
+  Acceptable because: O(N) host work dominated by O(N log N) device work.
+
+--------------------------------------------------------------------------------
+DECISION SUMMARY TABLE
+--------------------------------------------------------------------------------
+
+  Input N                           | Path           | Final kernel(s)
+  ----------------------------------+----------------+------------------------
+  1                                 | identity       | --
+  2..32                             | Phase 1        | packed_dft_bf16
+  pow2 > 32                         | Phase 2b pow2  | packed_dft_bf16 (recurse)
+  composite non-pow2 with div<=32   | Phase 2c mixed | packed_dft_bf16 (recurse)
+  prime > 32 OR no div <= 32        | Phase 2c blue  | packed_dft_bf16 (3 sub-FFTs)
+
+ALL paths funnel into the SAME kernel. The ONLY device kernel in
+fft_universal_bf16 is packed_dft_bf16_compute.
+
+--------------------------------------------------------------------------------
+COMPARISON: fft_universal vs fft_universal_bf16
+--------------------------------------------------------------------------------
+
+                    | fft_universal (fp32)      | fft_universal_bf16 (bf16)
+  ------------------+---------------------------+--------------------------
+  Device kernels    | 3 (batch_fft, pass2,      | 1 (packed_dft_bf16)
+                    |    packed_dft)            |
+  Compute units     | SFPU fp32 + FPU emul fp32 | FPU bf16 only
+  Pow2 small (<=1024)| batch_fft, 1 dispatch    | two_level, 2 dispatches
+  Pow2 medium       | six-step, 3 dispatches    | two_level recurse, many
+  Pow2 large        | four-step, 3 dispatches   | two_level recurse, many
+  Small N <= 32     | packed_dft (1 dispatch)   | packed_dft (1 dispatch)
+  Prime N           | Bluestein (M FFTs done    | Bluestein (3 length-M
+                    | via Stockham)             | FFTs through Phase 2b)
+  Composite N       | mixed-radix CT            | mixed-radix CT (recursive)
+  Twiddles in DRAM  | fp32 (4 KB per tile)      | bf16 (2 KB per tile)
+  Per-matmul FPU    | 4 bf16 passes (HiFi4)     | 1 bf16 pass
+  Precision (SNR)   | ~140 dB (SFPU) / ~60 dB   | ~48-56 dB (Phase 1)
+                    | (FPU emul)                |
+  Speed (small N)   | comparable                | comparable
+  Speed (large N)   | better (SFPU is fast)     | comparable
+                    |                           | (more dispatches but each
+                    |                           |  matmul is cheaper)
+
+================================================================================

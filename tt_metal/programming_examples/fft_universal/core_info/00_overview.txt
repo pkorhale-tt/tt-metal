@@ -1,0 +1,162 @@
+================================================================================
+       fft_universal -- CORE WORKLOAD OVERVIEW (READ THIS FIRST)
+================================================================================
+
+This directory contains one .txt file per dispatch scenario from
+flowchart.txt, showing exactly how the 64 Tensix worker cores are
+selected, what each core does, and how work is distributed.
+
+FILES IN THIS DIRECTORY:
+  00_overview.txt              <-- you are here
+  01_pow2_small_one_tile.txt   N <= 1024 single FFT (Path A, batch=1)
+  02_pow2_six_step.txt         1024 < N <= 65536 (six-step)
+  03_pow2_four_step.txt        N > 65536 (four-step)
+  04_packed_dft.txt            PATH 0: small N <= 32 packed DFT
+  05_path_a_batched_pow2.txt   PATH A: batched pow2 sub-FFTs (Bluestein/CT)
+  06_path_b_per_row.txt        PATH B: per-row Stockham (large pow2 sibling)
+  07_path_c_bluestein.txt      PATH C: Bluestein chirp-Z, prime N > 32
+  08_path_d_mixed_radix.txt    PATH D: mixed-radix Cooley-Tukey
+
+--------------------------------------------------------------------------------
+THE 64-CORE WORKER GRID (Wormhole)
+--------------------------------------------------------------------------------
+
+Tensix has an 8x8 worker grid (64 cores total). Logical coordinates
+are (col, row) with col in [0,7], row in [0,7].
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  | (0,0)| (1,0)| (2,0)| (3,0)| (4,0)| (5,0)| (6,0)| (7,0)|
+         +------+------+------+------+------+------+------+------+
+  row=1  | (0,1)| (1,1)| (2,1)| (3,1)| (4,1)| (5,1)| (6,1)| (7,1)|
+         +------+------+------+------+------+------+------+------+
+  row=2  | (0,2)| (1,2)| (2,2)| (3,2)| (4,2)| (5,2)| (6,2)| (7,2)|
+         +------+------+------+------+------+------+------+------+
+  row=3  | (0,3)| (1,3)| (2,3)| (3,3)| (4,3)| (5,3)| (6,3)| (7,3)|
+         +------+------+------+------+------+------+------+------+
+  row=4  | (0,4)| (1,4)| (2,4)| (3,4)| (4,4)| (5,4)| (6,4)| (7,4)|
+         +------+------+------+------+------+------+------+------+
+  row=5  | (0,5)| (1,5)| (2,5)| (3,5)| (4,5)| (5,5)| (6,5)| (7,5)|
+         +------+------+------+------+------+------+------+------+
+  row=6  | (0,6)| (1,6)| (2,6)| (3,6)| (4,6)| (5,6)| (6,6)| (7,6)|
+         +------+------+------+------+------+------+------+------+
+  row=7  | (0,7)| (1,7)| (2,7)| (3,7)| (4,7)| (5,7)| (6,7)| (7,7)|
+         +------+------+------+------+------+------+------+------+
+
+  Linear ID `c` -> (col, row) mapping:
+      logical = ( c % grid_cols , c / grid_cols )
+
+--------------------------------------------------------------------------------
+HOW CORE COUNT IS PICKED -- TWO RULES
+--------------------------------------------------------------------------------
+
+RULE 1 (used by batch_fft and pass2):
+    num_cores = min(work_units, 64)
+
+    where work_units = batch (sub-FFTs) for batch_fft
+                     = N1 (twiddle tile rows) for pass2
+
+    Constraint: work_units MUST be a power of 2 (those plans assert
+    is_pow2). So num_cores is always 1, 2, 4, 8, 16, 32, or 64.
+
+RULE 2 (used by packed_dft, more permissive):
+    raw_num_tiles = ceil(count / 32)             // 32 sub-FFTs per tile
+    if raw_num_tiles <= 7:
+        num_cores = raw_num_tiles                 // 1..7 inclusive
+    else:
+        num_cores = ceil(raw_num_tiles / 8) * 8   // round up to multiple of 8
+        num_cores = min(num_cores, 64)
+
+    So allowed num_cores values are:
+        1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32, 40, 48, 56, 64
+
+--------------------------------------------------------------------------------
+HOW THE GRID RECTANGLE IS PICKED (pick_batch_grid)
+--------------------------------------------------------------------------------
+
+    inline std::pair<uint32_t, uint32_t> pick_batch_grid(uint32_t num_cores) {
+        const uint32_t cols = (num_cores < 8u) ? num_cores : 8u;
+        const uint32_t rows = num_cores / cols;
+        return {cols, rows};
+    }
+
+  num_cores | grid (cols x rows) | shape
+  ----------+--------------------+----------------
+       1    |       1 x 1        | single core
+       2    |       2 x 1        | one row
+       3    |       3 x 1        | one row
+       4    |       4 x 1        | one row
+       5    |       5 x 1        | one row
+       6    |       6 x 1        | one row
+       7    |       7 x 1        | one row
+       8    |       8 x 1        | full row 0
+      16    |       8 x 2        | rows 0..1
+      24    |       8 x 3        | rows 0..2
+      32    |       8 x 4        | rows 0..3
+      40    |       8 x 5        | rows 0..4
+      48    |       8 x 6        | rows 0..5
+      56    |       8 x 7        | rows 0..6
+      64    |       8 x 8        | FULL grid
+
+--------------------------------------------------------------------------------
+HOW EACH CORE GETS ITS WORK (Runtime args distribution)
+--------------------------------------------------------------------------------
+
+For c in [0, num_cores):
+    logical_core = ( c % grid_cols, c / grid_cols )
+    base         = c * work_per_core
+    SetRuntimeArgs(reader, logical_core, { ..., base, work_per_core, ... })
+    SetRuntimeArgs(writer, logical_core, { ..., base, work_per_core, ... })
+    SetRuntimeArgs(compute, logical_core, { work_per_core })
+
+So each core processes a contiguous range:
+    core c handles indices [c*work_per_core, (c+1)*work_per_core)
+
+EXAMPLE: batch=128, num_cores=64, batch_per_core=2
+
+    core 0  -> sub-FFTs 0,1
+    core 1  -> sub-FFTs 2,3
+    core 2  -> sub-FFTs 4,5
+    ...
+    core 63 -> sub-FFTs 126,127
+
+--------------------------------------------------------------------------------
+THREADS RUNNING ON EACH CORE (5 RISC-V + 1 FPU + 1 SFPU)
+--------------------------------------------------------------------------------
+
+Each Tensix core is its own little SoC. For every active core in a plan,
+three kernels are placed (and three RISC-V cores light up):
+
+    +----------------------------------------------------------+
+    |                       ONE TENSIX                          |
+    |                                                            |
+    |   BRISC0 (RISCV_0)   <-- reader kernel (NoC IN)           |
+    |   BRISC1 (RISCV_1)   <-- writer kernel (NoC OUT)          |
+    |   TRISC0/1/2         <-- compute kernel (UNPACK/MATH/PACK)|
+    |                                                            |
+    |   FPU  (matrix unit, bf16-mult / fp32-accum)              |
+    |   SFPU (vector, native fp32)                              |
+    |   ~1.5 MB L1                                              |
+    +----------------------------------------------------------+
+
+The 3 kernels coordinate through CBs (circular buffers in L1).
+
+--------------------------------------------------------------------------------
+KEY CODE LOCATIONS
+--------------------------------------------------------------------------------
+
+  Core grid picker (shared):
+      fft_stockham_host.cpp:188   pick_batch_grid()
+      fft_stockham_host.cpp:194   batch_logical_core()
+
+  Plan-specific core selection:
+      fft_stockham_host.cpp:241   batch_fft num_cores = min(batch, 64)
+      fft_stockham_host.cpp:586   pass2     num_cores = min(N1,    64)
+      fft_universal_host.cpp:364  packed_dft (rounded-up tile-based)
+
+  Per-core runtime arg distribution:
+      fft_stockham_host.cpp:332   batch_fft  (for c in num_cores)
+      fft_stockham_host.cpp:670   pass2
+      fft_universal_host.cpp:478  packed_dft
+
+================================================================================

@@ -1,0 +1,122 @@
+================================================================================
+       SCENARIO: pow2 N <= 1024 (single tile, single dispatch)
+================================================================================
+
+Path:    fft(N) -> fft_stockham::fft(N) -> ONE batch_fft dispatch
+Kernel:  batch_fft_compute (SFPU fp32 native)
+Cores:   ALWAYS 1 (because batch=1 for a single user FFT)
+
+--------------------------------------------------------------------------------
+WHY ONLY 1 CORE?
+--------------------------------------------------------------------------------
+
+For a single user FFT of length N <= 1024:
+    sub_N  = N
+    batch  = 1                            <-- only one sub-FFT in flight
+
+Code (fft_stockham_host.cpp:241):
+    bp->num_cores      = (batch < 64u) ? batch : 64u;   // = 1
+    bp->batch_per_core = batch / bp->num_cores;         // = 1
+
+So num_cores = min(1, 64) = 1.
+The whole length-N butterfly cascade runs on a single Tensix.
+
+--------------------------------------------------------------------------------
+THE 64-CORE GRID -- WHO IS ACTIVE
+--------------------------------------------------------------------------------
+
+Active cores: only (0,0)        Idle cores: 63
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |##0,0#| .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+  row=1  | .    | .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+  row=2  | .    | .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+  row=3  | .    | .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+  row=4  | .    | .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+  row=5  | .    | .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+  row=6  | .    | .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+  row=7  | .    | .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+
+Grid rectangle:  1 x 1
+Logical cores:   {(0,0)}
+
+--------------------------------------------------------------------------------
+WHAT THE ONE CORE DOES
+--------------------------------------------------------------------------------
+
+CORE (0,0) -- runs the full Stockham butterfly cascade on its single tile
+
+  base = 0, batch_per_core = 1
+  reader    -> reads tile 0 of in_r/in_i + LOG2_N twiddle tiles from DRAM
+  compute   -> LOG2_N stages of in-place radix-2 butterflies on the
+               single tile (SFPU fp32 *_binary_tile)
+               Stages: log2(N) in total
+                 N=2:    1 stage
+                 N=4:    2 stages
+                 N=8:    3 stages
+                 N=16:   4 stages
+                 N=32:   5 stages
+                 N=64:   6 stages
+                 N=128:  7 stages
+                 N=256:  8 stages
+                 N=512:  9 stages
+                 N=1024: 10 stages
+  writer    -> writes 1 output tile back to DRAM
+
+Other 63 cores: parked, no kernels placed there.
+
+--------------------------------------------------------------------------------
+WORKED EXAMPLE: N = 256
+--------------------------------------------------------------------------------
+
+  batch_fft(sub_N=256, batch=1)
+    num_cores      = 1
+    batch_per_core = 1
+    grid           = 1 x 1
+    log2_sub_N     = 8 stages
+
+  CORE (0,0):
+    base=0, batch_per_core=1
+    => does 8 in-place butterfly stages on its single tile
+    => 256 out-of-1024 slots used; the other 768 are zero pad
+
+  Other 63 cores: idle.
+
+--------------------------------------------------------------------------------
+TILE UTILISATION
+--------------------------------------------------------------------------------
+
+A tile holds 1024 fp32 elements (32 x 32). For sub_N = N, only the
+first N slots of the input tile are used; the remaining (1024 - N)
+are zero-padded and ignored.
+
+  sub_N | tile fill
+  ------+----------
+   128  |   12.5 %
+   256  |   25.0 %
+   512  |   50.0 %
+  1024  |  100.0 %
+
+This is the reason small single FFTs are so under-utilised: 1 core
+out of 64 AND only a fraction of that core's tile.
+
+--------------------------------------------------------------------------------
+NOTE: WHEN THIS PATH USES MORE CORES
+--------------------------------------------------------------------------------
+
+It does NOT, for a single user FFT.
+
+The same kernel IS reused at high core utilisation when called as a
+batch (batch >= 64) by Bluestein or mixed-radix recursion. See
+05_path_a_batched_pow2.txt for that case.
+
+================================================================================

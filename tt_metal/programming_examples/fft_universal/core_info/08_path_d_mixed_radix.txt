@@ -1,0 +1,188 @@
+================================================================================
+       SCENARIO: PATH D -- mixed-radix Cooley-Tukey, composite non-pow2 N
+================================================================================
+
+Path:    fft(N) -> batched_siblings_fft(1, N) -> PATH D
+            -> cooley_tukey_split_batched(count=1, N1, N2)
+            -> 6 stages: HOST reshape -> DEVICE FFT(N2 of count*N1)
+                         -> HOST twiddle/transpose
+                         -> DEVICE FFT(N1 of count*N2) -> HOST permute
+Kernels invoked DEVICE-side:
+   batched_siblings_fft(count*N1, N2)   <-- can recurse into PATH 0/A/B/C/D
+   batched_siblings_fft(count*N2, N1)   <-- ditto
+
+Cores: depends on what the inner sub-FFTs route to. The OUTER call
+always batches across (count * N_other), giving great utilisation
+even for small inner len.
+
+--------------------------------------------------------------------------------
+HOW MIXED-RADIX TURNS A BAD-UTILISATION PROBLEM INTO A GOOD ONE
+--------------------------------------------------------------------------------
+
+A user calling fft(60) might expect 1 small FFT on 1 core. Mixed-radix
+splits N=60 into 6 x 10, then dispatches:
+   Pass-1: batched_siblings_fft(6, 10)    -> 6 length-10 FFTs in parallel
+   Pass-2: batched_siblings_fft(10, 6)    -> 10 length-6 FFTs in parallel
+
+Each inner sub-FFT goes to PATH 0 (packed_dft, len <= 32) which packs
+them all into ONE matmul tile and runs ONE dispatch.
+
+Net result: 60-point FFT done in 2 small dispatches, each using as
+few as 1 core. Still under-utilised for tiny N, but BETTER than the
+naive single-core direct DFT.
+
+--------------------------------------------------------------------------------
+EXAMPLE A: N = 60 = 6 x 10
+--------------------------------------------------------------------------------
+
+  Pass-1: batched_siblings_fft(6, 10)
+    -> 10 <= 32 -> PATH 0 (packed_dft)
+       N=10, count=6, raw_num_tiles = ceil(6/32) = 1
+       num_cores = 1, tiles_per_core = 1, grid = 1 x 1
+
+       GRID:
+       row=0  |##0,0#| .  | .  | .  | .  | .  | .  | .  |
+       (rest idle)
+
+       Single tile: 6 sub-FFTs packed in rows 0..5
+
+  HOST: twiddle + transpose
+
+  Pass-2: batched_siblings_fft(10, 6)
+    -> 6 <= 32 -> PATH 0 (packed_dft)
+       N=6, count=10, raw_num_tiles = 1
+       num_cores = 1, grid = 1 x 1
+
+       Single tile: 10 sub-FFTs packed in rows 0..9
+
+Total: 2 dispatches, each 1 core, each 1 FPU matmul.
+Dispatch count = 2, total core-cycles = tiny.
+
+--------------------------------------------------------------------------------
+EXAMPLE B: N = 100 = 10 x 10
+--------------------------------------------------------------------------------
+
+  Pass-1: batched_siblings_fft(10, 10) -> packed_dft
+    N=10, count=10 -> 1 tile -> 1 core
+
+  Pass-2: batched_siblings_fft(10, 10) -> packed_dft
+    Same shape.
+
+Total: 2 dispatches, 1 core each.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: N = 3600 = 60 x 60 = (6 x 10) x (6 x 10)   -- recursive split
+--------------------------------------------------------------------------------
+
+This is the deepest recursion in the practical N range.
+
+  Outer split: cooley_tukey_split_batched(count=1, N1=60, N2=60)
+
+  PASS-1: batched_siblings_fft(60, 60)     <-- 60 sub-FFTs of len 60
+    -> 60 is composite non-pow2, > 32 -> PATH D AGAIN
+    -> cooley_tukey_split_batched(count=60, N1=6, N2=10)
+
+      Pass-1.1: batched_siblings_fft(360, 10)    <-- 360 sub-FFTs of len 10
+        -> PATH 0 (packed_dft)
+        -> raw_num_tiles = ceil(360/32) = 12
+        -> num_cores = 16 (rounded up), tiles/core = 1
+        -> grid = 8 x 2
+
+        GRID:
+        row=0  |##0,0#|##1,0#|##2,0#|##3,0#|##4,0#|##5,0#|##6,0#|##7,0#|
+        row=1  |##0,1#|##1,1#|##2,1#|##3,1#| .    | .    | .    | .    |
+        (rows 2-7 idle; cores 12-15 carry padded zero tiles)
+
+        12 useful tiles + 4 padded -> 75% effective utilisation
+
+      Pass-1.2: batched_siblings_fft(600, 6)     <-- 600 sub-FFTs of len 6
+        -> PATH 0 (packed_dft)
+        -> raw_num_tiles = ceil(600/32) = 19
+        -> num_cores = 24 (rounded up), tiles/core = 1
+        -> grid = 8 x 3
+
+        GRID:
+        row=0  |##0,0#|##1,0#|##2,0#|##3,0#|##4,0#|##5,0#|##6,0#|##7,0#|
+        row=1  |##0,1#|##1,1#|##2,1#|##3,1#|##4,1#|##5,1#|##6,1#|##7,1#|
+        row=2  |##0,2#|##1,2#|##2,2#|##3,2#| .    | .    | .    | .    |
+        (rows 3-7 idle; cores 20-23 carry padded zero tiles)
+
+        19 useful + 5 padded -> 79% effective utilisation
+
+  PASS-2: same recursive structure, mirrored
+
+Total dispatches:
+  Inner (per Pass-1 or Pass-2): 2 packed_dft dispatches
+  Outer:                        2 passes
+  GRAND TOTAL:                  4 packed_dft dispatches (assuming
+                                cached plans -- none in steady state
+                                ever rebuild the kernel)
+
+Cores used: 16-24 per dispatch (good utilisation for fft(3600))
+
+--------------------------------------------------------------------------------
+EXAMPLE D: N = 1369 = 37 x 37  (composite, but 37 has NO divisor <= 32)
+--------------------------------------------------------------------------------
+
+  largest_divisor_le_32(1369) = 1   -> PATH D rejects, falls to PATH C
+  (Bluestein) instead.
+
+  See 07_path_c_bluestein.txt for what happens (M = 4096, six-step).
+
+--------------------------------------------------------------------------------
+EXAMPLE E: N = 240 = 16 x 15    (mix of pow2 and non-pow2 factors)
+--------------------------------------------------------------------------------
+
+  pick_factors(240) -> (N1, N2) where one factor <= 32
+
+  Likely split: N1=15, N2=16
+    or          N1=16, N2=15
+
+  Pass-1: batched_siblings_fft(15, 16)     <-- 16 is pow2 <= 32
+    -> wait: len=16 -> 16 <= 32 -> PATH 0 (packed_dft)
+    -> N=16, count=15 -> 1 tile -> 1 core, 1 matmul
+
+  Pass-2: batched_siblings_fft(16, 15)     <-- 15 is composite non-pow2
+    -> N=15, count=16 -> 1 tile -> 1 core
+    -> packed_dft (15 <= 32)
+
+Total: 2 dispatches, 1 core each.
+
+--------------------------------------------------------------------------------
+GENERAL RULE FOR PATH D CORE USAGE
+--------------------------------------------------------------------------------
+
+PATH D itself does NO compute. It just dispatches batched sub-FFTs.
+The core layout depends entirely on what the recursive
+batched_siblings_fft call routes to:
+
+  inner len <= 32         -> PATH 0 packed_dft
+                              cores: depends on count (1..64)
+  inner len pow2 <= 1024  -> PATH A batch_fft
+                              cores: min(count_padded, 64)
+  inner len pow2 > 1024   -> PATH B per-row Stockham
+                              cores: 64 per pass, count rows in series
+  inner len prime > 32    -> PATH C Bluestein
+                              cores: depends on M (see PATH C doc)
+  inner len composite > 32-> PATH D recurse (this same rule applies)
+
+The OUTER batching multiplies the inner count, which is the key:
+even tiny inner FFTs (len=6) become high-throughput when the outer
+loop produces count >= 32.
+
+--------------------------------------------------------------------------------
+DISPATCH / CORE SUMMARY FOR COMMON COMPOSITE N
+--------------------------------------------------------------------------------
+
+  N    | Split           | Inner paths     | Total dispatches | Cores
+  -----+-----------------+-----------------+------------------+-------
+    36 | 6 x 6           | PATH 0 + PATH 0 |        2         |  1, 1
+    48 | 16 x 3          | PATH 0 + PATH 0 |        2         |  1, 1
+    60 | 6 x 10          | PATH 0 + PATH 0 |        2         |  1, 1
+   100 | 10 x 10         | PATH 0 + PATH 0 |        2         |  1, 1
+   240 | 16 x 15         | PATH 0 + PATH 0 |        2         |  1, 1
+   720 | (24,30)or(...)  | PATH 0 + PATH 0 |        2         | 1-2
+  3600 | 60 x 60 (rec)   | PATH 0 x 4      |        4         | 16, 24
+ 14400 | 120 x 120 (rec) | mixed           |     8+ recursive | various
+
+================================================================================

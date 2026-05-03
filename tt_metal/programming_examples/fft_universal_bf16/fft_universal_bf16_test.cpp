@@ -99,6 +99,36 @@ static std::vector<Complex> make_impulse(uint32_t N) {
     return x;
 }
 
+// ── Round-trip test for IFFT (ifft(fft(x)) == x) ─────────────────────────
+//
+// Round-trip error is bounded by ~2x the single-direction error (each
+// direction adds one bf16-rounded FPU matmul cycle). We use generous
+// thresholds to leave room for that compounded loss.
+static bool run_round_trip(
+    std::shared_ptr<MeshDevice> md,
+    const std::vector<Complex>& input,
+    const char*                 name,
+    float                       threshold = 4e-2f)
+{
+    const uint32_t N = static_cast<uint32_t>(input.size());
+
+    const auto t0  = std::chrono::high_resolution_clock::now();
+    const auto X   = fft_universal_bf16::fft(md, input);
+    const auto y   = fft_universal_bf16::ifft(md, X);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t0).count();
+
+    const float abs_e = max_err(input, y);
+    const float rel_e = rel_err(input, y);
+    const float snr   = snr_db(input, y);
+
+    const bool pass = rel_e < threshold;
+    std::printf(
+        "[%s] N=%-4u | abs=%.2e rel=%.2e snr=%.1f dB | round-trip=%.1f ms  %s\n",
+        pass ? "PASS" : "FAIL", N, abs_e, rel_e, snr, ms, name);
+    return pass;
+}
+
 static bool run_test(
     std::shared_ptr<MeshDevice> md,
     const std::vector<Complex>& input,
@@ -224,6 +254,23 @@ int main() {
     // it, the test will either hang or throw — either way, PASS will not
     // print. M = next_pow2(2·1369-1) = 4096.
     all &= run_test(md, make_random(1369),  "random N=1369  (37x37, Bluestein M=4096)",  5e-2f);
+
+    // ── IFFT round-trip across every dispatch path ────────────────────────
+    // Conjugate-trick IFFT reuses the entire forward pipeline; this
+    // exercises Phase 1 / 2b / 2c symmetrically.
+    std::printf("\n--- IFFT round-trip (ifft(fft(x)) == x) ---\n");
+    all &= run_round_trip(md, make_random(2),     "rt N=2     (Phase 1)");
+    all &= run_round_trip(md, make_random(8),     "rt N=8     (Phase 1)");
+    all &= run_round_trip(md, make_random(32),    "rt N=32    (Phase 1, 100% tile)");
+    all &= run_round_trip(md, make_random(7),     "rt N=7     (Phase 1, prime)");
+    all &= run_round_trip(md, make_random(64),    "rt N=64    (Phase 2b pow2 depth-1)");
+    all &= run_round_trip(md, make_random(1024),  "rt N=1024  (Phase 2b pow2, optimal)");
+    all &= run_round_trip(md, make_random(2048),  "rt N=2048  (Phase 2b pow2 depth-2)", 6e-2f);
+    all &= run_round_trip(md, make_random(60),    "rt N=60    (Phase 2c mixed)");
+    all &= run_round_trip(md, make_random(360),   "rt N=360   (Phase 2c mixed)");
+    all &= run_round_trip(md, make_random(37),    "rt N=37    (Phase 2c Bluestein M=128)", 6e-2f);
+    all &= run_round_trip(md, make_random(257),   "rt N=257   (Phase 2c Bluestein M=1024)", 6e-2f);
+    all &= run_round_trip(md, make_random(1369),  "rt N=1369  (Phase 2c Bluestein M=4096)", 8e-2f);
 
     md.reset();
     std::printf("\n%s\n",

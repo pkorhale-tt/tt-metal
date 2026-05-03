@@ -168,6 +168,50 @@ int main(int argc, char** argv) {
                 total, cold * static_cast<double>(iter));
 
     // ─────────────────────────────────────────────────────────────────────
+    // IFFT timing pass. Conjugate-trick IFFT internally calls fft(), so
+    // every plan is already warmed up — first iter measures only the
+    // (small) host conj/scale overhead on top of a cached forward call.
+    // ─────────────────────────────────────────────────────────────────────
+    std::printf("\n=== IFFT (universal, conjugate trick) ===\n");
+    auto spectrum = fft_universal::fft(md, signal);
+    std::vector<double> idt(iter, 0.0);
+    for (uint32_t i = 0; i < iter; ++i) {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        auto x = fft_universal::ifft(md, spectrum);
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        idt[i] = ms;
+        if (i < 3 || i == iter - 1) {
+            std::printf("  iter %3u  %8.3f ms\n", i, ms);
+        } else if (i == 3) {
+            std::printf("  ...\n");
+        }
+    }
+    const double ifft_avg =
+        std::accumulate(idt.begin() + 1, idt.end(), 0.0)
+            / static_cast<double>(iter - 1);
+    const double ifft_min = *std::min_element(idt.begin() + 1, idt.end());
+    const double ifft_max = *std::max_element(idt.begin() + 1, idt.end());
+    std::printf("\n--- IFFT summary ---\n");
+    std::printf("  Cached avg (iters 1..%u): %8.3f ms\n", iter - 1, ifft_avg);
+    std::printf("  Cached min / max:         %8.3f / %8.3f ms\n",
+                ifft_min, ifft_max);
+    std::printf("  IFFT/FFT ratio:           %.2fx\n", ifft_avg / cached_avg);
+
+    // Round-trip sanity check: max relative error of ifft(fft(x)) vs x.
+    {
+        auto rt = fft_universal::ifft(md, spectrum);
+        double max_abs_in = 0.0, max_abs_err = 0.0;
+        for (size_t i = 0; i < signal.size(); ++i) {
+            max_abs_in  = std::max<double>(max_abs_in, std::abs(signal[i]));
+            max_abs_err = std::max<double>(max_abs_err, std::abs(rt[i] - signal[i]));
+        }
+        const double rel = max_abs_err / std::max(1e-30, max_abs_in);
+        std::printf("  Round-trip rel err:       %8.2e   (ifft(fft(x)) vs x)\n",
+                    rel);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // CPU baseline run (single-thread fp32 radix-2). Only meaningful for
     // pow2 N; non-pow2 prints N/A so the table stays honest.
     // ─────────────────────────────────────────────────────────────────────

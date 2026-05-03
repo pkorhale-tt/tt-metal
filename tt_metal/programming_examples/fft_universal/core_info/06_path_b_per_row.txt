@@ -1,0 +1,148 @@
+================================================================================
+       SCENARIO: PATH B -- per-row Stockham (large pow2 sibling, len > 1024)
+================================================================================
+
+Path:    batched_siblings_fft(count, len)
+            with len pow2, len > 1024
+            -> for each row r in [0, count):
+                   y_r = fft_stockham::fft(row_r)
+            -> each row recurses into POW2 PATH (six-step or four-step)
+Kernel:  per-row depends on len (batch_fft + pass2)
+Cores:   FULL 64 cores per pass, BUT serialized over the count rows
+
+This is the LEAST efficient path because rows are processed one at a
+time -- 64 cores work on a single row's 3 passes, then move to the
+next row.
+
+--------------------------------------------------------------------------------
+WHY SERIALIZED?
+--------------------------------------------------------------------------------
+
+The batch_fft kernel requires sub_N <= 1024 (single tile per sub-FFT).
+For len > 1024 each row needs the full six-step / four-step machinery
+which itself uses 3 dispatches and saturates 64 cores.
+
+There's no current implementation to "batch" multiple six-step FFTs
+in one super-dispatch -- it would require sharding tiles across cores
+in a way that doesn't fit the 1-sub-FFT-per-tile assumption.
+
+So: rows are processed sequentially.
+
+--------------------------------------------------------------------------------
+TIMELINE for COUNT rows of LEN = 4096
+--------------------------------------------------------------------------------
+
+TIME ----------------------------------------------------------------->
+
+  ROW 0                       ROW 1                        ...
++-----+ +-----+ +-----+     +-----+ +-----+ +-----+      ...
+| P1  | | P2  | | P3  | --> | P1  | | P2  | | P3  | -->
+| 64c | | 64c | | 64c |     | 64c | | 64c | | 64c |
++-----+ +-----+ +-----+     +-----+ +-----+ +-----+
+
+Total dispatches per row: 3
+Total dispatches: 3 * count
+
+For count=2 and len=4096: 6 dispatches sequentially.
+
+--------------------------------------------------------------------------------
+EXAMPLE A: COUNT = 1, LEN = 4096
+--------------------------------------------------------------------------------
+
+  Single row -> single fft_stockham::fft(4096)
+  See 02_pow2_six_step.txt EXAMPLE A.
+
+  3 sequential dispatches, 64 cores per dispatch.
+
+--------------------------------------------------------------------------------
+EXAMPLE B: COUNT = 2, LEN = 4096  (Bluestein N=2003 -> M=4096)
+--------------------------------------------------------------------------------
+
+Bluestein needs 2 dispatches of size M=4096 (Step 2 forward, Step 4
+inverse).  Each call is batched_siblings_fft(1, 4096) at the outer
+level -- count=1 because Bluestein only batches across user-FFTs,
+which is 1 here.
+
+So this is really EXAMPLE A repeated twice in time:
+  Step 2: 3 dispatches (P1, P2, P3) on row 0
+  Step 4: 3 dispatches (P1, P2, P3) on row 0
+
+Total: 6 sequential dispatches, 64 cores each.
+
+--------------------------------------------------------------------------------
+EXAMPLE C (synthetic): COUNT = 4, LEN = 8192
+--------------------------------------------------------------------------------
+
+  for r in 0..3:
+    fft_stockham::fft(8192) on row r
+       N1 = 128, N2 = 64
+       3 dispatches: each uses 64 cores
+
+Total dispatches: 4 rows * 3 passes = 12 dispatches in time.
+
+       row 0:  P1 P2 P3
+       row 1:  P1 P2 P3
+       row 2:  P1 P2 P3
+       row 3:  P1 P2 P3
+
+Within each Pi: full 8x8 grid.
+
+--------------------------------------------------------------------------------
+GRID DURING ANY ONE DISPATCH (always full 8x8)
+--------------------------------------------------------------------------------
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+  row=2  |#0,2##|#1,2##|#2,2##|#3,2##|#4,2##|#5,2##|#6,2##|#7,2##|
+  row=3  |#0,3##|#1,3##|#2,3##|#3,3##|#4,3##|#5,3##|#6,3##|#7,3##|
+  row=4  |#0,4##|#1,4##|#2,4##|#3,4##|#4,4##|#5,4##|#6,4##|#7,4##|
+  row=5  |#0,5##|#1,5##|#2,5##|#3,5##|#4,5##|#5,5##|#6,5##|#7,5##|
+  row=6  |#0,6##|#1,6##|#2,6##|#3,6##|#4,6##|#5,6##|#6,6##|#7,6##|
+  row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+         +------+------+------+------+------+------+------+------+
+
+Each core does the same thing as in 02_pow2_six_step.txt or
+03_pow2_four_step.txt depending on len.
+
+--------------------------------------------------------------------------------
+COMPARISON: PATH A vs PATH B
+--------------------------------------------------------------------------------
+
+  Scenario        | PATH A (len <= 1024) | PATH B (len > 1024)
+  ----------------+----------------------+--------------------------
+  Dispatches      | 1 per call           | 3 * count per call
+  Parallelism     | 64-way over batch    | 64-way over butterflies
+  Per-core load   | many small FFTs      | fragments of one big FFT
+  Best for        | large count          | large len
+
+  Net effect: PATH B is fine for count=1 (just one big FFT) but
+  scales linearly with count -- wide but slow.
+
+--------------------------------------------------------------------------------
+WHEN THIS PATH IS HIT
+--------------------------------------------------------------------------------
+
+* User calls fft(N) with N pow2 and N > 1024 -> count=1 -> single
+  six-step / four-step (good utilisation).
+* Bluestein with M > 1024 -> count = (siblings) -> usually count=1 in
+  current code, so equivalent to a single user FFT of length M.
+* Mixed-radix recursion that produces (count, len) where len is
+  pow2 > 1024 -- rare in practice because pick_factors prefers
+  balanced splits keeping len <= 1024 when possible.
+
+--------------------------------------------------------------------------------
+SCALING TABLE
+--------------------------------------------------------------------------------
+
+  count | len    | dispatches | total cores * passes used
+  ------+--------+------------+---------------------------
+      1 |   2048 |     3      |   64 * 3   = 192
+      1 |   4096 |     3      |   192
+      1 |  16384 |     3      |   192
+      2 |   4096 |     6      |   384       (rows in series)
+      4 |   8192 |    12      |   768
+      8 |  16384 |    24      |  1536
+
+================================================================================

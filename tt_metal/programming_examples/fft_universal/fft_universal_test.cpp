@@ -79,6 +79,40 @@ static std::vector<Complex> make_random(uint32_t N, uint32_t seed = 42) {
     return x;
 }
 
+// ── Round-trip test for IFFT (ifft(fft(x)) == x) ──────────────────────────
+//
+// The conjugate-trick IFFT runs through the EXACT same dispatch tree as
+// the forward FFT, so any path-specific bug shows up symmetrically here.
+// Round-trip error is bounded by ~2x the single-direction error (one fp32
+// rounding cycle each way), so we reuse the same rel-error budget.
+static bool run_round_trip(
+    std::shared_ptr<MeshDevice> md,
+    const std::vector<Complex>& input,
+    const char*                 name)
+{
+    const uint32_t N = static_cast<uint32_t>(input.size());
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    const auto X  = fft_universal::fft(md, input);
+    const auto y  = fft_universal::ifft(md, X);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t0).count();
+
+    const float abs_e = max_err(input, y);
+    const float rel_e = rel_err(input, y);
+
+    float threshold;
+    if (fft_universal::is_pow2(N)) threshold = (N <= 65536u) ? 4e-3f : 1e-2f;
+    else                            threshold = 2e-2f;
+
+    const bool pass = rel_e < threshold;
+
+    std::printf(
+        "[%s] N=%-8u | abs=%.2e rel=%.2e | round-trip=%.1f ms  %s\n",
+        pass ? "PASS" : "FAIL", N, abs_e, rel_e, ms, name);
+    return pass;
+}
+
 // ── Single test ───────────────────────────────────────────────────────────
 //
 // Error budget notes:
@@ -165,6 +199,23 @@ int main() {
     all &= run_test(md, make_random(257),       "random  N=257     (prime,  Bluestein)");
     all &= run_test(md, make_random(509),       "random  N=509     (prime,  Bluestein)");
     all &= run_test(md, make_random(1021),      "random  N=1021    (prime,  Bluestein)");
+
+    // 6) IFFT round-trip across every dispatch path.
+    //    Conjugate-trick IFFT reuses the entire forward pipeline; this
+    //    exercises pow2 / Bluestein / Cooley-Tukey / packed_dft symmetrically.
+    std::printf("\n--- IFFT round-trip (ifft(fft(x)) == x) ---\n");
+    all &= run_round_trip(md, make_random(2),     "rt N=2      (pow2)");
+    all &= run_round_trip(md, make_random(8),     "rt N=8      (pow2)");
+    all &= run_round_trip(md, make_random(32),    "rt N=32     (pow2)");
+    all &= run_round_trip(md, make_random(7),     "rt N=7      (prime)");
+    all &= run_round_trip(md, make_random(31),    "rt N=31     (prime)");
+    all &= run_round_trip(md, make_random(60),    "rt N=60     (composite, 4 x 15)");
+    all &= run_round_trip(md, make_random(360),   "rt N=360    (composite)");
+    all &= run_round_trip(md, make_random(1024),  "rt N=1024   (pow2)");
+    all &= run_round_trip(md, make_random(16384), "rt N=16384  (pow2 six-step)");
+    all &= run_round_trip(md, make_random(37),    "rt N=37     (prime, Bluestein)");
+    all &= run_round_trip(md, make_random(257),   "rt N=257    (prime, Bluestein)");
+    all &= run_round_trip(md, make_random(1021),  "rt N=1021   (prime, Bluestein)");
 
     md.reset();
     std::printf("\n%s\n",

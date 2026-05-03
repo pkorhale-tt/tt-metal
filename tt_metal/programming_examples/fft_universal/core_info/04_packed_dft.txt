@@ -1,0 +1,197 @@
+================================================================================
+       SCENARIO: PATH 0 -- packed direct DFT, small N <= 32
+================================================================================
+
+Path:    fft(N) -> batched_siblings_fft(count, N) -> PATH 0
+            -> packed_direct_dft_batched(N, count)
+Kernel:  packed_dft_compute  (FPU matmul, fp32 inputs via HiFi4 = 4 bf16 passes)
+Cores:   1 to 64, picked by Rule 2 (multiple-of-8 with rounding)
+
+--------------------------------------------------------------------------------
+WHY THIS PATH USES A DIFFERENT CORE-COUNT RULE
+--------------------------------------------------------------------------------
+
+Unlike batch_fft (which only handles power-of-2 batches), packed_dft
+must handle ARBITRARY count values that come from Bluestein and
+mixed-radix recursion (e.g. count = 360 for fft(3600)).
+
+Code (fft_universal_host.cpp:351-372):
+    constexpr uint32_t kRowsPerTile = 32u;
+    raw_num_tiles = ceil(count / 32);    // each tile packs 32 sub-FFTs
+
+    if (raw_num_tiles <= 7)
+        num_cores = raw_num_tiles;        // 1..7 directly
+    else
+        num_cores = ceil(raw_num_tiles / 8) * 8;   // round up to multiple of 8
+        num_cores = min(num_cores, 64);
+
+    tiles_per_core = ceil(raw_num_tiles / num_cores);
+    num_tiles      = num_cores * tiles_per_core;   // padded; extras zero
+
+The padding rule exists because pick_batch_grid only emits valid
+rectangles for num_cores in {1..7, 8, 16, 24, 32, 40, 48, 56, 64}.
+Any extra padded tiles have zero input -> zero output (discarded).
+
+--------------------------------------------------------------------------------
+PACKING: 32 SUB-FFTs PER TILE
+--------------------------------------------------------------------------------
+
+A 32x32 tile holds 32 ROWS, each row is one sub-FFT input vector
+of length N (with the remaining 32-N slots zero-padded):
+
+   row 0:  [ x_0[0], x_0[1], ..., x_0[N-1], 0, 0, ..., 0 ]   <- sub-FFT 0
+   row 1:  [ x_1[0], x_1[1], ..., x_1[N-1], 0, 0, ..., 0 ]   <- sub-FFT 1
+   ...
+   row 31: [ x_31[0], ..., x_31[N-1], 0, ..., 0 ]            <- sub-FFT 31
+
+Each tile = 1 FPU matmul packs 32 sub-FFTs at once.
+Tile-fill efficiency = N/32:
+   N=2:   6.25%      N=8:  25%      N=24: 75%
+   N=4:  12.5%       N=16: 50%      N=32: 100%
+
+--------------------------------------------------------------------------------
+EXAMPLE A: COUNT = 1 (single small FFT, e.g. user calls fft(7))
+--------------------------------------------------------------------------------
+
+  N=7, count=1
+  raw_num_tiles  = ceil(1/32)  = 1
+  num_cores      = 1            (raw <= 7)
+  tiles_per_core = 1
+  grid           = 1 x 1
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |##0,0#| .    | .    | .    | .    | .    | .    | .    |
+  row=1  | .    | .    | .    | .    | .    | .    | .    | .    |
+  ...     (rows 2-7 empty)
+         +------+------+------+------+------+------+------+------+
+
+Only core (0,0) does the matmul. The single tile holds 1 real
+sub-FFT and 31 zero rows.
+
+--------------------------------------------------------------------------------
+EXAMPLE B: COUNT = 6, N = 10  (Mixed-radix split fft(60) = 6 x 10)
+--------------------------------------------------------------------------------
+
+  N=10, count=6
+  raw_num_tiles  = ceil(6/32)  = 1
+  num_cores      = 1
+  tiles_per_core = 1
+  grid           = 1 x 1
+
+Single tile: 6 sub-FFTs of length 10 packed in rows 0..5; rows 6..31 zero.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: COUNT = 360, N = 10  (fft(3600) -> CT(60,60) -> CT(6,10))
+--------------------------------------------------------------------------------
+
+  N=10, count=360
+  raw_num_tiles  = ceil(360/32) = 12
+  num_cores      = ceil(12/8) * 8 = 16   <-- rounded up to multiple of 8
+  tiles_per_core = ceil(12/16)   = 1
+  num_tiles      = 16 * 1        = 16   <-- 4 padded zero tiles
+  grid           = 8 x 2
+
+----- ACTIVE CORES (rows 0-1) -----
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##| .    | .    | .    | .    |
+  row=2  | .    | .    | .    | .    | .    | .    | .    | .    |
+  ...     (rows 2-7 empty)
+
+Cores 0-11: each holds 1 real tile (32 sub-FFTs each)
+Cores 12-15: each holds 1 padded zero tile (output discarded)
+
+  core 0  -> tile 0  (sub-FFTs   0..31)   -> 1 matmul
+  core 1  -> tile 1  (sub-FFTs  32..63)   -> 1 matmul
+  ...
+  core 11 -> tile 11 (sub-FFTs 352..359 + 24 zero rows) -> 1 matmul
+  core 12 -> all-zero tile -> wasted compute, output dropped
+  core 13 -> all-zero tile -> wasted compute, output dropped
+  core 14 -> all-zero tile -> wasted compute, output dropped
+  core 15 -> all-zero tile -> wasted compute, output dropped
+
+Effective utilisation: 12 useful tiles / 16 cores = 75%.
+
+--------------------------------------------------------------------------------
+EXAMPLE D: COUNT = 2048 (very batched, e.g. Bluestein internal)
+--------------------------------------------------------------------------------
+
+  N=8, count=2048
+  raw_num_tiles  = ceil(2048/32) = 64
+  num_cores      = ceil(64/8)*8  = 64    <-- FULL GRID
+  tiles_per_core = 64 / 64       = 1
+  grid           = 8 x 8
+
+----- FULL 8 x 8 GRID, every core does 1 matmul tile -----
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+  row=2  |#0,2##|#1,2##|#2,2##|#3,2##|#4,2##|#5,2##|#6,2##|#7,2##|
+  row=3  |#0,3##|#1,3##|#2,3##|#3,3##|#4,3##|#5,3##|#6,3##|#7,3##|
+  row=4  |#0,4##|#1,4##|#2,4##|#3,4##|#4,4##|#5,4##|#6,4##|#7,4##|
+  row=5  |#0,5##|#1,5##|#2,5##|#3,5##|#4,5##|#5,5##|#6,5##|#7,5##|
+  row=6  |#0,6##|#1,6##|#2,6##|#3,6##|#4,6##|#5,6##|#6,6##|#7,6##|
+  row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+         +------+------+------+------+------+------+------+------+
+
+Each core processes 32 length-8 sub-FFTs in 1 matmul.
+Total throughput: 64 cores * 32 sub-FFTs = 2048 length-8 FFTs in
+ONE dispatch.
+
+--------------------------------------------------------------------------------
+WHAT EACH ACTIVE CORE DOES
+--------------------------------------------------------------------------------
+
+For each tile in [0, tiles_per_core):
+
+  Reader (BRISC0):
+    read in_R tile from DRAM       (real input rows packed)
+    read in_I tile from DRAM       (imag input rows packed)
+    read W_R tile from DRAM        (cached, shared by all cores)
+    read W_I tile, W_I_neg tile    (cached, shared)
+    push 4 (A,B) pairs into CB_A, CB_B
+
+  Compute (TRISC, FPU matmul, MathFidelity::HiFi4, fp32_dest_acc=ON):
+    mm_init(CB_A, CB_B, CB_OUT_R)
+    // out_R = W_R*in_R - W_I*in_I  (using W_I_neg for the subtract)
+    matmul_tiles(in_R, W_R)          DST  = in_R * W_R
+    matmul_tiles(in_I, W_I_neg)      DST += in_I * (-W_I)
+    pack_tile -> CB_OUT_R
+    // out_I = W_I*in_R + W_R*in_I
+    matmul_tiles(in_R, W_I)          DST  = in_R * W_I
+    matmul_tiles(in_I, W_R)          DST += in_I * W_R
+    pack_tile -> CB_OUT_I
+
+  Writer (BRISC1):
+    write out_R tile, out_I tile to DRAM
+
+That's 4 FPU matmuls per tile (= per 32 sub-FFTs).
+With HiFi4, each matmul is 4 bf16 passes -> 16 bf16-mul-adds per tile.
+
+--------------------------------------------------------------------------------
+CORE / TILE SCALING TABLE
+--------------------------------------------------------------------------------
+
+  count | raw_tiles | num_cores | tiles/core | num_tiles | padded zeros
+  ------+-----------+-----------+-------------+-----------+-------------
+       1 |     1     |    1      |     1       |     1     |     0
+      32 |     1     |    1      |     1       |     1     |     0
+      64 |     2     |    2      |     1       |     2     |     0
+     128 |     4     |    4      |     1       |     4     |     0
+     224 |     7     |    7      |     1       |     7     |     0
+     256 |     8     |    8      |     1       |     8     |     0
+     360 |    12     |   16      |     1       |    16     |     4
+     512 |    16     |   16      |     1       |    16     |     0
+     768 |    24     |   24      |     1       |    24     |     0
+    1024 |    32     |   32      |     1       |    32     |     0
+    1536 |    48     |   48      |     1       |    48     |     0
+    2048 |    64     |   64      |     1       |    64     |     0
+    4096 |   128     |   64      |     2       |   128     |     0
+    8192 |   256     |   64      |     4       |   256     |     0
+
+================================================================================

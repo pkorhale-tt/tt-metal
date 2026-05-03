@@ -1,0 +1,522 @@
+================================================================================
+                  fft_universal (fp32) — DETAILED FLOWCHART
+================================================================================
+
+Covers every dispatch path, every decision point, every kernel, and how passes
+parallelize across cores.
+
+--------------------------------------------------------------------------------
+TOP-LEVEL ENTRY POINT
+--------------------------------------------------------------------------------
+
+                    +------------------------------+
+                    |   USER: fft_universal::fft   |
+                    |       (md, signal)           |
+                    |     N = signal.size()        |
+                    +--------------+---------------+
+                                   |
+                                   v
+                    +------------------------------+
+                    |       N == 1 ?               |
+                    +------+---------------+-------+
+                           | yes           | no
+                           v               v
+                    +-------------+   +---------------------+
+                    | return      |   |   is_pow2(N) ?      |
+                    | signal      |   +----+------------+---+
+                    | (identity)  |        | yes        | no
+                    +-------------+        v            v
+                                    +-------------+  +--------------+
+                                    | go to       |  | go to        |
+                                    | POW2 PATH   |  | NON-POW2     |
+                                    | (fft_stockham) |  | PATH        |
+                                    | ::fft       |  | (batched_    |
+                                    +-------------+  | siblings_fft,|
+                                                     |  count=1)    |
+                                                     +--------------+
+
+
+--------------------------------------------------------------------------------
+POW2 PATH -- fft_stockham::fft(md, signal)
+--------------------------------------------------------------------------------
+
+                    +------------------------------+
+                    |  fft_stockham::fft(N)        |
+                    |  N is power of 2             |
+                    +--------------+---------------+
+                                   |
+            +----------------------+----------------------------+
+            |                      |                            |
+     N <= 1024 (1 tile)    1024 < N <= 65536              N > 65536
+            |                      |                            |
+            v                      v                            v
+    +--------------+  +---------------------------+   +----------------------+
+    | ONE          |  | Six-step FFT              |   | Four-step FFT        |
+    | batch_fft    |  | (factor N = N1 x N2)      |   | (factor N = N1 x N2) |
+    | dispatch     |  |                           |   | N1 ~ sqrt(N), etc.   |
+    |              |  | Pass-1: batch_fft(N2,N1)  |   |                      |
+    | * count=1    |  |  -> batch_fft_compute     |   | Pass-1: batch_fft    |
+    | * sub_N=N    |  |                           |   | Pass-2: pass2_compute|
+    | * LOG2_SUB_N |  | Pass-2: pass2_compute     |   |   (twiddle layer)    |
+    |   stages     |  |   (outer twiddle)         |   | Pass-3: batch_fft    |
+    |              |  |                           |   |                      |
+    | Kernel:      |  | Pass-3: batch_fft(N1,N2)  |   | All on SFPU fp32     |
+    | batch_fft_   |  |                           |   | native               |
+    | compute      |  | All on SFPU fp32 native   |   |                      |
+    | [SFPU fp32]  |  |                           |   |                      |
+    +--------------+  +---------------------------+   +----------------------+
+
+
+PASS PARALLELISM (six-step / four-step):
+
+    The 3 passes are SEQUENTIAL (Pass-2 needs Pass-1 output, etc.)
+    Within EACH pass, work is distributed across UP TO 64 CORES in parallel.
+
+    TIME ----------------------------------------------------------->
+
+      Pass-1                Pass-2                Pass-3
+    +----------+          +----------+          +----------+
+    | batch_fft|          | pass2    |          | batch_fft|
+    | (N2,N1)  | --wait-->| twiddle  | --wait-->| (N1,N2)  |
+    | 64 cores |          | +transp  |          | 64 cores |
+    | parallel |          | 64 cores |          | parallel |
+    +----------+          +----------+          +----------+
+        ^                     ^                     ^
+        ONE                   ONE                   ONE
+        EnqueueMeshWorkload   EnqueueMeshWorkload   EnqueueMeshWorkload
+
+    num_cores per pass = min(batch, 64)
+    batch_per_core     = batch / num_cores
+
+    Examples:
+      N=4096   -> N1=64,  N2=64   -> 64 cores, 1 sub-FFT each
+      N=16384  -> N1=128, N2=128  -> 64 cores, 2 sub-FFTs each
+      N=65536  -> N1=256, N2=256  -> 64 cores, 4 sub-FFTs each
+      N<=1024  -> batch=1         -> ONLY 1 CORE active (single small FFT)
+
+
+--------------------------------------------------------------------------------
+NON-POW2 PATH -- batched_siblings_fft(count, len) DISPATCHER
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              |   batched_siblings_fft(count, len)   |
+              |   (universal sub-FFT dispatcher)     |
+              +-----------------+--------------------+
+                                |
+                                v
+        +-----------------------------------------------+
+        |   len == 1 OR count == 0 ?                    |
+        +----------------+------------------+-----------+
+                         | yes              | no
+                         v                  v
+                   +-----------+    +-------------------------+
+                   | out = in  |    |   2 <= len <= 32 ?      |
+                   | return    |    +-----+-----------+-------+
+                   +-----------+          | yes       | no
+                                          v           v
+                                   +-------------+  +---------------------+
+                                   | PATH 0      |  |   is_pow2(len) ?    |
+                                   | packed_     |  +-----+-----------+---+
+                                   | direct_dft  |        | yes       | no
+                                   |             |        v           v
+                                   | Kernel:     |  +----------+ +-----------+
+                                   | packed_dft_ |  | POW2 SUB | | is_prime  |
+                                   | compute     |  | ROUTE    | | (len) ?   |
+                                   | [FPU fp32   |  | (PATH    | +--+----+---+
+                                   |  HiFi4 = 4  |  |  A or B) |    |    |
+                                   |  bf16 passes]|  +----------+   | yes| no
+                                   +-------------+                  v    v
+                                                              +---------+ +---------+
+                                                              | PATH C  | | PATH D  |
+                                                              | bluestein| | mixed-  |
+                                                              | (chirp-Z)| | radix CT|
+                                                              +---------+ +---------+
+
+
+--------------------------------------------------------------------------------
+POW2 SUB-ROUTE (inside batched_siblings_fft for pow2 len)
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              | is_pow2(len) AND len > 32            |
+              +-----------------+--------------------+
+                                |
+                                v
+              +--------------------------------------+
+              | len <= 1024 (kBatchMaxSubN) ?        |
+              +-----------+----------------+---------+
+                          | yes            | no
+                          v                v
+              +--------------------+ +--------------------+
+              | PATH A             | | PATH B             |
+              | ONE batched        | | Per-row Stockham   |
+              | batch_fft dispatch | | (serialized over   |
+              |                    | |  count rows)       |
+              | * Pad count to     | |                    |
+              |   next pow2 if     | | for r in 0..count: |
+              |   needed           | |   row = in[r*len:  |
+              | * Discard zero     | |          (r+1)*len]|
+              |   sibling rows     | |   y = fft_stockham |
+              |                    | |       ::fft(row)   |
+              | Kernel:            | |                    |
+              | batch_fft_compute  | | Each row recurses  |
+              | [SFPU fp32 native] | | into POW2 PATH     |
+              |                    | | (1, 6step, 4step)  |
+              | Up to 64 cores     | |                    |
+              | parallel           | |                    |
+              +--------------------+ +--------------------+
+
+
+--------------------------------------------------------------------------------
+PATH C DETAIL -- BLUESTEIN
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              | batched_bluestein(count, N)          |
+              | N is prime > 32                      |
+              +-----------------+--------------------+
+                                |
+                                v
+              +--------------------------------------+
+              | get_bluestein_plan(N) [cache lookup] |
+              |   If miss:                           |
+              |     M = next_pow2(2N - 1)            |
+              |     Build chirp w[n] = exp(-i*pi*n^2/N)
+              |     Build b_ext (length M)           |
+              |     B_fft = fft_stockham::fft(b_ext) |
+              |       (1 pow2 FFT, ONCE, cached)     |
+              +-----------------+--------------------+
+                                |
+                                v
+        +-------------------------------------------------------+
+        | STEP 1 [HOST fp32]                                    |
+        |   For each sibling r in 0..count-1:                   |
+        |     A[r,n] = x[r,n] * w[n]   for n in [0, N)          |
+        |     A[r,n] = 0               for n in [N, M)          |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 2 [DEVICE]                                       |
+        |   A_fft = batched_siblings_fft(count, M, A)           |
+        |     M is pow2 -> POW2 SUB-ROUTE above                 |
+        |     If M <= 1024 -> PATH A: ONE batch_fft dispatch    |
+        |     If M >  1024 -> PATH B: per-row Stockham          |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 3 [HOST fp32]                                    |
+        |   For each sibling r:                                 |
+        |     A_fft[r,k] *= B_fft[k]   (same B every row)       |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 4 -- INVERSE via conjugate trick                 |
+        |   IFFT(X) = conj(FFT(conj(X))) / M                    |
+        |   (a) [HOST]   conj(A_fft) in place                   |
+        |   (b) [DEVICE] c = batched_siblings_fft(count, M)     |
+        |                  (same dispatch shape as Step 2)      |
+        |   (c) [HOST]   c = conj(c) / M                        |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 5 [HOST fp32]                                    |
+        |   For each sibling r:                                 |
+        |     out[r,k] = c[r,k] * w[k]   for k in [0, N)        |
+        |     (drops the M - N zero-padded tail)                |
+        +---------------------+---------------------------------+
+                              |
+                              v
+                       +-------------+
+                       |  RETURN out |
+                       |  (count x N)|
+                       +-------------+
+
+
+--------------------------------------------------------------------------------
+PATH D DETAIL -- MIXED-RADIX COOLEY-TUKEY
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              | cooley_tukey_split_batched(count, N) |
+              | N is composite non-pow2 > 32         |
+              | with divisor <= 32                   |
+              +-----------------+--------------------+
+                                |
+                                v
+              +--------------------------------------+
+              | pick_factors(N) -> (N1, N2)          |
+              +-----------------+--------------------+
+                                |
+                                v
+        +-------------------------------------------------------+
+        | STEP 1 [HOST fp32]   transposed reshape               |
+        |   A[r, n1, n2] = in[r, n1 + N1*n2]                    |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 2 [DEVICE/RECURSE]                               |
+        |   Pass-1: batched_siblings_fft(count*N1, N2)          |
+        |   N2 may be:                                          |
+        |     <= 32     -> packed_dft (PATH 0)                  |
+        |     pow2      -> batch_fft (PATH A) or per-row (B)    |
+        |     prime     -> Bluestein (PATH C)                   |
+        |     composite -> recurse into PATH D                  |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEPS 3+4 [HOST fp32] fused twiddle + transpose       |
+        |   ct_plan = get_ct_plan(N1, N2)  [cached twiddle]     |
+        |   For each (r, n1, k2):                               |
+        |     C[r, k2, n1] = A[r, n1, k2] * tw[n1*N2 + k2]      |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 5 [DEVICE/RECURSE]                               |
+        |   Pass-2: batched_siblings_fft(count*N2, N1)          |
+        |   Same dispatch cases as N2 above                     |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | STEP 6 [HOST fp32]   output permutation               |
+        |   out[r, N2*k1 + k2] = D[r, k2, k1]                   |
+        +---------------------+---------------------------------+
+                              |
+                              v
+                       +-------------+
+                       |  RETURN out |
+                       +-------------+
+
+
+--------------------------------------------------------------------------------
+PATH 0 DETAIL -- PACKED DIRECT-DFT (small N <= 32)
+--------------------------------------------------------------------------------
+
+              +--------------------------------------+
+              | packed_direct_dft_batched(N, count)  |
+              | N in [2, 32]                         |
+              +-----------------+--------------------+
+                                |
+                                v
+              +--------------------------------------+
+              | get_packed_dft_plan(N, count)        |
+              |   [cache lookup; if miss, build:]    |
+              |   * NxN DFT matrix W[n,k]            |
+              |     = exp(-2*pi*i*n*k/N)             |
+              |   * Split into W_R, W_I, W_I_neg     |
+              |   * Tilize all 3 to fp32 32x32 tiles |
+              |   * WriteShard tiles to DRAM (cached)|
+              |   * Set up CB config + kernels       |
+              |   * num_cores, tiles_per_core        |
+              +-----------------+--------------------+
+                                |
+                                v
+        +-------------------------------------------------------+
+        | HOST: Pack count sub-FFTs into row-major tiles        |
+        |   For each sibling r in 0..count-1:                   |
+        |     in_R_rm[r*32 + k] = x[r,k].real()  for k < N      |
+        |     in_I_rm[r*32 + k] = x[r,k].imag()                 |
+        |   tilize -> fp32 tile bytes                           |
+        |   WriteShard to DRAM (in_R_buf, in_I_buf)             |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | DEVICE: EnqueueMeshWorkload                           |
+        |   For each tile per core (tiles_per_core total):      |
+        |                                                       |
+        |   Reader (BRISC0):                                    |
+        |     read in_R, in_I tile from DRAM                    |
+        |     read W_R, W_I_neg, W_I, W_R from cached DRAM      |
+        |     push 4 (A,B) pairs into CB_A, CB_B                |
+        |                                                       |
+        |   Compute (TRISC):                                    |
+        |     mm_init(CB_A, CB_B, CB_OUT_R)                     |
+        |     // out_R = W_R*in_R + W_I_neg*in_I                |
+        |     matmul_tiles(in_R, W_R)        -> DST += ...      |
+        |     matmul_tiles(in_I, W_I_neg)    -> DST += ...      |
+        |     pack_tile -> CB_OUT_R                             |
+        |     // out_I = W_I*in_R + W_R*in_I                    |
+        |     matmul_tiles(in_R, W_I)        -> DST += ...      |
+        |     matmul_tiles(in_I, W_R)        -> DST += ...      |
+        |     pack_tile -> CB_OUT_I                             |
+        |                                                       |
+        |     [FPU fp32 inputs -> HiFi4 = 4 bf16 passes]        |
+        |                                                       |
+        |   Writer (BRISC1):                                    |
+        |     write out_R, out_I tiles to DRAM                  |
+        +---------------------+---------------------------------+
+                              |
+                              v
+        +-------------------------------------------------------+
+        | HOST: ReadShard out_R_buf, out_I_buf from DRAM        |
+        | untilize, recombine R + i*I into Complex              |
+        | Strip to count x N output                             |
+        +---------------------+---------------------------------+
+                              |
+                              v
+                       +-------------+
+                       |  RETURN out |
+                       +-------------+
+
+
+--------------------------------------------------------------------------------
+RECURSION EXAMPLES -- HOW FULL FFTs TRAVERSE THIS GRAPH
+--------------------------------------------------------------------------------
+
+EXAMPLE 1: N = 1024 (pow2 <= 1024)
+    fft(1024) -> fft_stockham::fft(1024)
+                  +-- ONE batch_fft dispatch
+                      -> batch_fft_compute kernel
+                      -> 1 core (batch=1), SFPU fp32
+    Total dispatches: 1
+
+
+EXAMPLE 2: N = 1,048,576 (pow2 > 65536) -- four-step
+    fft(1M) -> fft_stockham::fft(1M)
+                +-- Pass-1: batch_fft(1024, count=1024)  [64 cores]
+                +-- Pass-2: pass2_compute (twiddle)      [64 cores]
+                +-- Pass-3: batch_fft(1024, count=1024)  [64 cores]
+    Total dispatches: 3 (sequential, each saturates 64 cores)
+
+
+EXAMPLE 3: N = 7 (small prime)
+    fft(7) -> batched_siblings_fft(1, 7)
+              +-- PATH 0: packed_direct_dft_batched(7, 1)
+                          -> packed_dft_compute kernel
+                          -> 1 core, FPU fp32 (HiFi4 = 4 bf16 passes)
+    Total dispatches: 1 (4 matmuls inside)
+
+
+EXAMPLE 4: N = 37 (prime > 32)
+    fft(37) -> batched_siblings_fft(1, 37)
+               +-- PATH C: batched_bluestein(1, 37)
+                    M = 128
+                    +-- Step 2 [DEVICE]: batched_siblings_fft(1, 128)
+                    |     -> POW2 SUB-ROUTE -> PATH A
+                    |     -> ONE batch_fft dispatch
+                    +-- Step 4 [DEVICE]: batched_siblings_fft(1, 128)
+                    |     -> ONE batch_fft dispatch
+                    +-- (3 host fp32 stages)
+    Total dispatches: 2 (steady state, after plan caching)
+
+
+EXAMPLE 5: N = 60 (composite = 6 x 10)
+    fft(60) -> batched_siblings_fft(1, 60)
+               +-- PATH D: cooley_tukey_split_batched(1, 6, 10)
+                    +-- Step 2: batched_siblings_fft(6, 10)
+                    |           -> PATH 0: packed_dft (10 <= 32)
+                    +-- Steps 3+4: HOST fp32 twiddle
+                    +-- Step 5: batched_siblings_fft(10, 6)
+                    |           -> PATH 0: packed_dft (6 <= 32)
+                    +-- Step 6: HOST permute
+    Total dispatches: 2
+
+
+EXAMPLE 6: N = 3600 (composite = 60 x 60, recursive split)
+    fft(3600) -> batched_siblings_fft(1, 3600)
+                  +-- PATH D: cooley_tukey_split_batched(1, 60, 60)
+                       +-- Pass-1: batched_siblings_fft(60, 60)
+                       |     -> PATH D again: split (60, 6, 10)
+                       |     +-- batched_siblings_fft(360, 10) -> packed_dft
+                       |     +-- batched_siblings_fft(600, 6)  -> packed_dft
+                       +-- Pass-2: batched_siblings_fft(60, 60)
+                             -> same recursive structure
+    Total dispatches: 4
+
+
+EXAMPLE 7: N = 1369 = 37*37 (composite, no divisor <= 32)
+    fft(1369) -> batched_siblings_fft(1, 1369)
+                  +-- largest_divisor_le_32(1369) = 1 (no divisor <= 32)
+                  +-- PATH C: batched_bluestein(1, 1369)
+                       M = next_pow2(2737) = 4096
+                       +-- Step 2: batched_siblings_fft(1, 4096)
+                       |           -> POW2 SUB-ROUTE -> PATH B (4096 > 1024)
+                       |           -> fft_stockham::fft(4096)
+                       |             -> six-step:
+                       |                +-- batch_fft(N2, N1)  Pass-1
+                       |                +-- pass2_compute      Pass-2
+                       |                +-- batch_fft(N1, N2)  Pass-3
+                       +-- Step 4: same structure, 3 more dispatches
+    Total dispatches: 6
+
+
+--------------------------------------------------------------------------------
+ALL DISPATCHED KERNELS IN fft_universal
+--------------------------------------------------------------------------------
+
+  1. batch_fft_compute.cpp        (in fft_stockham/)
+     Used by: pow2 leaves (Path A, six-step inner, four-step inner)
+     Compute: SFPU fp32 (*_binary_tile)
+     Wraps:   complex multiply (cmul) + butterfly add/sub
+
+  2. pass2_compute.cpp            (in fft_stockham/)
+     Used by: outer twiddle layer in six-step / four-step
+     Compute: SFPU fp32 (per-element twiddle multiply)
+
+  3. packed_dft_compute.cpp       (in fft_universal/)
+     Used by: PATH 0 -- small N <= 32 packed direct-DFT
+     Compute: FPU matmul, fp32 inputs (HiFi4 = 4 bf16 passes)
+
+
+--------------------------------------------------------------------------------
+CACHING INFRASTRUCTURE
+--------------------------------------------------------------------------------
+
+  1. PackedDFTPlan cache       keyed by (md*, N, count)
+     Stores: kernel program, CB config, twiddle tiles in DRAM,
+             host scratch buffers
+     One per (N, count) combo
+
+  2. BluesteinPlan cache       keyed by N
+     Stores: chirp_fwd[N], B_fft[M], M
+     Built once per prime N
+
+  3. CooleyTukeyPlan cache     keyed by (N1, N2)
+     Stores: twiddle[N1*N2] for the between-pass multiply
+     Built once per (N1, N2) split
+
+
+--------------------------------------------------------------------------------
+DECISION SUMMARY TABLE
+--------------------------------------------------------------------------------
+
+  Input N             | Path                  | Final kernel(s)        | Compute unit
+  --------------------+-----------------------+------------------------+------------------
+  1                   | identity              | --                     | host only
+  2..32 (any)         | PATH 0                | packed_dft_compute     | FPU fp32 (HiFi4)
+  pow2, 33..1024      | POW2 -> PATH A        | batch_fft_compute      | SFPU fp32
+  pow2, 1025..65536   | POW2 -> six-step      | batch_fft + pass2      | SFPU fp32
+  pow2, > 65536       | POW2 -> four-step     | batch_fft + pass2      | SFPU fp32
+  prime, 33..511      | PATH C -> A           | batch_fft (x2)         | SFPU fp32
+  prime, >= 512       | PATH C -> B           | batch_fft + pass2      | SFPU fp32
+  composite non-pow2  | PATH D (recurse)      | mix of above           | mixed
+
+
+--------------------------------------------------------------------------------
+PASS PARALLELISM SUMMARY
+--------------------------------------------------------------------------------
+
+  N range            | # dispatches | Cores per dispatch
+  -------------------+--------------+--------------------
+  N <= 1024          | 1            | 1   (batch=1)
+  1024 < N <= 65536  | 3 sequential | up to 64 in parallel per pass
+  N > 65536          | 3 sequential | up to 64 in parallel per pass
+
+  KEY POINT:
+    * Passes WITHIN a six-step / four-step FFT are SEQUENTIAL (data dependency).
+    * Pass-2 cannot start until host has read back Pass-1's full output.
+    * Pass-3 cannot start until Pass-2 finishes.
+    * Inside ONE pass, work is split across UP TO 64 Tensix cores in parallel.
+    * num_cores = min(batch, 64)
+    * batch_per_core = batch / num_cores
+
+================================================================================

@@ -12,6 +12,7 @@
 
 #include "fft_universal_host.cpp"
 
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -49,6 +50,25 @@ int main(int argc, char** argv) {
         if (idx < 0 || idx >= static_cast<int>(N)) continue;
         std::printf("  X[%d] = (%+.3f, %+.3f)   |X|=%.3f\n",
                     idx, X[idx].real(), X[idx].imag(), std::abs(X[idx]));
+    }
+
+    // ── IFFT round-trip: ifft(fft(x)) should reconstruct the input ──
+    const std::vector<Complex> y = fft_universal::ifft(md, X);
+
+    double max_in = 0.0, max_err = 0.0;
+    for (uint32_t n = 0; n < N; ++n) {
+        max_in  = std::max<double>(max_in,  std::abs(signal[n]));
+        max_err = std::max<double>(max_err, std::abs(y[n] - signal[n]));
+    }
+    const double rel = max_err / std::max(1e-30, max_in);
+    std::printf(
+        "\nIFFT round-trip: max |y - x| = %.2e   (rel = %.2e)\n",
+        max_err, rel);
+    std::printf("  Sample reconstruction at n=0..2:\n");
+    for (uint32_t n = 0; n < std::min<uint32_t>(N, 3u); ++n) {
+        std::printf("    x[%u] = (%+.3f, %+.3f)   y[%u] = (%+.3f, %+.3f)\n",
+                    n, signal[n].real(), signal[n].imag(),
+                    n, y[n].real(),     y[n].imag());
     }
 
     md.reset();

@@ -905,4 +905,54 @@ inline std::vector<Complex> fft(
     return fft(md, cx);
 }
 
+// ─── Inverse FFT via the conjugate trick ─────────────────────────────────────
+//
+//   IFFT(X) = conj( FFT( conj(X) ) ) / N
+//
+// Reuses the entire forward dispatch tree (Stockham pow2, packed_dft,
+// Bluestein, mixed-radix CT) without writing a single new device kernel.
+// All plan caches (PackedDFTPlan, BluesteinPlan, CooleyTukeyPlan,
+// BatchFFTPlan, Pass2Plan) are direction-agnostic — they key on N (and
+// counts), not on FFT vs IFFT — so steady-state IFFT performance is
+// identical to forward FFT performance.
+//
+// Total host overhead vs. a forward FFT: 3 O(N) loops over fp32 complex
+// elements (one conj-in, one conj-out, one /N scale). Microseconds even
+// at N = 1M.
+//
+// The same identity is already used internally by batched_bluestein for
+// its IFFT-of-M step; this just exposes the pattern as a public API.
+inline std::vector<Complex> ifft(
+    std::shared_ptr<MeshDevice>  md,
+    const std::vector<Complex>&  spectrum)
+{
+    const uint32_t N = static_cast<uint32_t>(spectrum.size());
+    assert(N >= 1u && "IFFT requires N >= 1");
+    if (N == 1u) return spectrum;
+
+    std::vector<Complex> conj_in(N);
+    for (uint32_t k = 0; k < N; ++k) conj_in[k] = std::conj(spectrum[k]);
+
+    const std::vector<Complex> fwd = fft(md, conj_in);
+
+    const float inv_N = 1.0f / static_cast<float>(N);
+    std::vector<Complex> out(N);
+    for (uint32_t k = 0; k < N; ++k) out[k] = std::conj(fwd[k]) * inv_N;
+    return out;
+}
+
+// Convenience overload for purely real input (e.g. a power spectrum that
+// is being inverted as a real-valued signal — caller embeds it as zero-
+// imaginary complex).
+inline std::vector<Complex> ifft(
+    std::shared_ptr<MeshDevice>  md,
+    const std::vector<float>&    real_spectrum)
+{
+    std::vector<Complex> cx(real_spectrum.size());
+    for (size_t i = 0; i < real_spectrum.size(); ++i) {
+        cx[i] = Complex(real_spectrum[i], 0.0f);
+    }
+    return ifft(md, cx);
+}
+
 }  // namespace fft_universal

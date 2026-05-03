@@ -88,6 +88,49 @@ int main(int argc, char** argv) {
     std::printf("  Speedup of cached vs cold: %.1fx\n", cold / std::max(warm_avg, 1e-9));
     std::printf("  Total wall time:           %8.3f ms\n", total_ms);
 
+    // ─────────────────────────────────────────────────────────────────────
+    // IFFT timing pass. Conjugate-trick IFFT internally calls fft(); all
+    // PackedDFTBf16Plan entries are already cached from the forward loop
+    // above, so the first iter only sees the small host conj/scale cost
+    // on top of a steady-state forward call.
+    // ─────────────────────────────────────────────────────────────────────
+    std::printf("\n=== IFFT (universal_bf16, conjugate trick) ===\n");
+    const auto spectrum = fft_universal_bf16::fft(md, signal);
+    std::vector<double> ims(iters);
+    for (uint32_t it = 0; it < iters; ++it) {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        const auto x  = fft_universal_bf16::ifft(md, spectrum);
+        ims[it] = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        (void)x;
+        if (it < 3 || it == iters - 1) {
+            std::printf("  iter %3u  %8.3f ms\n", it, ims[it]);
+        } else if (it == 3) {
+            std::printf("  ...\n");
+        }
+    }
+    const double ifft_avg =
+        std::accumulate(ims.begin() + 1, ims.end(), 0.0)
+            / static_cast<double>(std::max(iters - 1, 1u));
+    const double ifft_min = (iters > 1) ? *std::min_element(ims.begin() + 1, ims.end()) : ims[0];
+    const double ifft_max = (iters > 1) ? *std::max_element(ims.begin() + 1, ims.end()) : ims[0];
+    std::printf("\n  --- IFFT summary ---\n");
+    std::printf("  Cached avg (iters 1..%u):  %8.3f ms\n", iters - 1, ifft_avg);
+    std::printf("  Cached min / max:          %8.3f / %8.3f ms\n", ifft_min, ifft_max);
+    std::printf("  IFFT/FFT ratio:            %.2fx\n", ifft_avg / std::max(warm_avg, 1e-9));
+
+    // Round-trip sanity check.
+    {
+        const auto rt = fft_universal_bf16::ifft(md, spectrum);
+        double max_in = 0.0, max_e = 0.0;
+        for (size_t i = 0; i < signal.size(); ++i) {
+            max_in = std::max<double>(max_in, std::abs(signal[i]));
+            max_e  = std::max<double>(max_e,  std::abs(rt[i] - signal[i]));
+        }
+        std::printf("  Round-trip rel err:        %8.2e   (ifft(fft(x)) vs x)\n",
+                    max_e / std::max(1e-30, max_in));
+    }
+
     md.reset();
     return 0;
 }

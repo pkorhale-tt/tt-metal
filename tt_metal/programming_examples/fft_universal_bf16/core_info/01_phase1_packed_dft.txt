@@ -1,0 +1,246 @@
+================================================================================
+       SCENARIO: PHASE 1 -- packed direct-DFT, N in [2, 32]
+================================================================================
+
+Path:    fft(N) -> packed_direct_dft_bf16_batched(N, count=1)
+Kernel:  packed_dft_bf16_compute  (FPU bf16 matmul, fp32 accum, MathFidelity::HiFi4)
+Cores:   ALWAYS 1 when called from top-level fft() with a single user input
+         (because count=1 means raw_num_tiles = ceil(1/32) = 1)
+
+This phase is the ONLY phase that runs at the top level for small N,
+AND it's the inner kernel of every other Phase. So understanding this
+file is the foundation for understanding all the other Phases.
+
+--------------------------------------------------------------------------------
+WHY ONE CORE FOR A USER FFT(N <= 32)?
+--------------------------------------------------------------------------------
+
+  count = 1                                <-- only ONE sub-FFT requested
+  raw_num_tiles  = ceil(1/32) = 1
+  num_cores      = 1                       (raw <= 7 branch)
+  tiles_per_core = 1
+  grid           = 1 x 1
+
+GRID:
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |##0,0#| .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+  row=1  | .    | .    | .    | .    | .    | .    | .    | .    |
+  ...     (rows 1-7 idle)
+  row=7  | .    | .    | .    | .    | .    | .    | .    | .    |
+         +------+------+------+------+------+------+------+------+
+
+ONLY core (0,0) does work. The single tile holds:
+   row 0:  [ x[0], x[1], ..., x[N-1], 0, 0, ..., 0 ]    (N samples + zero pad)
+   rows 1..31: all zero (no batch)
+
+--------------------------------------------------------------------------------
+WHEN PHASE 1 USES MORE CORES
+--------------------------------------------------------------------------------
+
+When called as the INNER kernel of Phase 2b/2c, count grows:
+
+  Caller / context                                    | count value
+  ----------------------------------------------------+-------------
+  Top-level fft(N) for N in [2, 32]                   |     1
+  Phase 2b pass-1 (N2 <= 32, called from N-pow2 outer)|    32 = N1
+  Phase 2b pass-2 (N1 = 32, always)                   |    N2
+  Phase 2c mixed pass-1 (N2 <= 32)                    |    N1
+  Phase 2c mixed pass-2 (N1 from largest_div_le_32)   |    N2
+  Phase 2c Bluestein -> reduces to fft(M) -> Phase 2b |    32 or M/32
+
+So the SAME packed_dft_bf16 kernel runs under 1 core for tiny user
+calls but at 64 cores when batched from a large outer FFT.
+
+--------------------------------------------------------------------------------
+TILE PACKING (32 sub-FFTs per tile)
+--------------------------------------------------------------------------------
+
+  row 0:  [ x_0[0], x_0[1], ..., x_0[N-1], 0, 0, ..., 0 ]   <- sub-FFT 0
+  row 1:  [ x_1[0], x_1[1], ..., x_1[N-1], 0, 0, ..., 0 ]   <- sub-FFT 1
+  ...
+  row 31: [ x_31[0], ..., x_31[N-1], 0, ..., 0 ]            <- sub-FFT 31
+
+Each tile = 1 FPU matmul packs 32 sub-FFTs at once.
+Effective tile-fill = N/32:
+   N=2:  6.25%      N=8:  25%      N=24:  75%
+   N=4: 12.5%       N=16: 50%      N=32: 100%
+
+--------------------------------------------------------------------------------
+EXAMPLE A: N = 7, count = 1  (user calls fft(7))
+--------------------------------------------------------------------------------
+
+  raw_num_tiles  = 1
+  num_cores      = 1
+  tiles_per_core = 1
+  grid           = 1 x 1
+
+  Single tile:  row 0 = first 7 samples + 25 zeros
+                rows 1..31 = all zero
+
+  CORE (0,0):
+    reader -> reads in_R, in_I, T_R, T_I, T_I_neg tiles (5 tiles, all bf16)
+    compute -> 4 FPU bf16 matmul_tiles (complex mul)
+    writer -> writes out_R, out_I tiles (2 tiles, bf16)
+
+  Effective work: 1 useful sub-FFT (the user's), 31 wasted rows in the
+  matmul (their outputs are zero by zero-input -> zero-output).
+
+  Tile-fill = 7/32 = 21.9%.
+
+--------------------------------------------------------------------------------
+EXAMPLE B: N = 32, count = 32  (called from Phase 2b PASS-2 of fft(1024))
+--------------------------------------------------------------------------------
+
+  count          = 32
+  raw_num_tiles  = ceil(32/32) = 1
+  num_cores      = 1                       (raw <= 7 still triggers)
+  tiles_per_core = 1
+  grid           = 1 x 1
+
+  WAIT -- count=32 also gives raw_num_tiles=1. So this is also 1 core!
+  Same single tile, but now FULLY PACKED (32 useful sub-FFTs in 32 rows).
+
+  Tile-fill = 100%, sub-FFT-fill = 100%. Maximum efficiency for the
+  one core that's active.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: N = 32, count = 256  (called from Phase 2b PASS-2 of fft(8192))
+--------------------------------------------------------------------------------
+
+  count          = 256
+  raw_num_tiles  = ceil(256/32) = 8
+  num_cores      = 8                       (raw <= 8, no rounding)
+  tiles_per_core = 1
+  grid           = 8 x 1
+
+GRID:
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  | .    | .    | .    | .    | .    | .    | .    | .    |
+  ...     (rows 1-7 idle)
+
+  core 0 -> tile 0  (sub-FFTs 0..31)
+  core 1 -> tile 1  (sub-FFTs 32..63)
+  ...
+  core 7 -> tile 7  (sub-FFTs 224..255)
+
+Each core does 1 FPU matmul = 4 matmul_tiles calls.
+Total: 8 cores in parallel, all 256 sub-FFTs done in one dispatch.
+
+--------------------------------------------------------------------------------
+EXAMPLE D: N = 32, count = 360  (Phase 2b 2c style with padding)
+--------------------------------------------------------------------------------
+
+  count          = 360
+  raw_num_tiles  = ceil(360/32) = 12
+  num_cores      = ceil(12/8) * 8 = 16     (rounded up to multiple of 8)
+  tiles_per_core = ceil(12/16)    = 1
+  num_tiles      = 16 (12 useful + 4 padded zero)
+  grid           = 8 x 2
+
+GRID:
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##| .    | .    | .    | .    |
+  row=2  | .    | .    | .    | .    | .    | .    | .    | .    |
+  ...     (rows 2-7 idle; cores 12-15 process padded zero tiles)
+         +------+------+------+------+------+------+------+------+
+
+  core 0  -> tile 0  (sub-FFTs   0..31)
+  ...
+  core 11 -> tile 11 (sub-FFTs 352..359 + 24 zero rows)
+  core 12 -> tile 12 (all zero -> wasted compute, output discarded)
+  core 13 -> tile 13 (all zero -> wasted)
+  core 14 -> tile 14 (all zero -> wasted)
+  core 15 -> tile 15 (all zero -> wasted)
+
+  Effective utilisation: 12 useful tiles / 16 cores = 75%.
+
+--------------------------------------------------------------------------------
+EXAMPLE E: COUNT = 2048 (very batched, e.g. inside Bluestein recursion)
+--------------------------------------------------------------------------------
+
+  count          = 2048
+  raw_num_tiles  = ceil(2048/32) = 64
+  num_cores      = 64                       <-- FULL GRID
+  tiles_per_core = 1
+  grid           = 8 x 8
+
+----- FULL 8x8 GRID, every core does 1 matmul tile -----
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+  row=2  |#0,2##|#1,2##|#2,2##|#3,2##|#4,2##|#5,2##|#6,2##|#7,2##|
+  row=3  |#0,3##|#1,3##|#2,3##|#3,3##|#4,3##|#5,3##|#6,3##|#7,3##|
+  row=4  |#0,4##|#1,4##|#2,4##|#3,4##|#4,4##|#5,4##|#6,4##|#7,4##|
+  row=5  |#0,5##|#1,5##|#2,5##|#3,5##|#4,5##|#5,5##|#6,5##|#7,5##|
+  row=6  |#0,6##|#1,6##|#2,6##|#3,6##|#4,6##|#5,6##|#6,6##|#7,6##|
+  row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+         +------+------+------+------+------+------+------+------+
+
+Each core: 1 tile = 32 sub-FFTs = 4 FPU matmuls.
+Total throughput: 64 cores * 32 sub-FFTs = 2048 length-N FFTs per dispatch.
+
+--------------------------------------------------------------------------------
+WHAT EACH ACTIVE CORE DOES (per tile)
+--------------------------------------------------------------------------------
+
+For each tile in [base, base + tiles_per_core):
+
+  Reader (BRISC0):
+    read in_R tile from DRAM       (real input, bf16)
+    read in_I tile from DRAM       (imag input, bf16)
+    read T_R tile from DRAM        (cached twiddle, bf16, shared)
+    read T_I tile, T_I_neg tile    (cached, shared)
+    push 4 (A,B) pairs into CB_A, CB_B  (Float16_b CBs)
+
+  Compute (TRISC, FPU bf16 matmul, fp32 DST):
+    mm_init(CB_A, CB_B, CB_OUT_R)
+    // out_R = in_R * T_R + in_I * T_I_neg
+    matmul_tiles(in_R, T_R)         DST  = in_R x T_R       [bf16 multiply]
+    matmul_tiles(in_I, T_I_neg)     DST += in_I x (-T_I)    [bf16 multiply]
+    pack_tile -> CB_OUT_R            (fp32 DST -> bf16 out)
+    // out_I = in_R * T_I + in_I * T_R
+    matmul_tiles(in_R, T_I)         DST  = in_R x T_I       [bf16 multiply]
+    matmul_tiles(in_I, T_R)         DST += in_I x T_R       [bf16 multiply]
+    pack_tile -> CB_OUT_I
+
+  Writer (BRISC1):
+    write out_R tile, out_I tile to DRAM (bf16)
+
+  4 FPU bf16 matmuls per tile.
+  Each bf16 matmul = 1 FPU pass (vs 4 passes for fp32 matmul under
+  HiFi4) -- this is the speed advantage of bf16.
+
+--------------------------------------------------------------------------------
+SCALING TABLE (ALL Phases use this same formula)
+--------------------------------------------------------------------------------
+
+  count | raw_tiles | num_cores | tiles/core | grid  | utilisation | padded
+  ------+-----------+-----------+-------------+-------+-------------+--------
+       1 |     1     |    1      |     1       | 1x1   | 1/64=1.6%   |   0
+      32 |     1     |    1      |     1       | 1x1   | 100% tile-fill| 0
+      33 |     2     |    2      |     1       | 2x1   | 100% tile-fill| 0
+      64 |     2     |    2      |     1       | 2x1   |             |   0
+     128 |     4     |    4      |     1       | 4x1   |             |   0
+     224 |     7     |    7      |     1       | 7x1   |             |   0
+     256 |     8     |    8      |     1       | 8x1   | 100%        |   0
+     360 |    12     |   16      |     1       | 8x2   | 75%         |   4
+     512 |    16     |   16      |     1       | 8x2   |             |   0
+     768 |    24     |   24      |     1       | 8x3   |             |   0
+    1024 |    32     |   32      |     1       | 8x4   |             |   0
+    1536 |    48     |   48      |     1       | 8x6   |             |   0
+    2048 |    64     |   64      |     1       | 8x8   | 100%        |   0
+    4096 |   128     |   64      |     2       | 8x8   |             |   0
+    8192 |   256     |   64      |     4       | 8x8   |             |   0
+
+================================================================================

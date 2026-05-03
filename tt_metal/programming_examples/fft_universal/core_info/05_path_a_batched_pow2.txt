@@ -1,0 +1,179 @@
+================================================================================
+       SCENARIO: PATH A -- batched pow2 sub-FFTs (sub_N <= 1024)
+================================================================================
+
+Path:    batched_siblings_fft(count, len)
+            with len pow2, len > 32, len <= 1024
+            -> ONE batch_fft(sub_N=len, batch=count) dispatch
+Kernel:  batch_fft_compute  (SFPU fp32)
+Cores:   min(batch_padded, 64)
+
+This path is what makes Bluestein and Mixed-radix fast: instead of
+serializing many small FFTs across cores, ONE dispatch processes all
+of them in parallel.
+
+--------------------------------------------------------------------------------
+WHY BATCH MUST BE A POWER OF 2
+--------------------------------------------------------------------------------
+
+Code (fft_stockham_host.cpp:239):
+    assert(is_pow2(batch) && batch >= 1);
+
+When the caller (Bluestein, Mixed-radix) asks for an arbitrary count,
+batched_siblings_fft pads count UP to the next power of 2 and adds
+zero-input rows. The output for those padded rows is computed but
+discarded.
+
+--------------------------------------------------------------------------------
+CORE COUNT FORMULA
+--------------------------------------------------------------------------------
+
+    sub_N = len               (must be pow2, <= 1024)
+    batch = next_pow2(count)  (must be pow2, >= 1)
+
+    num_cores      = min(batch, 64)
+    batch_per_core = batch / num_cores
+    grid           = pick_batch_grid(num_cores)
+
+--------------------------------------------------------------------------------
+EXAMPLE A: COUNT = 1, LEN = 512  (just a single FFT, len > 32)
+--------------------------------------------------------------------------------
+
+  batch = 1
+  num_cores      = 1
+  batch_per_core = 1
+  grid           = 1 x 1
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |##0,0#| .    | .    | .    | .    | .    | .    | .    |
+  ...     (all other cores idle)
+
+Same as 01_pow2_small_one_tile (the small-pow2 dispatch path
+collapses into this when called with count=1).
+
+--------------------------------------------------------------------------------
+EXAMPLE B: COUNT = 60, LEN = 60  (Bluestein internal: M=128 -> NO, this
+is from CT(60,60) -> per-row pass with N1=60, but 60 isn't pow2 so
+it would actually go through CT recursion. Use a real example.)
+--------------------------------------------------------------------------------
+
+  Real example: Bluestein(N=37) calls batched_siblings_fft(1, 128)
+  Then batch=1, falls to Example A.
+
+  Better example: CT split fft(2048) where N1=64, N2=32
+  -> batched_siblings_fft(64, 32) routes to packed_dft (len <= 32)
+  -> NOT this path.
+
+  Genuine Path A trigger: a custom user batched call OR
+  Bluestein with M small enough that a SIBLING dispatch is worth it.
+
+--------------------------------------------------------------------------------
+EXAMPLE C: COUNT = 64, LEN = 512  (synthetic Path A heavy use)
+--------------------------------------------------------------------------------
+
+  batch = 64
+  num_cores      = 64
+  batch_per_core = 1
+  grid           = 8 x 8
+
+----- FULL GRID -----
+
+           col=0  col=1  col=2  col=3  col=4  col=5  col=6  col=7
+         +------+------+------+------+------+------+------+------+
+  row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+  row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+  row=2  |#0,2##|#1,2##|#2,2##|#3,2##|#4,2##|#5,2##|#6,2##|#7,2##|
+  row=3  |#0,3##|#1,3##|#2,3##|#3,3##|#4,3##|#5,3##|#6,3##|#7,3##|
+  row=4  |#0,4##|#1,4##|#2,4##|#3,4##|#4,4##|#5,4##|#6,4##|#7,4##|
+  row=5  |#0,5##|#1,5##|#2,5##|#3,5##|#4,5##|#5,5##|#6,5##|#7,5##|
+  row=6  |#0,6##|#1,6##|#2,6##|#3,6##|#4,6##|#5,6##|#6,6##|#7,6##|
+  row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+         +------+------+------+------+------+------+------+------+
+
+  core 0  -> sub-FFT 0   (one length-512 Stockham, 9 stages)
+  core 1  -> sub-FFT 1
+  ...
+  core 63 -> sub-FFT 63
+
+--------------------------------------------------------------------------------
+EXAMPLE D: COUNT = 50, LEN = 256  (mixed-radix recursion, padding)
+--------------------------------------------------------------------------------
+
+  batch = next_pow2(50) = 64                  <-- padded by 14 zero rows
+  num_cores      = 64
+  batch_per_core = 1
+  grid           = 8 x 8
+
+  cores 0-49: real sub-FFTs (one length-256 Stockham each)
+  cores 50-63: zero-input -> zero-output, discarded by caller
+
+  Padding waste: 14/64 = 21.9% wasted compute. Worth it because the
+  alternative would be 50 individual single-core dispatches.
+
+--------------------------------------------------------------------------------
+EXAMPLE E: COUNT = 256, LEN = 64  (many small-ish sub-FFTs)
+--------------------------------------------------------------------------------
+
+  batch = 256
+  num_cores      = min(256, 64) = 64
+  batch_per_core = 256 / 64     = 4           <-- 4 sub-FFTs per core
+  grid           = 8 x 8
+
+  core 0  -> sub-FFTs 0,1,2,3   (each: length-64 Stockham, 6 stages)
+  core 1  -> sub-FFTs 4,5,6,7
+  core 2  -> sub-FFTs 8,9,10,11
+  ...
+  core 63 -> sub-FFTs 252..255
+
+WITHIN one core: 4 sub-FFTs run sequentially in a for-loop.
+ACROSS cores: all 64 progress in parallel.
+
+--------------------------------------------------------------------------------
+EXAMPLE F: COUNT = 1024, LEN = 1024  (large per-row dispatches)
+--------------------------------------------------------------------------------
+
+This is right on the cusp; per-row Stockham (PATH B) takes over for
+any LEN > 1024. PATH A handles LEN <= 1024.
+
+  batch = 1024
+  num_cores      = 64
+  batch_per_core = 1024 / 64 = 16             <-- 16 sub-FFTs per core
+  grid           = 8 x 8
+
+  core 0 -> sub-FFTs 0..15
+  ...
+  core 63 -> sub-FFTs 1008..1023
+
+Each core does 16 length-1024 sub-FFTs (each: 10 butterfly stages on
+a fully-filled tile) sequentially.
+
+--------------------------------------------------------------------------------
+WHAT EACH ACTIVE CORE DOES
+--------------------------------------------------------------------------------
+
+For each k in [0, batch_per_core):
+  reader   -> read input tile (base + k) + LOG2_SUB_N twiddle tiles
+  compute  -> log2(sub_N) in-place butterfly stages   [SFPU fp32]
+  writer   -> write output tile (base + k) to DRAM
+
+Per-core-per-FFT work scales with sub_N (LOG2 stages); per-FFT
+parallelism comes from the 64-way batch split.
+
+--------------------------------------------------------------------------------
+SCALING TABLE
+--------------------------------------------------------------------------------
+
+  count | batch | num_cores | batch_per_core | grid | utilisation
+  ------+-------+-----------+----------------+------+------------
+      1 |   1   |    1      |       1        | 1x1  | 1/64 = 1.6%
+      4 |   4   |    4      |       1        | 4x1  | 4/64 = 6.3%
+      8 |   8   |    8      |       1        | 8x1  | 12.5%
+     16 |  16   |   16      |       1        | 8x2  | 25%
+     32 |  32   |   32      |       1        | 8x4  | 50%
+     64 |  64   |   64      |       1        | 8x8  | 100%
+    128 | 128   |   64      |       2        | 8x8  | 100%
+    256 | 256   |   64      |       4        | 8x8  | 100%
+   1024 | 1024  |   64      |      16        | 8x8  | 100%
+
+================================================================================
