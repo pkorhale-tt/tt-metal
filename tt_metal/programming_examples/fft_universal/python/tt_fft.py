@@ -217,7 +217,34 @@ def chord(N: int, freqs=(50, 120, 240), amps=(1.0, 0.6, 0.3),
 # Binary discovery
 # ----------------------------------------------------------------------
 
-_BUILD_DIR = os.environ.get("TT_FFT_BUILD", "./build")
+# ----------------------------------------------------------------------
+# Auto-discover the tt-metal repo root and set TT_METAL_HOME for the
+# child process. The C++ binaries fail with "Root Directory is not set"
+# if TT_METAL_HOME isn't exported, regardless of what cwd you launched
+# Python from. Walk up from this file until we see a tt_metal/ folder.
+# ----------------------------------------------------------------------
+
+def _discover_repo_root() -> Optional[str]:
+    here = os.path.abspath(os.path.dirname(__file__))
+    cur  = here
+    for _ in range(20):
+        if os.path.isdir(os.path.join(cur, "tt_metal")) and \
+           os.path.isdir(os.path.join(cur, "tt_metal", "hw")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur: break
+        cur = parent
+    return None
+
+
+_REPO_ROOT = os.environ.get("TT_METAL_HOME") or _discover_repo_root()
+if _REPO_ROOT and not os.environ.get("TT_METAL_HOME"):
+    os.environ["TT_METAL_HOME"] = _REPO_ROOT  # so child binary can see it
+
+# Build dir defaults to <repo>/build but can be overridden.
+_BUILD_DIR = os.environ.get(
+    "TT_FFT_BUILD",
+    os.path.join(_REPO_ROOT, "build") if _REPO_ROOT else "./build")
 
 _BIN_FP32 = os.environ.get(
     "TT_FFT_BIN_FP32",
@@ -308,6 +335,8 @@ def _run_device(x: np.ndarray, inverse: bool, precision: str,
         cmd = [bin_, in_path, out_path] + (["--inverse"] if inverse else [])
         env = os.environ.copy()
         env.setdefault("ARCH_NAME", "wormhole_b0")
+        if _REPO_ROOT:
+            env.setdefault("TT_METAL_HOME", _REPO_ROOT)
         if verbose:
             print(f"[tt_fft] {' '.join(cmd)}")
         t0 = time.time()
