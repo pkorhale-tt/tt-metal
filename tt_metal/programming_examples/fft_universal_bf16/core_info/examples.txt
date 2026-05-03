@@ -1,0 +1,516 @@
+================================================================================
+   fft_universal_bf16 (TRUE bf16) — WORKED EXAMPLES: 1 FFT/CORE  vs  2 FFTs/CORE
+================================================================================
+
+For every Phase in this directory, this file gives TWO concrete worked
+examples:
+
+  EXAMPLE 1 -- "1 TILE per core" : one piece of work per core, simplest case
+  EXAMPLE 2 -- "2 TILES per core": each core processes a sequential pair,
+                                   WITH a full DRAM <-> L1 timeline showing
+                                   the bf16 reader/compute/writer pipeline.
+
+Important: the bf16 pipeline has ONE device kernel (packed_dft_bf16),
+so the per-core execution model is the SAME across all 4 phases. What
+changes between phases is the (N, count) pair the host hands to the
+kernel. Every example below is one invocation of the same packed_dft_bf16
+kernel.
+
+bf16 vs fp32 distinction (key memory-bandwidth fact):
+  bf16 tile = 2048 bytes (vs 4096 for fp32). Half the DRAM bandwidth
+  per tile -- which is why bf16 has more headroom for DRAM-bound paths.
+
+Sections:
+  A) PHASE 1   -- packed_dft_bf16, N in [2, 32]
+  B) PHASE 2b  -- pow2 N > 32 (recursive two-level CT)
+  C) PHASE 2c  -- mixed-radix (composite N > 32 with divisor <= 32)
+  D) PHASE 2c  -- Bluestein (prime N > 32)
+
+
+================================================================================
+A) PHASE 1 -- packed_dft_bf16, N in [2, 32]
+================================================================================
+Kernel: packed_dft_bf16_compute  (FPU bf16 matmul, fp32 accum)
+Each tile packs 32 sub-FFTs (rows of a 32x32 bf16 tile).
+
+--------------------------------------------------------------------------------
+EXAMPLE A.1 -- 1 TILE PER CORE
+   Trigger: top-level fft(N=32) with count=1
+            OR Phase 2b PASS-2 of fft(1024) with N1=32, count=32.
+
+  raw_num_tiles  = ceil(32 / 32) = 1
+  num_cores      = 1
+  tiles_per_core = 1
+  grid           = 1 x 1
+
+GRID:  only (0,0) is active.
+
+Per-core work:
+  core (0,0) -> tile 0  (32 sub-FFTs of length 32, 100% tile fill)
+  4 FPU bf16 matmuls per tile (real complex multiply).
+
+--------------------------------------------------------------------------------
+EXAMPLE A.2 -- 2 TILES PER CORE   (with full DRAM <-> L1 detail)
+   Trigger: Phase 2b PASS-2 of fft(8192) with N1=32, count=256
+            ceil(256/32) = 8 raw tiles, num_cores = 8 -> 1 tile/core (not 2!)
+   Better trigger: Phase 2b PASS-2 of fft(16384), count=512
+            ceil(512/32) = 16 raw tiles, num_cores = 16 -> 1 tile/core
+   REAL trigger: Phase 2b PASS-2 of fft(32768), count=1024
+            ceil(1024/32) = 32 raw tiles, num_cores = 32 -> 1 tile/core
+   Honest trigger for 2 tiles/core: Phase 2b PASS-2 of fft(131072),
+            count=4096; ceil(4096/32) = 128 raw tiles, num_cores = 64
+            -> tiles_per_core = 2.
+
+  N=32, count=4096, raw_num_tiles=128, num_cores=64, tiles_per_core=2.
+  grid = 8 x 8
+
+Per core, e.g. core 0 handles tiles 0 and 1 (sub-FFTs 0..63).
+
+DETAILED DRAM <-> L1 PIPELINE for ONE bf16 core (e.g. core 0):
+
+  CB layout (all DataFormat::Float16_b, 2048 B per tile):
+    CB_A     : depth 4 (queued in_R, in_I for both tiles)
+    CB_B     : depth 4 (queued T_R, T_I, T_I_neg)
+    CB_OUT_R : depth 2 (output, double-buffered)
+    CB_OUT_I : depth 2 (output, double-buffered)
+
+  Twiddle tiles (T_R, T_I, T_I_neg) for length-N=32 are SHARED across
+  all 64 cores. They were built once at plan-build time and live in DRAM.
+  Each core fetches 3 twiddle tiles per tile (4 matmul pairs require
+  T_R, T_I_neg, T_I, T_R as srcB inputs).
+
+  Time -->
+  +---------------------------+----------------------------+--------------+
+  | Reader BRISC0 (NoC IN)    | Compute TRISC (FPU bf16)   | Writer BRISC1|
+  +---------------------------+----------------------------+--------------+
+  | T0: NoC GET in_R[0]       | wait...                    | wait...      |
+  |     2048 B from DRAM      |                            |              |
+  |     -> CB_A in L1         |                            |              |
+  |     (~125 ns at 25 GB/s)  |                            |              |
+  | T1: NoC GET in_I[0]       |                            |              |
+  |     -> CB_A in L1         |                            |              |
+  | T2: NoC GET T_R           |                            |              |
+  |     -> CB_B in L1         |                            |              |
+  | T3: NoC GET T_I_neg       |                            |              |
+  |     -> CB_B in L1         |                            |              |
+  | T4: NoC GET T_I           |                            |              |
+  |     -> CB_B in L1         |                            |              |
+  | T5: NoC GET T_R           |                            |              |
+  |     -> CB_B in L1         |                            |              |
+  |     // 4 (A,B) pairs ready| T6: mm_init                |              |
+  |                           | T7: matmul_tiles           |              |
+  |                           |     (in_R[0] x T_R)        |              |
+  |                           |     bf16 in -> fp32 DST    |              |
+  |                           |     (1 FPU pass, ~50 ns)   |              |
+  | T6: NoC GET in_R[1]       | T8: matmul_tiles           |              |
+  |     (overlapped w/ FPU!!) |     (in_I[0] x T_I_neg)    |              |
+  |     -> CB_A in L1         |     DST += previous        |              |
+  | T7: NoC GET in_I[1]       | T9: pack_tile              |              |
+  |     -> CB_A in L1         |     fp32 DST -> bf16       |              |
+  | T8: NoC GET T_R (cached   |     -> CB_OUT_R            |              |
+  |     in DRAM)              | T10: matmul_tiles          | T9: NoC PUT  |
+  | T9: NoC GET T_I_neg       |      (in_R[0] x T_I)       |     out_R[0] |
+  | T10: NoC GET T_I          | T11: matmul_tiles          |     L1 -> DRAM|
+  | T11: NoC GET T_R          |      (in_I[0] x T_R)       |     2048 B   |
+  |                           | T12: pack_tile             |              |
+  |     // tile 1 fully       |      -> CB_OUT_I           | T11: NoC PUT |
+  |     // queued before      |      // tile 0 DONE        |     out_I[0] |
+  |     // compute even       | T13: matmul_tiles          |     L1 -> DRAM|
+  |     // touched it!        |      (in_R[1] x T_R)       |              |
+  |                           | T14: matmul_tiles          |              |
+  |                           |      (in_I[1] x T_I_neg)   |              |
+  |                           | T15: pack_tile             |              |
+  |                           |      -> CB_OUT_R           | T15: NoC PUT |
+  |                           | T16: matmul_tiles          |     out_R[1] |
+  |                           |      (in_R[1] x T_I)       |     L1 -> DRAM|
+  |                           | T17: matmul_tiles          |              |
+  |                           |      (in_I[1] x T_R)       |              |
+  |                           | T18: pack_tile             | T18: NoC PUT |
+  |                           |      -> CB_OUT_I           |     out_I[1] |
+  |                           |      // tile 1 DONE        |     L1 -> DRAM|
+  +---------------------------+----------------------------+--------------+
+
+KEY OBSERVATIONS:
+  1. CB_A depth = 4 means the reader can FULLY queue both tiles' worth
+     of (in_R, in_I) before compute even begins. The reader is then
+     idle while compute and writer pipeline through.
+  2. EACH bf16 matmul is 1 FPU pass (vs 4 passes for fp32 matmul under
+     HiFi4). So 4 matmuls per tile = 4 FPU passes = ~200 ns of compute,
+     vs ~800 ns for fp32. This is the ~4x bf16 compute advantage.
+  3. The writer for tile 0's outputs runs in parallel with compute for
+     tile 1's matmuls. NoC PUT bandwidth (~25 GB/s per direction) is
+     plenty for 2 KB tiles.
+  4. By the time compute starts on tile 1, the writer has already
+     fired off out_R[0] and out_I[0]. By the time tile 1 finishes,
+     the writer is just slightly behind compute and finishes ~125 ns
+     later.
+  5. NET EFFECT: 2 bf16 tiles/core take ~1.4x the time of 1 tile, not
+     2x. Bandwidth and pipeline overlap dominate.
+
+Per-core L1 footprint (bf16):
+  CB_A:    4 tiles * 2048 B = 8 KB
+  CB_B:    4 tiles * 2048 B = 8 KB
+  CB_OUT:  4 tiles * 2048 B = 8 KB
+  Stack:   ~few KB
+  TOTAL:   ~26 KB out of ~1.5 MB L1
+  HALF the footprint of fp32. (Lots of room for future kernel optims.)
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+B) PHASE 2b -- pow2 N > 32 (recursive two-level CT, N1 = 32)
+================================================================================
+This phase is just MULTIPLE invocations of packed_dft_bf16, one for
+PASS-1 and one for PASS-2 of two_level_fft_bf16. The per-call core
+distribution follows the same Rule 2 as Phase 1.
+
+--------------------------------------------------------------------------------
+EXAMPLE B.1 -- 1 TILE PER CORE (everywhere)
+   Scenario: fft(1024) -> two_level_fft_bf16(1024, N1=32)   N2 = 32
+
+  PASS-1: packed_dft_bf16(N=32, count=32)
+    raw_num_tiles = ceil(32/32) = 1
+    num_cores     = 1
+    tiles/core    = 1
+    grid          = 1 x 1
+    -> only (0,0). Tile-fill = 100% (each row = 32 useful samples).
+
+  HOST: fp32 twiddle multiply + transpose
+
+  PASS-2: packed_dft_bf16(N=32, count=32)
+    Same shape: 1 core, 1 tile/core, 100% tile-fill.
+
+Total dispatches: 2, each on 1 core. SIMPLEST OPTIMAL CASE -- both
+passes use a fully-packed tile.
+
+--------------------------------------------------------------------------------
+EXAMPLE B.2 -- 2 TILES PER CORE (in PASS-2)   (with full DRAM <-> L1 detail)
+   Scenario: fft(131072) -> two_level_fft_bf16(131072, N1=32)   N2 = 4096
+
+  PASS-1: 32 calls to fft(4096)  (each recurses through Phase 2b again
+          since N2=4096 > 32; depth-2 recursion).
+    For each sibling r in 0..31:
+      fft(4096) -> two_level(4096, N1=32)  N2_inner = 128
+        PASS-1.inner: packed_dft_bf16(N=128, count=32)
+          But 128 > 32 -> recurses AGAIN (depth-3 at this point)
+          Each fft(128) -> 2 dispatches, 1 core each
+          So PASS-1.inner = 32 * 2 = 64 dispatches per fft(4096)
+        PASS-2.inner: packed_dft_bf16(N=32, count=128)
+          raw_num_tiles = 4, num_cores = 4, 1 tile/core
+        Total per fft(4096): 65 dispatches.
+      So PASS-1 of fft(131072) = 32 * 65 = 2080 dispatches.
+
+  PASS-2 of fft(131072): packed_dft_bf16(N=32, count=4096)
+    raw_num_tiles  = ceil(4096/32) = 128
+    num_cores      = 64                        <-- FULL GRID
+    tiles_per_core = 128 / 64 = 2              <-- 2 tiles/core
+    grid           = 8 x 8
+
+GRID for PASS-2 (full):
+       row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+       row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+       ...
+       row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+
+DETAILED DRAM <-> L1 PIPELINE for PASS-2 of this scenario:
+  Each core handles 2 tiles, each containing 32 length-32 sub-FFTs.
+  Tile-fill = 100% (each row = 32 useful samples).
+
+  This is the MAXIMUM-EFFICIENCY case for the bf16 kernel:
+    - 64/64 cores active                                 (100% grid)
+    - 2 tiles/core fully packed                          (100% per-tile)
+    - 4 FPU bf16 matmuls per tile                        (1 FPU pass each)
+    - Reader/compute/writer fully pipelined              (CB depth=4 input)
+
+  Time-aligned view (per core):
+    +-----------+----------------------+-----------+
+    | Reader    | Compute (FPU bf16)   | Writer    |
+    +-----------+----------------------+-----------+
+    | A_R[0]    |                      |           |
+    | A_I[0]    |                      |           |
+    | T_R       | matmul (A_R[0]*T_R)  |           |
+    | T_I_neg   | matmul (A_I[0]*Tn)   |           |
+    | T_I       | pack -> CB_OUT_R     |           |
+    | T_R       | matmul (A_R[0]*T_I)  |           |
+    | A_R[1]    | matmul (A_I[0]*T_R)  |           |
+    |  /reader  | pack -> CB_OUT_I     | OUT_R[0]  |
+    |   ahead   |                      | OUT_I[0]  |
+    | A_I[1]    |                      |           |
+    | T_R cache | matmul (A_R[1]*T_R)  |           |
+    | T_I_neg   | matmul (A_I[1]*Tn)   |           |
+    | T_I       | pack -> CB_OUT_R     |           |
+    | T_R       | matmul (A_R[1]*T_I)  | OUT_R[1]  |
+    |           | matmul (A_I[1]*T_R)  |           |
+    |           | pack -> CB_OUT_I     | OUT_I[1]  |
+    +-----------+----------------------+-----------+
+
+  Total wall-time per core for 2 tiles:
+    8 matmul_tiles + 4 pack_tiles  ~ 8 * 50 ns + 4 * 50 ns = 600 ns FPU
+    Reader/writer NoC overlap mostly hidden by FPU work.
+    TOTAL ~ 1 us per core for 2 tiles = ~64 sub-FFTs.
+
+  Aggregate Pass-2 throughput:
+    64 cores * 64 sub-FFTs (in parallel) = 4096 length-32 sub-FFTs in
+    1 us of wall time.
+
+DRAM <-> L1 BANDWIDTH TALLY for PASS-2:
+  Per core: read 2 * 2 * 2048 B (A_R, A_I tiles) = 8192 B
+            read 4 * 2048 B    (T tiles, cached) = 8192 B
+            write 2 * 2 * 2048 B (B_R, B_I tiles)= 8192 B
+            TOTAL              = 24 KB per core
+
+  Across 64 cores: 64 * 24 KB = 1.5 MB of DRAM traffic per dispatch.
+  Wormhole DRAM aggregate ~70 GB/s -> 1.5 MB / 70 GB/s = ~21 us.
+
+  But the kernel only takes 1 us of wall time! So PASS-2 is actually
+  BANDWIDTH-bound at scale (the FPU is idle waiting on DRAM most of the
+  time). This is why pass-2 hits ~10% of total six-step wall time.
+
+KEY OBSERVATIONS for 2 tiles/core in bf16 PASS-2:
+  1. PASS-2 is BANDWIDTH-bound, not compute-bound. The 2-tile/core
+     case is well-pipelined but hits the DRAM read/write bandwidth
+     ceiling.
+  2. bf16 helps here vs fp32: HALF the DRAM bytes per tile (2 KB vs 4 KB)
+     means PASS-2 in bf16 is 2x faster per tile than fp32 PASS-2 would be.
+  3. The FPU is mostly waiting on the reader. This is fundamental: 4
+     FPU passes / tile is just not enough work to amortize a 2 KB DRAM
+     read at 25 GB/s.
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+C) PHASE 2c -- mixed-radix (composite N > 32 with divisor <= 32)
+================================================================================
+Same packed_dft_bf16 kernel, called twice via two_level_fft_bf16 with
+N1 = largest_divisor_le_32(N).
+
+--------------------------------------------------------------------------------
+EXAMPLE C.1 -- 1 TILE PER CORE
+   Scenario: fft(60) -> mixed_radix(60)  N1=30, N2=2
+
+  PASS-1: packed_dft_bf16(N=2, count=30)
+    raw_num_tiles = ceil(30/32) = 1
+    num_cores     = 1
+    tiles/core    = 1
+    grid          = 1 x 1
+    Tile content: 30 sub-FFTs of length 2 in rows 0..29.
+    Tile-fill: 2/32 (per row).
+
+  HOST: fp32 twiddle multiply + transpose
+
+  PASS-2: packed_dft_bf16(N=30, count=2)
+    raw_num_tiles = 1, num_cores = 1, 1 tile/core
+    Tile content: 2 sub-FFTs of length 30 in rows 0..1.
+
+Total: 2 dispatches, 1 core each.
+
+--------------------------------------------------------------------------------
+EXAMPLE C.2 -- 2 TILES PER CORE (in PASS-2)   (with full DRAM <-> L1 detail)
+   Scenario: fft(14400) -> mixed_radix(14400)  N1=30, N2=480
+
+  PASS-1: 30 calls to fft(480) (recurses)
+    fft(480) -> mixed_radix(480)  N1=30, N2=16
+      PASS-1.inner: packed_dft_bf16(N=16, count=30)
+                    1 dispatch, 1 core
+      PASS-2.inner: packed_dft_bf16(N=30, count=16)
+                    1 dispatch, 1 core
+      -> 2 dispatches per inner call
+    -> 30 * 2 = 60 dispatches for outer PASS-1.
+
+  PASS-2 of fft(14400): packed_dft_bf16(N=30, count=480)
+    raw_num_tiles  = ceil(480/32) = 15
+    Hmm, 15 cores not allowed. Round up: num_cores = 16.
+    tiles_per_core = ceil(15/16) = 1 -> still 1 per core (15 useful + 1 padded)
+
+  -- so 14400 doesn't quite hit 2 tiles/core in PASS-2.
+
+  REAL trigger for 2 tiles/core in mixed-radix:
+    fft(57600) = mixed_radix(57600)  N1=30, N2=1920
+      PASS-2: packed_dft_bf16(N=30, count=1920)
+        raw_num_tiles  = ceil(1920/32) = 60
+        num_cores      = 64    (rounded up from 60)
+        tiles_per_core = 1     (60 useful tiles + 4 padded)
+
+  Even larger: fft(122880) = mixed_radix(122880)  N1=30, N2=4096
+      PASS-2: packed_dft_bf16(N=30, count=4096)
+        raw_num_tiles  = ceil(4096/32) = 128
+        num_cores      = 64                   <-- FULL GRID
+        tiles_per_core = 128 / 64 = 2         <-- 2 TILES/CORE
+
+  Use this scenario for the detailed pipeline.
+
+  N=30, count=4096 (PASS-2 of fft(122880)):
+    grid = 8 x 8, all 64 cores active, each with 2 tiles.
+
+DETAILED DRAM <-> L1 PIPELINE (core 0):
+  Each tile contains 32 sub-FFTs of length 30 (30/32 = 94% per-row fill).
+  4 FPU bf16 matmuls per tile (same kernel as everything else).
+
+  Reader   : pull A_R[0..1], A_I[0..1] from DRAM (4 tiles * 2 KB = 8 KB)
+  Twiddles : pull T_R, T_I, T_I_neg from DRAM    (3 tiles * 2 KB = 6 KB,
+             cached in DRAM, shared across all 64 cores)
+  Compute  : 8 matmul_tiles + 4 pack_tiles   (~600 ns FPU)
+  Writer   : push B_R[0..1], B_I[0..1] to DRAM (4 tiles * 2 KB = 8 KB)
+
+  +----------+----------------+--------------------------+------------+
+  | Reader   | Twiddle pull   | Compute (FPU bf16)       | Writer     |
+  +----------+----------------+--------------------------+------------+
+  | A_R[0]   |                |                          |            |
+  | A_I[0]   | T_R/T_I/T_Ineg |                          |            |
+  |          |                | mm_init                  |            |
+  |          |                | matmul (A_R[0]*T_R)      |            |
+  | A_R[1]   |                | matmul (A_I[0]*T_Ineg)   |            |
+  | (overlap |                | pack -> OUT_R            |            |
+  |  w/ FPU) |                | matmul (A_R[0]*T_I)      |            |
+  | A_I[1]   |                | matmul (A_I[0]*T_R)      | OUT_R[0]   |
+  |          | T (cached, fast| pack -> OUT_I            | DRAM       |
+  |          |  on 2nd tile)  |                          | OUT_I[0]   |
+  |          |                | // tile 0 done           | DRAM       |
+  |          |                | matmul (A_R[1]*T_R)      |            |
+  |          |                | matmul (A_I[1]*T_Ineg)   |            |
+  |          |                | pack -> OUT_R            |            |
+  |          |                | matmul (A_R[1]*T_I)      | OUT_R[1]   |
+  |          |                | matmul (A_I[1]*T_R)      | DRAM       |
+  |          |                | pack -> OUT_I            | OUT_I[1]   |
+  +----------+----------------+--------------------------+------------+
+
+  Per-core wall time: ~1 us (similar to Phase 1 because the kernel is
+  identical -- only the (N, count) values change).
+
+  Aggregate dispatch:
+    64 cores in parallel, each 2 tiles, each tile = 32 sub-FFTs.
+    -> 64 * 64 = 4096 sub-FFTs of length 30 in 1 us.
+
+KEY OBSERVATIONS:
+  1. Mixed-radix's PASS-2 has THE SAME pipelining as Phase 1, because
+     it's THE SAME kernel. Only the N value (and therefore the 32x32
+     twiddle table content) differs.
+  2. With N=30, the per-row tile fill is 94% (30 of 32 slots used).
+     Better than N=2 (PASS-1 of fft(60) = 6%), much better than the
+     ~50% common fill of medium-sized mixed-radix splits.
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+D) PHASE 2c -- Bluestein (prime N > 32)
+================================================================================
+Bluestein invokes 3 length-M FFTs (each goes through Phase 2b pow2),
+plus host-side chirp ops. The DEVICE work is governed by M, not N.
+
+--------------------------------------------------------------------------------
+EXAMPLE D.1 -- 1 TILE PER CORE   (small prime, single-core regime)
+   Scenario: fft(257) -> bluestein  M = 1024  (depth-1 Phase 2b, OPTIMAL)
+
+  Each FFT(M=1024) -> Phase 2b N1=32, N2=32.
+    PASS-1: packed_dft_bf16(N=32, count=32)  1 core, 1 tile, 100% fill
+    PASS-2: packed_dft_bf16(N=32, count=32)  1 core, 1 tile, 100% fill
+
+  Bluestein: 3 FFT(1024) calls = 6 dispatches, EACH on 1 core.
+
+GRID for every dispatch:  only (0,0).
+Per-core: 1 tile, 100% packed = 32 length-32 sub-FFTs per matmul-set.
+
+This is optimal SINGLE-CORE bf16 throughput. The FPU is never idle.
+
+--------------------------------------------------------------------------------
+EXAMPLE D.2 -- 2 TILES PER CORE   (large prime, full-grid regime)
+   Scenario: fft(65537) -> bluestein  M = 262144  (depth-3 Phase 2b)
+
+  Each FFT(M=262144) -> Phase 2b deep recursion. The dominant pass-2
+  has count = 8192:
+    raw_num_tiles  = ceil(8192/32) = 256
+    num_cores      = 64                        <-- FULL GRID
+    tiles_per_core = 256 / 64 = 4              <-- 4 TILES/CORE!
+
+  (Even higher than 2 tiles. Let's pick a 2-tile case instead.)
+
+  Better trigger: fft(521) -> bluestein  M = 2048  (depth-2 Phase 2b)
+    Each FFT(M=2048) -> Phase 2b N1=32, N2=64
+      PASS-1.inner: 32 calls to fft(64), each = 2 dispatches/1 core
+                    = 64 dispatches per FFT(M)
+      PASS-2.inner: packed_dft_bf16(N=32, count=64)
+                    raw_num_tiles  = 2
+                    num_cores      = 2
+                    tiles_per_core = 1
+        -> 2 cores, 1 tile each. Still 1 tile per core.
+
+  REAL 2-tile trigger via Bluestein: fft(4099) -> bluestein  M = 16384
+    Each FFT(16384) -> Phase 2b N1=32, N2=512
+      PASS-2.inner: packed_dft_bf16(N=32, count=512)
+                    raw_num_tiles  = 16
+                    num_cores      = 16
+                    tiles_per_core = 1
+        -> 16 cores, 1 tile each.
+
+  Have to go BIGGER. fft(8191) -> bluestein M = 16384 same shape.
+  fft(16381) -> bluestein M = 65536 -> Phase 2b N1=32, N2=2048
+      PASS-2.inner: packed_dft_bf16(N=32, count=2048)
+                    raw_num_tiles  = 64
+                    num_cores      = 64                  <-- FULL GRID
+                    tiles_per_core = 1                   <-- still 1!
+
+  fft(32771) -> bluestein M = 65536 (same).
+  fft(65537) -> bluestein M = 262144 -> N2=8192
+      PASS-2.inner: packed_dft_bf16(N=32, count=8192)
+                    raw_num_tiles  = 256
+                    num_cores      = 64
+                    tiles_per_core = 4                   <-- 4 tiles/core!
+
+  Use this scenario, but show 2 tiles for cleanliness (assume count=4096
+  case which arises from fft(8191) -> M=16384 -> N2=512 differently...
+  actually let's just describe the count=4096 case directly):
+
+  HYPOTHETICAL: PASS-2 with N=32, count=4096 inside Bluestein
+  (this would arise from a prime N near the upper limit of the Phase 2b
+  ceiling).
+    grid = 8 x 8, 2 tiles/core.
+
+  This dispatch is IDENTICAL in shape to Example B.2 (Phase 2b PASS-2
+  of fft(131072)) because it's the same packed_dft_bf16 kernel with
+  N=32 and count=4096.
+
+  So the DRAM <-> L1 timeline is the SAME as Example B.2 above. Refer
+  to that section for the cycle-by-cycle details.
+
+KEY OBSERVATIONS for Bluestein 2-tile regime:
+  1. Bluestein's per-dispatch core/tile shape is FULLY DETERMINED by
+     M, not N. fft(prime_N) and fft(M) have identical inner kernels;
+     Bluestein just runs 3 of them.
+  2. So tuning Bluestein performance reduces to tuning Phase 2b for
+     length M. There is no Bluestein-specific kernel.
+  3. The ONLY Bluestein-specific cost is host-side O(M) chirp ops --
+     about 1 us per N=4099-equivalent at M=16384. Negligible.
+
+--------------------------------------------------------------------------------
+
+================================================================================
+SUMMARY -- 1 vs 2 PER CORE in bf16
+================================================================================
+
+  Phase / scenario              | 1 tile/core wall | 2 tiles/core wall
+  ------------------------------+------------------+-------------------
+  Phase 1 packed_dft_bf16       |       T          |     ~1.4 T
+  Phase 2b PASS-2 (saturated)   |       T          |     ~1.4 T
+  Phase 2c mixed-radix PASS-2   |       T          |     ~1.4 T
+  Phase 2c Bluestein inner      |       T          |     ~1.4 T
+
+The "hidden speedup" via reader/writer/compute overlap is ~30%.
+Same as fp32, but with HALF the DRAM bandwidth needed (bf16 tile = 2 KB
+vs fp32 = 4 KB). This means bf16 is LESS bandwidth-bound at 2 tiles/core
+than fp32 -- the FPU has more headroom before saturating DRAM.
+
+KEY DIFFERENCES from fp32 examples:
+  1. ONE kernel, ONE per-core code path. Every example above is the
+     SAME kernel binary executing the SAME compute loop -- only the
+     (N, count) parameters change.
+  2. bf16 tile = 2 KB, halving DRAM traffic per tile vs fp32.
+  3. bf16 matmul = 1 FPU pass, vs 4 passes for fp32 under HiFi4 -- this
+     is the 4x FPU throughput advantage of bf16.
+  4. SAME L1 footprint headroom as fp32 (~50 KB per core), out of
+     ~1.5 MB. Plenty of room for future optimizations like fusing the
+     host transpose into the kernel.
+
+================================================================================

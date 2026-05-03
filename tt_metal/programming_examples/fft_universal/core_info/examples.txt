@@ -1,0 +1,429 @@
+================================================================================
+   fft_universal (fp32) — WORKED EXAMPLES: 1 FFT/CORE  vs  2 FFTs/CORE
+================================================================================
+
+For every scenario in this directory, this file gives TWO concrete worked
+examples:
+
+  EXAMPLE 1 -- "1 FFT per core" : one piece of work per core, simplest case
+  EXAMPLE 2 -- "2 FFTs per core": each core processes a sequential pair,
+                                  WITH a full DRAM <-> L1 timeline showing
+                                  how the reader/compute/writer pipeline
+                                  hides DRAM latency through CB double-
+                                  buffering.
+
+Sections:
+  A) PATH 0 -- packed direct-DFT (small N <= 32)
+  B) PATH A -- batched pow2 (sub_N <= 1024)
+  C) Six-step / Four-step  Pass-1 / Pass-3  (batch_fft inner)
+  D) Six-step / Four-step  Pass-2           (twiddle multiply)
+
+
+================================================================================
+A) PATH 0 -- packed direct-DFT (small N <= 32)
+================================================================================
+Kernel: packed_dft_compute  (FPU fp32 matmul, HiFi4 = 4 bf16 passes)
+Each tile packs 32 sub-FFTs (rows of a 32x32 tile).
+
+--------------------------------------------------------------------------------
+EXAMPLE A.1 -- 1 TILE PER CORE
+   Trigger: count = 256, N = 16  (e.g. fft(8192) Phase 2b PASS-2 in fft_bf16
+                                  context, or any caller of packed_dft with
+                                  count/32 == cores)
+
+  raw_num_tiles  = ceil(256 / 32) = 8
+  num_cores      = 8                             (raw <= 8, no rounding)
+  tiles_per_core = 8 / 8 = 1
+  grid           = 8 x 1
+
+GRID (only row 0 active):
+       row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+
+Per-core work:
+  core 0 -> tile 0  (sub-FFTs 0..31)
+  core 1 -> tile 1  (sub-FFTs 32..63)
+  ...
+  core 7 -> tile 7  (sub-FFTs 224..255)
+
+Each core does EXACTLY ONE iteration through its compute loop.
+
+--------------------------------------------------------------------------------
+EXAMPLE A.2 -- 2 TILES PER CORE   (with full DRAM <-> L1 detail)
+   Trigger: count = 4096, N = 16   (e.g. heavily batched packed_dft call)
+
+  raw_num_tiles  = ceil(4096 / 32) = 128
+  num_cores      = 64                          (clamped to 64)
+  tiles_per_core = 128 / 64 = 2
+  grid           = 8 x 8
+
+GRID (full):
+       row=0  |#0,0##|#1,0##|#2,0##|#3,0##|#4,0##|#5,0##|#6,0##|#7,0##|
+       row=1  |#0,1##|#1,1##|#2,1##|#3,1##|#4,1##|#5,1##|#6,1##|#7,1##|
+       ... (rows 0..7 all active)
+       row=7  |#0,7##|#1,7##|#2,7##|#3,7##|#4,7##|#5,7##|#6,7##|#7,7##|
+
+Per-core work:
+  core 0  -> tile 0  AND tile 1  (sub-FFTs   0..63)
+  core 1  -> tile 2  AND tile 3  (sub-FFTs  64..127)
+  ...
+  core 63 -> tile 126 AND tile 127 (sub-FFTs 4032..4095)
+
+Each core's compute kernel runs:
+   for (k = 0; k < tiles_per_core /*=2*/; ++k) {
+       process_tile(base + k);
+   }
+
+DETAILED DRAM <-> L1 PIPELINE (for ONE core, e.g. core 0):
+   CB depths in this kernel: CB_A = 4, CB_B = 4, CB_OUT_R = 2, CB_OUT_I = 2
+   Twiddle tiles (T_R, T_I, T_I_neg) are READ-ONCE-PER-TILE because they're
+   tiny and shared across all cores. They live in DRAM and are pulled into
+   CBs each iteration.
+
+   Time -->
+   ┌──────────────────────────┬────────────────────────┬──────────────────┐
+   │  Reader BRISC0 (NoC IN)  │ Compute TRISC (FPU)    │ Writer BRISC1    │
+   ├──────────────────────────┼────────────────────────┼──────────────────┤
+   │ T0: NoC GET in_R[0]      │ wait...                │ wait...          │
+   │     DRAM -> L1 CB_A      │                        │                  │
+   │     (4096 B, ~250 ns)    │                        │                  │
+   │ T1: NoC GET in_I[0]      │                        │                  │
+   │     DRAM -> L1 CB_A      │                        │                  │
+   │ T2: NoC GET T_R          │                        │                  │
+   │     DRAM -> L1 CB_B      │                        │                  │
+   │ T3: NoC GET T_I_neg      │                        │                  │
+   │     DRAM -> L1 CB_B      │                        │                  │
+   │ T4: NoC GET T_I          │                        │                  │
+   │     DRAM -> L1 CB_B      │                        │                  │
+   │ T5: NoC GET T_R          │                        │                  │
+   │     DRAM -> L1 CB_B      │                        │                  │
+   │ // 4 (A,B) pairs queued  │ // CBs full, can start │                  │
+   │                          │ T6: matmul_tiles       │                  │
+   │ // CB_A still has space  │     (in_R[0], T_R)     │                  │
+   │ // for in_R[1] -- start  │     -> DST fp32        │                  │
+   │ // pulling tile 1!!      │ T7: matmul_tiles       │                  │
+   │ T6: NoC GET in_R[1]      │     (in_I[0], T_I_neg) │                  │
+   │     DRAM -> L1 CB_A      │     -> DST fp32        │                  │
+   │     (overlapped w/ FPU!) │ T8: pack_tile          │                  │
+   │ T7: NoC GET in_I[1]      │     -> CB_OUT_R        │                  │
+   │     DRAM -> L1 CB_A      │ T9: matmul_tiles       │ T9: NoC PUT      │
+   │ T8: NoC GET T_R (cached  │     (in_R[0], T_I)     │     out_R[0]     │
+   │     by L1 hopefully)     │ T10: matmul_tiles      │     L1 -> DRAM   │
+   │ T9: NoC GET T_I_neg      │     (in_I[0], T_R)     │     (parallel    │
+   │ T10: NoC GET T_I         │ T11: pack_tile         │      w/ FPU!)    │
+   │ T11: NoC GET T_R         │     -> CB_OUT_I        │ T11: NoC PUT     │
+   │                          │ // Tile 0 DONE         │     out_I[0]     │
+   │ // Reader is fully ahead │ // Switch to tile 1    │     L1 -> DRAM   │
+   │ // of compute now        │ T12: matmul_tiles      │                  │
+   │                          │     (in_R[1], T_R)     │                  │
+   │                          │ T13: matmul_tiles      │                  │
+   │                          │     (in_I[1], T_I_neg) │                  │
+   │                          │ T14: pack_tile         │                  │
+   │                          │     -> CB_OUT_R        │                  │
+   │                          │ T15: matmul_tiles      │ T15: NoC PUT     │
+   │                          │     (in_R[1], T_I)     │     out_R[1]     │
+   │                          │ T16: matmul_tiles      │ T16: NoC PUT     │
+   │                          │     (in_I[1], T_R)     │     out_I[1]     │
+   │                          │ T17: pack_tile         │                  │
+   │                          │     -> CB_OUT_I        │                  │
+   │                          │ // Tile 1 DONE -- exit │                  │
+   └──────────────────────────┴────────────────────────┴──────────────────┘
+
+KEY OBSERVATIONS for the 2-tile case:
+  1. CB_A depth = 4 lets the reader queue BOTH tiles' (in_R, in_I) before
+     compute even starts on tile 0. While compute chews on tile 0, reader
+     is free to start pulling twiddles for tile 1.
+  2. The WRITER runs in parallel with the FPU. Writing out_R[0] happens
+     while compute is doing the (in_R[0]*T_I, in_I[0]*T_R) matmuls for
+     out_I[0]. NoC bandwidth (~25 GB/s per direction) is consumed without
+     stealing from the FPU.
+  3. By the time tile 0's writer is done, tile 1's input is already
+     in L1, so compute starts on tile 1 with ZERO DRAM stall.
+  4. NET EFFECT: 2 tiles per core take roughly 1.5x the time of 1 tile,
+     not 2x, because of the pipelining.
+
+Per-core L1 footprint:
+  CB_A:    4 tiles * 4096 B = 16 KB    (in_R / in_I for both tiles)
+  CB_B:    4 tiles * 4096 B = 16 KB    (4 twiddle tiles in flight)
+  CB_OUT:  4 tiles * 4096 B = 16 KB    (2 output tiles each)
+  Stack:   ~few KB
+  TOTAL:   ~50 KB out of ~1.5 MB L1 -- plenty of headroom.
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+B) PATH A -- batched pow2 sub-FFTs (sub_N <= 1024)
+================================================================================
+Kernel: batch_fft_compute  (SFPU fp32, log2(sub_N) butterfly stages per FFT)
+Each FFT lives in ONE tile (1024 elements when sub_N == 1024).
+
+--------------------------------------------------------------------------------
+EXAMPLE B.1 -- 1 FFT PER CORE
+   Trigger: batch = 64, sub_N = 256
+
+  num_cores      = min(64, 64) = 64
+  batch_per_core = 64 / 64     = 1
+  grid           = 8 x 8
+
+GRID (full).
+Per-core: 1 sub-FFT, 8 butterfly stages on a single tile.
+
+--------------------------------------------------------------------------------
+EXAMPLE B.2 -- 2 FFTs PER CORE   (with full DRAM <-> L1 detail)
+   Trigger: batch = 128, sub_N = 256
+
+  num_cores      = 64
+  batch_per_core = 128 / 64 = 2
+  grid           = 8 x 8
+
+Per core, sub-FFTs 0..1 (core 0), 2..3 (core 1), ...
+
+CB layout for batch_fft_compute (17 CBs in total):
+  EVEN, ODD, TW (* both R/I)  : depth 2 each (double-buffered pipeline)
+  TMP, TW_ODD, STATE_R/I, SYNC: depth 1 each
+
+DETAILED DRAM <-> L1 PIPELINE (core 0, processes sub-FFTs 0 and 1):
+
+  Each Stockham stage reads a TWIDDLE TILE from DRAM and butterflies an
+  EVEN tile + ODD tile in L1 producing an updated EVEN/ODD pair.
+
+  Time -->
+  +---------+---------+---------+--------+--------+--------+
+  | Reader  | Twiddle | Compute (SFPU stage by stage)      | Writer  |
+  | (input) | reads   | 8 stages for sub_N=256             | (output)|
+  +---------+---------+---------+--------+--------+--------+
+  | Pull    | Pull tw0|         |        |        |        |         |
+  | EVEN[0] |         |         |        |        |        |         |
+  | + ODD[0]|         |         |        |        |        |         |
+  +---------+---------+ Stage 0 |        |        |        |         |
+  |         | Pull tw1| (radix-2|        |        |        |         |
+  |         |         |  butter |        |        |        |         |
+  |         |         |  flies) | Stage1 |        |        |         |
+  | // tile0|         |         |        | Stage2 |        |         |
+  | // done |         |         |        |        | ...    |         |
+  | // start|         |         |        |        | ...    |         |
+  | // tile1|         |         |        |        |        |         |
+  | Pull    |         |         |        |        | Stage7 |         |
+  | EVEN[1] |         |         |        |        |        |         |
+  | + ODD[1]|         |         |        |        |        | NoC PUT |
+  |         |         |         |        |        |        | OUT[0]  |
+  |         |         | (sub-FFT 0 fully complete here)    | DRAM    |
+  |         | Pull tw0|         |        |        |        |         |
+  |         | (cached)|         |        |        |        |         |
+  +---------+---------+ Stage 0 | Stage1 |...     | Stage7 |         |
+  |         |         | (sub-FFT 1)                        | NoC PUT |
+  |         |         |                                    | OUT[1]  |
+  |         |         |                                    | DRAM    |
+  +---------+---------+--------+---------+---------+-------+---------+
+
+KEY OBSERVATIONS:
+  1. Each Stockham stage is an SFPU vector op on the entire 1024-element
+     tile (zero-pad past sub_N=256). 8 stages = 8 vector passes per FFT.
+  2. The TWIDDLE TILES (tw0..tw7 = log2(256) = 8 of them) are SHARED
+     across all 64 cores -- after the first core fetches tw0, the other
+     63 cores' fetches hit DRAM but can be coalesced. In practice the
+     same tw0 lives in L1 of cores 0..63 simultaneously.
+  3. Reader can pull the tile 1 EVEN/ODD pair while compute is working
+     stages 4..7 of tile 0. By the time compute finishes tile 0,
+     tile 1's input is already in L1.
+  4. Writer fires immediately after stage 7 of each FFT -- it never waits
+     for compute on the NEXT tile. Net: writer overlap is ~50% of total
+     time on a 2-tile/core dispatch.
+  5. NET EFFECT: 2 FFTs per core take ~1.6x the time of 1 FFT/core, not
+     2x, due to (overlap of input read for FFT 1 with compute on FFT 0)
+     and (overlap of output write for FFT 0 with compute on FFT 1).
+
+Per-core L1 footprint:
+  EVEN,ODD,TW (R/I,depth 2): 6 * 2 tiles = ~50 KB
+  TMP, TW_ODD, STATE       : ~25 KB
+  Per-FFT scratch          : ~10 KB
+  TOTAL                    : ~85 KB (still <6% of L1)
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+C) Six-step / Four-step  Pass-1 / Pass-3  (batch_fft inner)
+================================================================================
+Inside fft_stockham::fft, Pass-1 dispatches batch_fft(N2, N1) and Pass-3
+dispatches batch_fft(N1, N2). Same kernel as PATH A but with much larger
+batches.
+
+--------------------------------------------------------------------------------
+EXAMPLE C.1 -- 1 FFT PER CORE   (six-step, balanced)
+   Scenario: N = 4096 -> N1 = 64, N2 = 64
+
+  PASS-1: batch_fft(sub_N=64, batch=64)
+    num_cores      = 64
+    batch_per_core = 1
+    grid           = 8 x 8
+
+  PASS-3: identical shape.
+
+Each core does ONE length-64 Stockham FFT (6 stages on a single tile).
+Tile-fill = 64/1024 = 6.25%.
+
+--------------------------------------------------------------------------------
+EXAMPLE C.2 -- 2 FFTs PER CORE   (six-step, deeper)
+   Scenario: N = 16384 -> N1 = 128, N2 = 128
+
+  PASS-1: batch_fft(sub_N=128, batch=128)
+    num_cores      = 64
+    batch_per_core = 128 / 64 = 2
+    grid           = 8 x 8
+
+  PASS-3: identical shape.
+
+Per core, e.g. core 0 processes sub-FFTs 0 and 1.
+
+DETAILED DRAM <-> L1 PIPELINE (core 0 in PASS-1, sub_N=128, 7 stages):
+
+  Same kernel as Example B.2; here's the per-tile inner loop differences:
+    log2(128) = 7 stages instead of 8
+    Per-stage vector op spans only the first 128 elements of the tile;
+    the rest are zero-padded and ignored by the kernel.
+
+  Time -->
+  +-------------+-------------+----------------------------+-------------+
+  | Reader      | Twiddle pulls (cached after 1st core)    | Writer      |
+  +-------------+-------------+----------------------------+-------------+
+  | EVEN[0]+    | tw0..tw6    | 7 stages on tile 0         |             |
+  | ODD[0] from |             |  (stages 1-3 SFPU heavy)   |             |
+  | DRAM        |             |  (stage 0 = bit-reverse-   |             |
+  |             |             |   like trivial pass)       |             |
+  |             |             |                            | NoC PUT     |
+  |             |             | // tile 0 done             | OUT[0]      |
+  | EVEN[1]+    |             |                            |             |
+  | ODD[1] from |             |                            |             |
+  | DRAM        |             |                            |             |
+  | (overlapped | tw0..tw6    | 7 stages on tile 1         |             |
+  | w/ writer   | (already in |                            |             |
+  | for tile 0) | L1)         |                            |             |
+  |             |             |                            | NoC PUT     |
+  |             |             |                            | OUT[1]      |
+  +-------------+-------------+----------------------------+-------------+
+
+WHAT'S DIFFERENT FROM Example B.2:
+  - 7 stages instead of 8 (sub_N=128 vs 256)
+  - 64 cores ALL doing this in lockstep, so the second tile read on
+    core 0 happens while cores 1..63 are also pulling theirs -- DRAM
+    bandwidth is shared. Wormhole has 6 DRAM channels x 12 GB/s each ~
+    ~70 GB/s aggregate; 64 cores fetching 8 KB tiles / iter = 512 KB
+    ~ 7 us per pulse.
+  - Pass-2 cannot start until ALL 64 cores complete BOTH their sub-FFTs.
+
+Aggregate Pass-1 wall time: ~ (1 sub-FFT time) * (1 + alpha) where
+alpha = small overhead from reader/writer pipelining ~ 0.5x.
+So Pass-1 with 2 sub-FFTs/core ~ 1.5x the time of Pass-1 with 1
+sub-FFT/core, not 2x.
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+D) Six-step / Four-step  Pass-2  (twiddle multiply on device + transpose host)
+================================================================================
+Kernel: pass2_compute  (SFPU fp32, complex elementwise multiply)
+Each tile = one row of B = N2 elements (zero-padded to 1024).
+
+--------------------------------------------------------------------------------
+EXAMPLE D.1 -- 1 TILE PER CORE
+   Scenario: N = 4096 -> N1 = 64, N2 = 64
+
+  pass2(N1=64, N2=64)
+    num_cores      = min(64, 64) = 64
+    tiles_per_core = 64 / 64 = 1
+    grid           = 8 x 8
+
+Per core: 1 twiddle multiply on 1 tile. SFPU runs through 64 elements
+(rest zero), 1 vector op for real part, 1 for imag part.
+
+--------------------------------------------------------------------------------
+EXAMPLE D.2 -- 2 TILES PER CORE   (with full DRAM <-> L1 detail)
+   Scenario: N = 16384 -> N1 = 128, N2 = 128
+
+  pass2(N1=128, N2=128)
+    num_cores      = min(128, 64) = 64
+    tiles_per_core = 128 / 64 = 2
+    grid           = 8 x 8
+
+Per core, e.g. core 0 handles twiddle rows 0 and 1 of B = N1xN2 grid.
+
+DETAILED DRAM <-> L1 PIPELINE (core 0):
+
+  CBs in pass2_compute (8 total, all depth 2 except TMP):
+    A_R, A_I  : input from Pass-1 output  (depth 2, double-buffered)
+    T_R, T_I  : twiddle from cached DRAM  (depth 2)
+    B_R, B_I  : output                    (depth 2)
+    TMP_R, TMP_I                           (depth 1, intermediate)
+
+  For each tile k in {0, 1}, the per-tile work is:
+    real_tmp = A_R[k] * T_R[k] - A_I[k] * T_I[k]     // real of complex mul
+    imag_tmp = A_R[k] * T_I[k] + A_I[k] * T_R[k]     // imag of complex mul
+    pack_tile -> B_R[k], B_I[k]
+
+  Time -->
+  +-----------+---------+--------------------------+-----------+
+  | Reader    | TWiddle | Compute SFPU             | Writer    |
+  +-----------+---------+--------------------------+-----------+
+  | A_R[0]    | T_R[0]  |                          |           |
+  | A_I[0]    | T_I[0]  |                          |           |
+  |           |         | mul: A_R[0] * T_R[0]     |           |
+  |           |         | mul: A_I[0] * T_I[0]     |           |
+  |           |         | sub: real_tmp = R*R-I*I  |           |
+  |           |         | mul: A_R[0] * T_I[0]     |           |
+  |           |         | mul: A_I[0] * T_R[0]     |           |
+  |           |         | add: imag_tmp = R*I+I*R  |           |
+  |           |         | pack -> B_R[0], B_I[0]   |           |
+  | A_R[1]    | T_R[1]  |                          | B_R[0]    |
+  | (parallel | (cached |                          | DRAM      |
+  | w/ writer)| 2nd hit)|                          | (parallel |
+  |           |         |                          | with NEXT |
+  |           |         |                          | reader)   |
+  | A_I[1]    | T_I[1]  |                          | B_I[0]    |
+  |           |         | mul: A_R[1] * T_R[1]     | DRAM      |
+  |           |         | mul: A_I[1] * T_I[1]     |           |
+  |           |         | (4 muls + 2 adds total)  |           |
+  |           |         | pack -> B_R[1], B_I[1]   | B_R[1]    |
+  |           |         |                          | B_I[1]    |
+  +-----------+---------+--------------------------+-----------+
+
+KEY OBSERVATIONS for pass2:
+  1. ARITHMETIC INTENSITY IS LOW: 4 muls + 2 adds per element, no
+     reduction. SFPU is bandwidth-bound here, NOT compute-bound.
+  2. The twiddle tiles T_R[k]/T_I[k] are CACHED in DRAM (built once at
+     plan-build time) -- the same N1 x N2 twiddle table is shared
+     across all 64 cores; each core just reads its own row.
+  3. Writer completes B[0] while reader is fetching A[1] -- the second
+     tile's I/O overlaps the first's compute completely.
+  4. NET WALL TIME: 2 tiles/core ~ 1.4x of 1 tile/core. Pass-2 is
+     ~10% of total six-step wall time, so this scaling barely matters.
+
+Per-core L1 footprint:
+  A_R/A_I (depth 2)        : 16 KB
+  T_R/T_I (depth 2)        : 16 KB
+  B_R/B_I (depth 2)        : 16 KB
+  TMP_R/TMP_I              : 8 KB
+  TOTAL                    : ~60 KB
+
+--------------------------------------------------------------------------------
+
+================================================================================
+SUMMARY -- 1 vs 2 PER CORE
+================================================================================
+
+  Path / scenario          | 1 per core wall | 2 per core wall | Speedup hidden
+  -------------------------+-----------------+-----------------+----------------
+  PATH 0 packed_dft        |     T           |    ~1.5 T       | 25%
+  PATH A batched pow2      |     T           |    ~1.6 T       | 20%
+  Six-step Pass-1/Pass-3   |     T           |    ~1.5 T       | 25%
+  Six-step Pass-2          |     T           |    ~1.4 T       | 30%
+
+The "hidden speedup" is the fraction of dispatch time saved by reader/
+writer/compute pipelining via the double-buffered CBs.
+
+ALL of this is automatic -- no kernel-side or host-side changes are
+needed to enable pipelining. The CB depths (2 for most CBs, 4 for input
+CBs in packed_dft) are tuned to make this overlap maximal.
+
+================================================================================
