@@ -96,10 +96,13 @@ def load_image(
         H, W = size if size is not None else (256, 256)
         return make_synthetic_image(H=H, W=W, kind="mixed")
 
-    img = (_read_with_pillow(path)
-           or _read_with_cv2(path)
-           or _read_with_skimage(path)
-           or _read_with_matplotlib(path))
+    # NOTE: can't use `a or b` — numpy arrays don't have a scalar truth value.
+    img = None
+    for reader in (_read_with_pillow, _read_with_cv2,
+                   _read_with_skimage, _read_with_matplotlib):
+        img = reader(path)
+        if img is not None:
+            break
     if img is None:
         print(f"[image_loader] could not read {path!r}; using synthetic image")
         H, W = size if size is not None else (256, 256)
@@ -108,10 +111,14 @@ def load_image(
     if grayscale and img.ndim == 3:
         img = img.mean(axis=-1)
 
-    if size is not None and img.shape != size:
+    if size is not None and img.shape != tuple(size):
         img = _resize(img, size)
 
-    return img.astype(np.float32)
+    img = img.astype(np.float32)
+    # Normalise to [0, 1] regardless of source dtype (uint8, uint16, float).
+    if img.max() > 1.5:
+        img = img / 255.0
+    return img
 
 
 def _resize(img: np.ndarray, target: Tuple[int, int]) -> np.ndarray:
