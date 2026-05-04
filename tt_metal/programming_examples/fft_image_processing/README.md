@@ -18,8 +18,41 @@ fft_image_processing/
 ├── visualization.py     # matplotlib panel + spectrum + image savers
 ├── benchmarking.py      # head-to-head timing across engines
 ├── main.py              # CLI entry point that wires everything together
+├── fft2_runner.cpp      # single-process 2D FFT C++ runner (host-only)
+├── CMakeLists.txt       # build glue for fft2_runner
 ├── requirements.txt
 └── outputs/             # generated PNGs land here
+```
+
+## How the 2-D FFT runs on Wormhole
+
+`fft_module.py` picks one of two execution paths automatically:
+
+1. **Single-process 2-D runner (preferred).** A dedicated C++ binary
+   `metal_example_fft_image_processing_fft2_runner` opens the MeshDevice
+   ONCE, runs all `H + W` 1-D FFTs in a single device session, and writes
+   the result back. Scales cleanly to 256x256 and beyond. **No kernel
+   changes** — it reuses the same `fft_universal` compute kernels; only
+   the host-side orchestration is new.
+2. **Per-row subprocess fallback.** If the dedicated 2-D binary isn't
+   built yet, falls back to launching the 1-D `tt_fft` wrapper per row +
+   per column. Fine for ~16x16 / 32x32 images; larger sizes will exhaust
+   firmware re-init resources because each call opens/closes the device.
+
+To enable path 1:
+
+```bash
+cmake --build build --target \
+    metal_example_fft_image_processing_fft2_runner -j 8
+```
+
+Then any `--engine custom` run with any image size goes through the fast
+single-process path. Verify with:
+
+```python
+from fft_image_processing import fft_module
+print(fft_module.backend_info())
+# fft2_path: 'single-process 2D'   <-- you want this
 ```
 
 ## Build & path setup (one time, on the Wormhole machine)
