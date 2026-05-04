@@ -351,10 +351,32 @@ def _run_device(x: np.ndarray, inverse: bool, precision: str,
         r = subprocess.run(cmd, env=env, capture_output=not verbose, text=True)
         ms_wall = (time.time() - t0) * 1000.0
         if r.returncode != 0:
-            tail = (r.stderr or r.stdout or "").splitlines()[-20:]
+            # Print BOTH stdout and stderr; pull out the most informative
+            # parts (TT_FATAL / TT_THROW / Failed lines) plus the first 40
+            # and last 40 lines, so the real error isn't hidden behind a
+            # giant stack trace.
+            so = (r.stdout or "").splitlines()
+            se = (r.stderr or "").splitlines()
+            all_lines = so + (["--- stderr ---"] if so and se else []) + se
+            key = [ln for ln in all_lines
+                   if ("TT_FATAL" in ln or "TT_THROW" in ln
+                       or "what():" in ln or "info:" in ln
+                       or "Failed" in ln)]
+            head = all_lines[:40]
+            tail = all_lines[-40:]
+            msg_parts = []
+            if key:
+                msg_parts.append("[key error lines]")
+                msg_parts.extend(key[:10])
+            msg_parts.append("[head of output]")
+            msg_parts.extend(head)
+            if len(all_lines) > 80:
+                msg_parts.append("...")
+            msg_parts.append("[tail of output]")
+            msg_parts.extend(tail)
             raise RuntimeError(
                 f"tt_fft device call failed (exit={r.returncode}):\n"
-                + "\n".join(tail))
+                + "\n".join(msg_parts))
         y = _read_complex(out_path, n)
         return (y, ms_wall) if return_ms else y
     finally:

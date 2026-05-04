@@ -106,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="warm-up iterations (excluded from timing). default 1.")
     g_b.add_argument("--no-bench", action="store_true",
                      help="skip the benchmark step.")
+    g_b.add_argument("--bench-engines", default="auto",
+                     help="comma-separated list of engines to benchmark "
+                          "(custom,numpy,torch). 'auto' picks numpy+torch for "
+                          "images larger than 64x64 to avoid 2N subprocess "
+                          "calls through the per-call wormhole wrapper. "
+                          "default: auto.")
 
     g_o = p.add_argument_group("output")
     g_o.add_argument("--out", default="outputs",
@@ -249,10 +255,23 @@ def run(args: argparse.Namespace) -> None:
 
     # ---------------- 8. Benchmark ----------------
     if not args.no_bench:
-        print("[8/8] Benchmark engines on the same input...")
+        if args.bench_engines == "auto":
+            h, w = input_img.shape[:2]
+            if max(h, w) <= 64:
+                bench_engines = ("custom", "numpy", "torch")
+            else:
+                bench_engines = ("numpy", "torch")
+                print(f"[8/8] image is {h}x{w} (> 64); excluding 'custom' "
+                      f"from benchmark to avoid {2*h} subprocess launches.")
+                print("      use --bench-engines custom,numpy,torch to force "
+                      "it (slow), or --size 32 for a tiny demo.")
+        else:
+            bench_engines = tuple(s.strip() for s in args.bench_engines.split(",")
+                                  if s.strip())
+        print(f"[8/8] Benchmark engines: {bench_engines}")
         bench = benchmarking.benchmark_fft2(
             input_img,
-            engines=("custom", "numpy", "torch"),
+            engines=bench_engines,
             precision=args.precision,
             iters=args.bench_iters, warmup=args.bench_warmup)
         ref = "torch" if "torch" in bench else "numpy"
