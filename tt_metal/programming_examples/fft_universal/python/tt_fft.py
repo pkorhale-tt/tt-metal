@@ -237,9 +237,14 @@ def _discover_repo_root() -> Optional[str]:
     return None
 
 
-_REPO_ROOT = os.environ.get("TT_METAL_HOME") or _discover_repo_root()
-if _REPO_ROOT and not os.environ.get("TT_METAL_HOME"):
-    os.environ["TT_METAL_HOME"] = _REPO_ROOT  # so child binary can see it
+_REPO_ROOT = (os.environ.get("TT_METAL_RUNTIME_ROOT")
+              or os.environ.get("TT_METAL_HOME")
+              or _discover_repo_root())
+if _REPO_ROOT:
+    # Set BOTH names so we work on old (TT_METAL_HOME) and new
+    # (TT_METAL_RUNTIME_ROOT) versions of tt-metal.
+    os.environ.setdefault("TT_METAL_HOME", _REPO_ROOT)
+    os.environ.setdefault("TT_METAL_RUNTIME_ROOT", _REPO_ROOT)
 
 # Build dir defaults to <repo>/build but can be overridden.
 _BUILD_DIR = os.environ.get(
@@ -336,7 +341,10 @@ def _run_device(x: np.ndarray, inverse: bool, precision: str,
         env = os.environ.copy()
         env.setdefault("ARCH_NAME", "wormhole_b0")
         if _REPO_ROOT:
-            env.setdefault("TT_METAL_HOME", _REPO_ROOT)
+            # Force-set both names regardless of what's in the parent env;
+            # different tt-metal versions check different variables.
+            env["TT_METAL_HOME"]         = _REPO_ROOT
+            env["TT_METAL_RUNTIME_ROOT"] = _REPO_ROOT
         if verbose:
             print(f"[tt_fft] {' '.join(cmd)}")
         t0 = time.time()
