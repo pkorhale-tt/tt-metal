@@ -1,0 +1,7 @@
+numpy>=1.21
+matplotlib>=3.5
+torch>=1.13
+# Optional (any one is enough; image_loader falls back gracefully):
+Pillow>=9.0
+# scikit-image>=0.19
+# opencv-python>=4.5
