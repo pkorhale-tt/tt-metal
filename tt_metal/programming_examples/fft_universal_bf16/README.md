@@ -30,9 +30,21 @@ N ≥ 2**:
 | prime `N > 32`                                 | Phase 2c: Bluestein's chirp-Z, `M = next_pow2(2N-1)` → 2b     |
 | composite with no divisor ≤ 32 (e.g. `37²`)    | Phase 2c: Bluestein on `N` itself                             |
 
-Every path funnels through the same `packed_dft_bf16` kernel on device.
-No new device kernels were added beyond Phase 1 — Phase 2b/2c are
-host-only orchestration.
+Every reduction path funnels through the same `packed_dft_bf16` kernel
+on the FPU (bf16 matmul). The precision-critical between-pass twiddle
+multiply is dispatched to `fft_stockham`'s `pass2_compute` kernel
+(SFPU fp32, 64 cores) when (N1, N2) are both pow2 and N2 ≤ 1024 — so
+no host cos/sin sits on the hot path. Mixed-radix shapes that don't
+fit the pow2 kernel (e.g. N1=4, N2=9) fall back to a tiny host loop.
+
+### Plan A — on-device Pass-2 (active)
+
+Earlier prototype kept Pass-2 on the host CPU because the only twiddle
+table available was fp32 trig built per call. With this change the
+twiddles are pre-computed and uploaded once per `(N1, N2)` to DRAM and
+the per-tile complex multiply runs across up to 64 SFPUs. End-to-end
+result: bf16 path no longer ping-pongs through PCIe between Pass-1
+and Pass-3, and the cos/sin work is gone.
 
 ## How the dispatch tree works
 

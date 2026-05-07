@@ -10,11 +10,21 @@ Wormhole, so any SFPU op would silently upcast to fp32, breaking the
 
 KEY DIFFERENCE FROM fft_universal (fp32):
   fp32 pipeline:    3 device kernels  (batch_fft, pass2, packed_dft)
-  bf16 pipeline:    1 device kernel   (packed_dft_bf16) -- used everywhere
+  bf16 pipeline:    2 device kernels  (packed_dft_bf16  +  pass2 [SFPU fp32,
+                                       reused from fft_stockham])
 
-All host orchestration glue (twiddle multiply, transpose, chirp, FFT
-of A and B, conjugate trick) is fp32 on the CPU. The reduction-critical
-arithmetic (the matmuls) is bf16 on the FPU.
+The reduction-critical matmuls run on the Tensix FPU in bf16. The between-
+pass twiddle multiply (precision-critical pointwise step) runs on the
+fft_stockham pass2 SFPU kernel in fp32 -- 64 cores, twiddles cached on
+device, no host cos/sin on the hot path.
+
+  Plan A (active): when (N1, N2) are both pow2 and N2 <= 1024 the
+  twiddle+transpose dispatches to fft_stockham::pass2_twiddle_transpose
+  (on-device SFPU fp32). Otherwise (mixed-radix sizes like N1=4 N2=9)
+  it falls back to a tiny host loop.
+
+Conjugate trick / chirp (Bluestein) and outer-shape orchestration are
+still on host in fp32 -- those are not on the per-FFT hot path.
 
 --------------------------------------------------------------------------------
 TOP-LEVEL ENTRY POINT
