@@ -21,14 +21,9 @@
 //                * pow2 N > 32     (N1 = 32, recurses via fft())
 //                * composite N > 32 with a divisor ≤ 32
 //                  (N1 = largest divisor ≤ 32, recurses via fft())
-//              All reduction stays on-device (packed_dft_bf16). The between-
-//              pass twiddle is kept in fp32 for accuracy: when (N1, N2) are
-//              both pow2 and N2 ≤ 1024, it dispatches to fft_stockham's
-//              on-device pass-2 kernel (64 SFPUs, fp32 multiply, twiddles
-//              cached per (N1, N2) — no host cos/sin on the hot path).
-//              For mixed-radix sizes that don't fit that kernel's pow2
-//              constraint (e.g. N1 = 4, N2 = 9), it falls back to a tiny
-//              host loop in fp32.
+//              All reduction stays on-device (packed_dft_bf16); the between-
+//              pass twiddle is fp32 on the host (pointwise, no reduction →
+//              fp32 there is strictly more accurate than bf16 would be).
 //   Phase 2c — Bluestein's chirp-Z for:
 //                * prime N > 32
 //                * composite N > 32 with NO divisor ≤ 32 (e.g. N = 37² = 1369)
@@ -513,6 +508,49 @@ inline void packed_direct_dft_bf16_batched(
     }
 }
 
+// ─── Between-pass twiddle table cache ────────────────────────────────────
+//
+// The twiddle table T[n1, k2] = exp(-2πi · n1 · k2 / N) used by Step 3 of
+// two_level_fft_bf16 is a pure function of (N, N1, N2). We pre-compute it
+// the first time we see a given (N, N1, N2) triple, then reuse it for
+// every subsequent call. This kills the cos/sin work on the hot path —
+// the loop becomes one complex multiply per element.
+//
+// The same key (N, N1, N2) is used everywhere: outer pow2 path picks
+// N1=32, recursive sub-paths pick smaller N1, mixed-radix picks variable
+// N1. Each unique combination ends up cached exactly once for the life of
+// the process.
+inline std::vector<Complex>& two_level_twiddle_cache_entry(
+    uint32_t N, uint32_t N1, uint32_t N2)
+{
+    static std::unordered_map<uint64_t, std::vector<Complex>> cache;
+    const uint64_t key = (uint64_t{N}  * 0x9E3779B97F4A7C15ull)
+                       ^ (uint64_t{N1} * 0xBF58476D1CE4E5B9ull)
+                       ^ (uint64_t{N2} * 0x94D049BB133111EBull);
+    return cache[key];
+}
+
+inline const Complex* get_two_level_twiddle_cached(
+    uint32_t N, uint32_t N1, uint32_t N2)
+{
+    auto& tab = two_level_twiddle_cache_entry(N, N1, N2);
+    if (tab.size() == static_cast<size_t>(N1) * N2) return tab.data();
+
+    tab.assign(static_cast<size_t>(N1) * N2, Complex{0.0f, 0.0f});
+    const double two_pi_over_N = -2.0 * M_PI / static_cast<double>(N);
+    for (uint32_t n1 = 0; n1 < N1; ++n1) {
+        for (uint32_t k2 = 0; k2 < N2; ++k2) {
+            const double angle =
+                two_pi_over_N * static_cast<double>(n1) * static_cast<double>(k2);
+            tab[static_cast<size_t>(n1) * N2 + k2] = Complex{
+                static_cast<float>(std::cos(angle)),
+                static_cast<float>(std::sin(angle))
+            };
+        }
+    }
+    return tab.data();
+}
+
 // ─── Generic two-level Cooley-Tukey ─────────────────────────────────────────
 //
 // The core primitive that the pow2 and mixed-radix paths both call. Splits
@@ -579,42 +617,25 @@ inline void two_level_fft_bf16(
         }
     }
 
-    // ── Step 3: between-pass twiddle + transpose ───────────────────────────
+    // Step 3: host-side fp32 pointwise twiddle + transpose.
     //   B[n1, k2] = A'[n1, k2] · exp(-2πi · n1 · k2 / N)
     //   C[k2, n1] = B[n1, k2]
     // Linearised:
     //   A'       indexed by [n1·N2 + k2]  (one sub-FFT per row)
     //   pass2_in indexed by [k2·N1 + n1]  (sub-FFT r = k2, length N1)
     //
-    // Plan A: when (N1, N2) are both pow2 and N2 ≤ 1024 we hand the work
-    // to fft_stockham's on-device pass-2 kernel. The kernel runs the
-    // multiply on 64 SFPUs in fp32 (UNPACK auto-converts bf16↔fp32 at
-    // the CB boundary, so precision is preserved end-to-end). Twiddles
-    // are pre-computed once per (N1, N2) and cached on the device — no
-    // host cos/sin on the hot path.
-    //
-    // Otherwise (e.g. mixed-radix N1 = 4, N2 = 9) fall back to the
-    // plain host loop — those sizes are small and host work is cheap.
+    // The twiddle table is a pure function of (N, N1, N2) — same for every
+    // call. We cache it so the hot path is just one fp32 complex multiply
+    // per element (no cos/sin). For N=16384 with depth-1 recursion this
+    // alone removes ~32k cos/sin calls per outer FFT.
+    const Complex* __restrict__ twid =
+        get_two_level_twiddle_cached(N, N1, N2);
     std::vector<Complex> pass2_in(N);
-    const bool pass2_can_use_device =
-        is_pow2(N1) && is_pow2(N2) && (N2 <= fft_stockham::kTileElems);
-    if (pass2_can_use_device) {
-        fft_stockham::StockhamPlan p2_plan{};
-        p2_plan.N  = N;
-        p2_plan.N1 = N1;
-        p2_plan.N2 = N2;
-        // Returns C in (N2, N1) row-major == pass2_in linearisation.
-        pass2_in = fft_stockham::pass2_twiddle_transpose(md, A_prime, p2_plan);
-    } else {
-        const double two_pi_over_N = -2.0 * M_PI / static_cast<double>(N);
-        for (uint32_t n1 = 0; n1 < N1; ++n1) {
-            for (uint32_t k2 = 0; k2 < N2; ++k2) {
-                const double angle =
-                    two_pi_over_N * static_cast<double>(n1) * static_cast<double>(k2);
-                const Complex T{static_cast<float>(std::cos(angle)),
-                                static_cast<float>(std::sin(angle))};
-                pass2_in[k2 * N1 + n1] = A_prime[n1 * N2 + k2] * T;
-            }
+    for (uint32_t n1 = 0; n1 < N1; ++n1) {
+        const Complex* __restrict__ tw_row = twid + static_cast<size_t>(n1) * N2;
+        const Complex* __restrict__ a_row  = A_prime.data() + static_cast<size_t>(n1) * N2;
+        for (uint32_t k2 = 0; k2 < N2; ++k2) {
+            pass2_in[k2 * N1 + n1] = a_row[k2] * tw_row[k2];
         }
     }
 

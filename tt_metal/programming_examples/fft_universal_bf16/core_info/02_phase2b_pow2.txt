@@ -3,37 +3,26 @@
 ================================================================================
 
 Path:    fft(N) -> pow2_fft_bf16(N) -> two_level_fft_bf16(N, N1=32)
-            -> 3 dispatches:  PASS-1 (packed_dft_bf16, FPU bf16)
-                              PASS-2 (pass2_compute,    SFPU fp32) [Plan A]
-                              PASS-3 (packed_dft_bf16, FPU bf16)
+            -> 2 dispatches (PASS-1, PASS-2), both packed_dft_bf16
             (PASS-1 may RECURSE into fft() if N2 > 32)
-Kernels: packed_dft_bf16_compute  (FPU bf16 matmul, Pass-1 / Pass-3)
-         pass2_compute            (SFPU fp32 cmul,  Pass-2, reused from
-                                                      fft_stockham/kernel)
-Cores:   per-dispatch:
-           PASS-1, PASS-3:  depends on `count` (see batched_pow2 rule)
-           PASS-2:          min(N1, 64) = up to 32 cores @ N1=32
+Kernel:  packed_dft_bf16_compute  (FPU bf16 matmul)
+Cores:   per-dispatch, depends on `count` of that dispatch (Rule above)
 
 --------------------------------------------------------------------------------
 PASS TIMELINE
 --------------------------------------------------------------------------------
 
-Three sequential device dispatches. The Pass-2 dispatch replaces the old
-host-CPU twiddle loop -- twiddles are pre-computed and cached on device,
-SFPU does the multiply in fp32 across 32 cores in parallel.
+The two passes are SEQUENTIAL (Pass-2 needs Pass-1's output via the
+host twiddle). Within each dispatch, work is distributed across cores.
 
 TIME ----------------------------------------------------------------->
 
-  PASS-1                 PASS-2                   PASS-3
-+------------+         +-------------+           +------------+
-| packed_dft | ------> | pass2_      | --------> | packed_dft |
-| _bf16      |         | compute     |           | _bf16      |
-| (N2, 32)   |         | (SFPU fp32) |           | (32, N2)   |
-+------------+         +-------------+           +------------+
-                       64 cores in
-                       parallel,
-                       twiddles cached
-                       per (N1, N2).
+  PASS-1                 HOST                   PASS-2
++------------+         +-------+              +------------+
+| packed_dft | --read->| twid+ | --write----> | packed_dft |
+| _bf16      |         | trans |              | _bf16      |
+| (N2, 32)   |         | (fp32)|              | (32, N2)   |
++------------+         +-------+              +------------+
      ^                                              ^
      | PASS-1 if N2 <= 32:                          | PASS-2 always:
      |   1 dispatch                                 |   1 dispatch

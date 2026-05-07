@@ -31,20 +31,24 @@ N ≥ 2**:
 | composite with no divisor ≤ 32 (e.g. `37²`)    | Phase 2c: Bluestein on `N` itself                             |
 
 Every reduction path funnels through the same `packed_dft_bf16` kernel
-on the FPU (bf16 matmul). The precision-critical between-pass twiddle
-multiply is dispatched to `fft_stockham`'s `pass2_compute` kernel
-(SFPU fp32, 64 cores) when (N1, N2) are both pow2 and N2 ≤ 1024 — so
-no host cos/sin sits on the hot path. Mixed-radix shapes that don't
-fit the pow2 kernel (e.g. N1=4, N2=9) fall back to a tiny host loop.
+on device (FPU bf16 matmul). The between-pass twiddle multiply runs on
+the host in fp32 — pointwise, no reduction, so fp32 there is strictly
+more accurate than bf16 would be.
 
-### Plan A — on-device Pass-2 (active)
+### Why Pass-2 is on the host (and what would move it on-device)
 
-Earlier prototype kept Pass-2 on the host CPU because the only twiddle
-table available was fp32 trig built per call. With this change the
-twiddles are pre-computed and uploaded once per `(N1, N2)` to DRAM and
-the per-tile complex multiply runs across up to 64 SFPUs. End-to-end
-result: bf16 path no longer ping-pongs through PCIe between Pass-1
-and Pass-3, and the cos/sin work is gone.
+We tried the obvious "Plan A" — dispatch the twiddle multiply through
+`fft_stockham`'s on-device `pass2_compute` (SFPU fp32, 64 cores). It
+**regressed performance** (4.06 ms → 7.31 ms at N=16384) because the
+bf16 dispatcher already returns Pass-1's output to the host before
+Pass-3 starts. Adding an on-device Pass-2 in the middle inserts an
+**extra** WriteShard + ReadShard pair per call, not a removed one.
+
+For Pass-2 to actually win on this path, the bf16 dispatcher needs to
+keep intermediate buffers in DRAM across passes (no readback between
+Pass-1 and Pass-3). That's a deeper refactor of the multi-pass plumbing
+— see SOP "device residency for bf16 multi-pass". Until then, host
+Pass-2 is the faster path.
 
 ## How the dispatch tree works
 
