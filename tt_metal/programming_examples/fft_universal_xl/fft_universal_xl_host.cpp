@@ -156,6 +156,25 @@ inline std::vector<Complex> fft_impl(
     std::printf("]  outer F1=%u, inner M=%u  (Option B: host twiddle)\n",
                 F1, M);
 
+    auto checksum = [](const std::vector<Complex>& v) -> std::pair<double, double> {
+        double s_abs = 0.0, s_sq = 0.0;
+        for (const auto& c : v) {
+            s_abs += std::fabs(c.real()) + std::fabs(c.imag());
+            s_sq  += static_cast<double>(c.real()) * c.real()
+                   + static_cast<double>(c.imag()) * c.imag();
+        }
+        return { s_abs, s_sq };
+    };
+    auto p_chk = [&](const char* tag, const std::vector<Complex>& v) {
+        auto [s_abs, s_sq] = checksum(v);
+        std::printf("    [chk] %-12s  size=%-9zu  L1=%.6e  L2^2=%.6e  "
+                    "v[0]=(%.4g,%.4g)  v[N-1]=(%.4g,%.4g)\n",
+                    tag, v.size(), s_abs, s_sq,
+                    v.front().real(), v.front().imag(),
+                    v.back().real(),  v.back().imag());
+    };
+    p_chk("signal_in", signal);
+
     // ── Step 0: strided pre-pack ──────────────────────────────────────
     // T[n1, n2] = signal[n2 * F1 + n1].  Each row n1 (length M) holds the
     // STRIDED gather signal[n1], signal[F1+n1], signal[2*F1+n1], ...
@@ -168,6 +187,7 @@ inline std::vector<Complex> fft_impl(
             tr[n2] = signal[static_cast<size_t>(n2) * F1 + n1];
         }
     }
+    p_chk("T_strided", T);
 
     // ── Step 1: F1 row-FFTs of length M (sequential) ──────────────────
     // Each row of T is a length-M contiguous buffer ready for fft_stockham.
@@ -177,15 +197,32 @@ inline std::vector<Complex> fft_impl(
         const Complex* src = T.data() + static_cast<size_t>(n1) * M;
         std::copy(src, src + M, row.begin());
 
+        // Per-row checksum BEFORE fft to confirm the right input is sent in.
+        auto [in_l1, in_l2] = checksum(row);
+        std::printf("    [chk] row[%u] in     L1=%.6e  L2^2=%.6e  "
+                    "row[0]=(%.4g,%.4g)\n",
+                    n1, in_l1, in_l2, row.front().real(), row.front().imag());
+
         std::vector<Complex> y_n1 = fft_stockham::fft(md, row);
+
+        auto [out_l1, out_l2] = checksum(y_n1);
+        std::printf("    [chk] row[%u] fft    size=%zu  L1=%.6e  L2^2=%.6e  "
+                    "y[0]=(%.4g,%.4g)  y[1]=(%.4g,%.4g)\n",
+                    n1, y_n1.size(), out_l1, out_l2,
+                    y_n1.empty() ? 0.0f : y_n1[0].real(),
+                    y_n1.empty() ? 0.0f : y_n1[0].imag(),
+                    y_n1.size() < 2 ? 0.0f : y_n1[1].real(),
+                    y_n1.size() < 2 ? 0.0f : y_n1[1].imag());
 
         Complex* dst = Y.data() + static_cast<size_t>(n1) * M;
         std::copy(y_n1.begin(), y_n1.end(), dst);
     }
+    p_chk("Y_after_fft", Y);
 
     // ── Step 2: host outer twiddle multiply ───────────────────────────
     auto tw = get_outer_twiddle(p.N, F1);
     for (size_t i = 0; i < Y.size(); ++i) Y[i] *= tw->w[i];
+    p_chk("Y_after_tw ", Y);
 
     // ── Step 3: transpose Y (F1 x M) -> Z (M x F1) on host ─────────────
     std::vector<Complex> Z(p.N);
@@ -195,11 +232,13 @@ inline std::vector<Complex> fft_impl(
             Z[static_cast<size_t>(k) * F1 + n1] = src[k];
         }
     }
+    p_chk("Z_transp   ", Z);
 
     // ── Step 4: M sub-FFTs of length F1 (one batched device dispatch) ─
     // F1 <= 1024 by planner construction so batch_fft accepts it.
     std::vector<Complex> W;
     fft_stockham::batch_fft(md, /*sub_N=*/F1, /*batch=*/M, Z, W);
+    p_chk("W_batchfft ", W);
 
     // ── Step 5: final reorder W (M x F1) -> X (length N) ──────────────
     // After Step 4 each row j in W is a length-F1 spectrum corresponding
@@ -217,6 +256,7 @@ inline std::vector<Complex> fft_impl(
         const uint32_t k1      = k / M;
         X[k] = W[static_cast<size_t>(k_inner) * F1 + k1];
     }
+    p_chk("X_out      ", X);
     return X;
 }
 
