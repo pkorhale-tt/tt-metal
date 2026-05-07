@@ -18,8 +18,12 @@
 //
 // Algorithm for K=3 (N = F1 * M, F1 = SMALLEST factor, M = N / F1):
 //
-//   Step 1  : F1 sequential calls to fft_stockham::fft on rows of length M
-//             (reshape `signal` as F1 x M row-major, FFT each row).
+//   Step 0  : strided pre-pack — reshape signal so row n1 (length M) is
+//             T[n1, n2] = signal[n2 * F1 + n1].  Pure host memory shuffle
+//             (no arithmetic).  This is REQUIRED for the standard 2-step
+//             Cooley-Tukey decomposition; doing contiguous chunks would
+//             give the wrong inner-FFT input.
+//   Step 1  : F1 sequential calls to fft_stockham::fft on rows of length M.
 //   Step 2  : host outer twiddle multiply
 //                 Y[n1, k_inner] *= w_N^(n1 * k_inner)
 //             with w_N = exp(-2*pi*i / N), table cached per N.
@@ -152,12 +156,25 @@ inline std::vector<Complex> fft_impl(
     std::printf("]  outer F1=%u, inner M=%u  (Option B: host twiddle)\n",
                 F1, M);
 
+    // ── Step 0: strided pre-pack ──────────────────────────────────────
+    // T[n1, n2] = signal[n2 * F1 + n1].  Each row n1 (length M) holds the
+    // STRIDED gather signal[n1], signal[F1+n1], signal[2*F1+n1], ...
+    // This is the input layout the inner FFT_M expects in standard 2-step
+    // Cooley-Tukey decomposition.  Pure memory shuffle, no arithmetic.
+    std::vector<Complex> T(p.N);
+    for (uint32_t n1 = 0; n1 < F1; ++n1) {
+        Complex* tr = T.data() + static_cast<size_t>(n1) * M;
+        for (uint32_t n2 = 0; n2 < M; ++n2) {
+            tr[n2] = signal[static_cast<size_t>(n2) * F1 + n1];
+        }
+    }
+
     // ── Step 1: F1 row-FFTs of length M (sequential) ──────────────────
-    // Reshape `signal` as F1 x M row-major: row n1 is signal[n1*M : (n1+1)*M].
+    // Each row of T is a length-M contiguous buffer ready for fft_stockham.
     std::vector<Complex> Y(p.N);
     std::vector<Complex> row(M);
     for (uint32_t n1 = 0; n1 < F1; ++n1) {
-        const Complex* src = signal.data() + static_cast<size_t>(n1) * M;
+        const Complex* src = T.data() + static_cast<size_t>(n1) * M;
         std::copy(src, src + M, row.begin());
 
         std::vector<Complex> y_n1 = fft_stockham::fft(md, row);
