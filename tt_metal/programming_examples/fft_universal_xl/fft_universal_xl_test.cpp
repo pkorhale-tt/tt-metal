@@ -122,8 +122,81 @@ int main() {
     test_round_trip   (md, 65536,   1e-4);
     test_round_trip   (md, 1048576, 1e-4);
 
-    // K=3 cases (N > 1M).  Round-trip only; full DFT is unaffordable here.
-    std::printf("\n-- XL outer recursion (k = 3) --\n");
+    // K=3 cases (N > 1M).  Use cheap-to-verify spectra first to localise
+    // bugs without an O(N^2) reference DFT.
+    std::printf("\n-- XL outer recursion (k = 3): impulse input --\n");
+    {
+        // x[n] = delta(n); expected X[k] = 1 for every k.
+        const uint32_t N = 2097152;
+        std::vector<Complex> x(N, Complex{0.0f, 0.0f});
+        x[0] = Complex{1.0f, 0.0f};
+        auto X = fft_universal_xl::fft(md, x);
+
+        // Check ALL bins are ~1 + 0i.
+        double worst = 0.0;
+        uint32_t worst_k = 0;
+        for (uint32_t k = 0; k < N; ++k) {
+            const double dr = static_cast<double>(X[k].real()) - 1.0;
+            const double di = static_cast<double>(X[k].imag());
+            const double e  = std::sqrt(dr * dr + di * di);
+            if (e > worst) { worst = e; worst_k = k; }
+        }
+        const bool ok = worst <= 1e-4;
+        std::printf("%s N=%-9u  impulse fft (expect X[k]=1 for all k)  "
+                    "max_err=%.3e at k=%u\n",
+                    tick(ok), N, worst, worst_k);
+        (ok ? g_pass : g_fail)++;
+
+        if (!ok) {
+            std::printf("    First 8 bins of X:\n");
+            for (uint32_t k = 0; k < 8 && k < N; ++k) {
+                std::printf("      X[%u] = (%.4g, %.4g)\n",
+                            k, X[k].real(), X[k].imag());
+            }
+            std::printf("    Bins around the M boundary (M=%u):\n", N / 2);
+            for (uint32_t k = (N/2) - 4; k < (N/2) + 4; ++k) {
+                std::printf("      X[%u] = (%.4g, %.4g)\n",
+                            k, X[k].real(), X[k].imag());
+            }
+        }
+    }
+
+    std::printf("\n-- XL outer recursion (k = 3): single-tone input --\n");
+    {
+        // x[n] = exp(+2*pi*i * k0 * n / N); expected X[k] has a single
+        // spike of magnitude N at k=k0, zero elsewhere.
+        const uint32_t N  = 2097152;
+        const uint32_t k0 = 7;   // arbitrary low bin
+        std::vector<Complex> x(N);
+        const double ang = 2.0 * M_PI * static_cast<double>(k0)
+                                      / static_cast<double>(N);
+        for (uint32_t n = 0; n < N; ++n) {
+            x[n] = Complex{
+                static_cast<float>(std::cos(ang * n)),
+                static_cast<float>(std::sin(ang * n))
+            };
+        }
+        auto X = fft_universal_xl::fft(md, x);
+
+        // Find max-magnitude bin.
+        uint32_t peak_k = 0;
+        double   peak_m = 0.0;
+        for (uint32_t k = 0; k < N; ++k) {
+            const double m = std::sqrt(
+                static_cast<double>(X[k].real()) * X[k].real() +
+                static_cast<double>(X[k].imag()) * X[k].imag());
+            if (m > peak_m) { peak_m = m; peak_k = k; }
+        }
+        const bool ok =
+            (peak_k == k0) && (peak_m > 0.95 * static_cast<double>(N));
+        std::printf("%s N=%-9u  single tone k0=%u  found peak at k=%u "
+                    "(|X|=%.3e, expected %.3e)\n",
+                    tick(ok), N, k0, peak_k, peak_m,
+                    static_cast<double>(N));
+        (ok ? g_pass : g_fail)++;
+    }
+
+    std::printf("\n-- XL outer recursion (k = 3): random round-trip --\n");
     test_round_trip   (md, 2097152, 1e-4);  // 2M
     test_round_trip   (md, 4194304, 1e-4);  // 4M
 
