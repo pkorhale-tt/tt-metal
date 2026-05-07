@@ -4,17 +4,28 @@
 // fft_universal_xl_host.cpp — XL FFT dispatcher (Option B: host outer twiddle).
 //
 // Handles power-of-two N from 2 up to 1,073,741,824 (2^30) by chaining
-// existing fft_stockham kernels with a HOST-SIDE outer twiddle multiply.
+// existing fft_stockham kernels with HOST-SIDE outer twiddle multiply
+// AND HOST-SIDE outer length-F1 butterfly.
+//
+// Why the outer butterfly is on host (not on batch_fft):
+//   The existing fft_stockham::batch_fft kernel allocates ONE FULL
+//   1024-element tile per sub-FFT regardless of sub_N. For K=3 cases
+//   the outer pass would be batch=M sub-FFTs of length F1, where M
+//   can be up to 1,048,576. That's 4 buffers × 1M tiles × 4 KB =
+//   16 GB of DRAM — impossible on a 12 GB Wormhole. Until a packed
+//   batch_fft_xl kernel (many short FFTs / tile) lands, we have to
+//   keep this step on the host. F1 is by construction the SMALLEST
+//   factor in the plan (typically 2 or 4), so the per-element cost
+//   is at most a handful of FMAs — trivial vs the host outer-twiddle.
 //
 // Trade-off vs the eventual on-device path (Option A / pass2_xl):
 //   * Pros: works today with NO new device kernels, accepts any pow2 N.
-//   * Cons: the outer twiddle multiply is a host-side complex multiply
-//           per element. For N <= 1M we never hit this path (we delegate
-//           straight to fft_stockham). For N > 1M each element costs
-//           ~10 ns on the host — at N=1G that's ~10 s of host arithmetic
-//           on top of device time. Big-N runtime is dominated by the F1
-//           sequential outer fft_stockham calls anyway, so the host
-//           twiddle is rarely the bottleneck in practice.
+//   * Cons: outer twiddle multiply + outer length-F1 butterfly are on
+//           the host. For N <= 1M we never hit this path (we delegate
+//           straight to fft_stockham). For N > 1M, host arithmetic is
+//           O(N) with a tiny constant — bounded by the host-twiddle
+//           step which is ~150 ms / GB-elem. Big-N runtime is dominated
+//           by the F1 sequential inner fft_stockham calls anyway.
 //
 // Algorithm for K=3 (N = F1 * M, F1 = SMALLEST factor, M = N / F1):
 //
@@ -27,10 +38,13 @@
 //   Step 2  : host outer twiddle multiply
 //                 Y[n1, k_inner] *= w_N^(n1 * k_inner)
 //             with w_N = exp(-2*pi*i / N), table cached per N.
-//   Step 3  : transpose Y (F1 x M) -> Z (M x F1) on host (no arithmetic).
-//   Step 4  : ONE batched device dispatch: M sub-FFTs of length F1 via
-//             fft_stockham::batch_fft (F1 <= 1024 by planner construction).
-//   Step 5  : host reorder W (M x F1) -> X (length N).
+//   Step 3  : host length-F1 butterfly per inner index k_inner (M of them).
+//             Writes directly into the natural-order output X — fuses with
+//             the final reorder. F1 <= 1024 by planner; in practice F1 is
+//             the SMALLEST factor (2 or 4 for almost all N <= 1G), so this
+//             is a few FMAs per output element.
+//   Step 4  : (N/A — fused into Step 3.)
+//   Step 5  : (N/A — fused into Step 3.)
 //
 // The host twiddle table is cached so the SECOND call for the same N
 // is cos/sin-free.
@@ -153,27 +167,9 @@ inline std::vector<Complex> fft_impl(
     for (size_t i = 0; i < p.factors.size(); ++i) {
         std::printf("%s%u", (i ? ", " : ""), p.factors[i]);
     }
-    std::printf("]  outer F1=%u, inner M=%u  (Option B: host twiddle)\n",
+    std::printf("]  outer F1=%u, inner M=%u  "
+                "(Option B: host outer twiddle + host F1-pt butterfly)\n",
                 F1, M);
-
-    auto checksum = [](const std::vector<Complex>& v) -> std::pair<double, double> {
-        double s_abs = 0.0, s_sq = 0.0;
-        for (const auto& c : v) {
-            s_abs += std::fabs(c.real()) + std::fabs(c.imag());
-            s_sq  += static_cast<double>(c.real()) * c.real()
-                   + static_cast<double>(c.imag()) * c.imag();
-        }
-        return { s_abs, s_sq };
-    };
-    auto p_chk = [&](const char* tag, const std::vector<Complex>& v) {
-        auto [s_abs, s_sq] = checksum(v);
-        std::printf("    [chk] %-12s  size=%-9zu  L1=%.6e  L2^2=%.6e  "
-                    "v[0]=(%.4g,%.4g)  v[N-1]=(%.4g,%.4g)\n",
-                    tag, v.size(), s_abs, s_sq,
-                    v.front().real(), v.front().imag(),
-                    v.back().real(),  v.back().imag());
-    };
-    p_chk("signal_in", signal);
 
     // ── Step 0: strided pre-pack ──────────────────────────────────────
     // T[n1, n2] = signal[n2 * F1 + n1].  Each row n1 (length M) holds the
@@ -187,7 +183,6 @@ inline std::vector<Complex> fft_impl(
             tr[n2] = signal[static_cast<size_t>(n2) * F1 + n1];
         }
     }
-    p_chk("T_strided", T);
 
     // ── Step 1: F1 row-FFTs of length M (sequential) ──────────────────
     // Each row of T is a length-M contiguous buffer ready for fft_stockham.
@@ -197,66 +192,79 @@ inline std::vector<Complex> fft_impl(
         const Complex* src = T.data() + static_cast<size_t>(n1) * M;
         std::copy(src, src + M, row.begin());
 
-        // Per-row checksum BEFORE fft to confirm the right input is sent in.
-        auto [in_l1, in_l2] = checksum(row);
-        std::printf("    [chk] row[%u] in     L1=%.6e  L2^2=%.6e  "
-                    "row[0]=(%.4g,%.4g)\n",
-                    n1, in_l1, in_l2, row.front().real(), row.front().imag());
-
         std::vector<Complex> y_n1 = fft_stockham::fft(md, row);
-
-        auto [out_l1, out_l2] = checksum(y_n1);
-        std::printf("    [chk] row[%u] fft    size=%zu  L1=%.6e  L2^2=%.6e  "
-                    "y[0]=(%.4g,%.4g)  y[1]=(%.4g,%.4g)\n",
-                    n1, y_n1.size(), out_l1, out_l2,
-                    y_n1.empty() ? 0.0f : y_n1[0].real(),
-                    y_n1.empty() ? 0.0f : y_n1[0].imag(),
-                    y_n1.size() < 2 ? 0.0f : y_n1[1].real(),
-                    y_n1.size() < 2 ? 0.0f : y_n1[1].imag());
 
         Complex* dst = Y.data() + static_cast<size_t>(n1) * M;
         std::copy(y_n1.begin(), y_n1.end(), dst);
     }
-    p_chk("Y_after_fft", Y);
 
     // ── Step 2: host outer twiddle multiply ───────────────────────────
     auto tw = get_outer_twiddle(p.N, F1);
     for (size_t i = 0; i < Y.size(); ++i) Y[i] *= tw->w[i];
-    p_chk("Y_after_tw ", Y);
 
-    // ── Step 3: transpose Y (F1 x M) -> Z (M x F1) on host ─────────────
-    std::vector<Complex> Z(p.N);
-    for (uint32_t n1 = 0; n1 < F1; ++n1) {
-        const Complex* src = Y.data() + static_cast<size_t>(n1) * M;
-        for (uint32_t k = 0; k < M; ++k) {
-            Z[static_cast<size_t>(k) * F1 + n1] = src[k];
+    // ── Step 3: host length-F1 DFT, fused with the final reorder ──────
+    // For each inner output index c in [0, M), pull the F1 values
+    //   v[a] = Y[a, c]         (a in [0, F1))
+    // do an F1-point DFT
+    //   Vb[d] = sum_a v[a] * w_F1^(d * a)
+    // and write
+    //   X[c + M * d] = Vb[d]    for d in [0, F1)
+    //
+    // Why F1-point DFT (O(F1^2)) and not FFT (O(F1 log F1)): F1 is by
+    // planner construction the SMALLEST plan factor.  For every N up to
+    // 2^30 we currently produce, F1 ∈ {2, 4} — so F1^2 is at most 16
+    // multiplies per output element.  Going to FFT would not change the
+    // big-O bottleneck (host outer twiddle Step 2 dominates).  Doing it
+    // straight as DFT also lets us trivially fuse with the output reorder
+    // and avoid a separate transpose buffer.
+    std::vector<Complex> X(p.N);
+    if (F1 == 2u) {
+        // Special case: length-2 DFT is just (a + b, a - b).  Tightest
+        // possible host loop — one add and one sub per output pair.
+        for (uint32_t c = 0; c < M; ++c) {
+            const Complex a = Y[/*n1=0*/ 0u * M + c];
+            const Complex b = Y[/*n1=1*/ 1u * M + c];
+            X[c]            = a + b;          // d = 0
+            X[M + c]        = a - b;          // d = 1
+        }
+    } else {
+        // General length-F1 DFT.  Use a tiny per-N cached F1-point twiddle
+        // table — same amortisation pattern as the outer twiddle.
+        static thread_local std::vector<Complex> sub_tw;
+        static thread_local uint32_t             sub_tw_F1 = 0;
+        if (sub_tw_F1 != F1) {
+            sub_tw.assign(static_cast<size_t>(F1) * F1, Complex{1.0f, 0.0f});
+            const double two_pi_over_F1 = -2.0 * M_PI
+                                        / static_cast<double>(F1);
+            for (uint32_t d = 0; d < F1; ++d) {
+                Complex* trow = sub_tw.data() + static_cast<size_t>(d) * F1;
+                for (uint32_t a = 0; a < F1; ++a) {
+                    const double ang = two_pi_over_F1
+                                     * static_cast<double>(d)
+                                     * static_cast<double>(a);
+                    trow[a] = Complex{
+                        static_cast<float>(std::cos(ang)),
+                        static_cast<float>(std::sin(ang))
+                    };
+                }
+            }
+            sub_tw_F1 = F1;
+        }
+
+        std::vector<Complex> v(F1);
+        for (uint32_t c = 0; c < M; ++c) {
+            for (uint32_t a = 0; a < F1; ++a) {
+                v[a] = Y[static_cast<size_t>(a) * M + c];
+            }
+            for (uint32_t d = 0; d < F1; ++d) {
+                const Complex* trow = sub_tw.data()
+                                    + static_cast<size_t>(d) * F1;
+                Complex acc{0.0f, 0.0f};
+                for (uint32_t a = 0; a < F1; ++a) acc += v[a] * trow[a];
+                X[static_cast<size_t>(d) * M + c] = acc;
+            }
         }
     }
-    p_chk("Z_transp   ", Z);
-
-    // ── Step 4: M sub-FFTs of length F1 (one batched device dispatch) ─
-    // F1 <= 1024 by planner construction so batch_fft accepts it.
-    std::vector<Complex> W;
-    fft_stockham::batch_fft(md, /*sub_N=*/F1, /*batch=*/M, Z, W);
-    p_chk("W_batchfft ", W);
-
-    // ── Step 5: final reorder W (M x F1) -> X (length N) ──────────────
-    // After Step 4 each row j in W is a length-F1 spectrum corresponding
-    // to "column j" of the F1 x M matrix. The natural 1D output index k
-    // in [0, N) corresponds to (n1=k%F1, k_inner=k/F1) in the original
-    // Cooley-Tukey recipe (k = n1 * M + k_inner is the input index;
-    // the output index is k_out = k_inner * F1 + k1 — so a simple
-    // strided gather).  Using the symmetric mapping consistent with
-    // fft_stockham::final_reorder:
-    //
-    //   X[k] = W[(k % M) * F1 + (k / M)]
-    std::vector<Complex> X(p.N);
-    for (uint32_t k = 0; k < p.N; ++k) {
-        const uint32_t k_inner = k % M;
-        const uint32_t k1      = k / M;
-        X[k] = W[static_cast<size_t>(k_inner) * F1 + k1];
-    }
-    p_chk("X_out      ", X);
     return X;
 }
 
