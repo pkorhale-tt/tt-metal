@@ -41,18 +41,27 @@ ninja -C build \
 For pow2 `N <= 1M` the dispatcher delegates straight to `fft_stockham`
 (no XL-specific work, identical performance and accuracy).
 
-For pow2 `N > 1M` (the new regime), the dispatcher applies a 5-step
+For pow2 `N > 1M` (the new regime), the dispatcher applies a 4-step
 Cooley-Tukey decomposition with the **smallest** factor as outer:
 
 | Step | Where | What |
 |---|---|---|
+| 0 | host | strided pre-pack `T[n1, n2] = signal[n2·F1 + n1]` (no math) |
 | 1 | device | F1 sequential `fft_stockham::fft` calls of length M = N / F1 |
 | 2 | **host** ⚠ | outer twiddle multiply `Y[n1, k] *= exp(-2πi · n1·k / N)` (cached cos/sin table) |
-| 3 | host | transpose Y (F1 × M) → Z (M × F1) — pure memcopy, no math |
-| 4 | device | ONE batched `batch_fft(sub_N=F1, batch=M)` dispatch |
-| 5 | host | reorder W (M × F1) → X (length N) — pure memcopy |
+| 3 | **host** ⚠ | length-F1 DFT per inner index (F1 ∈ {2, 4} in practice — at most 16 muls/element) fused with the final reorder |
 
-**Step 2 is the only host arithmetic.** That's what Option A removes.
+**Why Step 3 is on host (not on `batch_fft`):** the existing `batch_fft`
+kernel allocates one full 1024-element tile per sub-FFT regardless of
+`sub_N`. For K=3 with `batch = M` up to 1 M, that would request **16 GB
+of DRAM** (4 buffers × 1 M tiles × 4 KB) — impossible on a 12 GB
+Wormhole. Until a packed `batch_fft_xl` kernel ships (many short FFTs
+per tile), Step 3 stays on the host. F1 is by planner construction the
+smallest factor (typically 2 or 4), so the DFT is trivial — for F1=2
+it degenerates to one add and one sub per output pair.
+
+**Steps 2 and 3 are the only host arithmetic.** Both are removed once
+Option A's `pass2_xl` kernel + a packed `batch_fft_xl` kernel land.
 
 ## What "Option B" gives you vs what "Option A" would add
 
