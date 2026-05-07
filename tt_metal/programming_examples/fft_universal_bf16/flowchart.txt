@@ -16,12 +16,23 @@ All host orchestration glue (twiddle multiply, transpose, chirp, FFT
 of A and B, conjugate trick) is fp32 on the CPU. The reduction-critical
 arithmetic (the matmuls) is bf16 on the FPU.
 
-NOTE: We tried to push Pass-2 onto the on-device fft_stockham SFPU
-kernel ("Plan A") but it added an extra WriteShard+ReadShard pair per
-call and regressed end-to-end runtime (4 ms -> 7 ms at N=16384). The
-real fix is to keep Pass-1's output in DRAM (no host trip) so Pass-2
-and Pass-3 can stream from there -- a deeper refactor of the bf16
-dispatcher. See SOP "device residency for bf16 multi-pass".
+OPTIMISATION HISTORY:
+  v1 (per-sibling recursion + per-call cos/sin)        : 4.06 ms @ N=16384
+  v2 (cached between-pass twiddle table)               : 3.52 ms (-13%)
+  v3 (batched_two_level_fft_bf16 collapses N1 sub-FFT  : 0.70 ms (-83%)
+       recursion into 2 batched dispatches)
+  Now competitive with fp32 (0.56 ms).
+
+  v3 dispatch count for N=16384:  3 device dispatches total
+       (was 65 with per-sibling recursion).
+  See `batched_two_level_fft_bf16` in fft_universal_bf16_host.cpp.
+
+  Earlier attempt that regressed: pushing Pass-2 onto the fft_stockham
+  on-device SFPU kernel ("Plan A") added an extra WriteShard+ReadShard
+  pair per call and slowed things to 7.31 ms. Reverted. Lesson: the
+  bf16 path round-trips through host between every dispatch, so the
+  win is in REMOVING dispatches, not redistributing where the multiply
+  happens.
 
 --------------------------------------------------------------------------------
 TOP-LEVEL ENTRY POINT

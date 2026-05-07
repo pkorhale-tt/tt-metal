@@ -1,5 +1,20 @@
 # fft_universal_bf16 — TRUE-bf16 FFT on Wormhole
 
+## Recommended operating range (measured)
+
+| Target accuracy        | Max usable N            | Notes                                |
+|------------------------|------------------------:|--------------------------------------|
+| rel err ≤ 2.5e-2 (bf16)|         **2,097,152 (2M)** | Verified with 1-iter probe sweep. 2M = 438 ms cached. |
+| rel err ≤ 5e-2         |          ≤ 4M (untested)   | Bf16 cliff is between 2M and 8M.     |
+| **Anywhere above 4M**  |   **not recommended**      | At N = 8M rel err ≈ 0.19 (broken).   |
+
+Use `fft_universal/` (fp32) when you need rel err ≤ 1e-5; it's clean
+up to N = 1,048,576 (1M). For N > 1M, this bf16 path is **the only
+working option** on the current build (fp32 Stockham planner asserts
+out at sub-FFT lengths > 1024).
+
+---
+
 Sibling of `fft_universal/` that keeps bf16 on the compute path end-to-end.
 Every multiply that happens on the Tensix is a `bf16 × bf16 → fp32` FPU
 matmul — no SFPU butterflies, no "bf16 storage with fp32 compute" detours.
@@ -44,11 +59,16 @@ bf16 dispatcher already returns Pass-1's output to the host before
 Pass-3 starts. Adding an on-device Pass-2 in the middle inserts an
 **extra** WriteShard + ReadShard pair per call, not a removed one.
 
-For Pass-2 to actually win on this path, the bf16 dispatcher needs to
-keep intermediate buffers in DRAM across passes (no readback between
-Pass-1 and Pass-3). That's a deeper refactor of the multi-pass plumbing
-— see SOP "device residency for bf16 multi-pass". Until then, host
-Pass-2 is the faster path.
+The right fix turned out to be the opposite direction: instead of
+moving more work onto the device, **batch the recursive sub-FFTs into
+fewer dispatches** so the host bounce per dispatch hurts less. See the
+"Performance" section below for measurements.
+
+For Pass-2 itself to actually win on-device, the bf16 dispatcher would
+need to keep intermediate buffers in DRAM across passes (no readback
+between Pass-1 and Pass-3). That's a deeper refactor of the multi-pass
+plumbing — see SOP "device residency for bf16 multi-pass". Until then,
+host Pass-2 is the faster path.
 
 ## How the dispatch tree works
 
@@ -141,53 +161,100 @@ ninja -C build \
 ./build/programming_examples/fft_universal_bf16/metal_example_fft_universal_bf16_demo 60    7    # mixed-radix
 ```
 
-## Expected precision
+## Measured precision and runtime  (post-v3 batched path)
 
-bf16 has ~8 bits of mantissa → ULP ~4e-3 relative. Random complex input
-with `|x| ≤ 1`:
+bf16 has ~8 bits of mantissa → ULP ~4e-3 relative. Numbers below are
+measured on Wormhole, random complex input `|x| ≤ 1`, 100 cached iters
+(50 for non-pow2). `rel err` is for `ifft(fft(x)) vs x` round-trip
+(test suite `random` cases match the same band, see test output).
 
-| N                               | Path                 | Rel err   | SNR         |
-|---------------------------------|----------------------|-----------|-------------|
-| `N ≤ 32`                        | Phase 1              | 2-4e-3    | 48-56 dB    |
-| pow2 `N ∈ [64, 1024]`           | Phase 2b depth-1     | 3-5e-3    | 46-50 dB    |
-| pow2 `N ∈ [2048, 16384]`        | Phase 2b depth-2     | 5-10e-3   | 40-46 dB    |
-| pow2 `N ∈ [32768, 65536]`       | Phase 2b depth-3     | 8-15e-3   | 36-42 dB    |
-| composite `N` (mixed-radix)     | Phase 2b (varies)    | 3-8e-3    | 42-50 dB    |
-| prime `N ≤ 251`                 | Bluestein, M ≤ 512   | 5-10e-3   | 40-46 dB    |
-| prime `N ≤ 1009`                | Bluestein, M ≤ 2048  | 8-20e-3   | 34-42 dB    |
-| hard composite (37²)            | Bluestein, M = 4096  | 10-25e-3  | 32-40 dB    |
+### Pow2 (Phase 2b)
 
-The accuracy cost scales with **recursion depth** (each device round-trip
-is ~2 bf16 roundings on the critical path). If your application needs
-tighter precision, use `fft_universal/` (fp32, ~1e-6 relative).
+| N         | FFT (ms) | IFFT (ms) | RT rel err | Path                       | Dispatches |
+|-----------|---------:|----------:|-----------:|----------------------------|-----------:|
+| 1024      |    0.084 |     0.083 |   9.55e-03 | depth-1 direct (N1=32)     |          1 |
+| 2048      |    0.331 |     0.330 |   1.08e-02 | v3 batched two-level       |          2 |
+| 4096      |    0.367 |     0.369 |   1.17e-02 | v3 batched two-level       |          2 |
+| 8192      |    0.459 |     0.462 |   1.08e-02 | v3 batched two-level       |          2 |
+| 16384     |    0.697 |     0.714 |   1.25e-02 | v3 batched two-level       |          2 |
+| 32768     |    1.268 |     1.188 |   1.26e-02 | v3 batched (1 unique JIT)  |          3 |
+| 65536     |   11.534 |    11.585 |   1.83e-02 | recursion + v3 inner       |        ~97 |
+| 131,072   |   15.108 |       —   |   1.90e-02 | depth-3 recursion + v3     |          — |
+| 262,144   |   21.421 |       —   |   1.47e-02 | depth-3 recursion + v3     |          — |
+| 524,288   |   36.785 |       —   |   1.64e-02 | depth-3 recursion + v3     |          — |
+| 1,048,576 |   68.444 |       —   |   2.09e-02 | depth-3 recursion + v3     |          — |
+| 2,097,152 |  437.776 |       —   |   2.19e-02 | deep recursion             |          — |
+| 8,388,608 | 1086.630 |  1146.401 |   1.86e-01 | **NUMERICALLY DEGRADED**   |          — |
 
-## Performance notes (honest)
+`N <= 32768` runs all-batched (1-3 dispatches). `N = 65536` and above
+fall outside the outer batched gate (`N2/32 > 32`) so they do
+recursive sub-FFTs — each of which uses v3 internally, keeping cost
+much lower than legacy per-sibling recursion would. **Up to N ≈ 2M
+the round-trip rel err stays in the ~2e-2 band (normal bf16).** At
+N = 8M cumulative bf16 roundings push rel err to ~0.19 — that size is
+beyond the usable accuracy envelope of the current path.
 
-Phase 2b/2c is orchestrated correctness-first, not performance-first.
-Each recursive level dispatches separately with no cross-sibling
-batching. For large `N` you will see **many kernel dispatches per FFT**:
+### Mixed-radix (Phase 2b composite)
 
-* `N = 2048`: ~65 dispatches (`pass-1` = 32 × Phase-2a, `pass-2` = 1).
-* `N = 16384`: ~65 dispatches (N1=32, N2=512 ≤ 1024).
-* `N = 65536`: ~2080 dispatches (N2=2048 needs another level).
-* Bluestein `N = 1009`: 3 × ~65 = ~195 dispatches on `M = 2048`.
+| N    | FFT (ms) | RT rel err | Path                        |
+|------|---------:|-----------:|-----------------------------|
+| 60   |    0.100 |   6.62e-03 | 30 × 2 (largest divisor)    |
+| 100  |    0.098 |   7.95e-03 | 25 × 4                      |
+| 360  |    0.100 |   8.09e-03 | 30 × 12                     |
+| 3600 |    2.964 |   1.17e-02 | depth-2 mixed (30 × 120)    |
 
-At ~0.14 ms per dispatch (warm) expect ~10 ms for `N = 2048`, ~10 ms for
-`N = 16384`, ~300 ms for `N = 65536`. This is slow vs CPU for the
-larger sizes — not because bf16 compute is slow, but because we are
-paying dispatch overhead per sub-FFT. Future work to batch same-size
-sub-FFTs into a single kernel would collapse those to 1-2 dispatches
-per pass. See `sop.txt → FUTURE WORK`.
+### Bluestein (Phase 2c)
+
+| N    | M (FFT len) | FFT (ms) | RT rel err |
+|------|------------:|---------:|-----------:|
+| 37   |         128 |    0.292 |   8.56e-03 |
+| 251  |         512 |    0.303 |   1.49e-02 |
+| 509  |        1024 |    0.318 |   1.91e-02 |
+| 1009 |        2048 |    1.019 |   1.90e-02 |
+| 1369 |        4096 |    1.157 |   1.86e-02 |
+
+Bluestein internally calls `fft(M)` three times, and all three benefit
+from v3's batched path → these numbers are roughly `3 × pow2(M)` time.
+
+### Round-trip precision band (test suite)
+
+Worst observed `ifft(fft(x))` rel err across the full sweep is
+**1.97e-02** (N=1369 Bluestein, depth-2 chained matmuls).
+Worst forward FFT-vs-double rel err is **8.70e-03** (N=1009 Bluestein).
+For 1e-6-class precision use `fft_universal/` (fp32 path).
+
+## Performance summary
+
+See [Measured precision and runtime](#measured-precision-and-runtime-post-v3-batched-path)
+above for the full sweep. Headline: **N = 16384 in 0.7 ms**, within
+24% of the fp32 path (0.56 ms).
+
+**Optimisation timeline at N=16384:**
+
+| Step | What changed                                        | ms    | Δ      |
+|------|-----------------------------------------------------|-------|--------|
+| v1   | per-sibling recursion + per-call host cos/sin       | 4.06  | —      |
+| v2   | cached between-pass twiddle table                   | 3.52  | -13%   |
+| v3   | `batched_two_level_fft_bf16` (collapse N1 sub-FFTs) | 0.70  | **-83%**|
+
+The big v3 win came from **removing dispatches**, not redistributing
+them. Going from 65 sequential dispatches to 3 batched ones eliminated
+~3 ms of host-device round-trip overhead.
+
+v3 also helps at sizes that fall outside its outer gate. At N=65536
+(N2/32 > 32, so the outer call still recurses) the inner `fft(2048)`
+sub-calls each pick up v3, giving ~11.5 ms instead of the ~50 ms a
+fully-non-batched depth-3 path would cost.
 
 ## Roadmap
 
-1. **Batched pow2 kernel**: make `packed_dft_bf16` accept a `count`
-   parameter that is *not* tied to `PACKED_ROWS_PER_TILE = 32`. Would
-   let one dispatch cover all siblings of a pass, collapsing
-   `pass-1 of N=2048` from 32 dispatches to 1.
+1. **bf16 batch_fft kernel** (analogue of fp32 `batch_fft`): would handle
+   `N > 32` natively without recursing back through the dispatcher. Pushes
+   `N >= 65536` into the batched fast path. Estimated 1-2 weeks of work.
 2. **Device-side twiddle + transpose**: a small `bf16 × bf16 → bf16`
-   elementwise kernel that avoids the host bounce between passes. The
-   accuracy loss for going bf16 on the pointwise step is bounded
-   because it has zero reduction depth.
-3. **Multi-core dispatch**: shard `count` siblings across Tensix cores
-   so the same dispatch gets wider parallelism.
+   elementwise kernel that avoids the host bounce between passes. Only
+   profitable once #3 below removes the readback that motivated host
+   twiddle in the first place.
+3. **Device residency for multi-pass**: keep Pass-1 output in DRAM so
+   Pass-2/3 can stream from there. Required before any on-device Pass-2
+   plan can win (see "Plan A" failure above).

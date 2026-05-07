@@ -1,5 +1,19 @@
 # fft_universal — FFT for ANY N (not just powers of two)
 
+## Recommended operating range (measured)
+
+| Target accuracy        | Max usable N            | Notes                                |
+|------------------------|------------------------:|--------------------------------------|
+| rel err ≤ 1e-6 (paper) |  **1,048,576 (2²⁰, 1M)** | Verified clean across 64K-1M sweep. 1M = 58 ms cached. |
+| rel err ≤ 1e-3         |  same; degrades with N  | Path is fp32 throughout, no soft cliff. |
+| Pow2 N ≥ 2,097,152 (2M)|     **NOT SUPPORTED**   | Stockham planner asserts `sub_N <= 1024`. |
+| Composite N ≥ ~10M     |   numerically broken    | rel err ≈ 0.46 at N=10M (chained mixed-radix on bf16-multiplier FPU). |
+
+For N > 1M, switch to `fft_universal_bf16/` — it handles up to ~2M
+with rel err ≈ 2e-2 (normal bf16) and doesn't hit the planner cap.
+
+---
+
 `fft_universal::fft(md, signal)` computes the DFT of a complex signal of any
 length N >= 2. Internally it reuses `fft_stockham/` for pow2 sub-FFTs of
 length ≥ 64 and adds ONE new device kernel — the **packed direct-DFT

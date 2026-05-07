@@ -3,26 +3,51 @@
 ================================================================================
 
 Path:    fft(N) -> pow2_fft_bf16(N) -> two_level_fft_bf16(N, N1=32)
-            -> 2 dispatches (PASS-1, PASS-2), both packed_dft_bf16
-            (PASS-1 may RECURSE into fft() if N2 > 32)
+            For 1024 < N <= 32768  (medium pow2):
+              -> Step 2 picks BATCHED two-level for Pass-1 (N2 = 32 * k, k <= 32)
+              -> 3 device dispatches total:
+                   PASS-1A: packed_dft_bf16(N=N2/32, count=N1*32 = 32*32 = 1024)
+                   PASS-1B: packed_dft_bf16(N=32,    count=N1*(N2/32) = 32*16 = 512)
+                            (these two are batched_two_level_fft_bf16)
+                   PASS-2 : packed_dft_bf16(N=32,    count=N2)
+            For N <= 1024:
+              -> 2 dispatches (PASS-1 and PASS-2), no recursion
+
 Kernel:  packed_dft_bf16_compute  (FPU bf16 matmul)
 Cores:   per-dispatch, depends on `count` of that dispatch (Rule above)
 
 --------------------------------------------------------------------------------
-PASS TIMELINE
+PASS TIMELINE  (N = 16384, N1 = 32, N2 = 512  -- medium pow2 path)
 --------------------------------------------------------------------------------
 
-The two passes are SEQUENTIAL (Pass-2 needs Pass-1's output via the
-host twiddle). Within each dispatch, work is distributed across cores.
+Three sequential dispatches. The OUTER pass-2 reuses the same plan as
+the INNER pass-1B (both have N=32, count=512), so only 3 unique device
+programs exist for the whole call.
 
-TIME ----------------------------------------------------------------->
+TIME ------------------------------------------------------------------>
 
-  PASS-1                 HOST                   PASS-2
-+------------+         +-------+              +------------+
-| packed_dft | --read->| twid+ | --write----> | packed_dft |
-| _bf16      |         | trans |              | _bf16      |
-| (N2, 32)   |         | (fp32)|              | (32, N2)   |
-+------------+         +-------+              +------------+
+  PASS-1A               HOST    PASS-1B              HOST    OUTER PASS-2
++------------+        +------+ +------------+      +------+ +------------+
+| packed_dft |        |twid+ | | packed_dft |      |twid+ | | packed_dft |
+| _bf16      | -read->|trans | | _bf16      |-read>|trans | | _bf16      |
+| N=16       |        |(fp32 | | N=32       |      |(fp32 | | N=32       |
+| count=1024 |        |cached| | count=512  |      |cached| | count=512  |
++------------+        +------+ +------------+      +------+ +------------+
+  ~32 cores                       ~16 cores                  ~16 cores
+  (collapses 32 recursive Pass-1 calls into 1 batched call)
+
+Without batching this call would have been 65 sequential dispatches
+(32 nested fft(512) calls, each doing 2 dispatches, plus 1 outer Pass-2).
+Batching collapses the 64 inner dispatches into 2.
+
+--------------------------------------------------------------------------------
+WHEN BATCHED PATH KICKS IN  (gate in two_level_fft_bf16 Step 2)
+--------------------------------------------------------------------------------
+
+  N2 <= 32              : single packed_dft_bf16 call (no recursion)
+  N2 = 32 * k, k <= 32  : batched_two_level_fft_bf16 (Plan B / Option B)
+  otherwise             : per-sibling recursion (legacy slow path,
+                          N >= 65536 with current 32-cap kernel)
      ^                                              ^
      | PASS-1 if N2 <= 32:                          | PASS-2 always:
      |   1 dispatch                                 |   1 dispatch
