@@ -551,6 +551,96 @@ inline const Complex* get_two_level_twiddle_cached(
     return tab.data();
 }
 
+// ─── Batched two-level Cooley-Tukey ─────────────────────────────────────────
+//
+// Same math as `two_level_fft_bf16` (factor N = N1 · N2, run Pass-1 of
+// length-N2 sub-FFTs, twiddle, transpose, Pass-3 of length-N1 sub-FFTs)
+// but for `batch` independent input vectors at once.
+//
+// The whole point is to collapse `batch` × (Pass-1 + Pass-3) sequential
+// dispatches into just 2 batched dispatches. With N=512, N1=32, batch=32
+// (the typical inner case for outer N=16384), this turns 64 dispatches
+// into 2 — the dominant cost was per-dispatch overhead (PCIe + tilize),
+// not the compute.
+//
+// Constraint: this helper is for the case where BOTH N1 and N2 fit the
+// packed_dft_bf16 kernel directly (i.e. both ≤ kPackedMaxN = 32). When
+// that doesn't hold we fall back to the per-sibling recursive path.
+inline void batched_two_level_fft_bf16(
+    std::shared_ptr<MeshDevice>  md,
+    uint32_t                     N,
+    uint32_t                     N1,
+    uint32_t                     batch,
+    const std::vector<Complex>&  in_natural,
+    std::vector<Complex>&        out_natural)
+{
+    assert(N1 >= 2u && N1 <= kPackedMaxN);
+    assert(N % N1 == 0u);
+    const uint32_t N2 = N / N1;
+    assert(N2 >= 2u && N2 <= kPackedMaxN);
+    assert(in_natural.size() == static_cast<size_t>(batch) * N);
+
+    // ── Step 1: per-batch reshape into (batch · N1) sub-FFTs of length N2.
+    // Layout: pass1_in[ (b·N1 + n1) · N2 + n2 ] = in_natural[ b·N + n1 + N1·n2 ]
+    std::vector<Complex> pass1_in(static_cast<size_t>(batch) * N);
+    for (uint32_t b = 0; b < batch; ++b) {
+        const Complex* src = in_natural.data() + static_cast<size_t>(b) * N;
+        for (uint32_t n1 = 0; n1 < N1; ++n1) {
+            Complex* dst = pass1_in.data()
+                         + (static_cast<size_t>(b) * N1 + n1) * N2;
+            for (uint32_t n2 = 0; n2 < N2; ++n2) {
+                dst[n2] = src[n1 + N1 * n2];
+            }
+        }
+    }
+
+    // ── Step 2: ONE big Pass-1 dispatch — batch·N1 length-N2 FFTs.
+    std::vector<Complex> A_prime;
+    packed_direct_dft_bf16_batched(md, /*N=*/N2, /*count=*/batch * N1,
+                                   pass1_in, A_prime);
+    // A_prime[(b·N1 + n1)·N2 + k2] = result of sub-FFT (b, n1) at bin k2.
+
+    // ── Step 3: per-batch host twiddle + transpose (cached twiddles).
+    // Twiddle table T[n1, k2] = exp(-2πi · n1 · k2 / N) is the same for
+    // every batch element; cache it once via the (N, N1, N2) key.
+    const Complex* __restrict__ twid =
+        get_two_level_twiddle_cached(N, N1, N2);
+    std::vector<Complex> pass2_in(static_cast<size_t>(batch) * N);
+    for (uint32_t b = 0; b < batch; ++b) {
+        for (uint32_t n1 = 0; n1 < N1; ++n1) {
+            const Complex* tw_row = twid + static_cast<size_t>(n1) * N2;
+            const Complex* a_row  = A_prime.data()
+                                  + (static_cast<size_t>(b) * N1 + n1) * N2;
+            // Per-batch Pass-2 input: batch b's tile starts at b·N, then
+            // sub-FFT k2 (length N1) at offset k2·N1.
+            Complex* p2_b = pass2_in.data() + static_cast<size_t>(b) * N;
+            for (uint32_t k2 = 0; k2 < N2; ++k2) {
+                p2_b[k2 * N1 + n1] = a_row[k2] * tw_row[k2];
+            }
+        }
+    }
+
+    // ── Step 4: ONE big Pass-2 dispatch — batch·N2 length-N1 FFTs.
+    std::vector<Complex> D;
+    packed_direct_dft_bf16_batched(md, /*N=*/N1, /*count=*/batch * N2,
+                                   pass2_in, D);
+    // D[(b·N2 + k2)·N1 + k1] = final bin (k2, k1) of batch b.
+
+    // ── Step 5: per-batch output permutation. natural-order index k for
+    // batch b is k = k2 + N2·k1 (matches the non-batched two_level path).
+    out_natural.assign(static_cast<size_t>(batch) * N, Complex{0.0f, 0.0f});
+    for (uint32_t b = 0; b < batch; ++b) {
+        const Complex* d_b   = D.data()           + static_cast<size_t>(b) * N;
+        Complex*       out_b = out_natural.data() + static_cast<size_t>(b) * N;
+        for (uint32_t k2 = 0; k2 < N2; ++k2) {
+            const Complex* d_row = d_b + static_cast<size_t>(k2) * N1;
+            for (uint32_t k1 = 0; k1 < N1; ++k1) {
+                out_b[k2 + N2 * k1] = d_row[k1];
+            }
+        }
+    }
+}
+
 // ─── Generic two-level Cooley-Tukey ─────────────────────────────────────────
 //
 // The core primitive that the pow2 and mixed-radix paths both call. Splits
@@ -600,12 +690,25 @@ inline void two_level_fft_bf16(
         }
     }
 
-    // Step 2: Pass-1 — N1 sibling length-N2 FFTs. If N2 ≤ 32 we batch
-    // them through one packed_dft_bf16 call (faster — one dispatch
-    // instead of N1). Otherwise we recurse per sibling.
+    // Step 2: Pass-1 — N1 sibling length-N2 FFTs. Three execution modes:
+    //   (a) N2 ≤ 32                   : single batched packed_dft_bf16 call
+    //   (b) N2 itself is two-level     : batched via batched_two_level_fft_bf16
+    //                                    (collapses per-sibling recursion into
+    //                                     2 batched dispatches instead of 2·N1)
+    //   (c) anything else              : per-sibling recursion (legacy path)
+    //
+    // (b) is the big perf unlock for medium pow2 N (1024 < N ≤ 32768) where
+    // the per-sibling recursion previously meant ~64 sequential dispatches.
     std::vector<Complex> A_prime(N);
     if (N2 <= kPackedMaxN) {
         packed_direct_dft_bf16_batched(md, /*N=*/N2, /*count=*/N1, pass1_in, A_prime);
+    } else if (is_pow2(N2) && (N2 % kPackedMaxN == 0u)
+                           && (N2 / kPackedMaxN) <= kPackedMaxN) {
+        // N2 = 32 · k with k ≤ 32 → batched two-level for all N1 sub-FFTs at once.
+        // (in_natural shape for the batched call is exactly pass1_in: N1 sub-
+        // FFTs of length N2, contiguous. Here `batch` plays the role of N1.)
+        batched_two_level_fft_bf16(md, /*N=*/N2, /*N1=*/kPackedMaxN,
+                                   /*batch=*/N1, pass1_in, A_prime);
     } else {
         for (uint32_t r = 0; r < N1; ++r) {
             std::vector<Complex> sub_in(
