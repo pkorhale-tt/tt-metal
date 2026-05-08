@@ -4,8 +4,6 @@
 
 #include "experimental_nanobind.hpp"
 
-#include <cstdio>
-
 #include <nanobind/nanobind.h>
 
 #include "ttnn/operations/experimental/adaptive_pool/adaptive_pools_nanobind.hpp"
@@ -118,9 +116,7 @@ void py_module(nb::module_& mod) {
     matmul::detail::bind_group_attn_matmul(mod);
 
     plusone::detail::bind_experimental_plusone_operation(mod);
-    std::printf("[experimental_nanobind] BEFORE fft binding\n");  std::fflush(stdout);
     fft::detail::bind_experimental_fft_operation(mod);
-    std::printf("[experimental_nanobind] AFTER fft binding\n");   std::fflush(stdout);
     dropout::detail::bind_experimental_dropout_operation(mod);
     reshape::detail::bind_view(mod);
 

@@ -4,7 +4,6 @@
 
 #include "fft_nanobind.hpp"
 
-#include <cstdio>
 #include <utility>
 
 #include <nanobind/nanobind.h>
@@ -17,9 +16,6 @@
 namespace ttnn::operations::experimental::fft::detail {
 
 void bind_experimental_fft_operation(nb::module_& mod) {
-    // TEMP debug: confirm this runs at module init.
-    std::printf("[fft_nanobind] bind_experimental_fft_operation: ENTER\n"); std::fflush(stdout);
-    try {
     const auto* doc =
         R"doc(
             1-D Fast Fourier Transform (forward).
@@ -74,14 +70,6 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                 return self(input_real);
             },
             nb::arg("input_real").noconvert()});
-    std::printf("[fft_nanobind] bind_experimental_fft_operation: OK\n"); std::fflush(stdout);
-    } catch (const std::exception& e) {
-        std::printf("[fft_nanobind] bind_experimental_fft_operation: EXCEPTION: %s\n", e.what()); std::fflush(stdout);
-        throw;
-    } catch (...) {
-        std::printf("[fft_nanobind] bind_experimental_fft_operation: UNKNOWN EXCEPTION\n"); std::fflush(stdout);
-        throw;
-    }
 }
 
 }  // namespace ttnn::operations::experimental::fft::detail
