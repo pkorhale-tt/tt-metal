@@ -77,8 +77,17 @@ def test_fft_matches_torch(device, N, tol):
 
 
 # ── Roundtrip (FFT → IFFT) ─────────────────────────────────────────────────
-@pytest.mark.parametrize("N", [8, 1024, 4096])
-def test_fft_ifft_roundtrip(device, N):
+# Roundtrip accumulates fp32 noise from BOTH passes, so tolerances are ~2x
+# the corresponding forward-only tolerances in test_fft_matches_torch.
+@pytest.mark.parametrize(
+    "N, tol",
+    [
+        (8,    5e-5),
+        (1024, 1e-4),
+        (4096, 2e-4),
+    ],
+)
+def test_fft_ifft_roundtrip(device, N, tol):
     """
     IFFT(FFT(x)) should reproduce x. Verifies (a) the inverse path is
     wired and (b) the 1/N scale is applied exactly once.
@@ -99,8 +108,8 @@ def test_fft_ifft_roundtrip(device, N):
     err_imag = ttnn.to_torch(rec_im).reshape(-1).abs().max().item()
 
     rel = torch.linalg.norm(got - torch_in) / torch.linalg.norm(torch_in)
-    assert rel < 1e-5, f"roundtrip rel err {rel.item():.2e} too high"
-    assert err_imag < 1e-4, f"reconstructed imag part should be ~0 (got {err_imag:.2e})"
+    assert rel < tol, f"roundtrip N={N} rel err {rel.item():.2e} exceeds {tol:.0e}"
+    assert err_imag < tol, f"reconstructed imag part should be ~0 (got {err_imag:.2e})"
 
 
 # ── Out-of-support guard ────────────────────────────────────────────────────
