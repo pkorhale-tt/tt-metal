@@ -47,6 +47,7 @@
 
 #include "fft_inner_host.hpp"   // reuse the inner radix-2 kernel & plan cache
 
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <vector>
@@ -187,12 +188,40 @@ struct BatchFFTPlan {
 };
 
 // Distribute `num_cores` workers over a (cols, rows) sub-grid that fits
-// inside the device's compute grid. `grid_x` is the device's compute-grid
-// width — 8 on Wormhole, 13 on Blackhole.
+// inside the device's compute grid (grid_x = 8 on WH, 13 on BH).
+// Finds the densest (cols, rows) such that cols*rows == num_cores AND
+// cols <= grid_x. Caller is responsible for ensuring such a factorisation
+// exists (use `max_cores_for_grid` below for the pow2-batch case).
 inline std::pair<uint32_t, uint32_t> pick_batch_grid(uint32_t num_cores, uint32_t grid_x) {
-    const uint32_t cols = (num_cores < grid_x) ? num_cores : grid_x;
-    const uint32_t rows = num_cores / cols;
-    return {cols, rows};
+    // Search downward from grid_x for the largest divisor of num_cores
+    // that is <= grid_x. Guaranteed to terminate at cols=1 in the worst case.
+    uint32_t cols = (num_cores < grid_x) ? num_cores : grid_x;
+    while (cols > 1 && num_cores % cols != 0) {
+        --cols;
+    }
+    return {cols, num_cores / cols};
+}
+
+// Largest power-of-2 P with P <= grid_x*grid_y AND P factors as
+// (cols<=grid_x, rows<=grid_y). Used by callers (stockham batch_fft / pass2)
+// that require num_cores to divide a power-of-2 batch.
+//
+//   WH 8x8   → 64       (8,8)
+//   BH 13x10 → 64       (8,8)        — 128=(8,16) overflows grid_y=10
+//
+// The two archs happen to agree at 64 because BH's grid is 13x10 (not
+// 16-tall) and the stockham planner only ever passes pow2 batches.
+inline uint32_t max_cores_for_grid(uint32_t grid_x, uint32_t grid_y) {
+    uint32_t best = 1;
+    for (uint32_t p = 2; p <= grid_x * grid_y; p *= 2) {
+        // Is there cols <= grid_x dividing p with p/cols <= grid_y?
+        bool ok = false;
+        for (uint32_t c = std::min(p, grid_x); c >= 1; --c) {
+            if (p % c == 0 && p / c <= grid_y) { ok = true; break; }
+        }
+        if (ok) best = p;
+    }
+    return best;
 }
 
 inline tt::tt_metal::CoreCoord batch_logical_core(
@@ -242,9 +271,11 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
     assert(is_pow2(sub_N) && sub_N >= 2);
     assert(is_pow2(batch) && batch >= 1);
 
-    // Cap by what the device actually has: WH 8x8=64, BH ~13x10=130.
+    // Cap by what the device can actually accommodate as a (cols<=grid_x,
+    // rows<=grid_y) rectangle. Stockham requires num_cores | batch (pow2),
+    // so we use max_cores_for_grid which restricts to factorable pow2 sizes.
     const auto     dev_grid  = md->compute_with_storage_grid_size();
-    const uint32_t max_cores = static_cast<uint32_t>(dev_grid.x) * static_cast<uint32_t>(dev_grid.y);
+    const uint32_t max_cores = max_cores_for_grid(dev_grid.x, dev_grid.y);
     bp->num_cores      = (batch < max_cores) ? batch : max_cores;
     bp->batch_per_core = batch / bp->num_cores;
     assert(bp->num_cores * bp->batch_per_core == batch);
@@ -593,8 +624,9 @@ inline std::shared_ptr<Pass2Plan> make_pass2_plan(
     assert(is_pow2(N1) && N1 >= 2);
     assert(is_pow2(N2) && N2 >= 2);
 
+    // Same factorisation constraint as batch_fft: num_cores | N1 (pow2).
     const auto     dev_grid  = md->compute_with_storage_grid_size();
-    const uint32_t max_cores = static_cast<uint32_t>(dev_grid.x) * static_cast<uint32_t>(dev_grid.y);
+    const uint32_t max_cores = max_cores_for_grid(dev_grid.x, dev_grid.y);
     pp->num_cores      = (N1 < max_cores) ? N1 : max_cores;
     pp->tiles_per_core = N1 / pp->num_cores;
     assert(pp->num_cores * pp->tiles_per_core == N1);
