@@ -30,7 +30,12 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_bf16)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_xl)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_image_processing)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/basic_fft)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float32)
+# fft_float32 is dev scratch — its single .cpp is a compute kernel
+# (#include "api/compute/compute_kernel_api.h") incorrectly registered as
+# a host executable, which fails to compile under the host toolchain.
+# Disabled until the dir is cleaned up (see programming-examples cleanup
+# task). Other fft_float32_* dirs are independent and unaffected.
+# add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float32)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float32_optimized)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float32_multicore)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/fft_float32_multicore_optimised)
