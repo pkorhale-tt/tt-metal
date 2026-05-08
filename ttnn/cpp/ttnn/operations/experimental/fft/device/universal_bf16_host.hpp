@@ -255,12 +255,19 @@ inline std::shared_ptr<PackedDFTBf16Plan> make_packed_dft_bf16_plan(
     // <= 7 (cols=n, rows=1) OR a multiple of 8 (cols=8, rows=n/8). Round
     // up, clamp to 64, pad the tile count to match. Extra tiles receive
     // zero input (scratch is zero-initialised) → zero output, discarded.
+    // Cap by the device's compute grid: WH 8x8=64, BH ~13x10=130. Round
+    // num_cores up to a multiple of grid.x so pick_batch_grid yields a
+    // dense rectangle.
+    const auto     dev_grid  = md->compute_with_storage_grid_size();
+    const uint32_t grid_x    = static_cast<uint32_t>(dev_grid.x);
+    const uint32_t max_cores = grid_x * static_cast<uint32_t>(dev_grid.y);
+
     uint32_t num_cores;
-    if (raw_num_tiles <= 7u) {
+    if (raw_num_tiles < grid_x) {
         num_cores = raw_num_tiles;
     } else {
-        num_cores = ((raw_num_tiles + 7u) / 8u) * 8u;
-        if (num_cores > 64u) num_cores = 64u;
+        num_cores = ((raw_num_tiles + grid_x - 1u) / grid_x) * grid_x;
+        if (num_cores > max_cores) num_cores = max_cores;
     }
     const uint32_t tiles_per_core = (raw_num_tiles + num_cores - 1u) / num_cores;
     const uint32_t num_tiles      = num_cores * tiles_per_core;
@@ -268,7 +275,7 @@ inline std::shared_ptr<PackedDFTBf16Plan> make_packed_dft_bf16_plan(
     pp->num_cores      = num_cores;
     pp->tiles_per_core = tiles_per_core;
     pp->num_tiles      = num_tiles;
-    std::tie(pp->grid_cols, pp->grid_rows) = fft_stockham::pick_batch_grid(num_cores);
+    std::tie(pp->grid_cols, pp->grid_rows) = fft_stockham::pick_batch_grid(num_cores, grid_x);
 
     std::printf(
         "[packed_dft_bf16] N=%u  count=%u  =>  num_tiles=%u  cores=%u  grid=%ux%u  "

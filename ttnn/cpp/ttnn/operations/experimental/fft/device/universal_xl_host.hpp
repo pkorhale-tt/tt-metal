@@ -145,7 +145,21 @@ inline std::shared_ptr<OuterTwiddle> get_outer_twiddle(uint32_t N, uint32_t F1) 
 // pointing at the kernel work that lifts the ceiling. Once the packed
 // batch_fft_xl kernel ships (option_a_pass2_xl_design.md), Step 3 moves
 // to device and this constant should be raised to 1G (1u << 30).
-inline constexpr uint32_t kXlMaxNFp32 = 16u * 1024u * 1024u;   // 16M
+inline constexpr uint32_t kXlMaxNFp32_WH = 16u * 1024u * 1024u;   // 16M  (Wormhole)
+inline constexpr uint32_t kXlMaxNFp32_BH = 64u * 1024u * 1024u;   // 64M  (Blackhole — ~2x DRAM BW + 2x cores)
+
+// Pick the practical N ceiling for the running device. Blackhole has
+// roughly 2x the DRAM bandwidth and 2x the compute cores of Wormhole,
+// so the host-side Step-3 outer DFT stays in the seconds range up to
+// ~64M. Anything beyond still requires the packed batch_fft_xl kernel.
+inline uint32_t xl_max_n_fp32(const std::shared_ptr<MeshDevice>& md) {
+    return (md->arch() == tt::ARCH::BLACKHOLE) ? kXlMaxNFp32_BH
+                                               : kXlMaxNFp32_WH;
+}
+
+// Back-compat alias used by call sites and error messages — set to the
+// most conservative (Wormhole) value so any compile-time use is safe.
+inline constexpr uint32_t kXlMaxNFp32 = kXlMaxNFp32_WH;
 
 // Recursive entry: handles pow2 N up to kXlMaxNFp32 by falling through to
 // fft_stockham for N <= 1M (k <= 2 in the plan), and applying the
@@ -177,18 +191,22 @@ inline std::vector<Complex> fft_impl(
         std::abort();
     }
 
-    // Practical host-runtime gate. Above 16M the host-side length-F1 DFT
-    // (Step 3) dominates wall-clock; refuse with a clear, actionable error
-    // rather than silently running for minutes.
-    if (p.N > kXlMaxNFp32) {
+    // Practical host-runtime gate. Above the per-arch ceiling the host-side
+    // length-F1 DFT (Step 3) dominates wall-clock; refuse with a clear,
+    // actionable error rather than silently running for minutes.
+    //
+    //   Wormhole : 16M
+    //   Blackhole: 64M (2x DRAM BW + 2x cores → host Step-3 amortises further)
+    const uint32_t n_ceiling = xl_max_n_fp32(md);
+    if (p.N > n_ceiling) {
         std::fprintf(stderr,
-            "[fft_universal_xl] N=%u above the practical 16M ceiling "
+            "[fft_universal_xl] N=%u above the practical %uM ceiling for this arch "
             "(F1=%u, host Step-3 cost ~F1^2 * N ops). The algorithm is "
             "correct here, but the host outer DFT would dominate wall-clock. "
             "To lift this ceiling, implement the packed batch_fft_xl kernel "
             "described in fft_universal_xl/option_a_pass2_xl_design.md and "
-            "raise kXlMaxNFp32 to 1u << 30.\n",
-            p.N, F1);
+            "raise kXlMaxNFp32_{WH,BH} to 1u << 30.\n",
+            p.N, n_ceiling >> 20, F1);
         std::abort();
     }
 

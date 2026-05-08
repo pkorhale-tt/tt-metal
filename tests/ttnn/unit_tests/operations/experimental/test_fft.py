@@ -27,6 +27,15 @@ def _rel_err(got_complex, ref_complex):
     ).item()
 
 
+def _is_blackhole(device):
+    """Best-effort arch probe — falls back to False if the attribute is
+    unavailable on this build of ttnn."""
+    arch = getattr(device, "arch", None)
+    if callable(arch):
+        arch = arch()
+    return str(arch).lower().endswith("blackhole")
+
+
 # ── Shape / dtype plumbing ──────────────────────────────────────────────────
 @pytest.mark.parametrize("N", [1024, 4096])
 def test_fft_returns_correct_shape_and_dtype(device, N):
@@ -256,6 +265,32 @@ def test_fft_complex_input(device, N, dtype, tol):
     assert rel < tol, (
         f"complex-input fft N={N} dtype={dtype} rel err {rel:.2e} exceeds {tol:.0e}"
     )
+
+
+# ── Blackhole portability smoke test ────────────────────────────────────────
+@pytest.mark.parametrize("N", [1024, 4096, 16384])
+def test_fft_blackhole_smoke(device, N):
+    """Blackhole-only smoke test: exercises the device-grid query path
+    in the orchestrators (must not clamp to Wormhole's 64-core grid).
+    Skipped on Wormhole — the regular fp32 tests already cover that path."""
+    if not _is_blackhole(device):
+        pytest.skip("Blackhole-specific smoke test")
+
+    torch_in = torch.randn(N, dtype=torch.float32)
+    tt_in = ttnn.from_torch(
+        torch_in, dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+
+    re, im = ttnn.fft(tt_in)
+    got = torch.complex(
+        ttnn.to_torch(re).reshape(-1).to(torch.float32),
+        ttnn.to_torch(im).reshape(-1).to(torch.float32),
+    )
+    ref = torch.fft.fft(torch_in.to(torch.complex64))
+
+    rel = _rel_err(got, ref)
+    assert rel < 5e-4, f"BH smoke N={N} rel err {rel:.2e}"
 
 
 # ── Out-of-support guard ────────────────────────────────────────────────────

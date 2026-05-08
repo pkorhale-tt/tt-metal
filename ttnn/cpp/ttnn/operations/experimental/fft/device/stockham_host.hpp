@@ -185,8 +185,11 @@ struct BatchFFTPlan {
     bool initialized = false;
 };
 
-inline std::pair<uint32_t, uint32_t> pick_batch_grid(uint32_t num_cores) {
-    const uint32_t cols = (num_cores < 8u) ? num_cores : 8u;
+// Distribute `num_cores` workers over a (cols, rows) sub-grid that fits
+// inside the device's compute grid. `grid_x` is the device's compute-grid
+// width — 8 on Wormhole, 13 on Blackhole.
+inline std::pair<uint32_t, uint32_t> pick_batch_grid(uint32_t num_cores, uint32_t grid_x) {
+    const uint32_t cols = (num_cores < grid_x) ? num_cores : grid_x;
     const uint32_t rows = num_cores / cols;
     return {cols, rows};
 }
@@ -238,10 +241,13 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
     assert(is_pow2(sub_N) && sub_N >= 2);
     assert(is_pow2(batch) && batch >= 1);
 
-    bp->num_cores      = (batch < 64u) ? batch : 64u;
+    // Cap by what the device actually has: WH 8x8=64, BH ~13x10=130.
+    const auto     dev_grid  = md->compute_with_storage_grid_size();
+    const uint32_t max_cores = static_cast<uint32_t>(dev_grid.x) * static_cast<uint32_t>(dev_grid.y);
+    bp->num_cores      = (batch < max_cores) ? batch : max_cores;
     bp->batch_per_core = batch / bp->num_cores;
     assert(bp->num_cores * bp->batch_per_core == batch);
-    std::tie(bp->grid_cols, bp->grid_rows) = pick_batch_grid(bp->num_cores);
+    std::tie(bp->grid_cols, bp->grid_rows) = pick_batch_grid(bp->num_cores, dev_grid.x);
 
     std::printf(
         "[batch_fft] sub_N=%u  batch=%u  =>  cores=%u  grid=%ux%u  "
@@ -583,10 +589,12 @@ inline std::shared_ptr<Pass2Plan> make_pass2_plan(
     assert(is_pow2(N1) && N1 >= 2);
     assert(is_pow2(N2) && N2 >= 2);
 
-    pp->num_cores      = (N1 < 64u) ? N1 : 64u;
+    const auto     dev_grid  = md->compute_with_storage_grid_size();
+    const uint32_t max_cores = static_cast<uint32_t>(dev_grid.x) * static_cast<uint32_t>(dev_grid.y);
+    pp->num_cores      = (N1 < max_cores) ? N1 : max_cores;
     pp->tiles_per_core = N1 / pp->num_cores;
     assert(pp->num_cores * pp->tiles_per_core == N1);
-    std::tie(pp->grid_cols, pp->grid_rows) = pick_batch_grid(pp->num_cores);
+    std::tie(pp->grid_cols, pp->grid_rows) = pick_batch_grid(pp->num_cores, dev_grid.x);
 
     std::printf(
         "[pass2] N1=%u N2=%u  =>  cores=%u  grid=%ux%u  tiles/core=%u\n",
