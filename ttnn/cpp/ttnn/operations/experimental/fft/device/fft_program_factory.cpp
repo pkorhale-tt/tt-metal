@@ -91,7 +91,12 @@ void radix2_inplace(Complex* a, uint32_t N, bool inverse) {
 // this for the Stockham backend; we re-check here so the host fallback
 // fails loudly if anyone widens the dispatch table without updating
 // this kernel.)
-constexpr bool is_pow2(uint32_t n) {
+//
+// Renamed `is_pow2_local` (rather than `is_pow2`) so the Unity build
+// can pull both this TU and fft_device_operation.cpp — which has its
+// own anonymous-namespace `is_pow2` — into the same compilation unit
+// without ODR collision.
+constexpr bool is_pow2_local(uint32_t n) {
     return n != 0u && (n & (n - 1u)) == 0u;
 }
 
@@ -121,7 +126,7 @@ void run_host_fft(
     TT_FATAL(shape.size() >= 1u, "fft host fallback: tensor has rank 0");
 
     const uint32_t N = shape[-1];
-    TT_FATAL(is_pow2(N),
+    TT_FATAL(is_pow2_local(N),
              "fft host fallback: only power-of-two N supported (got {}).", N);
 
     const uint64_t total = in_re_tensor.logical_volume();
