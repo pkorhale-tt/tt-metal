@@ -43,6 +43,7 @@
 #include "tt-metalium/mesh_command_queue.hpp"
 #include "tt-metalium/mesh_workload.hpp"
 #include "tt-metalium/mesh_buffer.hpp"
+#include "tt-metalium/circular_buffer_constants.h"   // NUM_CIRCULAR_BUFFERS (host max → 64)
 
 #include "fft_inner_host.hpp"   // reuse the inner radix-2 kernel & plan cache
 
@@ -319,8 +320,11 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
-    constexpr uint32_t kNumCbSlots = 32;
-    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
+    // Vector must match the framework's CB-slot count, which is the host
+    // maximum (NUM_CIRCULAR_BUFFERS = 64 on host, regardless of arch).
+    // Using the canonical constant keeps WH (32 dev / 64 host) and BH
+    // (64 dev / 64 host) both working without per-arch ifdefs.
+    std::vector<UnpackToDestMode> u2d(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
     for (uint32_t id = 0; id < kBatchNumCbs; ++id) {
         u2d[id] = UnpackToDestMode::UnpackToDestFp32;
     }
@@ -660,8 +664,7 @@ inline std::shared_ptr<Pass2Plan> make_pass2_plan(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
-    constexpr uint32_t kNumCbSlots = 32;
-    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
+    std::vector<UnpackToDestMode> u2d(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
     for (uint32_t id = 0; id < kPass2NumCbs; ++id) {
         u2d[id] = UnpackToDestMode::UnpackToDestFp32;
     }

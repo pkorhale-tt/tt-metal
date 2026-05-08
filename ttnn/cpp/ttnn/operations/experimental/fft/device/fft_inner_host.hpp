@@ -42,6 +42,7 @@
 #include "tt-metalium/constants.hpp"
 #include "tt-metalium/kernel_types.hpp"
 #include "tt-metalium/circular_buffer_config.hpp"
+#include "tt-metalium/circular_buffer_constants.h"   // NUM_CIRCULAR_BUFFERS (host max → 64)
 #include "tt-metalium/hal_types.hpp"
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
@@ -310,8 +311,10 @@ inline void run_fft(
             .noc       = NOC::RISCV_1_default});
 
     // Unpack every CB directly to DEST in fp32 (see compute kernel notes).
-    constexpr uint32_t kNumCbSlots = 32;
-    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
+    // Vector size MUST equal the framework's CB-slot count: NUM_CIRCULAR_BUFFERS
+    // is 64 on host (always — the host max), 32 on Wormhole device, 64 on
+    // Blackhole device. Using the constant keeps both archs working.
+    std::vector<UnpackToDestMode> u2d(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
     for (uint32_t id = 0; id < NUM_CBS; ++id) {
         u2d[id] = UnpackToDestMode::UnpackToDestFp32;
     }
@@ -464,8 +467,7 @@ inline std::shared_ptr<FFTPlan> make_plan(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
-    constexpr uint32_t kNumCbSlots = 32;
-    std::vector<UnpackToDestMode> u2d(kNumCbSlots, UnpackToDestMode::Default);
+    std::vector<UnpackToDestMode> u2d(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
     for (uint32_t id = 0; id < NUM_CBS; ++id) {
         u2d[id] = UnpackToDestMode::UnpackToDestFp32;
     }
