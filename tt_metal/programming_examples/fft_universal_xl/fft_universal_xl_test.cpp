@@ -199,6 +199,8 @@ int main() {
     std::printf("\n-- XL outer recursion (k = 3): random round-trip --\n");
     test_round_trip   (md, 2097152, 1e-4);  // 2M
     test_round_trip   (md, 4194304, 1e-4);  // 4M
+    test_round_trip   (md, 8388608, 1e-4);  // 8M  — well inside the 16M gate
+    test_round_trip   (md, 16777216, 1e-4); // 16M — at the gate
 
     md->close();
 

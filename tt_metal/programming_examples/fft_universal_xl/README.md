@@ -67,17 +67,34 @@ Option A's `pass2_xl` kernel + a packed `batch_fft_xl` kernel land.
 
 | Property | Option B (today) | Option A (after the kernel work) |
 |---|---|---|
-| Pow2 N up to 1G | ✅ | ✅ |
-| No host arithmetic on data | ❌ (Step 2 is host) | ✅ |
+| Pow2 N supported | **2 ≤ N ≤ 16M** (gated; see below) | up to 1G |
+| No host arithmetic on data | ❌ (Steps 2 + 3 are host) | ✅ |
 | Correctness | ✅ identical | ✅ identical |
 | Speed at N ≤ 1M | identical to fft_stockham | identical to fft_stockham |
-| Speed at N = 8M | ~5-10s per FFT | ~1-2s per FFT (estimate) |
-| Speed at N = 1G | tens of minutes | seconds (estimate) |
+| Speed at N = 8M | ~250 ms host + device | sub-second |
+| Speed at N = 1G | host-bound (impractical) — gated off | seconds (estimate) |
 
-For typical workloads the Option-B speed at large N is **bottlenecked
-by the F1 sequential outer FFT calls** (Step 1), NOT by the host
-twiddle (Step 2). So Option A doesn't fully solve the speed problem at
-huge N — that's what Option C is for.
+## Why N is gated at 16M today (and not at the algorithmic 1G ceiling)
+
+The K=3 dispatcher's algorithm is correct for any pow2 N up to 1G
+(`M = N / F1 ≤ 1M` is the only correctness constraint). However, the
+host-side length-F1 outer DFT (Step 3) costs `O(F1² · M) = O(F1 · N)`
+host ops:
+
+| N | F1 | Step-3 host cost | Verdict |
+|---|---|---|---|
+| 2M | 2 | ~10 ms | trivial |
+| 4M | 4 | ~40 ms | fine |
+| 8M | 8 | ~250 ms | OK |
+| **16M** | **16** | **~1 s** | **practical ceiling** |
+| 32M | 32 | ~4 s | too slow for a public op |
+| 1G | 1024 | hours | impossible |
+
+`fft_universal_xl_host.cpp` enforces `kXlMaxNFp32 = 16M` and aborts
+above that with an error that points at the `pass2_xl` /
+`batch_fft_xl` kernel work that lifts the gate. **Once the packed
+`batch_fft_xl` kernel ships, raise `kXlMaxNFp32` to `1u << 30` and
+the algorithm runs through to 1G without source changes elsewhere.**
 
 ## Recommended sequencing
 
@@ -100,18 +117,20 @@ Use `metal_example_fft_universal_xl_planner_test` to verify.
 
 ## Honest limits of Option B (today)
 
+* **N is gated at 16M.** Algorithm runs to 1G; host arithmetic doesn't.
+  See "Why N is gated at 16M" above. The gate is a single constant in
+  `fft_universal_xl_host.cpp` (`kXlMaxNFp32`).
 * **No bf16 path yet.** The dispatcher only wraps `fft_stockham` (fp32).
   Adding bf16 means wrapping `fft_universal_bf16` analogously — about 50
   lines of code, blocked only on you saying you want it.
 * **Sequential outer FFTs.** Step 1 calls `fft_stockham::fft` F1 times
-  back-to-back. At N=8M with F1=8 that's only 8 calls (~5-10s total);
-  at N=1G with F1=1024 that's 1024 calls (tens of minutes). Option C
-  is the only fix for this.
-* **Host twiddle at Step 2.** ~10ns per element. At N=1G that's ~10s
+  back-to-back. At N=8M with F1=8 that's 8 calls; at N=16M with F1=16
+  that's 16 calls. Inside the gated regime this is fine.
+* **Host twiddle at Step 2.** ~10ns per element. At N=16M that's ~150ms
   of host CPU time on top of device time. Option A fixes this.
 * **Accuracy at huge N.** Same compounding bf16-multiplier issue
-  documented in `fft_universal/README.md`. Expect rel err ≈ 1e-5 at
-  N=8M, growing to ~1e-3 at N=1G. fp32 baseline is no longer paper-grade
+  documented in `fft_universal/README.md`. Inside the 16M gate fp32
+  rel err stays ≤ 3e-7 (verified), well below paper-grade tolerance
   past N=8M because of FPU bf16-multiplier rounding.
 
 ## See also

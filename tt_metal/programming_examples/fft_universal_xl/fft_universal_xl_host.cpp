@@ -133,9 +133,23 @@ inline std::shared_ptr<OuterTwiddle> get_outer_twiddle(uint32_t N, uint32_t F1) 
     return tw;
 }
 
-// Recursive entry: handles any pow2 N <= 1G by falling through to
+// Practical N ceiling for the K=3 host-arithmetic path.
+//
+// Algorithmically the K=3 dispatcher works for any N up to 1G (the K=3 cap
+// of the planner), but Step 3 is a host-side length-F1 DFT costing
+// O(F1^2) ops per inner index = O(F1 * N) host ops total. For F1 <= 16
+// (i.e. N <= 16M) the host time is bounded at a few seconds; above that
+// it dominates wall-clock and the path becomes unusable as a public op.
+//
+// We gate the dispatcher at N <= 16M for now and emit a clear error
+// pointing at the kernel work that lifts the ceiling. Once the packed
+// batch_fft_xl kernel ships (option_a_pass2_xl_design.md), Step 3 moves
+// to device and this constant should be raised to 1G (1u << 30).
+inline constexpr uint32_t kXlMaxNFp32 = 16u * 1024u * 1024u;   // 16M
+
+// Recursive entry: handles pow2 N up to kXlMaxNFp32 by falling through to
 // fft_stockham for N <= 1M (k <= 2 in the plan), and applying the
-// XL Steps 1-5 above for N > 1M.
+// XL Steps 0-3 above for 1M < N <= 16M.
 inline std::vector<Complex> fft_impl(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  signal,
@@ -151,14 +165,30 @@ inline std::vector<Complex> fft_impl(
     const uint32_t M  = p.N / F1;
     assert(F1 * M == p.N);
     assert(F1 <= kFactorCap);
-    // Smallest factor as F1 means M is the product of the rest, which
-    // is <= 1024^(k-1).  For our supported regime k <= 3 so M <= 1M.
-    // For k=4+ we'd recurse here; emit a clear error for now.
+
+    // K >= 4 (N > 1G) needs recursion through fft_universal_xl::fft for
+    // the inner length-M sub-problem; not implemented yet.
     if (M > 1024u * 1024u) {
         std::fprintf(stderr,
             "[fft_universal_xl] N=%u: inner length M=%u exceeds the 1M cap of "
-            "fft_stockham. K=%u plans not yet supported.\n",
+            "fft_stockham. K=%u plans (N > 1G) require recursive dispatch — "
+            "not yet implemented.\n",
             p.N, M, p.k());
+        std::abort();
+    }
+
+    // Practical host-runtime gate. Above 16M the host-side length-F1 DFT
+    // (Step 3) dominates wall-clock; refuse with a clear, actionable error
+    // rather than silently running for minutes.
+    if (p.N > kXlMaxNFp32) {
+        std::fprintf(stderr,
+            "[fft_universal_xl] N=%u above the practical 16M ceiling "
+            "(F1=%u, host Step-3 cost ~F1^2 * N ops). The algorithm is "
+            "correct here, but the host outer DFT would dominate wall-clock. "
+            "To lift this ceiling, implement the packed batch_fft_xl kernel "
+            "described in fft_universal_xl/option_a_pass2_xl_design.md and "
+            "raise kXlMaxNFp32 to 1u << 30.\n",
+            p.N, F1);
         std::abort();
     }
 
