@@ -27,9 +27,9 @@ struct FFTTensorArgs {
 // which kernel pipeline to instantiate.
 enum class FFTBackend : uint8_t {
     Stockham,        // Float32, pow2 N, N <= 1M
-    UniversalXL,     // Float32, pow2 N, 1M < N <= 16M  (NOT YET IMPLEMENTED)
-    Universal,       // Float32, non-pow2 N             (NOT YET IMPLEMENTED)
-    UniversalBf16,   // BFloat16, any N                 (NOT YET IMPLEMENTED)
+    UniversalXL,     // Float32, pow2 N, 1M < N <= 16M
+    Universal,       // Float32, non-pow2 N (mixed-radix / Bluestein)
+    UniversalBf16,   // BFloat16, any N (true-bf16 FPU matmul)
 };
 
 }  // namespace ttnn::experimental::prim

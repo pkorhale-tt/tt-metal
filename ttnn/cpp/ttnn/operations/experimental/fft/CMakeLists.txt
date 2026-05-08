@@ -41,7 +41,20 @@ target_sources(
         fft.cpp
 )
 
-target_include_directories(ttnn_op_experimental_fft PRIVATE ${FixmeOpIncDirs})
+target_include_directories(
+    ttnn_op_experimental_fft
+    PRIVATE
+        ${FixmeOpIncDirs}
+        # Workspace root — needed so fft_program_factory.cpp can include the
+        # backend orchestrators with their canonical
+        # `tt_metal/programming_examples/fft_*/fft_*_host.cpp` paths.
+        # These orchestrators are header-only inline modules; the include
+        # pulls their `inline std::vector<Complex> fft(md, signal)` API
+        # into the ttnn op TU. Removed once Phase 3 rewrites them as
+        # in-tree single-Program builders under
+        # ttnn/cpp/ttnn/operations/experimental/fft/device/*_host.hpp.
+        ${CMAKE_SOURCE_DIR}
+)
 target_link_libraries(
     ttnn_op_experimental_fft
     PRIVATE

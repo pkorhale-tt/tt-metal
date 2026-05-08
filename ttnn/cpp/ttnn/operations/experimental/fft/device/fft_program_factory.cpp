@@ -2,44 +2,54 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-// FFT program factory — Phase 1 (host-pass-through).
+// FFT program factory — full-backend dispatcher.
 //
-// Status (Phase 1, "Path A — host pass-through"):
-// =====================================================================
-// The FFT itself runs on the HOST CPU using a textbook iterative
-// radix-2 Cooley–Tukey kernel (forward and inverse). The on-device
-// program returned by `create()` is empty; we use the device_operation
-// framework purely as a Tensor-plumbing layer so that the public
-// `ttnn.experimental.fft` API behaves like any other ttnn op
-// (validation, output-tensor allocation, program-cache hash, etc.) and
-// the user gets back tensors populated with correct spectrum data.
+// Routes each call of `ttnn::experimental::fft / ifft` to one of four
+// device-resident orchestrators originally developed under
+// tt_metal/programming_examples/. Selection is by (dtype, N, is_pow2):
 //
-// Why host-only for Phase 1:
-//   * Zero new device-build artifacts → no kernel-path / installation
-//     issues, no build-system surface area to land in this PR.
-//   * The on-device kernels already exist and are validated end-to-end
-//     in tt_metal/programming_examples/fft_stockham/ and friends, but
-//     they are organised as standalone hosts (program-per-pass with
-//     their own EnqueueWriteShard / EnqueueReadShard), not as building
-//     blocks of a single fused Program. Wiring them into a single
-//     ttnn-style Program is Phase 2 (see TODO block at the end of this
-//     file).
-//   * Numerically correct FFT on the host is what unblocks downstream
-//     model authors who just want `ttnn.experimental.fft(x)` to work.
+//     fp32 + pow2  + N <= 1M    →  fft_stockham         (4-pass Stockham)
+//     fp32 + pow2  + N <= 16M   →  fft_universal_xl     (2-level Cooley–Tukey)
+//     fp32 + non-pow2           →  fft_universal        (mixed-radix / Bluestein)
+//     bf16 + any N              →  fft_universal_bf16   (true-bf16 FPU matmul)
 //
-// Phase 2 (later PR) will replace `run_host_fft()` with a true
-// on-device program build that reuses the Stockham kernels.
+// The orchestrators are header-only inline modules; including their
+// `*_host.cpp` files pulls in the kernel-launch code at translation-unit
+// scope and keeps every kernel reference (`CreateKernel("...")`) pointing
+// at the existing programming_examples source tree. Migration of those
+// kernel paths into ttnn/cpp/.../fft/device/kernels/ is staged in a
+// follow-up PR; the kernels are already copied there (Phase 2-A).
+//
+// This file is "host-orchestrated, device-executed" — every FFT pass
+// runs on Tensix cores via the orchestrator's MeshWorkload enqueues.
+// We funnel through the orchestrator's host API rather than building
+// one big fused Program because:
+//   * the orchestrators already implement every algorithm correctness-
+//     tested end-to-end in the programming_examples;
+//   * a fused single-Program rewrite (Phase 3) is a large, separate
+//     undertaking that should not block landing the public ttnn API.
+//
+// IFFT path: y = conj(fft(conj(X))) / N — applied per-row on host
+// around the forward backend call. No new device code required.
 
 #include "fft_program_factory.hpp"
 
 #include "ttnn/operation.hpp"
 #include "ttnn/tensor/tensor.hpp"
+#include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/host_api.hpp>
 
+// Backend orchestrators — header-only inline modules. Each has #pragma once;
+// transitive includes (notably fft_stockham) collapse cleanly.
+#include "tt_metal/programming_examples/fft_stockham/fft_stockham_host.cpp"
+#include "tt_metal/programming_examples/fft_universal/fft_universal_host.cpp"
+#include "tt_metal/programming_examples/fft_universal_xl/fft_universal_xl_host.cpp"
+#include "tt_metal/programming_examples/fft_universal_bf16/fft_universal_bf16_host.cpp"
+
 #include <algorithm>
-#include <cmath>
 #include <complex>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -47,139 +57,166 @@ namespace ttnn::experimental::prim {
 
 namespace {
 
-using Complex = std::complex<float>;
+using Complex  = std::complex<float>;
+using DataType = tt::tt_metal::DataType;
+using tt::tt_metal::distributed::MeshDevice;
 
-// In-place iterative Cooley–Tukey radix-2 DIT FFT.
-// `inverse=false` → e^{-i 2π k n / N};  `inverse=true` → e^{+i 2π k n / N}.
-// Caller is responsible for the 1/N scale on the inverse path.
-//
-// O(N log N) work, O(1) extra memory beyond the in-place buffer.
-void radix2_inplace(Complex* a, uint32_t N, bool inverse) {
-    // Bit-reversal permutation.
-    for (uint32_t i = 1u, j = 0u; i < N; ++i) {
-        uint32_t bit = N >> 1u;
-        for (; (j & bit) != 0u; bit >>= 1u) {
-            j ^= bit;
-        }
-        j ^= bit;
-        if (i < j) {
-            std::swap(a[i], a[j]);
-        }
-    }
-
-    const double sign = inverse ? +1.0 : -1.0;
-    for (uint32_t len = 2u; len <= N; len <<= 1u) {
-        const double  theta = sign * 2.0 * M_PI / static_cast<double>(len);
-        const Complex wlen  = {static_cast<float>(std::cos(theta)),
-                               static_cast<float>(std::sin(theta))};
-        const uint32_t half = len >> 1u;
-        for (uint32_t i = 0u; i < N; i += len) {
-            Complex w{1.0f, 0.0f};
-            for (uint32_t k = 0u; k < half; ++k) {
-                const Complex u = a[i + k];
-                const Complex v = a[i + k + half] * w;
-                a[i + k]        = u + v;
-                a[i + k + half] = u - v;
-                w *= wlen;
-            }
-        }
-    }
-}
-
-// Validates that N is a power of two — required by `radix2_inplace`.
-// (compute_output_specs / validate_on_program_cache_miss already enforce
-// this for the Stockham backend; we re-check here so the host fallback
-// fails loudly if anyone widens the dispatch table without updating
-// this kernel.)
-//
-// Renamed `is_pow2_local` (rather than `is_pow2`) so the Unity build
-// can pull both this TU and fft_device_operation.cpp — which has its
-// own anonymous-namespace `is_pow2` — into the same compilation unit
-// without ODR collision.
+// Renamed `is_pow2_local` (rather than `is_pow2`) so the Unity build can
+// merge this TU with fft_device_operation.cpp — which has its own
+// anonymous-namespace `is_pow2` — without ODR collision.
 constexpr bool is_pow2_local(uint32_t n) {
     return n != 0u && (n & (n - 1u)) == 0u;
 }
 
-// Reads the input tensor(s) to host, runs an N-point FFT (or IFFT) on
-// every length-N row, and replaces `tensor_return_value` with two new
-// device tensors holding the real and imaginary halves of the spectrum.
+// Pick + invoke the right backend for a single length-N row.
+// Mirrors `select_backend()` in fft_device_operation.cpp; that one
+// rejects unsupported (dtype, N) at validate time, so by the time we
+// reach here every branch is known-good.
+std::vector<Complex> fft_one_row(
+    std::shared_ptr<MeshDevice>& md,
+    DataType                     dtype,
+    const std::vector<Complex>&  signal) {
+
+    if (dtype == DataType::BFLOAT16) {
+        return fft_universal_bf16::fft(md, signal);
+    }
+    // Float32
+    const uint32_t N = static_cast<uint32_t>(signal.size());
+    if (!is_pow2_local(N))           return fft_universal::fft(md, signal);
+    if (N <= 1u * 1024u * 1024u)     return fft_stockham::fft(md, signal);
+    return fft_universal_xl::fft(md, signal);
+}
+
+// ── Tensor I/O helpers (handle fp32 ↔ bf16 at the host boundary) ────────────
+
+// Read a Tensor's full payload as a flat fp32 vector. For BFLOAT16 inputs
+// we explicitly call `to_vector<bfloat16>` and widen on host so we avoid
+// any silent cast that the templated `to_vector<float>` overload would
+// otherwise reject.
+std::vector<float> read_real_as_fp32(const Tensor& t) {
+    if (t.dtype() == DataType::BFLOAT16) {
+        const auto buf = t.to_vector<bfloat16>();
+        std::vector<float> out(buf.size());
+        for (size_t i = 0; i < buf.size(); ++i) {
+            out[i] = static_cast<float>(buf[i]);
+        }
+        return out;
+    }
+    return t.to_vector<float>();
+}
+
+// Build an output Tensor matching `spec` (dtype/shape/layout/memory) from
+// a host fp32 buffer, narrowing to bf16 if the spec requires it. The
+// returned tensor lives on `device`.
+Tensor write_real_with_spec(
+    std::vector<float>&&     buf,
+    const ttnn::TensorSpec&  spec,
+    MeshDevice*              device) {
+
+    if (spec.data_type() == DataType::BFLOAT16) {
+        std::vector<bfloat16> bf(buf.size());
+        for (size_t i = 0; i < buf.size(); ++i) {
+            bf[i] = bfloat16(buf[i]);
+        }
+        return Tensor::from_vector(std::move(bf), spec, device);
+    }
+    return Tensor::from_vector(std::move(buf), spec, device);
+}
+
+// Drives the per-row FFT loop and replaces the output tensors with new
+// device tensors holding the (real, imag) spectrum halves.
 //
-// We replace the existing tensors (rather than writing into their
-// existing buffers) to keep this function self-contained — `from_vector`
-// allocates a fresh DRAM buffer with the correct spec and uploads in
-// one go via the standard ttnn enqueue path. The blank tensors
-// originally allocated by `FFTDeviceOperation::create_output_tensors`
-// become unreferenced and are freed by RAII.
+// We replace the outputs (rather than writing into the buffers allocated
+// by `create_output_tensors`) because the orchestrators each manage
+// their own DRAM buffers and return a host vector; the framework-supplied
+// blank tensors become unreferenced and are freed by RAII.
 //
-// Phase 1 limitation: this drops the per-shard TensorTopology that the
-// device_operation framework imputes onto the blank output tensors
-// before calling us. For Phase 1 we only support single-device
-// dispatch, so the loss is invisible to callers; Phase 2 (real
-// on-device program) will preserve the original tensor objects.
-void run_host_fft(
+// Phase 2 limitation: drops the per-shard TensorTopology that the
+// device_operation layer imputes onto the blank outputs. We currently
+// only test on single-device dispatch, so the loss is invisible to
+// callers; a Phase-3 fused-Program rewrite will preserve the originals.
+void run_backend_fft(
     const FFTParams&            attrs,
     const FFTTensorArgs&        tensor_args,
     std::pair<Tensor, Tensor>&  tensor_return_value) {
 
     const auto& in_re_tensor = tensor_args.input_real;
     const auto& shape        = in_re_tensor.logical_shape();
-    TT_FATAL(shape.size() >= 1u, "fft host fallback: tensor has rank 0");
+    TT_FATAL(shape.size() >= 1u, "fft: tensor has rank 0");
 
-    const uint32_t N = shape[-1];
-    TT_FATAL(is_pow2_local(N),
-             "fft host fallback: only power-of-two N supported (got {}).", N);
-
+    const uint32_t N     = shape[-1];
     const uint64_t total = in_re_tensor.logical_volume();
     TT_FATAL(total % N == 0u,
-             "fft host fallback: total volume {} not divisible by N {}.",
-             total, N);
+             "fft: total volume {} not divisible by N {}.", total, N);
     const uint64_t batches = total / N;
 
-    // 1. Bring inputs to host as plain float buffers. `to_vector<float>`
-    //    handles device→host transfer + layout/dtype materialisation.
-    const std::vector<float> in_re = in_re_tensor.to_vector<float>();
+    const auto dtype = in_re_tensor.dtype();
+
+    // 1. Materialise host-side fp32 inputs.
+    const std::vector<float> in_re = read_real_as_fp32(in_re_tensor);
     std::vector<float>       in_im;
     if (attrs.inverse) {
         TT_FATAL(tensor_args.input_imag.has_value(),
-                 "fft host fallback: inverse path requires input_imag.");
-        in_im = tensor_args.input_imag->to_vector<float>();
+                 "fft (inverse): input_imag is required.");
+        in_im = read_real_as_fp32(*tensor_args.input_imag);
         TT_FATAL(in_im.size() == in_re.size(),
-                 "fft host fallback: inverse input_real/input_imag size mismatch "
-                 "({} vs {}).",
+                 "fft (inverse): real / imag size mismatch ({} vs {}).",
                  in_re.size(), in_im.size());
     } else {
         in_im.assign(in_re.size(), 0.0f);
     }
     TT_FATAL(in_re.size() == total,
-             "fft host fallback: to_vector returned {} elements, expected {}.",
+             "fft: read returned {} elements, expected {}.",
              in_re.size(), total);
 
-    // 2. Run radix-2 FFT row-by-row.
+    // 2. Wrap the device pointer in a no-op-deleter shared_ptr — the
+    //    orchestrators all take `shared_ptr<MeshDevice>`, but we don't
+    //    own the lifetime here (the tensor does).
+    auto* device_raw = in_re_tensor.device();
+    auto md = std::shared_ptr<MeshDevice>(
+        device_raw, [](MeshDevice*){});
+
     std::vector<float>   out_re(total);
     std::vector<float>   out_im(total);
     std::vector<Complex> work(N);
 
+    // IFFT via conjugate trick: y = conj(fft(conj(X))) / N.
     const float scale = attrs.inverse ? (1.0f / static_cast<float>(N)) : 1.0f;
+
+    // 3. Per-row dispatch through the selected backend.
     for (uint64_t b = 0u; b < batches; ++b) {
         const uint64_t off = b * static_cast<uint64_t>(N);
-        for (uint32_t i = 0u; i < N; ++i) {
-            work[i] = Complex{in_re[off + i], in_im[off + i]};
+
+        if (attrs.inverse) {
+            for (uint32_t i = 0u; i < N; ++i) {
+                work[i] = Complex{in_re[off + i], -in_im[off + i]};
+            }
+        } else {
+            for (uint32_t i = 0u; i < N; ++i) {
+                work[i] = Complex{in_re[off + i], in_im[off + i]};
+            }
         }
-        radix2_inplace(work.data(), N, /*inverse=*/attrs.inverse);
-        for (uint32_t i = 0u; i < N; ++i) {
-            out_re[off + i] = work[i].real() * scale;
-            out_im[off + i] = work[i].imag() * scale;
+
+        const auto X = fft_one_row(md, dtype, work);
+
+        if (attrs.inverse) {
+            for (uint32_t k = 0u; k < N; ++k) {
+                out_re[off + k] =  X[k].real() * scale;
+                out_im[off + k] = -X[k].imag() * scale;
+            }
+        } else {
+            for (uint32_t k = 0u; k < N; ++k) {
+                out_re[off + k] = X[k].real();
+                out_im[off + k] = X[k].imag();
+            }
         }
     }
 
-    // 3. Replace output tensors with fresh device tensors holding the
-    //    spectrum. The spec mirrors the input spec (compute_output_specs
-    //    enforces this contract), so output dtype/shape/layout/memory-
-    //    config all match what the user expects.
-    auto*        device = in_re_tensor.device();
-    const auto&  spec   = in_re_tensor.tensor_spec();
-    tensor_return_value.first  = Tensor::from_vector(std::move(out_re), spec, device);
-    tensor_return_value.second = Tensor::from_vector(std::move(out_im), spec, device);
+    // 4. Replace outputs with fresh device tensors. compute_output_specs
+    //    guarantees output spec mirrors input spec (dtype/shape/layout).
+    const auto& spec = in_re_tensor.tensor_spec();
+    tensor_return_value.first  = write_real_with_spec(std::move(out_re), spec, device_raw);
+    tensor_return_value.second = write_real_with_spec(std::move(out_im), spec, device_raw);
 }
 
 }  // namespace
@@ -188,11 +225,14 @@ FFTProgramFactory::cached_program_t FFTProgramFactory::create(
     const FFTParams&            operation_attributes,
     const FFTTensorArgs&        tensor_args,
     std::pair<Tensor, Tensor>&  tensor_return_value) {
-    // Phase 1: do the FFT on the host. The same call also runs in
-    // override_runtime_arguments() so cache hits stay correct.
-    run_host_fft(operation_attributes, tensor_args, tensor_return_value);
 
-    // Empty program — nothing to enqueue on device for Phase 1.
+    // Run the dispatched backend. The orchestrator handles its own
+    // EnqueueMeshWorkload + read-back, so by the time this returns the
+    // spectrum is already populated on `tensor_return_value`.
+    run_backend_fft(operation_attributes, tensor_args, tensor_return_value);
+
+    // Empty outer Program — the FFT work happens inside the orchestrator
+    // calls above, not in a Program owned by this factory.
     tt::tt_metal::Program program{};
     const uint32_t N = tensor_args.input_real.logical_shape()[-1];
 
@@ -210,62 +250,37 @@ void FFTProgramFactory::override_runtime_arguments(
     const FFTParams&            operation_attributes,
     const FFTTensorArgs&        tensor_args,
     std::pair<Tensor, Tensor>&  tensor_return_value) {
-    // Phase 1: cache-hit path — re-run the host FFT. The cached
-    // "program" itself is empty, so there are no kernel runtime args
-    // to update.
-    run_host_fft(operation_attributes, tensor_args, tensor_return_value);
+    // Cache-hit path — re-dispatch the backend. The cached "program" is
+    // empty; there are no kernel runtime args to update.
+    run_backend_fft(operation_attributes, tensor_args, tensor_return_value);
 }
 
 }  // namespace ttnn::experimental::prim
 
 // =====================================================================
-// PHASE 2 TODO — true on-device program
+// PHASE 3 TODO — single fused on-device Program
 // =====================================================================
-// Replace `run_host_fft()` with a Program that runs the four-pass
-// Stockham pipeline (pass1 / pass2 / pass3 / batch_fft) on the input
-// real tensor and writes the (real, imag) spectrum into the two output
-// tensors directly in DRAM.
+// The current factory is "host-orchestrated, device-executed": each
+// length-N row runs through one of four orchestrators that own their
+// own MeshWorkloads and command-queue enqueues. This is correct and
+// fast enough for the public API to land, but it has two costs:
 //
-// Phase 2-A (DONE): kernel sources are now in-tree at
-//   ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/
-//     dataflow/{fft,batch_fft,pass2}_{reader,writer}.cpp + *_common.h
-//     compute/{fft,batch_fft,pass2}_compute.cpp
-// They are installed alongside the ttnn library (see CMakeLists.txt)
-// so Phase 2-B can call CreateKernel(...) on them directly.
+//   1. B device dispatches per call for a [B, ..., N] tensor; a fused
+//      Program could batch the outer dimensions into one workload.
+//   2. The orchestrators' kernel paths still resolve to
+//      tt_metal/programming_examples/fft*/kernel/...; a self-contained
+//      ttnn op should resolve to the in-tree copies under
+//      ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/
+//      (already staged in Phase 2-A).
 //
-// 1. Refactor tt_metal/programming_examples/fft_stockham/fft_stockham_host.cpp
-//    so the program-build code is callable as a free function:
-//      build_stockham_program(MeshDevice*, uint32_t N,
-//                             Buffer* in_real,
-//                             Buffer* out_real, Buffer* out_imag)
-//        -> { Program, std::vector<KernelHandle>, std::vector<CoreCoord> }
-//    rather than baked into a top-level fft() that owns its own buffers
-//    and runs its own enqueues. Place the result at
-//      ttnn/cpp/ttnn/operations/experimental/fft/device/stockham_host.hpp
-//    (header-only inline functions, mirrors the programming_examples
-//    structure).
-//
-// 2. The current pass1_reader expects a complex-interleaved (real+imag)
-//    DRAM layout. ttnn input is real-only. Either:
-//      (a) zero-fill the imaginary half on host before kernel launch
-//          (one extra DRAM write — simplest), or
-//      (b) modify pass1_reader to synthesize imag=0 (faster, kernel
-//          change).
-//    Phase-2-A: ship (a). Phase-2-B: optimize to (b).
-//
-// 3. override_runtime_arguments must SetRuntimeArgs(kernel_id, core,
-//    {in_buf->address(), out_re->address(), out_im->address(), N})
-//    on every call, since the buffer addresses change per dispatch.
-//
-// 4. Inverse path: y = conj(fft(conj(X))) / N. Run the forward Stockham
-//    pipeline on conj(X), then conjugate + scale via a single SFPU pass
-//    appended to the writer (or as a tiny dedicated unary kernel).
-//
-// 5. Batching: ttnn tensors are typically [B, ..., N]. The current
-//    fft_stockham handles ONE FFT of length N. Either loop over batches
-//    at the program-factory level (B device enqueues — simple, slow for
-//    large B), or extend the existing batch_fft kernel — it already does
-//    sub_N <= 1024 batched FFTs and could be wrapped for larger N.
-//
-// All of the above is mechanical; the kernels themselves are correct
-// (verified end-to-end in the programming_examples).
+// Phase 3 work:
+//   * Refactor each orchestrator's `fft()` into
+//     `build_<backend>_program(md, N, in_buf, out_re_buf, out_im_buf)
+//        -> {Program, std::vector<KernelHandle>, std::vector<CoreCoord>}`
+//     emitting one Program per call, no internal enqueues.
+//   * Retarget all CreateKernel(...) paths to the in-tree kernels dir.
+//   * Wire override_runtime_arguments() to update buffer addresses on
+//     program-cache hits (currently a re-dispatch, which is fine but
+//     wastes the cached Program object).
+//   * Inverse path can stay as the conjugate trick or be inlined as a
+//     short SFPU pass appended to the writer kernel.

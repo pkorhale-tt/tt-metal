@@ -46,7 +46,7 @@ void FFTDeviceOperation::validate_on_program_cache_miss(
 
     TT_FATAL(
         input.layout() == tt::tt_metal::Layout::ROW_MAJOR,
-        "fft: only ROW_MAJOR layout is supported in Phase 1 (got {}).",
+        "fft: only ROW_MAJOR layout is supported (got {}).",
         static_cast<int>(input.layout()));
 
     const auto& shape = input.padded_shape();
@@ -66,16 +66,9 @@ void FFTDeviceOperation::validate_on_program_cache_miss(
                  "in dtype/layout/shape.");
     }
 
-    // This call also serves as a "is the (dtype, N) combination supported?"
-    // check; throws a clear TT_THROW for unsupported combos.
+    // Throws a clear TT_THROW for any unsupported (dtype, N) combo
+    // (e.g. fp32 + pow2 + N > 16M).
     (void)select_backend(input.dtype(), N);
-
-    // Phase 1 only ships the Stockham backend.
-    const auto backend = select_backend(input.dtype(), N);
-    TT_FATAL(backend == FFTBackend::Stockham,
-             "fft: backend {} is scaffolded but not yet wired up. "
-             "Phase 1 supports Float32 + pow2 N <= 1M (Stockham).",
-             static_cast<int>(backend));
 }
 
 FFTDeviceOperation::spec_return_value_t FFTDeviceOperation::compute_output_specs(
