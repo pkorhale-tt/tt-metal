@@ -3,7 +3,7 @@
 //
 // ─────────────────────────────────────────────────────────────────────────
 //  DUPLICATE — keep byte-for-byte in sync with
-//    ../compute/packed_dft_common.h
+//    ../dataflow/packed_dft_common.h
 //  Two copies exist because the tt-metal kernel build resolves "common.h"
 //  includes only against the kernel's own directory, so a single shared
 //  header in dataflow/ is invisible to compute/packed_dft_compute.cpp and

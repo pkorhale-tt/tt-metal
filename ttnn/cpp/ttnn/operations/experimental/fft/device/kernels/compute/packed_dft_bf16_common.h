@@ -3,7 +3,7 @@
 //
 // ─────────────────────────────────────────────────────────────────────────
 //  DUPLICATE — keep byte-for-byte in sync with
-//    ../compute/packed_dft_bf16_common.h
+//    ../dataflow/packed_dft_bf16_common.h
 //  Two copies exist because the tt-metal kernel build resolves "common.h"
 //  includes only against the kernel's own directory. Edit BOTH files for
 //  any change.

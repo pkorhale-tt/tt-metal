@@ -35,8 +35,19 @@ device/kernels/
     └── packed_dft_bf16_compute.cpp      packed direct DFT compute         (bf16)
 ```
 
-17 files total: 12 dataflow (6 reader/writer pairs + 6 common headers),
-5 compute.
+19 files total: 12 dataflow (6 reader/writer pairs + 6 common headers),
+7 compute (5 compute.cpp + 2 duplicated common.h — see below).
+
+### Why two copies of `packed_dft{,_bf16}_common.h`
+
+The tt-metal kernel build resolves bare `#include "X_common.h"` only
+against the kernel's own directory. The `packed_dft` and
+`packed_dft_bf16` kernel triples genuinely share state across both
+compute and dataflow (inherited from the original flat `kernel/` layout
+in `programming_examples/`), so each common.h is duplicated into both
+`compute/` and `dataflow/`. Both copies carry a sync-warning header.
+The other four common.h files (`fft`, `batch_fft`, `pass2`) are only
+used by their reader/writer kernels, so they live in `dataflow/` only.
 
 ## Backend → kernel mapping
 
