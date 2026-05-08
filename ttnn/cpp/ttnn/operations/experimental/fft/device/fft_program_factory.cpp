@@ -5,20 +5,20 @@
 // FFT program factory — full-backend dispatcher.
 //
 // Routes each call of `ttnn::experimental::fft / ifft` to one of four
-// device-resident orchestrators originally developed under
-// tt_metal/programming_examples/. Selection is by (dtype, N, is_pow2):
+// device-resident orchestrators that live in this same directory as
+// header-only modules. Selection is by (dtype, N, is_pow2):
 //
-//     fp32 + pow2  + N <= 1M    →  fft_stockham         (4-pass Stockham)
-//     fp32 + pow2  + N <= 16M   →  fft_universal_xl     (2-level Cooley–Tukey)
-//     fp32 + non-pow2           →  fft_universal        (mixed-radix / Bluestein)
-//     bf16 + any N              →  fft_universal_bf16   (true-bf16 FPU matmul)
+//     fp32 + pow2  + N <= 1M    →  stockham_host.hpp        (4-pass Stockham)
+//     fp32 + pow2  + N <= 16M   →  universal_xl_host.hpp    (2-level Cooley–Tukey)
+//     fp32 + non-pow2           →  universal_host.hpp       (mixed-radix / Bluestein)
+//     bf16 + any N              →  universal_bf16_host.hpp  (true-bf16 FPU matmul)
 //
-// The orchestrators are header-only inline modules; including their
-// `*_host.cpp` files pulls in the kernel-launch code at translation-unit
-// scope and keeps every kernel reference (`CreateKernel("...")`) pointing
-// at the existing programming_examples source tree. Migration of those
-// kernel paths into ttnn/cpp/.../fft/device/kernels/ is staged in a
-// follow-up PR; the kernels are already copied there (Phase 2-A).
+// The orchestrators are byte-for-byte ports of the originals under
+// tt_metal/programming_examples/ with two changes: every CreateKernel()
+// path now points at device/kernels/ (so the ttnn op is fully self-
+// contained), and the cross-includes use sibling headers in this
+// directory. The programming_examples copies remain as stand-alone
+// demos and are independent of this op's install.
 //
 // This file is "host-orchestrated, device-executed" — every FFT pass
 // runs on Tensix cores via the orchestrator's MeshWorkload enqueues.
@@ -39,12 +39,20 @@
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/host_api.hpp>
 
-// Backend orchestrators — header-only inline modules. Each has #pragma once;
-// transitive includes (notably fft_stockham) collapse cleanly.
-#include "tt_metal/programming_examples/fft_stockham/fft_stockham_host.cpp"
-#include "tt_metal/programming_examples/fft_universal/fft_universal_host.cpp"
-#include "tt_metal/programming_examples/fft_universal_xl/fft_universal_xl_host.cpp"
-#include "tt_metal/programming_examples/fft_universal_bf16/fft_universal_bf16_host.cpp"
+// Backend orchestrators — header-only inline modules, in-tree copies of
+// the originals under tt_metal/programming_examples/. The in-tree copies
+// have all CreateKernel(...) paths retargeted to device/kernels/ so the
+// ttnn op is fully self-contained and does not depend on
+// programming_examples being installed at runtime. See
+// device/kernels/README.md for provenance.
+//
+// Each header is #pragma once; transitive includes (notably stockham_host
+// being pulled in by universal/universal_xl/universal_bf16) collapse
+// cleanly via the include guard.
+#include "stockham_host.hpp"
+#include "universal_host.hpp"
+#include "universal_xl_host.hpp"
+#include "universal_bf16_host.hpp"
 
 #include <algorithm>
 #include <complex>
@@ -258,29 +266,25 @@ void FFTProgramFactory::override_runtime_arguments(
 }  // namespace ttnn::experimental::prim
 
 // =====================================================================
-// PHASE 3 TODO — single fused on-device Program
+// PHASE 4 TODO — single fused on-device Program
 // =====================================================================
 // The current factory is "host-orchestrated, device-executed": each
 // length-N row runs through one of four orchestrators that own their
 // own MeshWorkloads and command-queue enqueues. This is correct and
-// fast enough for the public API to land, but it has two costs:
+// fast enough for the public API to land, but it has one remaining
+// inefficiency: B device dispatches per call for a [B, ..., N] tensor.
+// A fused Program could batch the outer dimensions into one workload.
 //
-//   1. B device dispatches per call for a [B, ..., N] tensor; a fused
-//      Program could batch the outer dimensions into one workload.
-//   2. The orchestrators' kernel paths still resolve to
-//      tt_metal/programming_examples/fft*/kernel/...; a self-contained
-//      ttnn op should resolve to the in-tree copies under
-//      ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/
-//      (already staged in Phase 2-A).
-//
-// Phase 3 work:
+// Phase 4 work:
 //   * Refactor each orchestrator's `fft()` into
 //     `build_<backend>_program(md, N, in_buf, out_re_buf, out_im_buf)
 //        -> {Program, std::vector<KernelHandle>, std::vector<CoreCoord>}`
 //     emitting one Program per call, no internal enqueues.
-//   * Retarget all CreateKernel(...) paths to the in-tree kernels dir.
 //   * Wire override_runtime_arguments() to update buffer addresses on
 //     program-cache hits (currently a re-dispatch, which is fine but
 //     wastes the cached Program object).
 //   * Inverse path can stay as the conjugate trick or be inlined as a
 //     short SFPU pass appended to the writer kernel.
+//
+// Note: kernel-path retargeting is DONE — every backend now references
+// device/kernels/{compute,dataflow}/* directly.

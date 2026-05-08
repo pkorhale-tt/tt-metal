@@ -14,14 +14,18 @@ set_target_properties(
             api
 )
 
-# Kernel sources for the (forthcoming) on-device Stockham pipeline.
-# Layout follows the ttnn convention (matmul / sdpa / plusone / etc.):
-#   device/kernels/dataflow/{reader,writer,common.h}
-#   device/kernels/compute/*.cpp
-# These are NOT yet referenced from fft_program_factory.cpp (Phase 1
-# runs the FFT on host); they are installed here so Phase 2 can call
-# CreateKernel("ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/...")
-# without a separate file-relocation PR.
+# Kernel sources for every backend reachable from
+# ttnn::experimental::fft / ifft (stockham, universal_xl, universal,
+# universal_bf16). Layout follows the ttnn convention (matmul / sdpa /
+# plusone / etc.):
+#   device/kernels/dataflow/{*_reader,*_writer,*_common.h}
+#   device/kernels/compute/*_compute.cpp
+#
+# These kernels are referenced directly by the in-tree orchestrator
+# headers (device/{stockham,universal,universal_xl,universal_bf16}_host.hpp)
+# via canonical paths
+# `ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/...`.
+# See device/kernels/README.md for the full file → backend mapping.
 file(GLOB_RECURSE kernels device/kernels/*)
 
 target_sources(
@@ -41,20 +45,7 @@ target_sources(
         fft.cpp
 )
 
-target_include_directories(
-    ttnn_op_experimental_fft
-    PRIVATE
-        ${FixmeOpIncDirs}
-        # Workspace root — needed so fft_program_factory.cpp can include the
-        # backend orchestrators with their canonical
-        # `tt_metal/programming_examples/fft_*/fft_*_host.cpp` paths.
-        # These orchestrators are header-only inline modules; the include
-        # pulls their `inline std::vector<Complex> fft(md, signal)` API
-        # into the ttnn op TU. Removed once Phase 3 rewrites them as
-        # in-tree single-Program builders under
-        # ttnn/cpp/ttnn/operations/experimental/fft/device/*_host.hpp.
-        ${CMAKE_SOURCE_DIR}
-)
+target_include_directories(ttnn_op_experimental_fft PRIVATE ${FixmeOpIncDirs})
 target_link_libraries(
     ttnn_op_experimental_fft
     PRIVATE

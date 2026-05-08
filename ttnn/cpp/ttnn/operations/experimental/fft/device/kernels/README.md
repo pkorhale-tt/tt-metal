@@ -1,54 +1,81 @@
-# Stockham FFT kernels
+# `ttnn::experimental::fft` device kernels
 
-Kernels for the `ttnn::experimental::fft` device op. Phase 2 (forthcoming)
-will wire `fft_program_factory.cpp` to `CreateKernel(...)` these files; in
-Phase 1 they are present-but-unreferenced so this PR can land without a
-follow-up file-relocation PR.
+All kernels reachable from `ttnn::experimental::fft` / `ttnn::experimental::ifft`,
+staged in one place. Today (Phase 2) the program factory still calls the
+original orchestrators under `tt_metal/programming_examples/fft*/`, which
+themselves `CreateKernel(...)` against their in-tree paths. Phase 3 will
+retarget those `CreateKernel` paths to the canonical copies here, at
+which point the `programming_examples` copies become removable.
 
 ## Layout
 
 ```
 device/kernels/
-├── dataflow/                    (BRISC0 reader / BRISC1 writer)
-│   ├── fft_reader.cpp           ┐
-│   ├── fft_writer.cpp           │ inner radix-2 single-tile FFT
-│   ├── fft_common.h             ┘  (sub_N <= 1024)
-│   ├── batch_fft_reader.cpp     ┐
-│   ├── batch_fft_writer.cpp     │ batched single-tile FFT — 64 cores
-│   ├── batch_fft_common.h       ┘  parallel sub-FFTs of length sub_N
-│   ├── pass2_reader.cpp         ┐
-│   ├── pass2_writer.cpp         │ Stockham pass-2: per-element twiddle
-│   └── pass2_common.h           ┘  multiply, on-device (no transpose)
-└── compute/                     (TRISC0/1/2 — FPU + SFPU)
-    ├── fft_compute.cpp          radix-2 butterfly via FPU matmul
-    ├── batch_fft_compute.cpp    same as above, batched per core
-    └── pass2_compute.cpp        complex multiply via SFPU
+├── dataflow/                            (BRISC0 reader / BRISC1 writer)
+│   ├── fft_reader.cpp                   ┐
+│   ├── fft_writer.cpp                   │ inner radix-2 single-tile FFT
+│   ├── fft_common.h                     ┘  (sub_N <= 1024)  — fp32
+│   ├── batch_fft_reader.cpp             ┐
+│   ├── batch_fft_writer.cpp             │ batched single-tile FFT, 64 cores,
+│   ├── batch_fft_common.h               ┘  parallel sub-FFTs   — fp32
+│   ├── pass2_reader.cpp                 ┐
+│   ├── pass2_writer.cpp                 │ Stockham pass-2: per-element
+│   ├── pass2_common.h                   ┘  twiddle multiply   — fp32
+│   ├── packed_dft_reader.cpp            ┐
+│   ├── packed_dft_writer.cpp            │ packed direct DFT for small /
+│   ├── packed_dft_common.h              ┘  composite radices  — fp32
+│   ├── packed_dft_bf16_reader.cpp       ┐
+│   ├── packed_dft_bf16_writer.cpp       │ packed direct DFT, true-bf16 FPU
+│   └── packed_dft_bf16_common.h         ┘  matmul reduction   — bf16
+└── compute/                             (TRISC0/1/2 — FPU + SFPU)
+    ├── fft_compute.cpp                  radix-2 butterfly via FPU matmul (fp32)
+    ├── batch_fft_compute.cpp            same as above, batched per core   (fp32)
+    ├── pass2_compute.cpp                complex multiply via SFPU         (fp32)
+    ├── packed_dft_compute.cpp           packed direct DFT compute         (fp32)
+    └── packed_dft_bf16_compute.cpp      packed direct DFT compute         (bf16)
 ```
+
+17 files total: 12 dataflow (6 reader/writer pairs + 6 common headers),
+5 compute.
+
+## Backend → kernel mapping
+
+| `ttnn.fft` input         | Backend            | Kernels used                                                               |
+|--------------------------|--------------------|----------------------------------------------------------------------------|
+| fp32, pow2, N ≤ 64K      | `fft_stockham`     | `fft_*`                                                                    |
+| fp32, pow2, 64K < N ≤ 1M | `fft_stockham`     | `batch_fft_*` + `pass2_*`                                                  |
+| fp32, pow2, 1M < N ≤ 16M | `fft_universal_xl` | (delegates to `fft_stockham`)                                              |
+| fp32, non-pow2           | `fft_universal`    | `packed_dft_*` + `fft_stockham` kernels for pow2 sub-FFTs / Bluestein pad  |
+| bf16, any N              | `fft_universal_bf16` | `packed_dft_bf16_*`                                                      |
 
 ## Provenance
 
-Originally developed and validated end-to-end in:
+Each file is a verbatim copy of the corresponding kernel under
+`tt_metal/programming_examples/`:
 
-* `tt_metal/programming_examples/fft/kernel/`           → `dataflow/fft_*` + `compute/fft_compute.cpp`
-* `tt_metal/programming_examples/fft_stockham/kernel/`  → everything else
+| ttnn copy                                | Source of truth                                                            |
+|------------------------------------------|----------------------------------------------------------------------------|
+| `fft_*`                                  | `fft/kernel/fft_*.cpp`, `fft/kernel/fft_common.h`                          |
+| `batch_fft_*`, `pass2_*`                 | `fft_stockham/kernel/{batch_fft,pass2}_*.cpp` + `*_common.h`               |
+| `packed_dft_*`                           | `fft_universal/kernel/packed_dft_*.cpp` + `packed_dft_common.h`            |
+| `packed_dft_bf16_*`                      | `fft_universal_bf16/kernel/packed_dft_bf16_*.cpp` + `packed_dft_bf16_common.h` |
 
-The programming-examples copies remain unchanged for now; once the ttnn
-op is fully wired (Phase 2-C) the originals can be deleted in favour of
-this canonical location.
+Both copies must be kept in sync until Phase 3 retargets the orchestrator
+`CreateKernel(...)` paths and the `programming_examples` copies are
+deleted.
 
-## Pipeline (Phase 2 reference)
+## Build / install
 
-`ttnn::experimental::fft(x)` for length-N power-of-two will dispatch
-the four-pass Stockham pipeline:
+The parent `CMakeLists.txt` does
+`file(GLOB_RECURSE kernels device/kernels/*)` and installs the whole tree
+to `${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/ttnn/cpp/ttnn/operations/experimental/fft/`,
+so adding new files here requires no CMake changes — just rebuild.
 
-1. **batch_fft** (length-N₂, batch=N₁) — `batch_fft_*` kernels
-2. **pass2** — on-device twiddle multiply `W_N^(i·j)`
-3. **batch_fft** (length-N₁, batch=N₂) — `batch_fft_*` kernels
-4. final reorder — currently host-side, lifts to a writer-kernel pass
-   in Phase 2-C
+## Phase 3 plan (single-Program rewrite)
 
-For N ≤ 65,536 we collapse to the single-tile path (`fft_*`) directly.
-
-See the orchestration logic in
-`tt_metal/programming_examples/fft_stockham/fft_stockham_host.cpp`
-(soon to be lifted into `device/stockham_host.hpp`).
+The orchestrators in `programming_examples` each manage their own
+`MeshWorkload` enqueues. Phase 3 will refactor them into free
+`build_<backend>_program(md, N, in_buf, out_re_buf, out_im_buf)` builders
+that emit one `Program` per call (no internal enqueues), `CreateKernel`
+against the in-tree paths above, and let `FFTProgramFactory::create`
+own the dispatch + caching.
