@@ -70,6 +70,44 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                 return self(input_real);
             },
             nb::arg("input_real").noconvert()});
+
+    const auto* ifft_doc =
+        R"doc(
+            1-D Inverse Fast Fourier Transform.
+
+            Reverses :func:`ttnn.fft`. Takes the (real, imag) halves of a
+            spectrum, returns the (real, imag) of the reconstructed signal
+            scaled by 1/N. For a real input ``x``::
+
+                spec_re, spec_im = ttnn.fft(x)
+                rec_re,  rec_im  = ttnn.ifft(spec_re, spec_im)
+                # rec_re == x  (within fp32 noise);  rec_im ~ 0
+
+            Phase 1 support matrix matches :func:`ttnn.fft`.
+
+            Args:
+                * :attr:`spectrum_real`: Float32 ROW_MAJOR tensor, real part.
+                * :attr:`spectrum_imag`: Float32 ROW_MAJOR tensor, imag part.
+                                          Same shape/dtype/layout as
+                                          ``spectrum_real``.
+
+            Returns:
+                Tuple ``(real, imag)`` of Tensors, same shape as the inputs.
+        )doc";
+
+    using IFFTType = decltype(ttnn::ifft);
+    bind_registered_operation(
+        mod,
+        ttnn::ifft,
+        ifft_doc,
+        ttnn::nanobind_overload_t{
+            [](const IFFTType& self,
+               const ttnn::Tensor& spectrum_real,
+               const ttnn::Tensor& spectrum_imag) {
+                return self(spectrum_real, spectrum_imag);
+            },
+            nb::arg("spectrum_real").noconvert(),
+            nb::arg("spectrum_imag").noconvert()});
 }
 
 }  // namespace ttnn::operations::experimental::fft::detail

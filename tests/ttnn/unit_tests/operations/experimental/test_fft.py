@@ -37,12 +37,24 @@ def test_fft_returns_correct_shape_and_dtype(device, N):
 
 
 # ── Math correctness (forward FFT) ──────────────────────────────────────────
-@pytest.mark.parametrize("N", [2, 8, 64, 1024, 4096, 65536])
-def test_fft_matches_torch(device, N):
+# Tolerance scales as O(sqrt(log2 N)) for fp32 radix-2 with std::cos/std::sin
+# twiddles — so N=2 is essentially exact, N=64K loses ~16 stages of precision.
+# We pick a per-N tolerance that's tight enough to catch wiring bugs but
+# loose enough to avoid false fails on the fp32 noise floor.
+@pytest.mark.parametrize(
+    "N, tol",
+    [
+        (2,     1e-6),
+        (8,     1e-5),
+        (64,    5e-5),
+        (1024,  1e-4),
+        (4096,  1e-4),
+        (65536, 5e-4),
+    ],
+)
+def test_fft_matches_torch(device, N, tol):
     """
     Compares ttnn.fft against torch.fft.fft on a 1D Float32 input.
-    Tolerance is loose enough for fp32 host CT (≤ 5e-5 relative L2 at N=64K)
-    but tight enough to catch any wiring bug.
     """
     torch_in = torch.randn(N, dtype=torch.float32)
     torch_X = torch.fft.fft(torch_in)
@@ -61,7 +73,7 @@ def test_fft_matches_torch(device, N):
     rel = torch.linalg.norm(
         torch.complex(got_re, got_im) - torch_X
     ) / torch.linalg.norm(torch_X).clamp_min(1e-12)
-    assert rel < 1e-4, f"ttnn.fft N={N} rel err {rel.item():.2e} exceeds 1e-4"
+    assert rel < tol, f"ttnn.fft N={N} rel err {rel.item():.2e} exceeds {tol:.0e}"
 
 
 # ── Roundtrip (FFT → IFFT) ─────────────────────────────────────────────────

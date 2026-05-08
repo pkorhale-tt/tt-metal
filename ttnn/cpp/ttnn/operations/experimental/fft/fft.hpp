@@ -46,12 +46,15 @@ struct FFTOperation {
     //                Batched along leading dims.
     //   returns    : {real, imag} of the spectrum. Same shape as input.
     static std::pair<ttnn::Tensor, ttnn::Tensor> invoke(const Tensor& input_real);
+};
 
-    // Inverse FFT (conjugate-trick wrapper around forward FFT).
+// Inverse FFT. Separate registered_operation_t so it appears as
+// `ttnn.ifft(spec_re, spec_im)` in Python alongside `ttnn.fft(x)`.
+struct IFFTOperation {
     //   spectrum_real / spectrum_imag : real / imag parts of the spectrum.
     //   returns                       : {real, imag} of the time-domain
     //                                   signal divided by N.
-    static std::pair<ttnn::Tensor, ttnn::Tensor> invoke_ifft(
+    static std::pair<ttnn::Tensor, ttnn::Tensor> invoke(
         const Tensor& spectrum_real,
         const Tensor& spectrum_imag);
 };
@@ -60,5 +63,8 @@ struct FFTOperation {
 
 constexpr auto fft =
     ttnn::register_operation<"ttnn::fft", ttnn::operations::experimental::FFTOperation>();
+
+constexpr auto ifft =
+    ttnn::register_operation<"ttnn::ifft", ttnn::operations::experimental::IFFTOperation>();
 
 }  // namespace ttnn
