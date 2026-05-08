@@ -41,11 +41,20 @@ namespace ttnn {
 namespace operations::experimental {
 
 struct FFTOperation {
-    // Forward FFT.
+    // Forward FFT — real input.
     //   input_real : real-valued signal, last dim = N (the FFT length).
     //                Batched along leading dims.
     //   returns    : {real, imag} of the spectrum. Same shape as input.
     static std::pair<ttnn::Tensor, ttnn::Tensor> invoke(const Tensor& input_real);
+
+    // Forward FFT — complex input (two-tensor form).
+    //   input_real / input_imag : real and imaginary halves of the input
+    //                             signal. Must match in dtype/shape/layout.
+    //   returns                 : {real, imag} of the spectrum, same shape.
+    // Equivalent to the standard ``X = fft(input_real + i * input_imag)``.
+    static std::pair<ttnn::Tensor, ttnn::Tensor> invoke(
+        const Tensor& input_real,
+        const Tensor& input_imag);
 };
 
 // Inverse FFT. Separate registered_operation_t so it appears as

@@ -54,9 +54,23 @@ void bind_experimental_fft_operation(nb::module_& mod) {
 
             Args:
                 * :attr:`input_real`: Float32 or BFloat16 ROW_MAJOR tensor.
+                * :attr:`input_imag` (optional): Float32 or BFloat16
+                  ROW_MAJOR tensor — same shape, dtype, layout as
+                  ``input_real``. When supplied, the input is treated as
+                  the complex signal ``input_real + i * input_imag``;
+                  when omitted, the imaginary part is taken to be zero.
 
             Returns:
                 Tuple ``(real, imag)`` of Tensors.
+
+            Examples::
+
+                # Real input (most common):
+                spec_re, spec_im = ttnn.fft(x_real)
+
+                # Complex input — e.g. when chaining FFT after another
+                # operation that already produced a (real, imag) pair:
+                spec_re, spec_im = ttnn.fft(x_real, x_imag)
         )doc";
 
     using OperationType = decltype(ttnn::fft);
@@ -69,7 +83,15 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                const ttnn::Tensor& input_real) {
                 return self(input_real);
             },
-            nb::arg("input_real").noconvert()});
+            nb::arg("input_real").noconvert()},
+        ttnn::nanobind_overload_t{
+            [](const OperationType& self,
+               const ttnn::Tensor& input_real,
+               const ttnn::Tensor& input_imag) {
+                return self(input_real, input_imag);
+            },
+            nb::arg("input_real").noconvert(),
+            nb::arg("input_imag").noconvert()});
 
     const auto* ifft_doc =
         R"doc(

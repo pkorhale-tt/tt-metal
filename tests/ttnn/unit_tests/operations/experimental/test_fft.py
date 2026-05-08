@@ -222,6 +222,42 @@ def test_fft_ifft_roundtrip(device, N, dtype, tol):
     )
 
 
+# ── Complex-input forward FFT (2-arg overload) ──────────────────────────────
+@pytest.mark.parametrize(
+    "N, dtype, tol",
+    [
+        (256,  ttnn.float32,  5e-4),
+        (1024, ttnn.float32,  5e-4),
+        (4096, ttnn.float32,  1e-3),
+        (1024, ttnn.bfloat16, 5e-2),
+    ],
+)
+def test_fft_complex_input(device, N, dtype, tol):
+    """ttnn.fft(real, imag) should match torch.fft.fft of the corresponding
+    complex signal. Verifies the 2-arg overload + the program-factory path
+    that consumes input_imag on the forward direction."""
+    torch_re = torch.randn(N, dtype=torch.float32)
+    torch_im = torch.randn(N, dtype=torch.float32)
+
+    tt_re = ttnn.from_torch(torch_re, dtype=dtype,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    tt_im = ttnn.from_torch(torch_im, dtype=dtype,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+    spec_re, spec_im = ttnn.fft(tt_re, tt_im)
+
+    got = torch.complex(
+        ttnn.to_torch(spec_re).reshape(-1).to(torch.float32),
+        ttnn.to_torch(spec_im).reshape(-1).to(torch.float32),
+    )
+    ref = torch.fft.fft(torch.complex(torch_re, torch_im))
+
+    rel = _rel_err(got, ref)
+    assert rel < tol, (
+        f"complex-input fft N={N} dtype={dtype} rel err {rel:.2e} exceeds {tol:.0e}"
+    )
+
+
 # ── Out-of-support guard ────────────────────────────────────────────────────
 def test_fft_rejects_unsupported_large_n(device):
     """fp32 + pow2 + N > 16M is not yet wired (needs packed batch_fft_xl

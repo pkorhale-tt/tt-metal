@@ -160,17 +160,19 @@ void run_backend_fft(
 
     const auto dtype = in_re_tensor.dtype();
 
-    // 1. Materialise host-side fp32 inputs.
+    // 1. Materialise host-side fp32 inputs. input_imag is OPTIONAL on the
+    //    forward path (zero-fill when absent → real-input FFT) and REQUIRED
+    //    on the inverse path (you can't IFFT a real-only spectrum).
     const std::vector<float> in_re = read_real_as_fp32(in_re_tensor);
     std::vector<float>       in_im;
-    if (attrs.inverse) {
-        TT_FATAL(tensor_args.input_imag.has_value(),
-                 "fft (inverse): input_imag is required.");
+    if (tensor_args.input_imag.has_value()) {
         in_im = read_real_as_fp32(*tensor_args.input_imag);
         TT_FATAL(in_im.size() == in_re.size(),
-                 "fft (inverse): real / imag size mismatch ({} vs {}).",
+                 "fft: real / imag size mismatch ({} vs {}).",
                  in_re.size(), in_im.size());
     } else {
+        TT_FATAL(!attrs.inverse,
+                 "fft (inverse): input_imag is required.");
         in_im.assign(in_re.size(), 0.0f);
     }
     TT_FATAL(in_re.size() == total,
