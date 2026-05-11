@@ -11,7 +11,7 @@
 
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
-#include <tt-metalium/assert.hpp>
+#include <tt_stl/assert.hpp>
 
 #include <algorithm>
 #include <cassert>
