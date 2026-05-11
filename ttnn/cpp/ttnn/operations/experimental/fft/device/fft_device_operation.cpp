@@ -107,10 +107,14 @@ namespace ttnn::prim {
 std::pair<Tensor, Tensor> fft(
     const Tensor& input_real,
     bool inverse,
-    const std::optional<Tensor>& input_imag) {
+    const std::optional<Tensor>& input_imag,
+    ttnn::experimental::prim::FFTPrecision precision) {
     using OperationType = ttnn::experimental::prim::FFTDeviceOperation;
 
-    OperationType::operation_attributes_t attrs{ .inverse = inverse };
+    OperationType::operation_attributes_t attrs{
+        .inverse   = inverse,
+        .precision = precision,
+    };
     OperationType::tensor_args_t          args{ .input_real = input_real,
                                                 .input_imag = input_imag };
 

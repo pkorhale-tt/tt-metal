@@ -962,4 +962,217 @@ inline std::vector<Complex> ifft(
     return ifft(md, cx);
 }
 
+// ╔════════════════════════════════════════════════════════════════════════╗
+// ║  Precise (SFPU true-fp32) variants                                     ║
+// ╚════════════════════════════════════════════════════════════════════════╝
+//
+// Identical math to fft() / batched_siblings_fft() but skips Path 0 (the
+// packed_dft FPU-matmul kernel). The remaining paths — pow2 batch_fft,
+// Bluestein, mixed-radix CT — all bottom out in SFPU *_binary_tile ops
+// which are true IEEE fp32. For small non-pow2 N (e.g. N=6) this drops
+// round-trip error from ~1e-3 (FPU bf16-mantissa multiplier) to ~1e-7,
+// matching torch.fft at the cost of ~10-30× slower per-call time.
+//
+// We don't fork the entire universal_host machinery — only this dispatcher
+// switch differs, so we forward to the existing helpers (which themselves
+// re-enter via batched_siblings_fft_precise on the recursive sub-calls).
+
+inline void batched_bluestein_precise(
+    std::shared_ptr<MeshDevice>       md,
+    uint32_t                          count,
+    uint32_t                          N,
+    const std::vector<Complex>&       in,
+    std::vector<Complex>&             out);
+
+inline void cooley_tukey_split_batched_precise(
+    std::shared_ptr<MeshDevice>       md,
+    uint32_t                          count,
+    uint32_t                          N1,
+    uint32_t                          N2,
+    const std::vector<Complex>&       in,
+    std::vector<Complex>&             out);
+
+// Same dispatcher as batched_siblings_fft, MINUS Path 0 (packed_dft).
+inline void batched_siblings_fft_precise(
+    std::shared_ptr<MeshDevice>       md,
+    uint32_t                          count,
+    uint32_t                          len,
+    const std::vector<Complex>&       in,
+    std::vector<Complex>&             out)
+{
+    assert(in.size() == static_cast<size_t>(count) * len);
+
+    if (len == 1u || count == 0u) {
+        out = in;
+        return;
+    }
+
+    // Path A: pow2 length fitting in a tile → single batched dispatch.
+    // batch_fft uses SFPU butterflies (true fp32) — already precise.
+    if (is_pow2(len) && len <= kBatchMaxSubN) {
+        const uint32_t padded = next_pow2(count);
+        if (padded == count) {
+            fft_stockham::batch_fft(md, len, count, in, out);
+            return;
+        }
+        std::vector<Complex> in_padded(static_cast<size_t>(padded) * len,
+                                       Complex{0.0f, 0.0f});
+        std::copy(in.begin(), in.end(), in_padded.begin());
+        std::vector<Complex> out_padded;
+        fft_stockham::batch_fft(md, len, padded, in_padded, out_padded);
+        out.assign(out_padded.begin(),
+                   out_padded.begin() + static_cast<size_t>(count) * len);
+        return;
+    }
+
+    if (is_pow2(len)) {
+        out.resize(static_cast<size_t>(count) * len);
+        std::vector<Complex> row(len);
+        for (uint32_t r = 0; r < count; ++r) {
+            const size_t base = static_cast<size_t>(r) * len;
+            std::copy(in.begin() + base, in.begin() + base + len, row.begin());
+            const std::vector<Complex> Yr = fft_stockham::fft(md, row);
+            std::copy(Yr.begin(), Yr.end(), out.begin() + base);
+        }
+        return;
+    }
+
+    if (is_prime(len)) {
+        batched_bluestein_precise(md, count, len, in, out);
+        return;
+    }
+
+    const auto [N1, N2] = pick_factors(len);
+    cooley_tukey_split_batched_precise(md, count, N1, N2, in, out);
+}
+
+// Bluestein with the inner length-M FFTs routed through the precise
+// dispatcher (M is always pow2 → batch_fft → SFPU; this is a hygiene
+// move so the recursion is uniformly precise).
+inline void batched_bluestein_precise(
+    std::shared_ptr<MeshDevice>       md,
+    uint32_t                          count,
+    uint32_t                          N,
+    const std::vector<Complex>&       in,
+    std::vector<Complex>&             out)
+{
+    assert(in.size() == static_cast<size_t>(count) * N);
+    auto           plan = get_bluestein_plan(md, N);
+    const uint32_t M    = plan->M;
+    const auto&    w    = plan->chirp_fwd;
+    const auto&    B    = plan->B_fft;
+
+    std::vector<Complex> A(static_cast<size_t>(count) * M, Complex{0.0f, 0.0f});
+    for (uint32_t r = 0; r < count; ++r) {
+        const size_t in_base  = static_cast<size_t>(r) * N;
+        const size_t out_base = static_cast<size_t>(r) * M;
+        for (uint32_t n = 0; n < N; ++n) {
+            A[out_base + n] = in[in_base + n] * w[n];
+        }
+    }
+
+    std::vector<Complex> A_fft;
+    batched_siblings_fft_precise(md, count, M, A, A_fft);
+
+    for (uint32_t r = 0; r < count; ++r) {
+        const size_t base = static_cast<size_t>(r) * M;
+        for (uint32_t k = 0; k < M; ++k) A_fft[base + k] *= B[k];
+    }
+
+    for (auto& z : A_fft) z = std::conj(z);
+    std::vector<Complex> c;
+    batched_siblings_fft_precise(md, count, M, A_fft, c);
+    const float inv_M = 1.0f / static_cast<float>(M);
+    for (auto& z : c) z = std::conj(z) * inv_M;
+
+    out.resize(static_cast<size_t>(count) * N);
+    for (uint32_t r = 0; r < count; ++r) {
+        const size_t in_base  = static_cast<size_t>(r) * M;
+        const size_t out_base = static_cast<size_t>(r) * N;
+        for (uint32_t k = 0; k < N; ++k) {
+            out[out_base + k] = c[in_base + k] * w[k];
+        }
+    }
+}
+
+inline void cooley_tukey_split_batched_precise(
+    std::shared_ptr<MeshDevice>       md,
+    uint32_t                          count,
+    uint32_t                          N1,
+    uint32_t                          N2,
+    const std::vector<Complex>&       in,
+    std::vector<Complex>&             out)
+{
+    const uint32_t N     = N1 * N2;
+    const size_t   total = static_cast<size_t>(count) * N;
+    assert(in.size() == total);
+
+    std::vector<Complex> pass1_in(total);
+    for (uint32_t r = 0; r < count; ++r) {
+        const size_t in_base = static_cast<size_t>(r) * N;
+        for (uint32_t n1 = 0; n1 < N1; ++n1) {
+            const size_t out_base = (static_cast<size_t>(r) * N1 + n1) * N2;
+            for (uint32_t n2 = 0; n2 < N2; ++n2) {
+                pass1_in[out_base + n2] = in[in_base + n2 * N1 + n1];
+            }
+        }
+    }
+
+    std::vector<Complex> A;
+    batched_siblings_fft_precise(md, count * N1, N2, pass1_in, A);
+
+    auto ct_plan = get_ct_plan(N1, N2);
+    const Complex* __restrict__ twid = ct_plan->twiddle.data();
+    std::vector<Complex> C(total);
+    for (uint32_t r = 0; r < count; ++r) {
+        for (uint32_t n1 = 0; n1 < N1; ++n1) {
+            const size_t A_base    = (static_cast<size_t>(r) * N1 + n1) * N2;
+            const size_t twid_base = static_cast<size_t>(n1) * N2;
+            const size_t C_row     = static_cast<size_t>(r) * N2;
+            for (uint32_t k2 = 0; k2 < N2; ++k2) {
+                const Complex v = A[A_base + k2] * twid[twid_base + k2];
+                C[(C_row + k2) * N1 + n1] = v;
+            }
+        }
+    }
+
+    std::vector<Complex> D;
+    batched_siblings_fft_precise(md, count * N2, N1, C, D);
+
+    out.resize(total);
+    for (uint32_t r = 0; r < count; ++r) {
+        for (uint32_t k1 = 0; k1 < N1; ++k1) {
+            for (uint32_t k2 = 0; k2 < N2; ++k2) {
+                const size_t out_idx =
+                    static_cast<size_t>(r) * N + k1 * N2 + k2;
+                const size_t D_idx =
+                    (static_cast<size_t>(r) * N2 + k2) * N1 + k1;
+                out[out_idx] = D[D_idx];
+            }
+        }
+    }
+}
+
+inline std::vector<Complex> fft_precise(
+    std::shared_ptr<MeshDevice>  md,
+    const std::vector<Complex>&  signal)
+{
+    const uint32_t N = static_cast<uint32_t>(signal.size());
+    assert(N >= 1u && "FFT requires N >= 1");
+
+    if (N == 1u)    return signal;
+    // Pow2 N already uses Stockham/SFPU — precision is identical.
+    if (is_pow2(N)) return fft_stockham::fft(md, signal);
+
+    if (is_prime(N)) {
+        const uint32_t M = next_pow2(2u * N - 1u);
+        assert(M <= kStockhamMaxPow2);
+        (void)M;
+    }
+
+    std::vector<Complex> out;
+    batched_siblings_fft_precise(md, /*count=*/1u, /*len=*/N, signal, out);
+    return out;
+}
+
 }  // namespace fft_universal

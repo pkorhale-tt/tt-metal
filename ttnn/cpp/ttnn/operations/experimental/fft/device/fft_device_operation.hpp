@@ -41,6 +41,8 @@ namespace ttnn::prim {
 std::pair<Tensor, Tensor> fft(
     const Tensor& input_real,
     bool inverse,
-    const std::optional<Tensor>& input_imag);
+    const std::optional<Tensor>& input_imag,
+    ttnn::experimental::prim::FFTPrecision precision =
+        ttnn::experimental::prim::FFTPrecision::Precise);
 
 }  // namespace ttnn::prim

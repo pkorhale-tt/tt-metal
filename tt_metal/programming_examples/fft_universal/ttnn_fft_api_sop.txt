@@ -1,0 +1,335 @@
+===============================================================================
+ ttnn.fft / ttnn.ifft — Standard Operating Procedure (Python API)
+===============================================================================
+
+This document is the user-facing SOP for the FFT op shipped in tt-metal as
+`ttnn.fft` and `ttnn.ifft` (registered from
+ttnn/cpp/ttnn/operations/experimental/fft/). It tells you:
+
+  1. How to import and call the API
+  2. Tensor / dtype / shape rules
+  3. Which backend kernel runs for which N (the dispatcher tree)
+  4. Forward FFT — real input
+  5. Forward FFT — complex input (two-tensor form)
+  6. Inverse FFT (ifft)
+  7. Round-trip example (sanity check)
+  8. Comparing against torch.fft
+  9. Common errors and what they mean
+ 10. Performance notes
+ 11. Known limits
+
+===============================================================================
+ 1. Import / device setup
+===============================================================================
+
+  import torch
+  import ttnn
+
+  device = ttnn.open_device(device_id=0)
+
+  ...                        # FFT calls go here
+
+  ttnn.close_device(device)
+
+There is NO separate import for the FFT op — `ttnn.fft` and `ttnn.ifft`
+are top-level `ttnn` attributes once `import ttnn` succeeds. The op is
+registered in the experimental namespace internally but exposed as
+`ttnn.fft` for ergonomics.
+
+===============================================================================
+ 2. Tensor / dtype / shape rules
+===============================================================================
+
+Inputs
+------
+  * dtype      : ttnn.float32 OR ttnn.bfloat16
+  * layout     : ttnn.ROW_MAJOR_LAYOUT (the only layout the op accepts)
+  * device     : must be on a Tenstorrent device (call ttnn.from_torch with
+                 device=...)
+  * shape      : last dimension is the FFT length N. Leading dims are
+                 broadcast-batched (each row treated as an independent
+                 length-N signal).
+  * value      : real-valued. For complex input use the 2-arg overload
+                 (Section 5).
+
+Outputs
+-------
+Always a Python tuple `(out_real, out_imag)` of two tensors:
+  * same shape  as the input
+  * same dtype  as the input
+  * same device as the input
+  * same layout as the input (ROW_MAJOR)
+
+There is no native ttnn complex dtype — the spectrum is returned as
+two real tensors that you combine on the host using
+`torch.complex(out_real, out_imag)`.
+
+===============================================================================
+ 3. Which backend runs for which N (dispatcher tree)
+===============================================================================
+
+The dispatcher in device/fft_program_factory.cpp picks the kernel based on
+(dtype, N, is_pow2(N)):
+
+  +-----------------+--------------+----------------------+-------------------+
+  | dtype           | N is pow2 ?  | N range              | backend kernel    |
+  +-----------------+--------------+----------------------+-------------------+
+  | float32         | yes          | N <= 1,048,576       | fft_stockham      |
+  | float32         | yes          | 1M < N <= 16M (WH)   | fft_universal_xl  |
+  | float32         | yes          | 1M < N <= 64M (BH)   | fft_universal_xl  |
+  | float32         | no           | any N >= 2           | fft_universal     |
+  |                 |              |                      |   (Bluestein)     |
+  | bfloat16        | any          | any N >= 2           | fft_universal_bf16|
+  +-----------------+--------------+----------------------+-------------------+
+
+You don't pick the backend — `ttnn.fft(x)` is enough. The dispatcher logs
+which backend it chose at INFO level if you set:
+
+    TT_LOGGER_LEVEL=Info
+
+===============================================================================
+ 4. Forward FFT — real input (the common case)
+===============================================================================
+
+  N = 1024
+  x_torch = torch.randn(N, dtype=torch.float32)
+
+  x_tt = ttnn.from_torch(
+      x_torch,
+      dtype=ttnn.float32,
+      layout=ttnn.ROW_MAJOR_LAYOUT,
+      device=device,
+  )
+
+  out_re_tt, out_im_tt = ttnn.fft(x_tt)
+
+  out_re = ttnn.to_torch(out_re_tt).reshape(-1).to(torch.float32)
+  out_im = ttnn.to_torch(out_im_tt).reshape(-1).to(torch.float32)
+  out_complex = torch.complex(out_re, out_im)
+
+  ref = torch.fft.fft(x_torch.to(torch.complex64))
+  print("max abs err:", (out_complex - ref).abs().max().item())
+
+Key points:
+  * The input is REAL. The op internally treats the imaginary part as 0.
+  * Output is the FULL spectrum (X[0..N-1]), NOT the half-spectrum that
+    `torch.fft.rfft` returns. This matches `torch.fft.fft`.
+  * Output is unnormalised (no 1/N or 1/sqrt(N) scaling).
+
+===============================================================================
+ 5. Forward FFT — complex input (two-tensor form)
+===============================================================================
+
+When you have a complex signal already (real + imag halves), pass them
+both. The result is `fft(real + i*imag)`.
+
+  N = 1024
+  re_torch = torch.randn(N, dtype=torch.float32)
+  im_torch = torch.randn(N, dtype=torch.float32)
+
+  re_tt = ttnn.from_torch(re_torch, dtype=ttnn.float32,
+                          layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+  im_tt = ttnn.from_torch(im_torch, dtype=ttnn.float32,
+                          layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+  out_re_tt, out_im_tt = ttnn.fft(re_tt, im_tt)        # 2-arg overload
+
+Constraints on the 2-arg form:
+  * re_tt and im_tt MUST have identical shape, dtype, layout, device.
+  * Same dispatch tree as the 1-arg form (decided by dtype + N).
+
+===============================================================================
+ 6. Inverse FFT
+===============================================================================
+
+`ttnn.ifft` takes the spectrum as TWO tensors (it has no 1-arg overload —
+spectra are inherently complex).
+
+  spec_re_tt, spec_im_tt = ttnn.fft(x_tt)              # forward
+
+  rec_re_tt, rec_im_tt = ttnn.ifft(spec_re_tt, spec_im_tt)
+
+  rec_re = ttnn.to_torch(rec_re_tt).reshape(-1).to(torch.float32)
+  rec_im = ttnn.to_torch(rec_im_tt).reshape(-1).to(torch.float32)
+
+Convention:
+  * `ttnn.ifft` returns the time-domain signal divided by N.
+    That matches `torch.fft.ifft`. Imag part should be ~0 if the
+    original input was real.
+
+===============================================================================
+ 7. Round-trip example (sanity check)
+===============================================================================
+
+  import torch, ttnn
+
+  device = ttnn.open_device(device_id=0)
+  N = 4096
+
+  x = torch.randn(N, dtype=torch.float32)
+  x_tt = ttnn.from_torch(x, dtype=ttnn.float32,
+                         layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+  re, im = ttnn.fft(x_tt)
+  rec_re, rec_im = ttnn.ifft(re, im)
+
+  rec = ttnn.to_torch(rec_re).reshape(-1).to(torch.float32)
+  err = (rec - x).abs().max().item()
+  print(f"round-trip max abs err: {err:.2e}")
+
+  ttnn.close_device(device)
+
+Expected error ranges (rule of thumb, fp32 path):
+  N <= 4K            : err < 5e-5
+  4K  < N <= 65K     : err < 5e-4
+  65K < N <= 1M      : err < 5e-3
+
+bfloat16 round-trip errors are ~10x larger at the same N (mantissa cost).
+
+===============================================================================
+ 8. Comparing against torch.fft
+===============================================================================
+
+  ref     = torch.fft.fft(x.to(torch.complex64))     # full spectrum
+  got_re  = ttnn.to_torch(re).reshape(-1).to(torch.float32)
+  got_im  = ttnn.to_torch(im).reshape(-1).to(torch.float32)
+  got     = torch.complex(got_re, got_im)
+
+  rel_err = (got - ref).norm() / ref.norm()
+  print(f"rel err: {rel_err:.2e}")
+
+Use the same shape and dtype on both sides. Don't compare against
+`torch.fft.rfft` — it returns the half-spectrum (length N/2 + 1) and
+`ttnn.fft` returns the full N bins.
+
+===============================================================================
+ 9. Common errors and what they mean
+===============================================================================
+
+  RuntimeError: ttnn.fft only supports ROW_MAJOR_LAYOUT.
+    -> You passed a TILE_LAYOUT tensor. Convert with
+       ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT) or pass
+       layout=ttnn.ROW_MAJOR_LAYOUT to ttnn.from_torch.
+
+  RuntimeError: ttnn.fft expects a device tensor.
+    -> The tensor lives on host. Pass device=... to ttnn.from_torch.
+
+  RuntimeError: fft (inverse): input_imag is required.
+    -> ttnn.ifft must be called with both real AND imag spectrum tensors.
+
+  RuntimeError: fft: real/imag size mismatch.
+    -> The two tensors passed to ttnn.fft (or ttnn.ifft) have different
+       shapes. They must match exactly.
+
+  RuntimeError: ttnn.fft fp32 backend kernel limit (N > 16M on Wormhole).
+    -> Wormhole's fp32 kernel ceiling is N = 16,777,216. Either drop to
+       bfloat16 (no XL ceiling) or use Blackhole (ceiling is 64M).
+
+  AttributeError: module 'ttnn' has no attribute 'fft'
+    -> The Python module was loaded from a stale build. Either rebuild
+       (ninja -C build ttnn ttnncpp) and re-import, or check that
+       ttnn/ttnn/_ttnn.so points at build/ttnn/_ttnn.so.
+
+===============================================================================
+ 10. Performance notes
+===============================================================================
+
+  * First call for a given (N, dtype, batch) is slow — it builds the plan,
+    JIT-compiles kernels, and tilizes inputs. Subsequent calls hit the
+    plan cache and run at steady-state speed (typically 5-10x faster
+    than the first call).
+
+  * For the smallest sizes (N <= 32) the entire FFT runs as 1 tile on 1
+    Tensix core. Don't expect parallel speedup there — the win comes
+    from N >= 1024 where the work spreads across the grid.
+
+  * If you call ttnn.fft on many tensors of the SAME N back-to-back, the
+    plan is reused — all the work is just dispatch + PCIe.
+
+  * bf16 path uses true bf16 FPU matmuls inside the kernel; the
+    between-pass twiddle multiply runs in fp32 on the host (deliberate
+    precision/perf trade — see fft_universal_bf16/sop notes).
+
+  * fp32 pow2 paths are the fastest. Non-pow2 (Bluestein) and bf16
+    paths run more host work and more dispatches per call; expect
+    ~2-3x slowdown vs fp32 pow2 at the same N.
+
+===============================================================================
+ 11. Known limits
+===============================================================================
+
+  * Real input only on the 1-arg form. For complex input use the 2-arg
+    `ttnn.fft(real, imag)` overload.
+
+  * Output is always full-spectrum (length N) — no rfft / hfft analogues.
+
+  * No 2D / 3D FFT yet. Multi-dim FFT can be done by chaining transposes
+    and 1D FFTs but is not packaged as a single op.
+
+  * No autograd integration. ttnn.fft is a leaf op.
+
+  * Wormhole fp32 ceiling: N = 16M.
+  * Blackhole fp32 ceiling: N = 64M.
+  * bfloat16 ceiling: any N (limited by L1 / DRAM, not algorithm).
+
+===============================================================================
+ Quick reference (cheat sheet)
+===============================================================================
+
+  out_re, out_im = ttnn.fft(x_real)                            # forward, real
+  out_re, out_im = ttnn.fft(x_real, x_imag)                    # forward, complex
+  rec_re, rec_im = ttnn.ifft(spec_re, spec_im)                 # inverse
+  out_re, out_im = ttnn.fft(x_real, precision="precise")       # default, ~1e-7
+  out_re, out_im = ttnn.fft(x_real, precision="fast")          # fast, ~1e-3
+
+  layout      : ttnn.ROW_MAJOR_LAYOUT (required)
+  dtypes      : ttnn.float32 OR ttnn.bfloat16
+  shape       : (..., N), N >= 2
+  device      : tensor must be on device
+  output      : tuple of 2 tensors, same shape / dtype / layout / device
+  scaling     : forward unnormalised, inverse divided by N
+  precision   : "precise" (default, SFPU true fp32) or "fast" (FPU bf16-mantissa
+                matmul). Only meaningful for fp32 + non-pow2 N. Pow2 fp32 is
+                always Stockham (already true fp32); bf16 is always bf16 matmul.
+
+===============================================================================
+ 12. precision="precise" vs "fast" — when does it matter?
+===============================================================================
+
+The Tensix FPU has no true fp32 multiplier. ``matmul_tiles`` in any mode does
+the multiply in bf16-mantissa and accumulates into fp32. The packed direct-DFT
+kernel that the universal backend uses for small N (N <= 32) leverages this
+matmul for throughput — fast, but ~1e-3 round-trip error vs torch for fp32.
+
+The SFPU (``mul_binary_tile`` etc.) IS true fp32. The Stockham, Bluestein and
+Cooley-Tukey paths all bottom out in SFPU butterflies, so they give ~1e-7
+round-trip error matching torch.
+
+The ``precision`` kwarg controls which path the dispatcher takes for the one
+case where the choice exists (Float32 + non-pow2 N):
+
+  precision="precise" (default):
+      Skips the FPU-matmul packed_dft kernel for small N. Forces all
+      sub-FFTs through Stockham/Bluestein → SFPU. ~10-30× slower at
+      small N but matches torch.fft to fp32 noise.
+
+  precision="fast":
+      Original behavior — packed_dft kernel kicks in for every sub-FFT
+      length <= 32. Faster, but small N round-trip is ~1e-3.
+
+When the kwarg is IGNORED (no effect):
+  * dtype = bfloat16 (always FPU matmul; precision dominated by bf16)
+  * dtype = fp32, N pow2 (always Stockham / SFPU; already precise)
+  * dtype = fp32, N pow2 > 1M (always universal_xl / Stockham; already precise)
+
+Concrete numbers (round-trip max abs error, N=6 random fp32 input):
+
+  ttnn.fft(x)                      → precise  → ~ 1e-7
+  ttnn.fft(x, precision="fast")    → fast     → ~ 3e-3
+  torch.fft.ifft(torch.fft.fft(x)) → torch    → ~ 1e-7
+
+If you're benchmarking small N for raw throughput, opt into "fast". If you're
+matching torch numerics or composing FFTs in a longer pipeline where errors
+compound, stay on the default.
+
+===============================================================================

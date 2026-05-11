@@ -10,9 +10,26 @@
 
 namespace ttnn::experimental::prim {
 
+// Numerical-precision selector for the small-N (N <= 32) Float32 path.
+//
+// The packed direct-DFT kernel (``packed_dft_compute``) uses the Tensix FPU
+// matmul for throughput. The FPU multiplier is bf16-mantissa even when the
+// destination accumulator is set to fp32, so round-trip error at small N is
+// ~1e-3 (good enough for most signal-processing/ML use). The Stockham/
+// Bluestein/Cooley-Tukey paths use SFPU ``*_binary_tile`` ops which are true
+// IEEE fp32 throughout — round-trip error ~1e-7 to match torch.fft.
+//
+// Only meaningful for ``Float32, !is_pow2(N)``. Pow2 fp32 already routes via
+// Stockham (true fp32). bfloat16 paths always use the bf16 FPU matmul.
+enum class FFTPrecision : uint8_t {
+    Precise = 0,    // SFPU true-fp32 (default; matches torch precision)
+    Fast    = 1,    // FPU bf16-mantissa matmul (faster, ~1e-3 round-trip)
+};
+
 // Operation-level attributes (kernel-affecting only — see compute_program_hash).
 struct FFTParams {
-    bool inverse = false;
+    bool         inverse   = false;
+    FFTPrecision precision = FFTPrecision::Precise;
 };
 
 // Tensor inputs to the device op. Forward FFT uses input_real only; IFFT

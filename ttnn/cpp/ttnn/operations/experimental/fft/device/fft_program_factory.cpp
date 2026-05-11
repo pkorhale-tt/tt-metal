@@ -80,9 +80,19 @@ constexpr bool is_pow2_local(uint32_t n) {
 // Mirrors `select_backend()` in fft_device_operation.cpp; that one
 // rejects unsupported (dtype, N) at validate time, so by the time we
 // reach here every branch is known-good.
+//
+// `precision` is consulted ONLY for the Float32 + non-pow2 branch:
+//   * Precise (default) → fft_universal::fft_precise (SFPU, true fp32,
+//                          ~1e-7 round-trip — matches torch precision)
+//   * Fast              → fft_universal::fft         (FPU bf16-mantissa
+//                          matmul, ~1e-3 round-trip but ~10-30× faster
+//                          for small N)
+// All other branches (bf16, fp32+pow2, fp32+xl) ignore the flag — they
+// already use the right precision/throughput trade-off for their case.
 std::vector<Complex> fft_one_row(
     std::shared_ptr<MeshDevice>& md,
     DataType                     dtype,
+    FFTPrecision                 precision,
     const std::vector<Complex>&  signal) {
 
     if (dtype == DataType::BFLOAT16) {
@@ -90,7 +100,11 @@ std::vector<Complex> fft_one_row(
     }
     // Float32
     const uint32_t N = static_cast<uint32_t>(signal.size());
-    if (!is_pow2_local(N))           return fft_universal::fft(md, signal);
+    if (!is_pow2_local(N)) {
+        return (precision == FFTPrecision::Fast)
+            ? fft_universal::fft        (md, signal)
+            : fft_universal::fft_precise(md, signal);
+    }
     if (N <= 1u * 1024u * 1024u)     return fft_stockham::fft(md, signal);
     return fft_universal_xl::fft(md, signal);
 }
@@ -207,7 +221,7 @@ void run_backend_fft(
             }
         }
 
-        const auto X = fft_one_row(md, dtype, work);
+        const auto X = fft_one_row(md, dtype, attrs.precision, work);
 
         if (attrs.inverse) {
             for (uint32_t k = 0u; k < N; ++k) {

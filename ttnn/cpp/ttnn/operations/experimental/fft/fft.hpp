@@ -34,18 +34,29 @@
 #include "ttnn/operation.hpp"
 #include "ttnn/decorators.hpp"
 #include "ttnn/operations/core/core.hpp"
+#include "device/fft_device_operation_types.hpp"
 
 #include <utility>
 
 namespace ttnn {
 namespace operations::experimental {
 
+// Re-export of the device-op precision selector at the public op layer
+// so callers don't have to reach into the prim:: namespace.
+using FFTPrecision = ttnn::experimental::prim::FFTPrecision;
+
 struct FFTOperation {
     // Forward FFT — real input.
     //   input_real : real-valued signal, last dim = N (the FFT length).
     //                Batched along leading dims.
+    //   precision  : Precise (default, true fp32) or Fast (FPU bf16-mantissa
+    //                matmul). See FFTPrecision for the trade-off; only matters
+    //                for Float32 + non-pow2 N. Pow2 fp32 is always Stockham
+    //                (already true fp32); bf16 always uses bf16 matmul.
     //   returns    : {real, imag} of the spectrum. Same shape as input.
-    static std::pair<ttnn::Tensor, ttnn::Tensor> invoke(const Tensor& input_real);
+    static std::pair<ttnn::Tensor, ttnn::Tensor> invoke(
+        const Tensor& input_real,
+        FFTPrecision  precision = FFTPrecision::Precise);
 
     // Forward FFT — complex input (two-tensor form).
     //   input_real / input_imag : real and imaginary halves of the input
@@ -54,18 +65,23 @@ struct FFTOperation {
     // Equivalent to the standard ``X = fft(input_real + i * input_imag)``.
     static std::pair<ttnn::Tensor, ttnn::Tensor> invoke(
         const Tensor& input_real,
-        const Tensor& input_imag);
+        const Tensor& input_imag,
+        FFTPrecision  precision = FFTPrecision::Precise);
 };
 
 // Inverse FFT. Separate registered_operation_t so it appears as
 // `ttnn.ifft(spec_re, spec_im)` in Python alongside `ttnn.fft(x)`.
 struct IFFTOperation {
     //   spectrum_real / spectrum_imag : real / imag parts of the spectrum.
+    //   precision                     : same selector as FFT (forwarded to
+    //                                   the underlying forward dispatch via
+    //                                   the conjugate trick).
     //   returns                       : {real, imag} of the time-domain
     //                                   signal divided by N.
     static std::pair<ttnn::Tensor, ttnn::Tensor> invoke(
         const Tensor& spectrum_real,
-        const Tensor& spectrum_imag);
+        const Tensor& spectrum_imag,
+        FFTPrecision  precision = FFTPrecision::Precise);
 };
 
 }  // namespace operations::experimental

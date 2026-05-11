@@ -56,6 +56,91 @@ def test_fft_returns_correct_shape_and_dtype(device, N):
     assert imag.dtype == ttnn.float32
 
 
+# ── Precision selector — small non-pow2 fp32 ─────────────────────────────────
+#
+# Default (precision="precise") routes small non-pow2 N through SFPU
+# Stockham/Bluestein → true fp32, ~1e-7 round-trip (matches torch).
+#
+# precision="fast" keeps the FPU bf16-mantissa matmul kernel → ~1e-3 round-trip.
+#
+# Both must produce numerically reasonable results; the gap between them is
+# what we care about here.
+@pytest.mark.parametrize("N", [3, 5, 6, 7, 11, 17, 24, 32])
+def test_fft_precise_default_matches_torch(device, N):
+    torch_in = torch.randn(N, dtype=torch.float32)
+
+    tt_in = ttnn.from_torch(
+        torch_in, dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+
+    re, im = ttnn.fft(tt_in)  # default = "precise"
+    got = torch.complex(
+        ttnn.to_torch(re).reshape(-1).to(torch.float32),
+        ttnn.to_torch(im).reshape(-1).to(torch.float32),
+    )
+    ref = torch.fft.fft(torch_in.to(torch.complex64))
+
+    rel = _rel_err(got, ref)
+    assert rel < 5e-5, (
+        f"precise small N={N} rel err {rel:.2e} exceeds 5e-5 — SFPU "
+        f"path should match torch.fft to fp32 noise."
+    )
+
+
+@pytest.mark.parametrize("N", [3, 5, 6, 7, 11, 17, 24, 32])
+def test_fft_fast_path_still_works(device, N):
+    """precision='fast' should produce a recognisable FFT (not zeros / inf),
+    even though its precision is lower than the default. Tolerance is the
+    documented FPU-matmul ceiling (~1e-2 for safety)."""
+    torch_in = torch.randn(N, dtype=torch.float32)
+
+    tt_in = ttnn.from_torch(
+        torch_in, dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+
+    re, im = ttnn.fft(tt_in, precision="fast")
+    got = torch.complex(
+        ttnn.to_torch(re).reshape(-1).to(torch.float32),
+        ttnn.to_torch(im).reshape(-1).to(torch.float32),
+    )
+    ref = torch.fft.fft(torch_in.to(torch.complex64))
+
+    rel = _rel_err(got, ref)
+    assert rel < 1e-2, f"fast small N={N} rel err {rel:.2e} unexpectedly high"
+
+
+@pytest.mark.parametrize("N", [3, 6, 24])
+def test_ifft_precise_roundtrip_small_n(device, N):
+    """Round-trip for small non-pow2 N in precise mode must match torch."""
+    torch_in = torch.randn(N, dtype=torch.float32)
+
+    tt_in = ttnn.from_torch(
+        torch_in, dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+
+    re, im   = ttnn.fft(tt_in)              # precise (default)
+    rec_re, _ = ttnn.ifft(re, im)           # precise (default)
+    rec = ttnn.to_torch(rec_re).reshape(-1).to(torch.float32)
+
+    err = (rec - torch_in).abs().max().item()
+    assert err < 5e-5, (
+        f"precise round-trip N={N} max abs err {err:.2e} exceeds 5e-5"
+    )
+
+
+def test_fft_invalid_precision_raises(device):
+    torch_in = torch.randn(8, dtype=torch.float32)
+    tt_in = ttnn.from_torch(
+        torch_in, dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    with pytest.raises(Exception):
+        ttnn.fft(tt_in, precision="bogus")
+
+
 # ── fft_stockham backend (fp32 + pow2 + N <= 1M) ────────────────────────────
 @pytest.mark.parametrize(
     "N, tol",
@@ -267,30 +352,137 @@ def test_fft_complex_input(device, N, dtype, tol):
     )
 
 
-# ── Blackhole portability smoke test ────────────────────────────────────────
-@pytest.mark.parametrize("N", [1024, 4096, 16384])
-def test_fft_blackhole_smoke(device, N):
-    """Blackhole-only smoke test: exercises the device-grid query path
-    in the orchestrators (must not clamp to Wormhole's 64-core grid).
-    Skipped on Wormhole — the regular fp32 tests already cover that path."""
-    if not _is_blackhole(device):
-        pytest.skip("Blackhole-specific smoke test")
+# ── Blackhole full-coverage parity tests ────────────────────────────────────
+#
+# These exercise every backend on Blackhole, mirroring the Wormhole tests
+# above. They are skipped on Wormhole (the existing tests already cover
+# that arch). On Blackhole they validate end-to-end parity:
+#
+#   1. fp32 pow2  small  (N <= 4096)   single-core / few-core fft_inner
+#   2. fp32 pow2  large  (N >= 8192)   fft_inner cross-core stages
+#   3. fp32 pow2  multi-pass (N >= 65536)  stockham batch_fft + pass2
+#   4. fp32 non-pow2                  packed_dft (mixed-radix / Bluestein)
+#   5. bf16 any N                     packed_dft_bf16
+#   6. ifft + complex-input           dispatcher reuse of forward kernels
+#
+# Tolerances mirror the Wormhole values; if BH precision floor is meaningfully
+# different we'll calibrate from observed numbers (none expected — all
+# arithmetic flows through the same compute_kernel_api).
 
+
+@pytest.mark.parametrize(
+    "N, tol",
+    [
+        (1024,    2e-4),
+        (4096,    5e-4),
+        (8192,    7e-4),    # cross-core stages start (LOG2P=3)
+        (16384,   1e-3),    # cross-core stages (LOG2P=4)
+        (65536,   1.5e-3),  # cross-core stages (LOG2P=6)
+    ],
+)
+def test_fft_blackhole_fp32_pow2(device, N, tol):
+    """BH parity for fft_stockham fp32 pow2. Verifies cross-core sync fix
+    in fft_reader.cpp (Gap 1) under various LOG2P values."""
+    if not _is_blackhole(device):
+        pytest.skip("Blackhole-specific")
     torch_in = torch.randn(N, dtype=torch.float32)
     tt_in = ttnn.from_torch(
         torch_in, dtype=ttnn.float32,
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-
     re, im = ttnn.fft(tt_in)
     got = torch.complex(
         ttnn.to_torch(re).reshape(-1).to(torch.float32),
         ttnn.to_torch(im).reshape(-1).to(torch.float32),
     )
     ref = torch.fft.fft(torch_in.to(torch.complex64))
-
     rel = _rel_err(got, ref)
-    assert rel < 5e-4, f"BH smoke N={N} rel err {rel:.2e}"
+    assert rel < tol, f"BH fp32 pow2 N={N} rel err {rel:.2e}"
+
+
+@pytest.mark.parametrize(
+    "N, tol",
+    [
+        (24,    1.5e-3),
+        (96,    3e-3),
+        (1000,  5e-3),
+        (97,    5e-3),    # prime → Bluestein
+    ],
+)
+def test_fft_blackhole_fp32_nonpow2(device, N, tol):
+    """BH parity for fft_universal (mixed-radix / Bluestein). These use
+    matmul-based packed_dft kernels; expected to work without per-arch
+    changes since matmul LLK abstracts arch differences."""
+    if not _is_blackhole(device):
+        pytest.skip("Blackhole-specific")
+    torch_in = torch.randn(N, dtype=torch.float32)
+    tt_in = ttnn.from_torch(
+        torch_in, dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    re, im = ttnn.fft(tt_in)
+    got = torch.complex(
+        ttnn.to_torch(re).reshape(-1).to(torch.float32),
+        ttnn.to_torch(im).reshape(-1).to(torch.float32),
+    )
+    ref = torch.fft.fft(torch_in.to(torch.complex64))
+    rel = _rel_err(got, ref)
+    assert rel < tol, f"BH fp32 nonpow2 N={N} rel err {rel:.2e}"
+
+
+@pytest.mark.parametrize(
+    "N, tol",
+    [
+        (32,    1e-2),
+        (256,   1.5e-2),
+        (1024,  2e-2),
+        (96,    2e-2),
+    ],
+)
+def test_fft_blackhole_bf16(device, N, tol):
+    """BH parity for fft_universal_bf16. Same tolerance ceiling as WH
+    since precision is dominated by bf16 representation, not arch."""
+    if not _is_blackhole(device):
+        pytest.skip("Blackhole-specific")
+    torch_in = torch.randn(N, dtype=torch.float32)
+    tt_in = ttnn.from_torch(
+        torch_in, dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    re, im = ttnn.fft(tt_in)
+    got = torch.complex(
+        ttnn.to_torch(re).reshape(-1).to(torch.float32),
+        ttnn.to_torch(im).reshape(-1).to(torch.float32),
+    )
+    ref = torch.fft.fft(torch_in.to(torch.complex64))
+    rel = _rel_err(got, ref)
+    assert rel < tol, f"BH bf16 N={N} rel err {rel:.2e}"
+
+
+@pytest.mark.parametrize(
+    "N, dtype, tol",
+    [
+        (1024,  ttnn.float32,  5e-4),
+        (96,    ttnn.float32,  3e-3),
+        (256,   ttnn.bfloat16, 3e-2),
+    ],
+)
+def test_fft_blackhole_ifft_roundtrip(device, N, dtype, tol):
+    """BH parity for ifft. Reuses forward fft kernels with conjugate
+    twiddles + 1/N scale, so passes once the forward path passes."""
+    if not _is_blackhole(device):
+        pytest.skip("Blackhole-specific")
+    torch_in = torch.randn(N, dtype=torch.float32)
+    tt_in = ttnn.from_torch(
+        torch_in, dtype=dtype,
+        layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    spec_re, spec_im = ttnn.fft(tt_in)
+    rec_re, rec_im   = ttnn.ifft(spec_re, spec_im)
+    got = ttnn.to_torch(rec_re).reshape(-1).to(torch.float32)
+    rel = (torch.linalg.norm(got - torch_in)
+           / torch.linalg.norm(torch_in)).item()
+    assert rel < tol, f"BH ifft roundtrip N={N} dtype={dtype} rel err {rel:.2e}"
 
 
 # ── Out-of-support guard ────────────────────────────────────────────────────

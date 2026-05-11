@@ -4,16 +4,31 @@
 
 #include "fft_nanobind.hpp"
 
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
 
 #include "ttnn-nanobind/decorators.hpp"
 #include "ttnn/operations/experimental/fft/fft.hpp"
 
 namespace ttnn::operations::experimental::fft::detail {
+
+namespace {
+// String → FFTPrecision (case-sensitive, lower-case for ergonomics).
+// Anything else throws ValueError on the Python side.
+inline FFTPrecision parse_precision(const std::string& s) {
+    if (s == "precise") return FFTPrecision::Precise;
+    if (s == "fast")    return FFTPrecision::Fast;
+    throw std::invalid_argument(
+        "ttnn.fft / ttnn.ifft: precision must be 'precise' or 'fast' "
+        "(got '" + s + "').");
+}
+}  // namespace
 
 void bind_experimental_fft_operation(nb::module_& mod) {
     const auto* doc =
@@ -59,14 +74,23 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                   ``input_real``. When supplied, the input is treated as
                   the complex signal ``input_real + i * input_imag``;
                   when omitted, the imaginary part is taken to be zero.
+                * :attr:`precision` (str, default ``"precise"``):
+                  ``"precise"`` → SFPU true-fp32 path (matches
+                  ``torch.fft`` precision; round-trip ~1e-7).
+                  ``"fast"`` → FPU bf16-mantissa matmul (~10-30× faster
+                  for small N but ~1e-3 round-trip). Only meaningful for
+                  Float32 + non-pow2 N; ignored everywhere else.
 
             Returns:
                 Tuple ``(real, imag)`` of Tensors.
 
             Examples::
 
-                # Real input (most common):
+                # Real input (most common; precise default matches torch):
                 spec_re, spec_im = ttnn.fft(x_real)
+
+                # Opt into the fast (bf16-mantissa) path for small N:
+                spec_re, spec_im = ttnn.fft(x_real, precision="fast")
 
                 # Complex input — e.g. when chaining FFT after another
                 # operation that already produced a (real, imag) pair:
@@ -78,20 +102,26 @@ void bind_experimental_fft_operation(nb::module_& mod) {
         mod,
         ttnn::fft,
         doc,
-        ttnn::nanobind_overload_t{
-            [](const OperationType& self,
-               const ttnn::Tensor& input_real) {
-                return self(input_real);
-            },
-            nb::arg("input_real").noconvert()},
+        // 1-arg (real input). precision defaults to "precise".
         ttnn::nanobind_overload_t{
             [](const OperationType& self,
                const ttnn::Tensor& input_real,
-               const ttnn::Tensor& input_imag) {
-                return self(input_real, input_imag);
+               const std::string&  precision) {
+                return self(input_real, parse_precision(precision));
             },
             nb::arg("input_real").noconvert(),
-            nb::arg("input_imag").noconvert()});
+            nb::arg("precision") = std::string("precise")},
+        // 2-arg (complex input). precision defaults to "precise".
+        ttnn::nanobind_overload_t{
+            [](const OperationType& self,
+               const ttnn::Tensor& input_real,
+               const ttnn::Tensor& input_imag,
+               const std::string&  precision) {
+                return self(input_real, input_imag, parse_precision(precision));
+            },
+            nb::arg("input_real").noconvert(),
+            nb::arg("input_imag").noconvert(),
+            nb::arg("precision") = std::string("precise")});
 
     const auto* ifft_doc =
         R"doc(
@@ -112,6 +142,9 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                 * :attr:`spectrum_imag`: Float32 ROW_MAJOR tensor, imag part.
                                           Same shape/dtype/layout as
                                           ``spectrum_real``.
+                * :attr:`precision` (str, default ``"precise"``): same
+                  selector as ``ttnn.fft``. See the forward op's docstring
+                  for the trade-off.
 
             Returns:
                 Tuple ``(real, imag)`` of Tensors, same shape as the inputs.
@@ -125,11 +158,14 @@ void bind_experimental_fft_operation(nb::module_& mod) {
         ttnn::nanobind_overload_t{
             [](const IFFTType& self,
                const ttnn::Tensor& spectrum_real,
-               const ttnn::Tensor& spectrum_imag) {
-                return self(spectrum_real, spectrum_imag);
+               const ttnn::Tensor& spectrum_imag,
+               const std::string&  precision) {
+                return self(spectrum_real, spectrum_imag,
+                            parse_precision(precision));
             },
             nb::arg("spectrum_real").noconvert(),
-            nb::arg("spectrum_imag").noconvert()});
+            nb::arg("spectrum_imag").noconvert(),
+            nb::arg("precision") = std::string("precise")});
 }
 
 }  // namespace ttnn::operations::experimental::fft::detail
