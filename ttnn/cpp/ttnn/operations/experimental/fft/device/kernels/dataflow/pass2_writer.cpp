@@ -3,10 +3,6 @@
 //
 // pass2_writer.cpp — BRISC1 / writer for device-side Stockham Pass 2.
 //
-// For each of NUM_TILES row tiles owned by this core, wait on the
-// compute kernel's CB_B_R / CB_B_I outputs and flush them to the
-// matching DRAM page. No transpose here; the host completes that step
-// after reading the buffer back.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"

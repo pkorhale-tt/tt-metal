@@ -3,12 +3,6 @@
 //
 // batch_fft_compute.cpp — TRISC compute for device-side BATCH FFT.
 //
-// Identical butterfly logic to fft/kernel/fft_compute.cpp, just wrapped in
-// an outer loop over BATCH_PER_CORE sub-FFTs (each LOG2_SUB_N stages).
-//
-// out0 = even + W*odd
-// out1 = even - W*odd
-// All arithmetic on the SFPU via *_binary_tile (full IEEE fp32).
 
 #include <cstdint>
 #include "api/compute/common.h"

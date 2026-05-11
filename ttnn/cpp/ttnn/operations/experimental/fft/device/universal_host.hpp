@@ -3,55 +3,6 @@
 //
 // fft_universal_host.cpp — Host-side FFT that accepts ANY N >= 2.
 //
-// Reuses fft_stockham::fft (which itself routes to fft_example::fft for
-// N <= 65,536 and runs the 4-pass Stockham for larger powers of two), and
-// adds ONE new device kernel (Opt #5, under ./kernel/) for the tile-packed
-// direct DFT that handles every sub-FFT with length <= kPackedMaxN.
-//
-// Dispatch tree (every compute path ends on Wormhole):
-//   * N == 1                -> identity.
-//   * N is a power of two   -> fft_stockham::fft (direct pass-through, device).
-//   * N factors as 2^k * q  -> Cooley-Tukey split on (2^k, q), then recurse.
-//   * N is odd composite    -> Cooley-Tukey split on (smallest-prime, rest),
-//                              then recurse.
-//   * N is prime (>=3)      -> Bluestein (chirp-z): one forward + one inverse
-//                              pow2 FFT on the device (M = next pow2 >= 2N-1).
-//
-// Leaf path (batched_siblings_fft):
-//   * len <= 32   -> PACKED DIRECT-DFT kernel (Opt #5): 32 sub-FFTs per
-//                    tile, 4 real 32x32 matmuls per tile on the FPU. One
-//                    dispatch, tile efficiency = len/32 instead of
-//                    len/1024 — eliminates the ~99% PCIe padding waste of
-//                    the old small-leaf paths.
-//
-// Batched-recursion architecture (Opt #2 + #2b, complete):
-//
-//   Every recursion level operates on `count` sibling signals laid out
-//   back-to-back in row-major order. A single sub-FFT pass at depth d always
-//   becomes ONE of:
-//     * one fft_stockham::batch_fft dispatch (pow2 length <= 1024, any count),
-//     * one batched Bluestein → 2 pow2 batch_fft dispatches (prime length),
-//     * one batched Cooley-Tukey split → two recursive calls with count *= Nk.
-//
-//   Because composite splits MULTIPLY `count` by N1 or N2, batching width
-//   grows as we descend; by the time we reach the leaves, we're typically
-//   running a single pow2 batch_fft dispatch over thousands of sibling
-//   sub-FFTs — regardless of the original N's structure.
-//
-// Cost summary:
-//   * pow2 N                -> same as fft_stockham (no extra overhead).
-//   * prime N (single call) -> 2 batch_fft dispatches + O(N) host multiplies.
-//   * composite N           -> O(log N) batch_fft dispatches + O(N) host
-//                              reshape/twiddle/transpose per level. Dispatch
-//                              count is independent of how many sibling
-//                              sub-FFTs live at any level.
-//
-// Caches (globals; single-threaded use):
-//   * bluestein_cache keyed on N keeps the chirp table and B_fft so the second
-//     call for the same N skips all host pre-work.
-//   * ct_plan_cache keyed on (N1, N2) keeps the N1*N2 twiddle table so the
-//     Cooley-Tukey hot path is plain complex-multiply (no cos/sin per iter).
-//   * fft_stockham::fft carries its own program-build cache; we piggy-back.
 
 #pragma once
 
@@ -86,12 +37,6 @@ constexpr uint32_t kStockhamMaxPow2 = 1048576u;
 // serial recursion.
 constexpr uint32_t kBatchMaxSubN = 1024u;
 
-// Maximum sub-FFT length handled by the PACKED DIRECT-DFT kernel (Opt #5).
-// 32 is the natural ceiling: a 32x32 Tensix tile fits 32 sub-FFTs (one per
-// row) and the whole N×N twiddle matrix in a single tile. For len <= this
-// we always route through the packed kernel — tile efficiency jumps from
-// ~1-3% (batch_fft with sub_N << 1024) to (len / 32) ≈ 6-100%, which is
-// the dominant PCIe saving.
 constexpr uint32_t kPackedMaxN = 32u;
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
@@ -131,19 +76,6 @@ inline std::pair<uint32_t, uint32_t> pick_factors(uint32_t N) {
     return {p, N / p};
 }
 
-// ─── Bluestein (chirp-z) plan ────────────────────────────────────────────────
-//
-// Identity used:
-//   X[k] = sum_{n=0}^{N-1} x[n] exp(-2πi k n / N)
-//        = w[k] * sum_n (x[n] * w[n]) * conj(w)[k - n]
-//   where w[n] = exp(-i π n² / N).
-//
-// The inner sum is the linear convolution of (x * w) with conj(w), computed
-// as a length-M cyclic convolution with M = next_pow2(2N - 1):
-//   A = FFT_M(a), B = FFT_M(b_ext), c = IFFT_M(A * B), X[k] = w[k] * c[k]
-// where a is (x * w) zero-padded and b_ext is conj(w) symmetrically extended.
-//
-// B_fft, chirp_fwd, and M depend only on N — cache them.
 struct BluesteinPlan {
     uint32_t             N = 0u;
     uint32_t             M = 0u;
@@ -181,11 +113,6 @@ inline std::shared_ptr<BluesteinPlan> get_bluestein_plan(
                                      static_cast<float>(-std::sin(a)));
     }
 
-    // b_ext: length-M symmetric extension of conj(w).
-    //   b_ext[0]   = 1
-    //   b_ext[n]   = conj(w[n])    for n = 1..N-1
-    //   b_ext[M-n] = conj(w[n])    for n = 1..N-1   (negative-index mirror)
-    //   b_ext[n]   = 0             otherwise
     std::vector<Complex> b_ext(M, Complex(0.0f, 0.0f));
     b_ext[0] = Complex(1.0f, 0.0f);
     for (uint32_t n = 1; n < N; ++n) {
@@ -201,13 +128,6 @@ inline std::shared_ptr<BluesteinPlan> get_bluestein_plan(
     return plan;
 }
 
-// ─── Cooley-Tukey twiddle plan ───────────────────────────────────────────────
-//
-// For a mixed-radix split N = N1·N2 the twiddle factor
-//     T[n1, k2] = exp(-2πi · n1 · k2 / N)
-// is the same for every call and every sibling — cache it per (N1, N2) so
-// the per-call hot path is a plain complex-multiply instead of 2 transcendental
-// evaluations per element. Cache key packs both dims into 64 bits.
 struct CooleyTukeyPlan {
     uint32_t             N1 = 0u;
     uint32_t             N2 = 0u;
@@ -246,49 +166,6 @@ inline std::shared_ptr<CooleyTukeyPlan> get_ct_plan(uint32_t N1, uint32_t N2) {
     return plan;
 }
 
-// ╔════════════════════════════════════════════════════════════════════════╗
-// ║  Optimisation 5 — PACKED DIRECT-DFT kernel for small sub-FFTs (N<=32)  ║
-// ╚════════════════════════════════════════════════════════════════════════╝
-//
-// Motivation
-// ----------
-// The existing fft_stockham::batch_fft kernel stores ONE sub-FFT per tile.
-// For small sub_N the tile is padded with (1024 - sub_N) zeros, wasting
-// ~99% of every PCIe/DRAM byte for sub_N=8 and ~97% for sub_N=32. Since
-// fft_universal decomposes composite N via Cooley-Tukey down to small-prime
-// leaves, these tiny sub_N leaves dominate the dispatch-bytes budget.
-//
-// This kernel packs 32 sub-FFTs per tile (one sub-FFT per tile row) and
-// computes the direct DFT as a 32x32 complex matmul against a cached
-// twiddle matrix T[n, k] = exp(-2πi · k · n / N).  The 4 real 32x32 matmuls
-// that make up the complex matmul are offered to the Tensix FPU via
-// matmul_tiles(), so compute throughput is O(N²) per sub-FFT but N ≤ 32 so
-// it's trivially fast — the dispatch is bandwidth-bound, not compute-bound.
-//
-// Applicability
-// -------------
-//   * Routed for EVERY len ∈ [2, kPackedMaxN=32] at the batched_siblings_fft
-//     dispatcher, replacing both the batch_fft path (pow2 lengths 2..32)
-//     AND the batched_bluestein path (prime/composite 3..32).
-//   * Above 32, batch_fft already runs at >6% tile efficiency and its
-//     Stockham butterflies beat an O(N²) DFT; we keep those paths.
-//
-// Layout details (keyed with packed_dft_common.h)
-// -----------------------------------------------
-//   Per tile:
-//     row i ∈ [0, 32)   →   one sub-FFT (or zero-padding for i ≥ rows_used)
-//     col k ∈ [0, N)    →   spectrum slot k of that sub-FFT
-//     col k ∈ [N, 32)   →   padded zero
-//
-//   Host scratch uses ROW-MAJOR 32*num_tiles × 32 layout; we call
-//   tilize_nfaces before WriteShard and untilize_nfaces after ReadShard to
-//   convert to / from the Tensix face-interleaved tile format required by
-//   the matmul FPU. tilize_nfaces supports float, so no precision loss.
-//
-//   Twiddle matrix T (single tile per cached N): stored tilized too, with
-//   a separate T_I_neg tile so every on-device matmul adds into DST and no
-//   SFPU subtract is needed.
-
 struct PackedDFTPlan {
     uint32_t N              = 0;    // DFT length   (<= kPackedMaxN)
     uint32_t count          = 0;    // number of sub-FFTs as requested by caller
@@ -304,11 +181,6 @@ struct PackedDFTPlan {
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> tw_r_buf, tw_i_buf, tw_i_neg_buf;
     tt::tt_metal::distributed::MeshWorkload workload;
 
-    // Reused host scratch (same pattern as BatchFFTPlan / Pass2Plan): a
-    // 32*num_tiles × 32 row-major float buffer plus its tilized mirror.
-    // Zero-initialised once at plan-construction time; per-call repack
-    // overwrites only the valid [0, N) slots of each active row, so the
-    // padding zeros stay put across calls.
     std::vector<float> in_r_rm,  in_i_rm;     // row-major (host layout)
     std::vector<float> in_r_til, in_i_til;    // tilized   (device layout)
     std::vector<float> out_r_til, out_i_til;
@@ -317,10 +189,6 @@ struct PackedDFTPlan {
     bool initialized = false;
 };
 
-// Build the N×N twiddle matrix in ROW-MAJOR 32x32 layout (one tile). The
-// matmul on device computes out[i, k] = Σ_n in[i, n] · T[n, k], so T is
-// indexed T[n, k] = exp(-2πi · k · n / N). Positions outside [0, N)² are
-// zero so padded input slots contribute nothing.
 inline std::pair<std::vector<float>, std::vector<float>> packed_dft_twiddle_rm(uint32_t N) {
     std::vector<float> tr(32u * 32u, 0.0f), ti(32u * 32u, 0.0f);
     const double tau_over_N = -2.0 * M_PI / static_cast<double>(N);
@@ -351,19 +219,6 @@ inline std::shared_ptr<PackedDFTPlan> make_packed_dft_plan(
     constexpr uint32_t kRowsPerTile = 32u;
     const uint32_t raw_num_tiles = (count + kRowsPerTile - 1u) / kRowsPerTile;
 
-    // Distribute tiles across up to 64 cores. fft_stockham::pick_batch_grid
-    // only produces a valid (cols, rows) rectangle when num_cores is either
-    // <= 7 (cols=n, rows=1) OR a multiple of 8 (cols=8, rows=n/8). If we
-    // handed it raw_num_tiles directly it would silently drop cores (e.g.
-    // n=38 → grid=8x4=32, and cores 32..37 receive no kernel placement →
-    // SetRuntimeArgs asserts). Round num_cores up to the next valid shape,
-    // clamp to 64, then pad num_tiles out to num_cores * tiles_per_core.
-    // Extra tiles get zero input (pre-zeroed scratch) → zero output that
-    // we discard at unpack time, same strategy BatchFFTPlan uses for its
-    // pow2 padding.
-    // Cap by the device's compute grid: WH 8x8=64, BH ~13x10=130. Round
-    // num_cores up to a multiple of grid.x so pick_batch_grid yields a
-    // dense rectangle.
     const auto     dev_grid  = md->compute_with_storage_grid_size();
     const uint32_t grid_x    = static_cast<uint32_t>(dev_grid.x);
     const uint32_t max_cores = grid_x * static_cast<uint32_t>(dev_grid.y);
@@ -462,13 +317,6 @@ inline std::shared_ptr<PackedDFTPlan> make_packed_dft_plan(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
-    // IMPORTANT: do NOT set UnpackToDestFp32 for a matmul kernel. That
-    // mode routes tiles straight into DST (used by some SFPU paths), which
-    // leaves srcA / srcB uninitialised when matmul_tiles tries to read
-    // them → FPU multiplies garbage → 1e28 / inf outputs. The standard
-    // tt-metal matmul_single_core example omits unpack_to_dest_mode for
-    // exactly this reason; keep matmul defaults here and rely on
-    // fp32_dest_acc_en to carry fp32 accumulation.
     auto ck = CreateKernel(
         prog,
         "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/compute/packed_dft_compute.cpp",
@@ -566,13 +414,6 @@ inline void packed_direct_dft_batched(
             ti[k] = src[k].imag();
         }
     }
-    // If a previous call used a larger `count` with the SAME plan (rare —
-    // only hits on plan reuse across counts), those rows would still have
-    // stale data in cols [0, N). For our dispatcher, plan keys include
-    // count so this cannot happen — but zero the just-vacated tail anyway
-    // for safety when count hit the plan exactly.
-    // (Left as-is: PackedDFTPlan is keyed on (N, count), so no cross-call
-    // leakage is possible.)
 
     // Row-major → tilized (matmul expects Tensix face layout).
     const uint32_t total_rows = plan->num_tiles * kRowsPerTile;
@@ -630,27 +471,6 @@ inline void cooley_tukey_split_batched(
     const std::vector<Complex>&       in,
     std::vector<Complex>&             out);
 
-// ─── batched_siblings_fft: the universal dispatcher ──────────────────────────
-//
-// Computes `count` independent FFTs of length `len`, stored back-to-back in
-// row-major order (in[r * len + k] is element k of sibling r). Every recursive
-// level of the engine passes through here.
-//
-// Dispatch (in order of priority):
-//   * len == 1 or count == 0         -> trivial copy.
-//   * len pow2 and <= 1024 (tile)    -> ONE fft_stockham::batch_fft dispatch,
-//                                        padding `count` up to next_pow2 with
-//                                        zero-signal sibling rows (whose DFTs
-//                                        are also zero — harmless, discarded).
-//   * len pow2 but > 1024            -> serial fft_stockham::fft per row (the
-//                                        kernel's multi-pass Stockham handles
-//                                        up to N=1,048,576 for a single row).
-//   * len prime (>= 3)               -> batched_bluestein: ONE pre-mul, TWO
-//                                        batched length-M FFTs (M=next_pow2(2N-1)),
-//                                        ONE pointwise mul, ONE post-mul.
-//   * len composite non-pow2         -> cooley_tukey_split_batched, which does
-//                                        two recursive calls with count *= Nk.
-//                                        Batching width grows with depth.
 inline void batched_siblings_fft(
     std::shared_ptr<MeshDevice>       md,
     uint32_t                          count,
@@ -665,14 +485,6 @@ inline void batched_siblings_fft(
         return;
     }
 
-    // Path 0 (Opt #5): any len ∈ [2, 32] goes through the packed direct-DFT
-    // kernel. For these small lengths this is strictly a win vs both the
-    // pow2 batch_fft path (which wastes ~97-99% of every tile on padding
-    // zeros) AND the prime-length Bluestein path (2 dispatches at M up to
-    // 64, each with similarly poor tile efficiency). Pack 32 sub-FFTs per
-    // tile, compute as a complex 32x32 matmul → one dispatch, (len/32)
-    // tile efficiency. Covers every small prime/composite leaf the CT
-    // recursion would otherwise bounce into Bluestein or serial batch_fft.
     if (len >= 2u && len <= kPackedMaxN) {
         packed_direct_dft_batched(md, len, count, in, out);
         return;
@@ -723,16 +535,6 @@ inline void batched_siblings_fft(
     cooley_tukey_split_batched(md, count, N1, N2, in, out);
 }
 
-// ─── batched_bluestein ───────────────────────────────────────────────────────
-//
-// Compute `count` sibling length-N Bluestein FFTs. Instead of `count`
-// independent Bluestein chains (2 × count length-M dispatches), we run:
-//   1. batched pre-multiply by chirp w   (host, O(count·N))
-//   2. ONE batched length-M forward FFT  (device, via batched_siblings_fft)
-//   3. batched pointwise × B_fft          (host, O(count·M))
-//   4. ONE batched length-M inverse FFT  (device, via conjugate trick)
-//   5. batched post-multiply by chirp w  (host, O(count·N))
-// Total device dispatches: 2 — independent of `count`.
 inline void batched_bluestein(
     std::shared_ptr<MeshDevice>       md,
     uint32_t                          count,
@@ -785,23 +587,6 @@ inline void batched_bluestein(
     }
 }
 
-// ─── cooley_tukey_split_batched ──────────────────────────────────────────────
-//
-// Compute `count` sibling length-(N1·N2) FFTs via one mixed-radix split.
-// Every host-side reshape/twiddle/transpose is loop-extended over `count`,
-// and every sub-FFT call scales `count` by N1 or N2 — so batching width
-// accumulates as we recurse deeper.
-//
-// Index schemes (matching fft_stockham, scheme (c)):
-//   n  = n1 + N1 * n2     (n1 ∈ [0,N1), n2 ∈ [0,N2))
-//   k  = N2 * k1 + k2     (k1 ∈ [0,N1), k2 ∈ [0,N2))
-//
-//   1. transposed reshape:  A[r, n1, n2] = in[r, n1 + N1 * n2]
-//   2. pass-1  len N2:      batched_siblings_fft(count * N1, N2)
-//   3. twiddle:             A[r, n1, k2] *= exp(-2πi · n1 · k2 / N)
-//   4. transpose:           C[r, k2, n1] = A[r, n1, k2]
-//   5. pass-2  len N1:      batched_siblings_fft(count * N2, N1)
-//   6. output permute:      out[r, N2·k1 + k2] = D[r, k2, k1]
 inline void cooley_tukey_split_batched(
     std::shared_ptr<MeshDevice>       md,
     uint32_t                          count,
@@ -878,10 +663,6 @@ inline std::vector<Complex> fft(
     assert(N >= 1u && "FFT requires N >= 1");
 
     if (N == 1u)    return signal;
-    // Large pow2 Ns go directly to fft_stockham so we keep its optimised
-    // multi-pass path (up to N = 1M). Everything else — including small pow2
-    // — funnels through the batched engine with count=1, which still uses
-    // batch_fft internally for tile-sized pow2s.
     if (is_pow2(N)) return fft_stockham::fft(md, signal);
 
     if (is_prime(N)) {
@@ -909,23 +690,6 @@ inline std::vector<Complex> fft(
     return fft(md, cx);
 }
 
-// ─── Inverse FFT via the conjugate trick ─────────────────────────────────────
-//
-//   IFFT(X) = conj( FFT( conj(X) ) ) / N
-//
-// Reuses the entire forward dispatch tree (Stockham pow2, packed_dft,
-// Bluestein, mixed-radix CT) without writing a single new device kernel.
-// All plan caches (PackedDFTPlan, BluesteinPlan, CooleyTukeyPlan,
-// BatchFFTPlan, Pass2Plan) are direction-agnostic — they key on N (and
-// counts), not on FFT vs IFFT — so steady-state IFFT performance is
-// identical to forward FFT performance.
-//
-// Total host overhead vs. a forward FFT: 3 O(N) loops over fp32 complex
-// elements (one conj-in, one conj-out, one /N scale). Microseconds even
-// at N = 1M.
-//
-// The same identity is already used internally by batched_bluestein for
-// its IFFT-of-M step; this just exposes the pattern as a public API.
 inline std::vector<Complex> ifft(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  spectrum)
@@ -958,21 +722,6 @@ inline std::vector<Complex> ifft(
     }
     return ifft(md, cx);
 }
-
-// ╔════════════════════════════════════════════════════════════════════════╗
-// ║  Precise (SFPU true-fp32) variants                                     ║
-// ╚════════════════════════════════════════════════════════════════════════╝
-//
-// Identical math to fft() / batched_siblings_fft() but skips Path 0 (the
-// packed_dft FPU-matmul kernel). The remaining paths — pow2 batch_fft,
-// Bluestein, mixed-radix CT — all bottom out in SFPU *_binary_tile ops
-// which are true IEEE fp32. For small non-pow2 N (e.g. N=6) this drops
-// round-trip error from ~1e-3 (FPU bf16-mantissa multiplier) to ~1e-7,
-// matching torch.fft at the cost of ~10-30× slower per-call time.
-//
-// We don't fork the entire universal_host machinery — only this dispatcher
-// switch differs, so we forward to the existing helpers (which themselves
-// re-enter via batched_siblings_fft_precise on the recursive sub-calls).
 
 inline void batched_bluestein_precise(
     std::shared_ptr<MeshDevice>       md,

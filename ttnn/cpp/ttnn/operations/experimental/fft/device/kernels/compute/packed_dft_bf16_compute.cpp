@@ -3,24 +3,6 @@
 //
 // packed_dft_bf16_compute.cpp — TRISC compute for the TRUE-bf16 packed
 // direct-DFT kernel.
-//
-// The compute sequence is identical in shape to the fp32 variant
-// (../fft_universal/kernel/packed_dft_compute.cpp) — four accumulating
-// matmul_tiles per output tile, two pack_tile into (CB_OUT_R, CB_OUT_I).
-// What differs is the *data format on the FPU operand path*:
-//
-//   * CB_A / CB_B are Float16_b (bf16, set host-side). The unpacker feeds
-//     srcA / srcB in bf16 — native FPU format for bf16 × bf16 multiplies.
-//   * fp32_dest_acc_en=true → DST is fp32, so the running
-//     reduction-sum across the two accumulating matmul calls keeps fp32
-//     precision before we pack back to bf16.
-//   * No unpack_to_dest_mode override (that would bypass srcA/srcB and
-//     break matmul — same trap the fp32 version documents).
-//
-// pack_tile(dst_idx, cb_id) honours each CB's own data format, so DST
-// (fp32) → CB_OUT_R / CB_OUT_I (bf16) conversion happens automatically
-// during the pack. That single conversion is the *only* bf16 rounding
-// per output tile — internal matmul accumulation stays fp32.
 
 #include <cstdint>
 #include "api/compute/common.h"

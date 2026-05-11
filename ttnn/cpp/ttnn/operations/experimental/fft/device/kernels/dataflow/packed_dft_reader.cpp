@@ -3,27 +3,6 @@
 //
 // packed_dft_reader.cpp — BRISC0 / reader for the PACKED DIRECT-DFT kernel.
 //
-// Per output tile `t` assigned to this core, we stream 4 (A, B) tile pairs
-// into (CB_A, CB_B) so the compute kernel can perform 4 matmul_tiles calls
-// that together produce (out_R, out_I) for tile t:
-//
-//   pair 1 : (in_R[t], T_R)       → out_R += in_R · T_R
-//   pair 2 : (in_I[t], T_I_neg)   → out_R += in_I · (-T_I)
-//   pair 3 : (in_R[t], T_I)       → out_I += in_R · T_I
-//   pair 4 : (in_I[t], T_R)       → out_I += in_I · T_R
-//
-// The host pre-negates T_I once at plan-construction time and ships
-// T_I_neg as a dedicated DRAM tile so every matmul on device is an
-// *adding* matmul. No SFPU work on device.
-//
-// NoC cost per tile = 8 DRAM reads (in_R / in_I each read 2x, T_R also 2x,
-// T_I / T_I_neg 1x each). Twiddle tiles are single-tile DRAM buffers whose
-// second fetch resolves from the NoC cache on every core, so the duplicates
-// are effectively free for sub_N <= 32 where compute time dominates anyway.
-//
-// Reader → writer synchronisation is implicit: the writer only looks at
-// (CB_OUT_R, CB_OUT_I) which the compute kernel pushes after each pair of
-// output tiles, so we don't need an extra SYNC CB here.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"

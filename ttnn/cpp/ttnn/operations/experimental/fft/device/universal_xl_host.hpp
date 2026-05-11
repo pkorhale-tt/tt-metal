@@ -3,51 +3,6 @@
 //
 // fft_universal_xl_host.cpp — XL FFT dispatcher (Option B: host outer twiddle).
 //
-// Handles power-of-two N from 2 up to 1,073,741,824 (2^30) by chaining
-// existing fft_stockham kernels with HOST-SIDE outer twiddle multiply
-// AND HOST-SIDE outer length-F1 butterfly.
-//
-// Why the outer butterfly is on host (not on batch_fft):
-//   The existing fft_stockham::batch_fft kernel allocates ONE FULL
-//   1024-element tile per sub-FFT regardless of sub_N. For K=3 cases
-//   the outer pass would be batch=M sub-FFTs of length F1, where M
-//   can be up to 1,048,576. That's 4 buffers × 1M tiles × 4 KB =
-//   16 GB of DRAM — impossible on a 12 GB Wormhole. Until a packed
-//   batch_fft_xl kernel (many short FFTs / tile) lands, we have to
-//   keep this step on the host. F1 is by construction the SMALLEST
-//   factor in the plan (typically 2 or 4), so the per-element cost
-//   is at most a handful of FMAs — trivial vs the host outer-twiddle.
-//
-// Trade-off vs the eventual on-device path (Option A / pass2_xl):
-//   * Pros: works today with NO new device kernels, accepts any pow2 N.
-//   * Cons: outer twiddle multiply + outer length-F1 butterfly are on
-//           the host. For N <= 1M we never hit this path (we delegate
-//           straight to fft_stockham). For N > 1M, host arithmetic is
-//           O(N) with a tiny constant — bounded by the host-twiddle
-//           step which is ~150 ms / GB-elem. Big-N runtime is dominated
-//           by the F1 sequential inner fft_stockham calls anyway.
-//
-// Algorithm for K=3 (N = F1 * M, F1 = SMALLEST factor, M = N / F1):
-//
-//   Step 0  : strided pre-pack — reshape signal so row n1 (length M) is
-//             T[n1, n2] = signal[n2 * F1 + n1].  Pure host memory shuffle
-//             (no arithmetic).  This is REQUIRED for the standard 2-step
-//             Cooley-Tukey decomposition; doing contiguous chunks would
-//             give the wrong inner-FFT input.
-//   Step 1  : F1 sequential calls to fft_stockham::fft on rows of length M.
-//   Step 2  : host outer twiddle multiply
-//                 Y[n1, k_inner] *= w_N^(n1 * k_inner)
-//             with w_N = exp(-2*pi*i / N), table cached per N.
-//   Step 3  : host length-F1 butterfly per inner index k_inner (M of them).
-//             Writes directly into the natural-order output X — fuses with
-//             the final reorder. F1 <= 1024 by planner; in practice F1 is
-//             the SMALLEST factor (2 or 4 for almost all N <= 1G), so this
-//             is a few FMAs per output element.
-//   Step 4  : (N/A — fused into Step 3.)
-//   Step 5  : (N/A — fused into Step 3.)
-//
-// The host twiddle table is cached so the SECOND call for the same N
-// is cos/sin-free.
 
 #pragma once
 
@@ -74,12 +29,6 @@ using tt::tt_metal::distributed::MeshDevice;
 
 namespace detail {
 
-// Pick the SMALLEST factor in the plan as F1 (outer dimension).
-// Rationale: outer Step 1 is F1 sequential fft_stockham calls; F1 small
-// minimises sequential cost.  Inner length M = N / F1 still has to fit
-// fft_stockham (i.e., M <= 1M), which is guaranteed because the planner
-// produces factors <= 1024 and M = product of remaining factors so the
-// largest possible M = 1024 * 1024 = 1M.
 inline uint32_t pick_outer_factor(const XLPlan& p) {
     assert(!p.factors.empty());
     return *std::min_element(p.factors.begin(), p.factors.end());
@@ -133,25 +82,9 @@ inline std::shared_ptr<OuterTwiddle> get_outer_twiddle(uint32_t N, uint32_t F1) 
     return tw;
 }
 
-// Practical N ceiling for the K=3 host-arithmetic path.
-//
-// Algorithmically the K=3 dispatcher works for any N up to 1G (the K=3 cap
-// of the planner), but Step 3 is a host-side length-F1 DFT costing
-// O(F1^2) ops per inner index = O(F1 * N) host ops total. For F1 <= 16
-// (i.e. N <= 16M) the host time is bounded at a few seconds; above that
-// it dominates wall-clock and the path becomes unusable as a public op.
-//
-// We gate the dispatcher at N <= 16M for now and emit a clear error
-// pointing at the kernel work that lifts the ceiling. Once the packed
-// batch_fft_xl kernel ships (option_a_pass2_xl_design.md), Step 3 moves
-// to device and this constant should be raised to 1G (1u << 30).
 inline constexpr uint32_t kXlMaxNFp32_WH = 16u * 1024u * 1024u;   // 16M  (Wormhole)
 inline constexpr uint32_t kXlMaxNFp32_BH = 64u * 1024u * 1024u;   // 64M  (Blackhole — ~2x DRAM BW + 2x cores)
 
-// Pick the practical N ceiling for the running device. Blackhole has
-// roughly 2x the DRAM bandwidth and 2x the compute cores of Wormhole,
-// so the host-side Step-3 outer DFT stays in the seconds range up to
-// ~64M. Anything beyond still requires the packed batch_fft_xl kernel.
 inline uint32_t xl_max_n_fp32(const std::shared_ptr<MeshDevice>& md) {
     return (md->arch() == tt::ARCH::BLACKHOLE) ? kXlMaxNFp32_BH
                                                : kXlMaxNFp32_WH;
@@ -191,12 +124,6 @@ inline std::vector<Complex> fft_impl(
         std::abort();
     }
 
-    // Practical host-runtime gate. Above the per-arch ceiling the host-side
-    // length-F1 DFT (Step 3) dominates wall-clock; refuse with a clear,
-    // actionable error rather than silently running for minutes.
-    //
-    //   Wormhole : 16M
-    //   Blackhole: 64M (2x DRAM BW + 2x cores → host Step-3 amortises further)
     const uint32_t n_ceiling = xl_max_n_fp32(md);
     if (p.N > n_ceiling) {
         std::fprintf(stderr,
@@ -212,11 +139,6 @@ inline std::vector<Complex> fft_impl(
 
     // (dev-time stdout printf removed.)
 
-    // ── Step 0: strided pre-pack ──────────────────────────────────────
-    // T[n1, n2] = signal[n2 * F1 + n1].  Each row n1 (length M) holds the
-    // STRIDED gather signal[n1], signal[F1+n1], signal[2*F1+n1], ...
-    // This is the input layout the inner FFT_M expects in standard 2-step
-    // Cooley-Tukey decomposition.  Pure memory shuffle, no arithmetic.
     std::vector<Complex> T(p.N);
     for (uint32_t n1 = 0; n1 < F1; ++n1) {
         Complex* tr = T.data() + static_cast<size_t>(n1) * M;
@@ -243,21 +165,6 @@ inline std::vector<Complex> fft_impl(
     auto tw = get_outer_twiddle(p.N, F1);
     for (size_t i = 0; i < Y.size(); ++i) Y[i] *= tw->w[i];
 
-    // ── Step 3: host length-F1 DFT, fused with the final reorder ──────
-    // For each inner output index c in [0, M), pull the F1 values
-    //   v[a] = Y[a, c]         (a in [0, F1))
-    // do an F1-point DFT
-    //   Vb[d] = sum_a v[a] * w_F1^(d * a)
-    // and write
-    //   X[c + M * d] = Vb[d]    for d in [0, F1)
-    //
-    // Why F1-point DFT (O(F1^2)) and not FFT (O(F1 log F1)): F1 is by
-    // planner construction the SMALLEST plan factor.  For every N up to
-    // 2^30 we currently produce, F1 ∈ {2, 4} — so F1^2 is at most 16
-    // multiplies per output element.  Going to FFT would not change the
-    // big-O bottleneck (host outer twiddle Step 2 dominates).  Doing it
-    // straight as DFT also lets us trivially fuse with the output reorder
-    // and avoid a separate transpose buffer.
     std::vector<Complex> X(p.N);
     if (F1 == 2u) {
         // Special case: length-2 DFT is just (a + b, a - b).  Tightest

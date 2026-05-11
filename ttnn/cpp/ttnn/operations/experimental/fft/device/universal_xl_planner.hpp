@@ -3,18 +3,6 @@
 //
 // fft_universal_xl_planner.hpp — Pure host K-level factorisation planner.
 //
-// Given a power-of-two N, produces an ordered list of factors
-//     [F1, F2, ..., Fk]
-// such that:
-//   * prod(Fi) == N
-//   * every Fi is a power of two with Fi <= kFactorCap (default 1024)
-//   * k is minimised, and within that the factorisation is "balanced"
-//     (factors as close to kFactorCap as possible, leftover concentrated
-//     in the LAST factor so the dispatcher recurses on the smallest tail)
-//
-// No device deps, no FFT math, no floats — this header is just integer
-// factorisation logic and is testable with a plain C++ compiler. It must
-// stay free of any tt-metal includes.
 
 #pragma once
 
@@ -51,21 +39,6 @@ struct XLPlan {
     bool two_pass()    const { return k() == 2u; }
     bool deep()        const { return k() >= 3u; }
 };
-
-// ─── Planner ────────────────────────────────────────────────────────────────
-//
-// Strategy (pow2-only):
-//   * Total butterfly stages = log2(N).
-//   * Each factor contributes at most log2(kFactorCap) = 10 stages.
-//   * k = ceil(log2N / 10) is therefore the MINIMUM number of factors
-//     achievable with the kFactorCap=1024 constraint.
-//   * We assign factors greedily from the front: F1 = F2 = ... = F_{k-1}
-//     = kFactorCap, and the final F_k absorbs whatever's left
-//     (always <= kFactorCap by construction).
-//
-// Why front-load the big factors: the eventual dispatcher recurses on
-// each factor; the LAST factor becomes a per-sibling fan-out. Keeping
-// it small minimises sequential recursion cost in Phase 1.
 
 inline XLPlan plan(uint32_t N) {
     assert(is_pow2(N) && "fft_universal_xl::plan currently requires pow2 N");
@@ -115,10 +88,6 @@ inline uint32_t largest_pow2_factor_le_cap(uint32_t N) {
     return f;
 }
 
-// "Outer / inner" split for the recursive dispatcher.  Given an XLPlan,
-// returns (F1, M) where M = N / F1 and F1 is the FIRST factor in the
-// plan.  The caller will dispatch ONE outer pass of length F1 over M
-// siblings, then recurse on length-M sub-FFTs.
 inline std::pair<uint32_t, uint32_t> outer_split(const XLPlan& p) {
     assert(!p.factors.empty());
     if (p.factors.size() == 1u) {

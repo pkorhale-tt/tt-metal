@@ -3,19 +3,6 @@
 //
 // fft_compute.cpp — TRISC / compute
 //
-// For each of the LOG2N stages, wait for EVEN/ODD/TW tiles from the reader,
-// do a radix-2 DIT butterfly on the whole tile (split-complex):
-//
-//     W*odd  :  (odd_r + i*odd_i) * (tw_r + i*tw_i)
-//     out0   =  even + W*odd
-//     out1   =  even - W*odd
-//
-// then push OUT0/OUT1 back to the reader for the scatter step.
-//
-// All arithmetic is done on the SFPU (vector float engine) via the
-// *_binary_tile ops, which give full IEEE-fp32 precision. The FPU ops
-// (add_tiles/mul_tiles) internally degrade to bf16 on Wormhole even with
-// fp32_dest_acc_en=true, so we avoid them for correctness.
 
 #include <cstdint>
 #include "api/compute/common.h"
@@ -69,10 +56,6 @@ FORCE_INLINE void sfpu_binop_push(uint32_t a, uint32_t b, uint32_t out) {
     cb_push_back(out, 1);
 }
 
-// Complex multiply: (ar + i*ai) * (br + i*bi) -> (outr + i*outi)
-//   outr = ar*br - ai*bi
-//   outi = ar*bi + ai*br
-// All six input CBs already waited-on. Does not pop them.
 FORCE_INLINE void cmul(
     uint32_t ar, uint32_t ai, uint32_t br, uint32_t bi,
     uint32_t outr, uint32_t outi)

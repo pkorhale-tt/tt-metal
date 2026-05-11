@@ -3,13 +3,6 @@
 //
 // fft_reader.cpp — BRISC0 / reader (multi-core, DMA-optimised)
 //
-// Same protocol as before; the gather / scatter / cross-core tile copy that
-// used to be naive scalar loops now use NoC async L1-to-L1 writes (the NoC
-// engine does the copy in hardware while BRISC moves on). One barrier per
-// group of copies amortises the sync cost.
-//
-// The "very small stride" stages (s < 4 => block size < 64 bytes) still
-// use scalar because NoC setup cost dominates for tiny blocks.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -224,20 +217,6 @@ void kernel_main() {
         cb_pop_front(CB_OUT1_I, 1);
     }
 
-    // ── CROSS-CORE stages (LOG2N_LOCAL .. LOG2N-1) ────────────────────────
-    //
-    // Pipeline strategy: the "send our state to stage k's partner" step is
-    // moved out of the top of the stage-k iteration.
-    //   - Stage 0 is primed by an explicit one-time send before the loop.
-    //   - Stage k+1's send is fused with stage k's scatter (both come from
-    //     the same post-butterfly tile, so one extra remote NoC write does
-    //     the trick).
-    // Result: by the time we reach the top of stage k+1, partner's data has
-    // already landed — the semaphore wait is near-instantaneous, and the
-    // NoC transit overlaps with our compute instead of blocking it.
-    //
-    // We also start the twiddle DRAM read BEFORE the semaphore wait so
-    // DRAM latency overlaps the (short) wait as well.
     if constexpr (P > 1) {
         // One-time initial send: prime partner_0's recv buffer.
         {
@@ -250,12 +229,6 @@ void kernel_main() {
             noc_async_write(state_r_l1, p0_rr, TILE_SIZE_FP32);
             noc_async_write(state_i_l1, p0_ri, TILE_SIZE_FP32);
 #if defined(ARCH_BLACKHOLE)
-            // BH: noc_async_write_barrier alone is not enough on BH —
-            // atomics are routed on a separate VC and can overtake the
-            // write-ack path under load. noc_async_full_barrier waits
-            // on EVERY NoC op (reads, posted/non-posted writes, atomics)
-            // before returning, guaranteeing the partner sees both the
-            // data tile AND the semaphore inc in the right order.
             noc_async_full_barrier();
 #else
             noc_async_write_barrier();
@@ -279,11 +252,6 @@ void kernel_main() {
             // by the initial prime for k=0). Monotonic count so missed/late
             // increments can't race.
 #if defined(ARCH_BLACKHOLE)
-            // BH: use _min (>=) variant so any inc batching by BH's NoC
-            // atomic unit doesn't deadlock the strict-equality wait.
-            // (Both wait variants already call invalidate_l1_cache() in
-            // their poll loop — see dataflow_api.h:1928,1954 — so no
-            // explicit invalidate is needed here.)
             noc_semaphore_wait_min(sem_ptr, k + 1);
 #else
             noc_semaphore_wait(sem_ptr, k + 1);
@@ -353,10 +321,6 @@ void kernel_main() {
                 noc_async_write(src_r, np_rr, TILE_SIZE_FP32);
                 noc_async_write(src_i, np_ri, TILE_SIZE_FP32);
 #if defined(ARCH_BLACKHOLE)
-                // BH: full barrier (reads + writes + atomics) before the
-                // semaphore inc. See paired comment in the prime block
-                // above for the rationale. WH keeps the cheaper write
-                // barrier — its NoC orders write+inc implicitly.
                 noc_async_full_barrier();
 #else
                 noc_async_write_barrier();

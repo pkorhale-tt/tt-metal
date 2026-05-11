@@ -3,69 +3,6 @@
 //
 // fft_universal_bf16_host.cpp — TRUE-bf16 variant of fft_universal.
 //
-// Goal
-// ----
-// Every on-device multiply is done by the Tensix FPU in bf16 × bf16 with
-// fp32 accumulation. No "bf16 storage + fp32 SFPU compute" tricks — on
-// Wormhole the SFPU has no native bf16 math path, so anything not routed
-// through matmul_tiles implicitly upcasts to fp32 at the unpacker. We call
-// that out explicitly in the dispatcher: if a path can't be expressed as
-// FPU matmul, we error rather than silently demoting to fp32.
-//
-// Phase status (this file)
-// ------------------------
-//   Phase 1  — TRUE-bf16 packed direct-DFT kernel for N in [2, 32] via FPU
-//              matmul. Genuine bf16 compute: Float16_b CBs, fp32_dest_acc_en,
-//              mm_init + matmul_tiles (bf16 srcA × bf16 srcB → fp32 DST → bf16).
-//   Phase 2b — Generic two-level Cooley-Tukey, reused for both:
-//                * pow2 N > 32     (N1 = 32, recurses via fft())
-//                * composite N > 32 with a divisor ≤ 32
-//                  (N1 = largest divisor ≤ 32, recurses via fft())
-//              All reduction stays on-device (packed_dft_bf16); the between-
-//              pass twiddle is fp32 on the host (pointwise, no reduction →
-//              fp32 there is strictly more accurate than bf16 would be).
-//   Phase 2c — Bluestein's chirp-Z for:
-//                * prime N > 32
-//                * composite N > 32 with NO divisor ≤ 32 (e.g. N = 37² = 1369)
-//              Builds length-M = next_pow2(2N-1) convolution, runs THREE
-//              length-M bf16 FFTs (which go back through Phase 2b), plus
-//              host-side chirp multiplies in fp32.
-//
-// Dispatch tree (top-level fft()):
-//   N == 1                       : identity
-//   N ≤ 32                       : Phase 1
-//   pow2 N > 32                  : Phase 2b pow2
-//   composite N > 32 w/ ÷ ≤ 32   : Phase 2b mixed-radix
-//   prime N > 32 / hard composite: Phase 2c Bluestein
-//
-// Every call path keeps the reduction-critical arithmetic on the Tensix FPU
-// in bf16; pointwise host work is in fp32 for exactness. No SFPU path is
-// ever taken, so the "true bf16 compute" contract is preserved end-to-end.
-//
-// API
-// ---
-//   fft_universal_bf16::fft(md, vector<complex<float>>) -> vector<complex<float>>
-//
-// Input and output are fp32 complex for drop-in compatibility with the
-// test / benchmark / demo harnesses. The fp32 → bf16 conversion happens
-// once at the host boundary (same tile pack as the device consumes), and
-// the bf16 → fp32 conversion happens once at read-back. Everything in
-// between — DRAM, CBs, FPU — is bf16.
-//
-// Precision expectations (random complex input, |x| ≤ 1)
-// ------------------------------------------------------
-//   N ≤ 32 (Phase 1)              : rel err 2-4e-3, SNR 49-56 dB
-//   pow2 N in [64, 1024]          : rel err 3-5e-3, SNR 48-50 dB
-//   pow2 N in [2048, 32768]       : rel err 5-10e-3 (depth-2/3 recursion)
-//   composite N with ÷ ≤ 32       : rel err 3-8e-3 (depth depends on factors)
-//   prime / hard-composite N      : rel err 5-15e-3 (Bluestein does 3 FFTs)
-//
-// Matmul reduction keeps each pass at O(log N) rounding depth; the
-// compounded depth from recursion is what costs precision as N grows.
-// Every rounding is bf16; there is no fp32 reduction on the device at any
-// point. This is as precise as a bf16 FPU-matmul FFT can be on this
-// hardware — tightening further requires either moving to fp32 (see
-// fft_universal/) or a hardware that supports tf32-style matmul.
 
 #pragma once
 
@@ -93,10 +30,6 @@ namespace fft_universal_bf16 {
 using Complex = std::complex<float>;
 using tt::tt_metal::distributed::MeshDevice;
 
-// ─── Tunables ────────────────────────────────────────────────────────────────
-// Maximum sub-FFT length the Phase 1 packed direct-DFT bf16 kernel handles.
-// Same 32 ceiling as the fp32 variant — a 32×32 tile fits 32 sub-FFTs and
-// the N×N twiddle matrix in a single tile.
 constexpr uint32_t kPackedMaxN = 32u;
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
@@ -124,10 +57,6 @@ inline bool is_prime(uint32_t n) {
     return true;
 }
 
-// Largest divisor of N in [2, 32]. Returns 0 if none exists (i.e. N's
-// smallest prime factor is > 32). Used by the mixed-radix path to split
-// composites so pass-2 is a length ≤ 32 DFT that the Phase-1 kernel handles
-// directly.
 inline uint32_t largest_divisor_le_32(uint32_t N) {
     uint32_t best = 0u;
     for (uint32_t d = 32u; d >= 2u; --d) {
@@ -177,14 +106,6 @@ inline std::vector<float> bf16_to_fp32_vec(const std::vector<uint16_t>& src) {
     return dst;
 }
 
-// ╔════════════════════════════════════════════════════════════════════════╗
-// ║  TRUE-bf16 packed direct-DFT plan for small N (N <= kPackedMaxN=32)    ║
-// ╚════════════════════════════════════════════════════════════════════════╝
-//
-// Dispatch shape is a 1-to-1 copy of fft_universal::PackedDFTPlan; only
-// the tile data format (Float16_b instead of Float32) and the host-side
-// tile size (2048 B vs 4096 B) change. Compare with
-// ../fft_universal/fft_universal_host.cpp for the detailed layout commentary.
 struct PackedDFTBf16Plan {
     uint32_t N              = 0;
     uint32_t count          = 0;
@@ -250,14 +171,6 @@ inline std::shared_ptr<PackedDFTBf16Plan> make_packed_dft_bf16_plan(
     constexpr uint32_t kRowsPerTile = 32u;
     const uint32_t raw_num_tiles = (count + kRowsPerTile - 1u) / kRowsPerTile;
 
-    // Same core-count rounding rule as the fp32 plan: fft_stockham's
-    // pick_batch_grid only yields a valid (cols, rows) when num_cores is
-    // <= 7 (cols=n, rows=1) OR a multiple of 8 (cols=8, rows=n/8). Round
-    // up, clamp to 64, pad the tile count to match. Extra tiles receive
-    // zero input (scratch is zero-initialised) → zero output, discarded.
-    // Cap by the device's compute grid: WH 8x8=64, BH ~13x10=130. Round
-    // num_cores up to a multiple of grid.x so pick_batch_grid yields a
-    // dense rectangle.
     const auto     dev_grid  = md->compute_with_storage_grid_size();
     const uint32_t grid_x    = static_cast<uint32_t>(dev_grid.x);
     const uint32_t max_cores = grid_x * static_cast<uint32_t>(dev_grid.y);
@@ -367,13 +280,6 @@ inline std::shared_ptr<PackedDFTBf16Plan> make_packed_dft_bf16_plan(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
-    // IMPORTANT (same trap the fp32 version documents): do NOT set
-    // unpack_to_dest_mode = UnpackToDestFp32 on a matmul kernel. That
-    // mode routes unpacker output straight into DST and leaves srcA/srcB
-    // uninitialised, so matmul_tiles reads garbage (1e28 / inf outputs).
-    // fp32_dest_acc_en=true keeps DST fp32 for the accumulating matmul,
-    // the operand path stays bf16 (Float16_b CBs) — that's the TRUE-bf16
-    // compute mode we want.
     auto ck = CreateKernel(
         prog,
         "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/compute/packed_dft_bf16_compute.cpp",
@@ -438,10 +344,6 @@ inline std::shared_ptr<PackedDFTBf16Plan> get_cached_packed_dft_bf16_plan(
     return pp;
 }
 
-// Host wrapper. Computes `count` independent length-N DFTs via the TRUE-bf16
-// packed direct-DFT kernel. The fp32 input is converted to bf16 at pack
-// time (once per call), ships as bf16 through DRAM/CBs/FPU, and the fp32
-// output is reconstructed from the bf16 result at unpack time.
 inline void packed_direct_dft_bf16_batched(
     std::shared_ptr<MeshDevice>   md,
     uint32_t                      N,
@@ -512,18 +414,6 @@ inline void packed_direct_dft_bf16_batched(
     }
 }
 
-// ─── Between-pass twiddle table cache ────────────────────────────────────
-//
-// The twiddle table T[n1, k2] = exp(-2πi · n1 · k2 / N) used by Step 3 of
-// two_level_fft_bf16 is a pure function of (N, N1, N2). We pre-compute it
-// the first time we see a given (N, N1, N2) triple, then reuse it for
-// every subsequent call. This kills the cos/sin work on the hot path —
-// the loop becomes one complex multiply per element.
-//
-// The same key (N, N1, N2) is used everywhere: outer pow2 path picks
-// N1=32, recursive sub-paths pick smaller N1, mixed-radix picks variable
-// N1. Each unique combination ends up cached exactly once for the life of
-// the process.
 inline std::vector<Complex>& two_level_twiddle_cache_entry(
     uint32_t N, uint32_t N1, uint32_t N2)
 {
@@ -555,21 +445,6 @@ inline const Complex* get_two_level_twiddle_cached(
     return tab.data();
 }
 
-// ─── Batched two-level Cooley-Tukey ─────────────────────────────────────────
-//
-// Same math as `two_level_fft_bf16` (factor N = N1 · N2, run Pass-1 of
-// length-N2 sub-FFTs, twiddle, transpose, Pass-3 of length-N1 sub-FFTs)
-// but for `batch` independent input vectors at once.
-//
-// The whole point is to collapse `batch` × (Pass-1 + Pass-3) sequential
-// dispatches into just 2 batched dispatches. With N=512, N1=32, batch=32
-// (the typical inner case for outer N=16384), this turns 64 dispatches
-// into 2 — the dominant cost was per-dispatch overhead (PCIe + tilize),
-// not the compute.
-//
-// Constraint: this helper is for the case where BOTH N1 and N2 fit the
-// packed_dft_bf16 kernel directly (i.e. both ≤ kPackedMaxN = 32). When
-// that doesn't hold we fall back to the per-sibling recursive path.
 inline void batched_two_level_fft_bf16(
     std::shared_ptr<MeshDevice>  md,
     uint32_t                     N,
@@ -645,34 +520,6 @@ inline void batched_two_level_fft_bf16(
     }
 }
 
-// ─── Generic two-level Cooley-Tukey ─────────────────────────────────────────
-//
-// The core primitive that the pow2 and mixed-radix paths both call. Splits
-// an FFT of length N = N1 × N2 (with N1 ∈ [2, 32] — this is enforced so
-// that pass-2 lands in the Phase-1 packed direct-DFT kernel unchanged).
-//
-// Index conventions:
-//   n = n1 + N1·n2,  n1 ∈ [0, N1), n2 ∈ [0, N2)            // input index
-//   k = k2 + N2·k1,  k1 ∈ [0, N1), k2 ∈ [0, N2)            // output index
-//
-//   A[n1, n2]  = x[n1 + N1·n2]                              // host reshape
-//   A'[n1, k2] = Σ_n2 A[n1, n2] · W_{N2}^{n2·k2}            // Pass-1 (sub-FFT)
-//   B[n1, k2]  = A'[n1, k2] · W_N^{n1·k2}                   // Twiddle (host)
-//   C[k2, n1]  = B[n1, k2]                                  // Transpose (host)
-//   D[k2, k1]  = Σ_n1 C[k2, n1] · W_{N1}^{n1·k1}            // Pass-2 (device)
-//   X[k2 + N2·k1] = D[k2, k1]                               // Host permute
-//
-// Pass-1 does N1 independent length-N2 FFTs. We delegate each one back
-// to fft() so the recursion terminates naturally: whenever N2 shrinks to
-// ≤ 32 it falls into the Phase-1 kernel. Pass-2 is N2 siblings of length
-// N1 ≤ 32 — that ALWAYS fits the Phase-1 kernel directly, which is the
-// whole reason for the N1 ≤ 32 constraint on this helper.
-//
-// The between-pass twiddle is done on the host in fp32. Pointwise ops
-// have no reduction, so fp32-on-host is strictly more accurate than
-// bf16-on-device there; the "true bf16 compute" contract is about the
-// reduction path (the matmuls inside pass-1 / pass-2), which stays
-// on-device in bf16.
 inline void two_level_fft_bf16(
     std::shared_ptr<MeshDevice>  md,
     uint32_t                     N,
@@ -694,15 +541,6 @@ inline void two_level_fft_bf16(
         }
     }
 
-    // Step 2: Pass-1 — N1 sibling length-N2 FFTs. Three execution modes:
-    //   (a) N2 ≤ 32                   : single batched packed_dft_bf16 call
-    //   (b) N2 itself is two-level     : batched via batched_two_level_fft_bf16
-    //                                    (collapses per-sibling recursion into
-    //                                     2 batched dispatches instead of 2·N1)
-    //   (c) anything else              : per-sibling recursion (legacy path)
-    //
-    // (b) is the big perf unlock for medium pow2 N (1024 < N ≤ 32768) where
-    // the per-sibling recursion previously meant ~64 sequential dispatches.
     std::vector<Complex> A_prime(N);
     if (N2 <= kPackedMaxN) {
         packed_direct_dft_bf16_batched(md, /*N=*/N2, /*count=*/N1, pass1_in, A_prime);
@@ -724,17 +562,6 @@ inline void two_level_fft_bf16(
         }
     }
 
-    // Step 3: host-side fp32 pointwise twiddle + transpose.
-    //   B[n1, k2] = A'[n1, k2] · exp(-2πi · n1 · k2 / N)
-    //   C[k2, n1] = B[n1, k2]
-    // Linearised:
-    //   A'       indexed by [n1·N2 + k2]  (one sub-FFT per row)
-    //   pass2_in indexed by [k2·N1 + n1]  (sub-FFT r = k2, length N1)
-    //
-    // The twiddle table is a pure function of (N, N1, N2) — same for every
-    // call. We cache it so the hot path is just one fp32 complex multiply
-    // per element (no cos/sin). For N=16384 with depth-1 recursion this
-    // alone removes ~32k cos/sin calls per outer FFT.
     const Complex* __restrict__ twid =
         get_two_level_twiddle_cached(N, N1, N2);
     std::vector<Complex> pass2_in(N);
@@ -761,13 +588,6 @@ inline void two_level_fft_bf16(
     }
 }
 
-// ─── Phase 2b: pow2 N > 32 via recursive two-level CT with N1 = 32 ──────────
-//
-// Every pow2 N ≥ 64 factors as 32 × (N/32). We pick N1 = 32 so pass-2 is
-// a length-32 DFT — directly handled by the Phase-1 kernel with no
-// additional bf16 roundings beyond the one input/output pack per pass.
-// Pass-1 recurses via fft(): when N/32 ≤ 32 it lands in Phase 1; when
-// N/32 > 32 it descends here again. Recursion depth = ceil(log_32(N)).
 inline void pow2_fft_bf16(
     std::shared_ptr<MeshDevice>  md,
     uint32_t                     N,
@@ -778,13 +598,6 @@ inline void pow2_fft_bf16(
     two_level_fft_bf16(md, N, /*N1=*/32u, in_natural, out_natural);
 }
 
-// ─── Phase 2c: composite non-pow2 N > 32 via mixed-radix Cooley-Tukey ──────
-//
-// Same two-level CT, with N1 = largest_divisor_le_32(N). That choice
-// minimises pass-1's sub-FFT length and therefore minimises recursion
-// depth on most inputs. For N whose smallest prime factor exceeds 32
-// (e.g. N = 37² = 1369) there is no divisor ≤ 32 and we fall back to
-// Bluestein on N itself — see the dispatcher.
 inline void mixed_radix_fft_bf16(
     std::shared_ptr<MeshDevice>  md,
     uint32_t                     N,
@@ -796,28 +609,6 @@ inline void mixed_radix_fft_bf16(
     two_level_fft_bf16(md, N, N1, in_natural, out_natural);
 }
 
-// ─── Phase 2c: Bluestein chirp-Z for primes (and hard composites) ───────────
-//
-// Classical Bluestein's algorithm expressing a length-N DFT as a length-M
-// cyclic convolution, where M is any pow2 ≥ 2N - 1.
-//
-//   chirp: c_n = exp(-πi · n² / N)
-//   a_n = x_n · c_n                          for n ∈ [0, N)
-//   b_n (length M) built as:
-//       b_n     = conj(c_n)                  for n ∈ [0, N)
-//       b_{M-n} = conj(c_n)                  for n ∈ [1, N)
-//       b_n     = 0                          elsewhere
-//   A = FFT_M(a, zero-padded to length M)
-//   B = FFT_M(b)
-//   P_k = A_k · B_k                          (pointwise, fp32 host)
-//   p   = IFFT_M(P)                          (= FFT_M(conj(P)) / M, conj)
-//   X_k = c_k · p_k                          for k ∈ [0, N)
-//
-// All three length-M FFTs go through fft() → pow2_fft_bf16 on bf16. The
-// chirps / pointwise multiplies happen on the host in fp32 — same
-// discipline as the twiddle in two_level_fft_bf16. This delivers TRUE
-// bf16 compute for prime lengths without needing a bf16-specific
-// Bluestein kernel.
 inline void bluestein_fft_bf16(
     std::shared_ptr<MeshDevice>  md,
     uint32_t                     N,
@@ -886,16 +677,6 @@ inline void bluestein_fft_bf16(
     }
 }
 
-// ─── Top-level dispatcher ────────────────────────────────────────────────────
-//
-// Routing:
-//   N == 1                       : identity
-//   N in [2, 32]                 : Phase 1 packed direct-DFT (bf16)
-//   pow2, N > 32                 : Phase 2b pow2 recursion (N1 = 32)
-//   composite non-pow2, N > 32,  : Phase 2c mixed-radix CT (N1 = largest ÷ ≤ 32)
-//     has divisor ≤ 32
-//   prime N > 32, or composite   : Phase 2c Bluestein (pads to pow2 M)
-//     with no divisor ≤ 32
 inline std::vector<Complex> fft(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  signal)
@@ -944,26 +725,6 @@ inline std::vector<Complex> fft(
     return fft(md, cx);
 }
 
-// ─── Inverse FFT via the conjugate trick ─────────────────────────────────────
-//
-//   IFFT(X) = conj( FFT( conj(X) ) ) / N
-//
-// Reuses the entire forward dispatch tree (Phase 1 packed_dft_bf16, Phase
-// 2b pow2 recursion, Phase 2c mixed-radix, Phase 2c Bluestein) without
-// touching a single device kernel. Conjugation and 1/N scaling are
-// pointwise host operations in fp32 — no reduction, so there's no bf16
-// precision loss added by the inverse step beyond the forward FFT's.
-//
-// PackedDFTBf16Plan is keyed by (N, count), not direction, so all plans
-// warm by the first forward call are reused immediately.
-//
-// The same identity is already used internally inside bluestein_fft_bf16
-// (Step 4, the IFFT-of-M); this just exposes the pattern as a public API.
-//
-// Round-trip precision matches single-direction precision (both add one
-// bf16 rounding cycle to each FPU matmul). For N <= 1024 the round trip
-// is ~45-55 dB SNR; for larger N depth-dependent recursion gives
-// ~35-50 dB.
 inline std::vector<Complex> ifft(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  spectrum)

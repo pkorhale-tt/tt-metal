@@ -3,20 +3,6 @@
 //
 // batch_fft_reader.cpp — BRISC0 / reader for device-side BATCH FFT.
 //
-// Each core processes BATCH_PER_CORE independent length-SUB_N FFTs back to
-// back, all sub-FFTs share the same per-stage twiddle tile (no cross-core
-// stages here — SUB_N <= 1024). The body of the per-stage scatter / gather
-// is identical to the inner fft_reader's local-stage path.
-//
-// Per sub-FFT k (in [0, BATCH_PER_CORE)):
-//   1. Load bit-reversed input tile  t = base_tile + k  into STATE.
-//   2. For each stage s in [0, LOG2_SUB_N):
-//        - Read twiddle tile s.
-//        - Scatter STATE -> EVEN/ODD.
-//        - Wait for compute -> OUT0/OUT1, gather back into STATE.
-//   3. Push CB_SYNC so the writer flushes STATE to output tile t.
-//      Wait until the writer pops STATE (1-slot CB) before reusing the
-//      L1 region for the next sub-FFT.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"

@@ -3,34 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // FFT program factory — full-backend dispatcher.
-//
-// Routes each call of `ttnn::experimental::fft / ifft` to one of four
-// device-resident orchestrators that live in this same directory as
-// header-only modules. Selection is by (dtype, N, is_pow2):
-//
-//     fp32 + pow2  + N <= 1M    →  stockham_host.hpp        (4-pass Stockham)
-//     fp32 + pow2  + N <= 16M   →  universal_xl_host.hpp    (2-level Cooley–Tukey)
-//     fp32 + non-pow2           →  universal_host.hpp       (mixed-radix / Bluestein)
-//     bf16 + any N              →  universal_bf16_host.hpp  (true-bf16 FPU matmul)
-//
-// The orchestrators are byte-for-byte ports of the originals under
-// tt_metal/programming_examples/ with two changes: every CreateKernel()
-// path now points at device/kernels/ (so the ttnn op is fully self-
-// contained), and the cross-includes use sibling headers in this
-// directory. The programming_examples copies remain as stand-alone
-// demos and are independent of this op's install.
-//
-// This file is "host-orchestrated, device-executed" — every FFT pass
-// runs on Tensix cores via the orchestrator's MeshWorkload enqueues.
-// We funnel through the orchestrator's host API rather than building
-// one big fused Program because:
-//   * the orchestrators already implement every algorithm correctness-
-//     tested end-to-end in the programming_examples;
-//   * a fused single-Program rewrite (Phase 3) is a large, separate
-//     undertaking that should not block landing the public ttnn API.
-//
-// IFFT path: y = conj(fft(conj(X))) / N — applied per-row on host
-// around the forward backend call. No new device code required.
 
 #include "fft_program_factory.hpp"
 
@@ -39,16 +11,6 @@
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/host_api.hpp>
 
-// Backend orchestrators — header-only inline modules, in-tree copies of
-// the originals under tt_metal/programming_examples/. The in-tree copies
-// have all CreateKernel(...) paths retargeted to device/kernels/ so the
-// ttnn op is fully self-contained and does not depend on
-// programming_examples being installed at runtime. See
-// device/kernels/README.md for provenance.
-//
-// Each header is #pragma once; transitive includes (notably stockham_host
-// being pulled in by universal/universal_xl/universal_bf16) collapse
-// cleanly via the include guard.
 #include "stockham_host.hpp"
 #include "universal_host.hpp"
 #include "universal_xl_host.hpp"
@@ -76,19 +38,6 @@ constexpr bool is_pow2_local(uint32_t n) {
     return n != 0u && (n & (n - 1u)) == 0u;
 }
 
-// Pick + invoke the right backend for a single length-N row.
-// Mirrors `select_backend()` in fft_device_operation.cpp; that one
-// rejects unsupported (dtype, N) at validate time, so by the time we
-// reach here every branch is known-good.
-//
-// `precision` is consulted ONLY for the Float32 + non-pow2 branch:
-//   * Precise (default) → fft_universal::fft_precise (SFPU, true fp32,
-//                          ~1e-7 round-trip — matches torch precision)
-//   * Fast              → fft_universal::fft         (FPU bf16-mantissa
-//                          matmul, ~1e-3 round-trip but ~10-30× faster
-//                          for small N)
-// All other branches (bf16, fp32+pow2, fp32+xl) ignore the flag — they
-// already use the right precision/throughput trade-off for their case.
 std::vector<Complex> fft_one_row(
     std::shared_ptr<MeshDevice>& md,
     DataType                     dtype,
@@ -111,10 +60,6 @@ std::vector<Complex> fft_one_row(
 
 // ── Tensor I/O helpers (handle fp32 ↔ bf16 at the host boundary) ────────────
 
-// Read a Tensor's full payload as a flat fp32 vector. For BFLOAT16 inputs
-// we explicitly call `to_vector<bfloat16>` and widen on host so we avoid
-// any silent cast that the templated `to_vector<float>` overload would
-// otherwise reject.
 std::vector<float> read_real_as_fp32(const Tensor& t) {
     if (t.dtype() == DataType::BFLOAT16) {
         const auto buf = t.to_vector<bfloat16>();
@@ -145,18 +90,6 @@ Tensor write_real_with_spec(
     return Tensor::from_vector(std::move(buf), spec, device);
 }
 
-// Drives the per-row FFT loop and replaces the output tensors with new
-// device tensors holding the (real, imag) spectrum halves.
-//
-// We replace the outputs (rather than writing into the buffers allocated
-// by `create_output_tensors`) because the orchestrators each manage
-// their own DRAM buffers and return a host vector; the framework-supplied
-// blank tensors become unreferenced and are freed by RAII.
-//
-// Phase 2 limitation: drops the per-shard TensorTopology that the
-// device_operation layer imputes onto the blank outputs. We currently
-// only test on single-device dispatch, so the loss is invisible to
-// callers; a Phase-3 fused-Program rewrite will preserve the originals.
 void run_backend_fft(
     const FFTParams&            attrs,
     const FFTTensorArgs&        tensor_args,
@@ -281,26 +214,3 @@ void FFTProgramFactory::override_runtime_arguments(
 
 }  // namespace ttnn::experimental::prim
 
-// =====================================================================
-// PHASE 4 TODO — single fused on-device Program
-// =====================================================================
-// The current factory is "host-orchestrated, device-executed": each
-// length-N row runs through one of four orchestrators that own their
-// own MeshWorkloads and command-queue enqueues. This is correct and
-// fast enough for the public API to land, but it has one remaining
-// inefficiency: B device dispatches per call for a [B, ..., N] tensor.
-// A fused Program could batch the outer dimensions into one workload.
-//
-// Phase 4 work:
-//   * Refactor each orchestrator's `fft()` into
-//     `build_<backend>_program(md, N, in_buf, out_re_buf, out_im_buf)
-//        -> {Program, std::vector<KernelHandle>, std::vector<CoreCoord>}`
-//     emitting one Program per call, no internal enqueues.
-//   * Wire override_runtime_arguments() to update buffer addresses on
-//     program-cache hits (currently a re-dispatch, which is fine but
-//     wastes the cached Program object).
-//   * Inverse path can stay as the conjugate trick or be inlined as a
-//     short SFPU pass appended to the writer kernel.
-//
-// Note: kernel-path retargeting is DONE — every backend now references
-// device/kernels/{compute,dataflow}/* directly.

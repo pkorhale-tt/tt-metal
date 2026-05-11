@@ -3,14 +3,6 @@
 //
 // pass2_common.h — Shared CB layout for the device-side Pass-2 kernel
 // (twiddle multiply step of Stockham). Tile-granular, full-IEEE-fp32.
-//
-// Pipeline (per row tile i, repeated NUM_TILES times per core):
-//   reader  : DRAM -> CB_A_R / CB_A_I / CB_T_R / CB_T_I
-//   compute : (A * T) -> CB_B_R / CB_B_I  via SFPU complex multiply
-//   writer  : CB_B_R / CB_B_I -> DRAM (same tile index)
-//
-// We do NOT do the transpose on device; that stays on the host (cheap
-// memory shuffle vs. the ~50–80 ms cos/sin work we just moved off-host).
 
 #pragma once
 

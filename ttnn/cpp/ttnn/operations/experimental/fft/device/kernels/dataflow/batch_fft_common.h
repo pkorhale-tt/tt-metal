@@ -3,19 +3,6 @@
 //
 // batch_fft_common.h — Shared layout for the device-side BATCH FFT
 // (Optimisation 1 of fft_stockham).
-//
-// Each core runs `BATCH_PER_CORE` independent radix-2 DIT sub-FFTs of length
-// SUB_N, all SUB_N <= 1024 (single tile per sub-FFT, no cross-core stages).
-//
-// Tile layout in DRAM (input and output, real / imag separate buffers):
-//   Tile index t  ==  sub-FFT id  ==  c * BATCH_PER_CORE + k
-// where c is the logical core index and k is the per-core sub-FFT index.
-//
-// Twiddle layout in DRAM (same for every core, since all stages are local):
-//   Tile s  ==  twiddle factors for stage s (s in [0, LOG2_SUB_N)).
-//
-// Same CB indices as fft/kernel/fft_common.h so we can reuse the inner
-// compute kernel verbatim.
 
 #pragma once
 

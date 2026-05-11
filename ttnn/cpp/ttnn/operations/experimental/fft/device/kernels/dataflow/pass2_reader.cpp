@@ -3,10 +3,6 @@
 //
 // pass2_reader.cpp — BRISC0 / reader for device-side Stockham Pass 2.
 //
-// Each core owns a contiguous range [first_tile, first_tile + num_tiles)
-// of input row tiles (rows of A in the (N1, N2) layout). For each row tile
-// it pulls four DRAM tiles into L1 — A_real, A_imag, T_real, T_imag — and
-// hands them to the compute kernel via the matching CBs.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"

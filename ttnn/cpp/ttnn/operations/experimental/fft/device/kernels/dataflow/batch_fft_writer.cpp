@@ -3,10 +3,6 @@
 //
 // batch_fft_writer.cpp — BRISC1 / writer for device-side BATCH FFT.
 //
-// For each of BATCH_PER_CORE sub-FFTs, wait for the reader's CB_SYNC and
-// flush the current STATE tile to its DRAM page (page index =
-// base_tile_idx + k). Pop SYNC + STATE so the reader's next iteration can
-// reuse the (1-slot) CB.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"

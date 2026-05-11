@@ -3,13 +3,6 @@
 //
 // pass2_compute.cpp — TRISC compute for device-side Stockham Pass 2.
 //
-// Per row tile i (repeated NUM_TILES times per core):
-//   B_real = A_real * T_real - A_imag * T_imag
-//   B_imag = A_real * T_imag + A_imag * T_real
-//
-// All arithmetic on the SFPU via *_binary_tile (full IEEE fp32). This is
-// the same complex-multiply pattern as `cmul` in fft/kernel/fft_compute.cpp,
-// here it just runs once per tile instead of once per butterfly stage.
 
 #include <cstdint>
 #include "api/compute/common.h"

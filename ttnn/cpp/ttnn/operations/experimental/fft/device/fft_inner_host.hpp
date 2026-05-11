@@ -3,35 +3,6 @@
 //
 // fft_host.cpp — multi-core radix-2 DIT FFT on Wormhole.
 //
-// Constraints:
-//   * N is a power of two, 2 <= N <= 65536.
-//   * FFT only (no IFFT).
-//   * 2D row-major core grid; P = max(1, N/1024) cores.
-//       N <= 1024  => P=1  (1x1)   pure single-core path, as before.
-//       N = 2048   => P=2  (2x1)
-//       N = 4096   => P=4  (4x1)
-//       N = 8192   => P=8  (8x1)
-//       N = 16384  => P=16 (8x2)
-//       N = 32768  => P=32 (8x4)
-//       N = 65536  => P=64 (8x8)   full Wormhole worker grid.
-//     Logical core index c (0..P-1) is row-major: x=c%cols, y=c/cols.
-//     The kernels only use `c` + a NoC-coord lookup table, so the grid
-//     shape is purely a host-side decision.
-//
-// Flow (see kernel/fft_common.h for details):
-//   1. pack_input does a global N-bit bit-reversal and packs the result into
-//      P contiguous 1024-element tiles (real+imag split). Tile c holds the
-//      chunk of bit-reversed input that core c owns as initial state.
-//   2. precompute_twiddles builds LOG2N * P tiles of twiddle factors:
-//        - For local stages (s < 10 or s < LOG2N if P==1) all P tiles at
-//          stage s are identical — the twiddles depend only on position
-//          within the tile.
-//        - For cross-core stages (s >= 10) each core's tile differs; the
-//          twiddle index at slot j is
-//            k = ((c & ~(1<<(s-10))) & ((1<<(s-9))-1)) * 1024 + j
-//          where c is the core index; both cores in a pair use the same k
-//          (the "lower" core of the pair).
-//   3. run_fft uploads input+twiddles, launches P-core program, reads back.
 
 #pragma once
 
@@ -308,10 +279,6 @@ inline void run_fft(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
-    // Unpack every CB directly to DEST in fp32 (see compute kernel notes).
-    // Vector size MUST equal the framework's CB-slot count: NUM_CIRCULAR_BUFFERS
-    // is 64 on host (always — the host max), 32 on Wormhole device, 64 on
-    // Blackhole device. Using the constant keeps both archs working.
     std::vector<UnpackToDestMode> u2d(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
     for (uint32_t id = 0; id < NUM_CBS; ++id) {
         u2d[id] = UnpackToDestMode::UnpackToDestFp32;
@@ -372,21 +339,6 @@ inline std::shared_ptr<MeshBuffer> make_io_buf(
     const Sizing z = compute_sizing(N);
     return make_mesh_buf(md, z.P * kTileSizeFp32, kTileSizeFp32);
 }
-
-// ── Persistent plan: build once, execute many times ───────────────────────
-//
-// A plan captures every device-side resource that depends only on N:
-//   * twiddle buffers (precomputed, uploaded once)
-//   * input / output DRAM buffers (addresses are stable, so runtime args
-//     stay valid across calls)
-//   * the compiled Program wrapped in a MeshWorkload (runtime args bound
-//     once to the persistent buffer addresses)
-//
-// On repeated calls with the same N:
-//   per-call cost  = WriteShard(input) + EnqueueMeshWorkload + ReadShard
-// instead of
-//   per-call cost  = above + program build + CBs + kernels + SetRuntimeArgs
-// which at N=65536 is the difference between ~25 ms and ~2–3 ms.
 
 struct FFTPlan {
     uint32_t N = 0;
@@ -562,17 +514,6 @@ inline std::shared_ptr<FFTPlan> get_cached_plan(
 }
 
 inline void clear_plan_cache() { detail::plan_cache().clear(); }
-
-// ── PyTorch-style one-shot FFT API (now backed by the plan cache) ────────
-//
-// First call for a given N builds the plan (~10–25 ms depending on N).
-// Subsequent calls with the same N skip all device-side setup and only pay
-// for input upload + enqueue + output download (~1–3 ms typically).
-//
-// Usage (C++ equivalent of `torch.fft.fft(signal)`):
-//
-//     std::vector<std::complex<float>> signal = { {10,0}, {20,0}, {30,0}, {40,0} };
-//     auto spectrum = fft_example::fft(md, signal);
 
 inline std::vector<std::complex<float>> fft(
     std::shared_ptr<MeshDevice> md,

@@ -3,37 +3,6 @@
 //
 // fft_stockham_host.cpp — Multi-pass Stockham (six-step / Bailey 4-step) FFT
 //                        orchestrator that lifts our radix-2 single-shot FFT
-//                        from N <= 65,536 to N up to ~1M points (and beyond).
-//
-// Strategy:
-//   * Factor N as N1 * N2 with both ≤ 65,536 (and both powers of two).
-//     For N ≤ 1M (our current Stockham regime) this also gives both ≤ 1024,
-//     so every sub-FFT fits in one Tensix tile.
-//   * Reshape input as (N1, N2) row-major.
-//   * Pass 1: row-FFT of length N2  (N1 sub-FFTs, all of length N2).
-//             Dispatched in ONE batched kernel launch via `batch_fft`:
-//             64 cores each run N1/64 sub-FFTs in parallel (Optimisation 1).
-//   * Pass 2: per-element twiddle multiply  W_N^(i*j)  +  transpose to (N2, N1).
-//             Twiddle multiply runs on device (Optimisation 2): 64 cores in
-//             parallel via a tile-granular complex-multiply kernel on the
-//             SFPU, with the (N1, N2) twiddle table pre-computed once and
-//             cached in DRAM. Transpose stays on the host (cheap memory
-//             shuffle, ~10 ms at N=1M) — the cos/sin work that dominated
-//             the old host pass is gone.
-//   * Pass 3: row-FFT of length N1  (N2 sub-FFTs of length N1) — also
-//             one batched dispatch.
-//   * Final reorder on host: X[k] = D[k % N2, k / N2].
-//
-// Total DRAM round-trips: 2 (one per pass), not one per stage. Each sub-FFT
-// stays fully L1-resident inside the batch kernel.
-//
-// Public API (mirrors fft_example::fft):
-//
-//     auto X = fft_stockham::fft(md, signal);   // 1D power-of-two of any size
-//                                                // (capped by host memory).
-//
-// For N <= 65,536 we transparently fall back to the inner radix-2 path so
-// callers never need to know which algorithm ran.
 
 #pragma once
 
@@ -127,35 +96,6 @@ inline StockhamPlan plan(uint32_t N) {
     return p;
 }
 
-// ╔════════════════════════════════════════════════════════════════════════╗
-// ║                Optimisation 1 — device-side BATCH FFT                  ║
-// ╚════════════════════════════════════════════════════════════════════════╝
-//
-// One device dispatch executes `batch` independent FFTs of length sub_N
-// (sub_N <= 1024, so each sub-FFT fits in one Tensix tile = no cross-core
-// stages). We use 64 cores and assign batch_per_core = batch / 64 sub-FFTs
-// to each core. This collapses the per-sub-FFT host overhead (program
-// build, runtime args, enqueue, finish) that today's host loop pays N1 (or
-// N2) times.
-//
-// Coverage. Stockham's kInnerMaxN=65536 split keeps both N1 and N2 ≤ 1024
-// for every N up to 1,048,576 (the regime our orchestrator handles), so
-// every sub-FFT in pass-1 and pass-3 is single-tile and goes through the
-// batch path. Larger N is unchanged (still asserts in plan()).
-//
-// DRAM layout (one tile = 1024 fp32 = 4096 bytes per side, real and imag
-// in separate buffers):
-//   in_r_buf[t]   = bit-reversed real of sub-FFT t   (t in [0, batch))
-//   in_i_buf[t]   = bit-reversed imag of sub-FFT t
-//   out_r_buf[t]  = real spectrum of sub-FFT t       (natural order)
-//   out_i_buf[t]  = imag spectrum of sub-FFT t
-// Every core c handles tiles [c*batch_per_core, (c+1)*batch_per_core).
-//
-// Twiddles (LOG2_SUB_N tiles per side, shared across cores — local stages
-// only depend on stage index s):
-//   tw_r_buf[s]   = cos(-2*pi * (p mod 2^s) / 2^(s+1))   p = 0..sub_N/2-1
-//   tw_i_buf[s]   = sin(-2*pi * (p mod 2^s) / 2^(s+1))
-
 struct BatchFFTPlan {
     uint32_t sub_N          = 0;
     uint32_t log2_sub_N     = 0;
@@ -171,27 +111,12 @@ struct BatchFFTPlan {
     std::shared_ptr<MeshBuffer> tw_r_buf,  tw_i_buf;
     tt::tt_metal::distributed::MeshWorkload workload;
 
-    // Host-side scratch buffers (reused across calls to avoid per-call
-    // malloc / memset of batch*kTileElems floats — the dominant host
-    // overhead for small sub_N with large batch. e.g. Bluestein(3) with
-    // batch=2048 would otherwise allocate+zero-init 16 MB per dispatch,
-    // and fft_universal issues ~9 such dispatches per N=3600 iteration.
-    //
-    // The batch-FFT reader and compute only touch the first `sub_N` slots
-    // of each tile; positions [sub_N, kTileElems) are never read. We zero-
-    // initialise once at plan-construction time so padded slots stay zero
-    // across all subsequent calls with the same plan.
     std::vector<float> in_r_host, in_i_host;
     std::vector<float> out_r_host, out_i_host;
 
     bool initialized = false;
 };
 
-// Distribute `num_cores` workers over a (cols, rows) sub-grid that fits
-// inside the device's compute grid (grid_x = 8 on WH, 13 on BH).
-// Finds the densest (cols, rows) such that cols*rows == num_cores AND
-// cols <= grid_x. Caller is responsible for ensuring such a factorisation
-// exists (use `max_cores_for_grid` below for the pow2-batch case).
 inline std::pair<uint32_t, uint32_t> pick_batch_grid(uint32_t num_cores, uint32_t grid_x) {
     // Search downward from grid_x for the largest divisor of num_cores
     // that is <= grid_x. Guaranteed to terminate at cols=1 in the worst case.
@@ -202,15 +127,6 @@ inline std::pair<uint32_t, uint32_t> pick_batch_grid(uint32_t num_cores, uint32_
     return {cols, num_cores / cols};
 }
 
-// Largest power-of-2 P with P <= grid_x*grid_y AND P factors as
-// (cols<=grid_x, rows<=grid_y). Used by callers (stockham batch_fft / pass2)
-// that require num_cores to divide a power-of-2 batch.
-//
-//   WH 8x8   → 64       (8,8)
-//   BH 13x10 → 64       (8,8)        — 128=(8,16) overflows grid_y=10
-//
-// The two archs happen to agree at 64 because BH's grid is 13x10 (not
-// 16-tall) and the stockham planner only ever passes pow2 batches.
 inline uint32_t max_cores_for_grid(uint32_t grid_x, uint32_t grid_y) {
     uint32_t best = 1;
     for (uint32_t p = 2; p <= grid_x * grid_y; p *= 2) {
@@ -347,10 +263,6 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default});
 
-    // Vector must match the framework's CB-slot count, which is the host
-    // maximum (NUM_CIRCULAR_BUFFERS = 64 on host, regardless of arch).
-    // Using the canonical constant keeps WH (32 dev / 64 host) and BH
-    // (64 dev / 64 host) both working without per-arch ifdefs.
     std::vector<UnpackToDestMode> u2d(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
     for (uint32_t id = 0; id < kBatchNumCbs; ++id) {
         u2d[id] = UnpackToDestMode::UnpackToDestFp32;
@@ -418,13 +330,6 @@ inline std::shared_ptr<BatchFFTPlan> get_cached_batch_plan(
     return bp;
 }
 
-// in_r / in_i are BATCH * kTileElems floats: batch contiguous tiles, each
-// tile holding bit-reversed input slots [0, sub_N) and zeros after.
-// Returns out_r / out_i in the same layout, natural-order spectrum slots
-// [0, sub_N) and undefined slots after.
-//
-// NOTE: `WriteShard` takes the data vector by non-const reference (same
-// signature as the inner kernel uses), so in_r / in_i must be non-const.
 inline void execute_batch(
     BatchFFTPlan&            plan,
     std::vector<float>&      in_r,
@@ -463,10 +368,6 @@ inline void batch_fft(
     auto plan = get_cached_batch_plan(md, sub_N, batch);
     const uint32_t log2_sub_N = plan->log2_sub_N;
 
-    // Reuse the plan's host scratch. Zero-init was done once at plan-
-    // construction time, and the kernel only reads positions [0, sub_N)
-    // of each tile — we overwrite exactly those positions below, so no
-    // per-call memset of the tile-padded region is required.
     const size_t tile_floats = kTileElems;
     std::vector<float>& in_r  = plan->in_r_host;
     std::vector<float>& in_i  = plan->in_i_host;
@@ -496,20 +397,6 @@ inline void batch_fft(
     }
 }
 
-// ── Pass 1: N1 row-FFTs of length N2 ──────────────────────────────────────
-//
-// Cooley-Tukey decomposition for N = N1 * N2 requires the FIRST FFT pass to
-// run over the slow-varying axis of the natural row-major reshape (i.e. it
-// is intrinsically a "column-FFT" of length N2 with stride N1 through the
-// 1D input). To turn it into a row-FFT we hand to our existing radix-2
-// kernel, we transpose-on-pack here:
-//
-//     packed[i, j]  =  x[j*N1 + i]    for i in [0, N1), j in [0, N2)
-//
-// Every sub-FFT is a single tile (N2 <= 1024 across the entire Stockham
-// regime up to N=1M), so we route through the device-side BATCH kernel:
-// one dispatch instead of N1 dispatches.
-
 inline std::vector<Complex> pass1_row_ffts(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  x,
@@ -531,32 +418,6 @@ inline std::vector<Complex> pass1_row_ffts(
     batch_fft(md, /*sub_N=*/p.N2, /*batch=*/p.N1, in_natural, out_natural);
     return out_natural;   // row-major (N1, N2) — exactly what pass 2 expects.
 }
-
-// ╔════════════════════════════════════════════════════════════════════════╗
-// ║          Optimisation 2 — device-side Pass-2 twiddle multiply          ║
-// ╚════════════════════════════════════════════════════════════════════════╝
-//
-// Pass 2 mathematically does:
-//   B[i, j] = A[i, j] * exp(-2*pi*i*i*j / N)         (twiddle multiply)
-//   C[j, i] = B[i, j]                                 (transpose)
-//
-// The cos/sin per element is what made the host implementation slow
-// (~50–80 ms at N=1M, single-threaded). We move ONLY that step to device:
-//   * Twiddles (constant for a given (N1, N2)) are pre-computed once on
-//     the host and uploaded to DRAM as N1 row tiles. Cached for the life
-//     of the plan, so cos/sin is paid exactly once per (N1, N2) pair.
-//   * The kernel does pure tile-granular complex multiply on the SFPU
-//     (full IEEE fp32) — same `cmul` pattern as the inner FFT compute.
-//   * 64 cores in parallel, each handling N1/64 row tiles.
-//
-// The transpose (B → C, just memory shuffling, ~10 ms on host at N=1M)
-// stays on the host. Fusing it into the kernel would require scattered
-// 4-byte NoC writes; the gain isn't worth the kernel complexity yet.
-//
-// DRAM layout:
-//   in_r/in_i_buf[i]  : row i of A, real / imag, N2 fp32 + zero pad
-//   tw_r/tw_i_buf[i]  : row i of T, real / imag, N2 fp32 + zero pad
-//   out_r/out_i_buf[i]: row i of B, real / imag, N2 fp32 + zero pad
 
 struct Pass2Plan {
     uint32_t N1 = 0, N2 = 0, N = 0;
@@ -750,15 +611,6 @@ inline std::shared_ptr<Pass2Plan> get_cached_pass2_plan(
     return pp;
 }
 
-// ── Pass 2: device twiddle multiply + host transpose ─────────────────────
-//
-// A is row-major (N1, N2) on host. We:
-//   1. pack each row into a tile (zero-pad past N2),
-//   2. upload to DRAM,
-//   3. dispatch the pass2 kernel (64 cores in parallel),
-//   4. download B (still in (N1, N2) tile layout),
-//   5. transpose to C in (N2, N1) row-major on host (cheap memory shuffle).
-
 inline std::vector<Complex> pass2_twiddle_transpose(
     std::shared_ptr<MeshDevice> md,
     const std::vector<Complex>& A,
@@ -806,12 +658,6 @@ inline std::vector<Complex> pass2_twiddle_transpose(
     return C;
 }
 
-// ── Pass 3: N2 row-FFTs of length N1 ──────────────────────────────────────
-//
-// Pass 2 already laid C out as (N2, N1) row-major. Each row j is a length-N1
-// natural-order signal we FFT in place. With N1 <= 1024 across our regime,
-// the batch path runs all N2 sub-FFTs in one device dispatch.
-
 inline std::vector<Complex> pass3_row_ffts(
     std::shared_ptr<MeshDevice>  md,
     const std::vector<Complex>&  C,
@@ -839,14 +685,6 @@ inline std::vector<Complex> final_reorder(
     }
     return X;
 }
-
-// ── Public API ────────────────────────────────────────────────────────────
-//
-// fft_stockham::fft(md, signal) — drop-in equivalent of
-// fft_example::fft(md, signal) that supports any N (power of two).
-//
-// For N <= 65,536 we just call the inner radix-2 directly (zero overhead).
-// For N >  65,536 we run the four-pass Stockham orchestrator.
 
 inline std::vector<Complex> fft(
     std::shared_ptr<MeshDevice>  md,

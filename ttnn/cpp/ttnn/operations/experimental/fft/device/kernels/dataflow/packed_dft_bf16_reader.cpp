@@ -3,11 +3,6 @@
 //
 // packed_dft_bf16_reader.cpp — BRISC0 / reader for the TRUE-bf16 packed
 // direct-DFT kernel. Same dataflow as the fp32 reader (see
-// ../fft_universal/kernel/packed_dft_reader.cpp) — DRAM tiles are routed
-// into CB_A / CB_B in the 4-pair sequence that lets the compute kernel run
-// four accumulating matmul_tiles calls per output tile. The data-format
-// awareness is dynamic (get_dataformat / get_tile_size on the CB), so
-// exactly the same code works whether the CBs are Float32 or Float16_b.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
