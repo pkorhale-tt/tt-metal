@@ -1,9 +1,9 @@
 ===============================================================================
- ttnn.fft / ttnn.ifft — Standard Operating Procedure (Python API)
+ ttnn.experimental.fft / ttnn.experimental.ifft — Standard Operating Procedure (Python API)
 ===============================================================================
 
 This document is the user-facing SOP for the FFT op shipped in tt-metal as
-`ttnn.fft` and `ttnn.ifft` (registered from
+`ttnn.experimental.fft` and `ttnn.experimental.ifft` (registered from
 ttnn/cpp/ttnn/operations/experimental/fft/). It tells you:
 
   1. How to import and call the API
@@ -31,10 +31,10 @@ ttnn/cpp/ttnn/operations/experimental/fft/). It tells you:
 
   ttnn.close_device(device)
 
-There is NO separate import for the FFT op — `ttnn.fft` and `ttnn.ifft`
+There is NO separate import for the FFT op — `ttnn.experimental.fft` and `ttnn.experimental.ifft`
 are top-level `ttnn` attributes once `import ttnn` succeeds. The op is
 registered in the experimental namespace internally but exposed as
-`ttnn.fft` for ergonomics.
+`ttnn.experimental.fft` for ergonomics.
 
 ===============================================================================
  2. Tensor / dtype / shape rules
@@ -82,7 +82,7 @@ The dispatcher in device/fft_program_factory.cpp picks the kernel based on
   | bfloat16        | any          | any N >= 2           | fft_universal_bf16|
   +-----------------+--------------+----------------------+-------------------+
 
-You don't pick the backend — `ttnn.fft(x)` is enough. The dispatcher logs
+You don't pick the backend — `ttnn.experimental.fft(x)` is enough. The dispatcher logs
 which backend it chose at INFO level if you set:
 
     TT_LOGGER_LEVEL=Info
@@ -101,7 +101,7 @@ which backend it chose at INFO level if you set:
       device=device,
   )
 
-  out_re_tt, out_im_tt = ttnn.fft(x_tt)
+  out_re_tt, out_im_tt = ttnn.experimental.fft(x_tt)
 
   out_re = ttnn.to_torch(out_re_tt).reshape(-1).to(torch.float32)
   out_im = ttnn.to_torch(out_im_tt).reshape(-1).to(torch.float32)
@@ -132,7 +132,7 @@ both. The result is `fft(real + i*imag)`.
   im_tt = ttnn.from_torch(im_torch, dtype=ttnn.float32,
                           layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
 
-  out_re_tt, out_im_tt = ttnn.fft(re_tt, im_tt)        # 2-arg overload
+  out_re_tt, out_im_tt = ttnn.experimental.fft(re_tt, im_tt)        # 2-arg overload
 
 Constraints on the 2-arg form:
   * re_tt and im_tt MUST have identical shape, dtype, layout, device.
@@ -142,18 +142,18 @@ Constraints on the 2-arg form:
  6. Inverse FFT
 ===============================================================================
 
-`ttnn.ifft` takes the spectrum as TWO tensors (it has no 1-arg overload —
+`ttnn.experimental.ifft` takes the spectrum as TWO tensors (it has no 1-arg overload —
 spectra are inherently complex).
 
-  spec_re_tt, spec_im_tt = ttnn.fft(x_tt)              # forward
+  spec_re_tt, spec_im_tt = ttnn.experimental.fft(x_tt)              # forward
 
-  rec_re_tt, rec_im_tt = ttnn.ifft(spec_re_tt, spec_im_tt)
+  rec_re_tt, rec_im_tt = ttnn.experimental.ifft(spec_re_tt, spec_im_tt)
 
   rec_re = ttnn.to_torch(rec_re_tt).reshape(-1).to(torch.float32)
   rec_im = ttnn.to_torch(rec_im_tt).reshape(-1).to(torch.float32)
 
 Convention:
-  * `ttnn.ifft` returns the time-domain signal divided by N.
+  * `ttnn.experimental.ifft` returns the time-domain signal divided by N.
     That matches `torch.fft.ifft`. Imag part should be ~0 if the
     original input was real.
 
@@ -170,8 +170,8 @@ Convention:
   x_tt = ttnn.from_torch(x, dtype=ttnn.float32,
                          layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
 
-  re, im = ttnn.fft(x_tt)
-  rec_re, rec_im = ttnn.ifft(re, im)
+  re, im = ttnn.experimental.fft(x_tt)
+  rec_re, rec_im = ttnn.experimental.ifft(re, im)
 
   rec = ttnn.to_torch(rec_re).reshape(-1).to(torch.float32)
   err = (rec - x).abs().max().item()
@@ -200,28 +200,28 @@ bfloat16 round-trip errors are ~10x larger at the same N (mantissa cost).
 
 Use the same shape and dtype on both sides. Don't compare against
 `torch.fft.rfft` — it returns the half-spectrum (length N/2 + 1) and
-`ttnn.fft` returns the full N bins.
+`ttnn.experimental.fft` returns the full N bins.
 
 ===============================================================================
  9. Common errors and what they mean
 ===============================================================================
 
-  RuntimeError: ttnn.fft only supports ROW_MAJOR_LAYOUT.
+  RuntimeError: ttnn.experimental.fft only supports ROW_MAJOR_LAYOUT.
     -> You passed a TILE_LAYOUT tensor. Convert with
        ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT) or pass
        layout=ttnn.ROW_MAJOR_LAYOUT to ttnn.from_torch.
 
-  RuntimeError: ttnn.fft expects a device tensor.
+  RuntimeError: ttnn.experimental.fft expects a device tensor.
     -> The tensor lives on host. Pass device=... to ttnn.from_torch.
 
   RuntimeError: fft (inverse): input_imag is required.
-    -> ttnn.ifft must be called with both real AND imag spectrum tensors.
+    -> ttnn.experimental.ifft must be called with both real AND imag spectrum tensors.
 
   RuntimeError: fft: real/imag size mismatch.
-    -> The two tensors passed to ttnn.fft (or ttnn.ifft) have different
+    -> The two tensors passed to ttnn.experimental.fft (or ttnn.experimental.ifft) have different
        shapes. They must match exactly.
 
-  RuntimeError: ttnn.fft fp32 backend kernel limit (N > 16M on Wormhole).
+  RuntimeError: ttnn.experimental.fft fp32 backend kernel limit (N > 16M on Wormhole).
     -> Wormhole's fp32 kernel ceiling is N = 16,777,216. Either drop to
        bfloat16 (no XL ceiling) or use Blackhole (ceiling is 64M).
 
@@ -243,7 +243,7 @@ Use the same shape and dtype on both sides. Don't compare against
     Tensix core. Don't expect parallel speedup there — the win comes
     from N >= 1024 where the work spreads across the grid.
 
-  * If you call ttnn.fft on many tensors of the SAME N back-to-back, the
+  * If you call ttnn.experimental.fft on many tensors of the SAME N back-to-back, the
     plan is reused — all the work is just dispatch + PCIe.
 
   * bf16 path uses true bf16 FPU matmuls inside the kernel; the
@@ -259,14 +259,14 @@ Use the same shape and dtype on both sides. Don't compare against
 ===============================================================================
 
   * Real input only on the 1-arg form. For complex input use the 2-arg
-    `ttnn.fft(real, imag)` overload.
+    `ttnn.experimental.fft(real, imag)` overload.
 
   * Output is always full-spectrum (length N) — no rfft / hfft analogues.
 
   * No 2D / 3D FFT yet. Multi-dim FFT can be done by chaining transposes
     and 1D FFTs but is not packaged as a single op.
 
-  * No autograd integration. ttnn.fft is a leaf op.
+  * No autograd integration. ttnn.experimental.fft is a leaf op.
 
   * Wormhole fp32 ceiling: N = 16M.
   * Blackhole fp32 ceiling: N = 64M.
@@ -276,11 +276,11 @@ Use the same shape and dtype on both sides. Don't compare against
  Quick reference (cheat sheet)
 ===============================================================================
 
-  out_re, out_im = ttnn.fft(x_real)                            # forward, real
-  out_re, out_im = ttnn.fft(x_real, x_imag)                    # forward, complex
-  rec_re, rec_im = ttnn.ifft(spec_re, spec_im)                 # inverse
-  out_re, out_im = ttnn.fft(x_real, precision="precise")       # default, ~1e-7
-  out_re, out_im = ttnn.fft(x_real, precision="fast")          # fast, ~1e-3
+  out_re, out_im = ttnn.experimental.fft(x_real)                            # forward, real
+  out_re, out_im = ttnn.experimental.fft(x_real, x_imag)                    # forward, complex
+  rec_re, rec_im = ttnn.experimental.ifft(spec_re, spec_im)                 # inverse
+  out_re, out_im = ttnn.experimental.fft(x_real, precision="precise")       # default, ~1e-7
+  out_re, out_im = ttnn.experimental.fft(x_real, precision="fast")          # fast, ~1e-3
 
   layout      : ttnn.ROW_MAJOR_LAYOUT (required)
   dtypes      : ttnn.float32 OR ttnn.bfloat16
@@ -324,8 +324,8 @@ When the kwarg is IGNORED (no effect):
 
 Concrete numbers (round-trip max abs error, N=6 random fp32 input):
 
-  ttnn.fft(x)                      → precise  → ~ 1e-7
-  ttnn.fft(x, precision="fast")    → fast     → ~ 3e-3
+  ttnn.experimental.fft(x)                      → precise  → ~ 1e-7
+  ttnn.experimental.fft(x, precision="fast")    → fast     → ~ 3e-3
   torch.fft.ifft(torch.fft.fft(x)) → torch    → ~ 1e-7
 
 If you're benchmarking small N for raw throughput, opt into "fast". If you're

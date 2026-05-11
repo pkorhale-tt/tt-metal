@@ -25,7 +25,7 @@ inline FFTPrecision parse_precision(const std::string& s) {
     if (s == "precise") return FFTPrecision::Precise;
     if (s == "fast")    return FFTPrecision::Fast;
     throw std::invalid_argument(
-        "ttnn.fft / ttnn.ifft: precision must be 'precise' or 'fast' "
+        "ttnn.experimental.fft / ttnn.experimental.ifft: precision must be 'precise' or 'fast' "
         "(got '" + s + "').");
 }
 }  // namespace
@@ -87,20 +87,20 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             Examples::
 
                 # Real input (most common; precise default matches torch):
-                spec_re, spec_im = ttnn.fft(x_real)
+                spec_re, spec_im = ttnn.experimental.fft(x_real)
 
                 # Opt into the fast (bf16-mantissa) path for small N:
-                spec_re, spec_im = ttnn.fft(x_real, precision="fast")
+                spec_re, spec_im = ttnn.experimental.fft(x_real, precision="fast")
 
                 # Complex input — e.g. when chaining FFT after another
                 # operation that already produced a (real, imag) pair:
-                spec_re, spec_im = ttnn.fft(x_real, x_imag)
+                spec_re, spec_im = ttnn.experimental.fft(x_real, x_imag)
         )doc";
 
-    using OperationType = decltype(ttnn::fft);
+    using OperationType = decltype(ttnn::experimental::fft);
     bind_registered_operation(
         mod,
-        ttnn::fft,
+        ttnn::experimental::fft,
         doc,
         // 1-arg (real input). precision defaults to "precise".
         ttnn::nanobind_overload_t{
@@ -127,15 +127,15 @@ void bind_experimental_fft_operation(nb::module_& mod) {
         R"doc(
             1-D Inverse Fast Fourier Transform.
 
-            Reverses :func:`ttnn.fft`. Takes the (real, imag) halves of a
+            Reverses :func:`ttnn.experimental.fft`. Takes the (real, imag) halves of a
             spectrum, returns the (real, imag) of the reconstructed signal
             scaled by 1/N. For a real input ``x``::
 
-                spec_re, spec_im = ttnn.fft(x)
-                rec_re,  rec_im  = ttnn.ifft(spec_re, spec_im)
+                spec_re, spec_im = ttnn.experimental.fft(x)
+                rec_re,  rec_im  = ttnn.experimental.ifft(spec_re, spec_im)
                 # rec_re == x  (within fp32 noise);  rec_im ~ 0
 
-            Phase 1 support matrix matches :func:`ttnn.fft`.
+            Phase 1 support matrix matches :func:`ttnn.experimental.fft`.
 
             Args:
                 * :attr:`spectrum_real`: Float32 ROW_MAJOR tensor, real part.
@@ -143,17 +143,17 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                                           Same shape/dtype/layout as
                                           ``spectrum_real``.
                 * :attr:`precision` (str, default ``"precise"``): same
-                  selector as ``ttnn.fft``. See the forward op's docstring
+                  selector as ``ttnn.experimental.fft``. See the forward op's docstring
                   for the trade-off.
 
             Returns:
                 Tuple ``(real, imag)`` of Tensors, same shape as the inputs.
         )doc";
 
-    using IFFTType = decltype(ttnn::ifft);
+    using IFFTType = decltype(ttnn::experimental::ifft);
     bind_registered_operation(
         mod,
-        ttnn::ifft,
+        ttnn::experimental::ifft,
         ifft_doc,
         ttnn::nanobind_overload_t{
             [](const IFFTType& self,

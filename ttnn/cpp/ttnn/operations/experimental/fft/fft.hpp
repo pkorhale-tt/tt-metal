@@ -70,7 +70,8 @@ struct FFTOperation {
 };
 
 // Inverse FFT. Separate registered_operation_t so it appears as
-// `ttnn.ifft(spec_re, spec_im)` in Python alongside `ttnn.fft(x)`.
+// `ttnn.experimental.ifft(spec_re, spec_im)` in Python alongside
+// `ttnn.experimental.fft(x)`.
 struct IFFTOperation {
     //   spectrum_real / spectrum_imag : real / imag parts of the spectrum.
     //   precision                     : same selector as FFT (forwarded to
@@ -86,10 +87,15 @@ struct IFFTOperation {
 
 }  // namespace operations::experimental
 
+namespace experimental {
+// Registered under the experimental namespace per Metal team convention —
+// new ops graduate to ttnn:: top-level only after the API stabilises.
+// Python users call ``ttnn.experimental.fft(x)`` / ``ttnn.experimental.ifft(re, im)``.
 constexpr auto fft =
-    ttnn::register_operation<"ttnn::fft", ttnn::operations::experimental::FFTOperation>();
+    ttnn::register_operation<"ttnn::experimental::fft", ttnn::operations::experimental::FFTOperation>();
 
 constexpr auto ifft =
-    ttnn::register_operation<"ttnn::ifft", ttnn::operations::experimental::IFFTOperation>();
+    ttnn::register_operation<"ttnn::experimental::ifft", ttnn::operations::experimental::IFFTOperation>();
+}  // namespace experimental
 
 }  // namespace ttnn

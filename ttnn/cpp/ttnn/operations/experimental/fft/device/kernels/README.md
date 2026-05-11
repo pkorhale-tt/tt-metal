@@ -51,7 +51,7 @@ used by their reader/writer kernels, so they live in `dataflow/` only.
 
 ## Backend → kernel mapping
 
-| `ttnn.fft` input         | Backend            | Kernels used                                                               |
+| `ttnn.experimental.fft` input | Backend       | Kernels used                                                               |
 |--------------------------|--------------------|----------------------------------------------------------------------------|
 | fp32, pow2, N ≤ 64K      | `fft_stockham`     | `fft_*`                                                                    |
 | fp32, pow2, 64K < N ≤ 1M | `fft_stockham`     | `batch_fft_*` + `pass2_*`                                                  |

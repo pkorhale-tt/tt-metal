@@ -48,7 +48,7 @@ def test_fft_returns_correct_shape_and_dtype(device, N):
         device=device,
     )
 
-    real, imag = ttnn.fft(tt_in)
+    real, imag = ttnn.experimental.fft(tt_in)
 
     assert real.shape == tt_in.shape, "real spectrum shape must match input"
     assert imag.shape == tt_in.shape, "imag spectrum shape must match input"
@@ -74,7 +74,7 @@ def test_fft_precise_default_matches_torch(device, N):
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
 
-    re, im = ttnn.fft(tt_in)  # default = "precise"
+    re, im = ttnn.experimental.fft(tt_in)  # default = "precise"
     got = torch.complex(
         ttnn.to_torch(re).reshape(-1).to(torch.float32),
         ttnn.to_torch(im).reshape(-1).to(torch.float32),
@@ -100,7 +100,7 @@ def test_fft_fast_path_still_works(device, N):
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
 
-    re, im = ttnn.fft(tt_in, precision="fast")
+    re, im = ttnn.experimental.fft(tt_in, precision="fast")
     got = torch.complex(
         ttnn.to_torch(re).reshape(-1).to(torch.float32),
         ttnn.to_torch(im).reshape(-1).to(torch.float32),
@@ -121,8 +121,8 @@ def test_ifft_precise_roundtrip_small_n(device, N):
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
 
-    re, im   = ttnn.fft(tt_in)              # precise (default)
-    rec_re, _ = ttnn.ifft(re, im)           # precise (default)
+    re, im   = ttnn.experimental.fft(tt_in)              # precise (default)
+    rec_re, _ = ttnn.experimental.ifft(re, im)           # precise (default)
     rec = ttnn.to_torch(rec_re).reshape(-1).to(torch.float32)
 
     err = (rec - torch_in).abs().max().item()
@@ -138,7 +138,7 @@ def test_fft_invalid_precision_raises(device):
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
     with pytest.raises(Exception):
-        ttnn.fft(tt_in, precision="bogus")
+        ttnn.experimental.fft(tt_in, precision="bogus")
 
 
 # ── fft_stockham backend (fp32 + pow2 + N <= 1M) ────────────────────────────
@@ -164,7 +164,7 @@ def test_fft_stockham_fp32_pow2(device, N, tol):
         layout=ttnn.ROW_MAJOR_LAYOUT,
         device=device,
     )
-    tt_re, tt_im = ttnn.fft(tt_in)
+    tt_re, tt_im = ttnn.experimental.fft(tt_in)
 
     got = torch.complex(
         ttnn.to_torch(tt_re).reshape(-1),
@@ -194,7 +194,7 @@ def test_fft_universal_xl_fp32_pow2(device, N, tol):
         layout=ttnn.ROW_MAJOR_LAYOUT,
         device=device,
     )
-    tt_re, tt_im = ttnn.fft(tt_in)
+    tt_re, tt_im = ttnn.experimental.fft(tt_in)
 
     got = torch.complex(
         ttnn.to_torch(tt_re).reshape(-1),
@@ -230,7 +230,7 @@ def test_fft_universal_fp32_nonpow2(device, N, tol):
         layout=ttnn.ROW_MAJOR_LAYOUT,
         device=device,
     )
-    tt_re, tt_im = ttnn.fft(tt_in)
+    tt_re, tt_im = ttnn.experimental.fft(tt_in)
 
     got = torch.complex(
         ttnn.to_torch(tt_re).reshape(-1),
@@ -269,7 +269,7 @@ def test_fft_universal_bf16(device, N, tol):
         layout=ttnn.ROW_MAJOR_LAYOUT,
         device=device,
     )
-    tt_re, tt_im = ttnn.fft(tt_in)
+    tt_re, tt_im = ttnn.experimental.fft(tt_in)
 
     # Spectrum comes back as bf16 — widen to fp32 for the comparison.
     got = torch.complex(
@@ -302,8 +302,8 @@ def test_fft_ifft_roundtrip(device, N, dtype, tol):
         device=device,
     )
 
-    spec_re, spec_im = ttnn.fft(tt_in)
-    rec_re, rec_im = ttnn.ifft(spec_re, spec_im)
+    spec_re, spec_im = ttnn.experimental.fft(tt_in)
+    rec_re, rec_im = ttnn.experimental.ifft(spec_re, spec_im)
 
     got      = ttnn.to_torch(rec_re).reshape(-1).to(torch.float32)
     err_imag = ttnn.to_torch(rec_im).reshape(-1).abs().max().item()
@@ -327,7 +327,7 @@ def test_fft_ifft_roundtrip(device, N, dtype, tol):
     ],
 )
 def test_fft_complex_input(device, N, dtype, tol):
-    """ttnn.fft(real, imag) should match torch.fft.fft of the corresponding
+    """ttnn.experimental.fft(real, imag) should match torch.fft.fft of the corresponding
     complex signal. Verifies the 2-arg overload + the program-factory path
     that consumes input_imag on the forward direction."""
     torch_re = torch.randn(N, dtype=torch.float32)
@@ -338,7 +338,7 @@ def test_fft_complex_input(device, N, dtype, tol):
     tt_im = ttnn.from_torch(torch_im, dtype=dtype,
                             layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
 
-    spec_re, spec_im = ttnn.fft(tt_re, tt_im)
+    spec_re, spec_im = ttnn.experimental.fft(tt_re, tt_im)
 
     got = torch.complex(
         ttnn.to_torch(spec_re).reshape(-1).to(torch.float32),
@@ -390,7 +390,7 @@ def test_fft_blackhole_fp32_pow2(device, N, tol):
         torch_in, dtype=ttnn.float32,
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    re, im = ttnn.fft(tt_in)
+    re, im = ttnn.experimental.fft(tt_in)
     got = torch.complex(
         ttnn.to_torch(re).reshape(-1).to(torch.float32),
         ttnn.to_torch(im).reshape(-1).to(torch.float32),
@@ -420,7 +420,7 @@ def test_fft_blackhole_fp32_nonpow2(device, N, tol):
         torch_in, dtype=ttnn.float32,
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    re, im = ttnn.fft(tt_in)
+    re, im = ttnn.experimental.fft(tt_in)
     got = torch.complex(
         ttnn.to_torch(re).reshape(-1).to(torch.float32),
         ttnn.to_torch(im).reshape(-1).to(torch.float32),
@@ -449,7 +449,7 @@ def test_fft_blackhole_bf16(device, N, tol):
         torch_in, dtype=ttnn.bfloat16,
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    re, im = ttnn.fft(tt_in)
+    re, im = ttnn.experimental.fft(tt_in)
     got = torch.complex(
         ttnn.to_torch(re).reshape(-1).to(torch.float32),
         ttnn.to_torch(im).reshape(-1).to(torch.float32),
@@ -477,8 +477,8 @@ def test_fft_blackhole_ifft_roundtrip(device, N, dtype, tol):
         torch_in, dtype=dtype,
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    spec_re, spec_im = ttnn.fft(tt_in)
-    rec_re, rec_im   = ttnn.ifft(spec_re, spec_im)
+    spec_re, spec_im = ttnn.experimental.fft(tt_in)
+    rec_re, rec_im   = ttnn.experimental.ifft(spec_re, spec_im)
     got = ttnn.to_torch(rec_re).reshape(-1).to(torch.float32)
     rel = (torch.linalg.norm(got - torch_in)
            / torch.linalg.norm(torch_in)).item()
@@ -505,4 +505,4 @@ def test_fft_rejects_unsupported_large_n(device):
         pytest.skip("not enough host/device memory to allocate 32M tensor")
 
     with pytest.raises(RuntimeError):
-        ttnn.fft(tt_in)
+        ttnn.experimental.fft(tt_in)

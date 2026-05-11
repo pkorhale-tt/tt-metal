@@ -53,7 +53,7 @@ def _run_fft(device, N):
         torch_in, dtype=ttnn.float32,
         layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    re, im = ttnn.fft(tt_in)
+    re, im = ttnn.experimental.fft(tt_in)
     got = torch.complex(
         ttnn.to_torch(re).reshape(-1).to(torch.float32),
         ttnn.to_torch(im).reshape(-1).to(torch.float32),
@@ -123,7 +123,7 @@ def test_diag_repeatability(device, N):
     )
 
     def one_run():
-        re, im = ttnn.fft(tt_in)
+        re, im = ttnn.experimental.fft(tt_in)
         return torch.complex(
             ttnn.to_torch(re).reshape(-1).to(torch.float32),
             ttnn.to_torch(im).reshape(-1).to(torch.float32),

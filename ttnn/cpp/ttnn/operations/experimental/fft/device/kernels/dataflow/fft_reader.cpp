@@ -249,10 +249,16 @@ void kernel_main() {
             const uint64_t p0_sm = get_noc_addr(p0_x, p0_y, sem_l1);
             noc_async_write(state_r_l1, p0_rr, TILE_SIZE_FP32);
             noc_async_write(state_i_l1, p0_ri, TILE_SIZE_FP32);
-            noc_async_write_barrier();
 #if defined(ARCH_BLACKHOLE)
-            // BH: see paired flush comment in the per-stage block below.
-            noc_async_writes_flushed();
+            // BH: noc_async_write_barrier alone is not enough on BH —
+            // atomics are routed on a separate VC and can overtake the
+            // write-ack path under load. noc_async_full_barrier waits
+            // on EVERY NoC op (reads, posted/non-posted writes, atomics)
+            // before returning, guaranteeing the partner sees both the
+            // data tile AND the semaphore inc in the right order.
+            noc_async_full_barrier();
+#else
+            noc_async_write_barrier();
 #endif
             noc_semaphore_inc(p0_sm, 1);
         }
@@ -275,14 +281,10 @@ void kernel_main() {
 #if defined(ARCH_BLACKHOLE)
             // BH: use _min (>=) variant so any inc batching by BH's NoC
             // atomic unit doesn't deadlock the strict-equality wait.
+            // (Both wait variants already call invalidate_l1_cache() in
+            // their poll loop — see dataflow_api.h:1928,1954 — so no
+            // explicit invalidate is needed here.)
             noc_semaphore_wait_min(sem_ptr, k + 1);
-            // BH: noc_semaphore_wait only invalidates the SEM cache line,
-            // not the recv data lines. Force a full L1 cache invalidation
-            // so the partner's tile data (just landed in recv_*_l1) is
-            // observable to the upcoming local-DMA read. WH's weaker L1
-            // caching makes this implicit; BH's stronger L1 cache can hold
-            // a stale recv view across the sem ack and corrupt the gather.
-            invalidate_l1_cache();
 #else
             noc_semaphore_wait(sem_ptr, k + 1);
 #endif
@@ -350,14 +352,14 @@ void kernel_main() {
                 const uint64_t np_sm = get_noc_addr(np_x, np_y, sem_l1);
                 noc_async_write(src_r, np_rr, TILE_SIZE_FP32);
                 noc_async_write(src_i, np_ri, TILE_SIZE_FP32);
-                noc_async_write_barrier();
 #if defined(ARCH_BLACKHOLE)
-                // BH: extra "writes flushed" pulse to make sure the data
-                // packets have actually departed this core's NoC interface
-                // before the atomic inc. WH orders write+inc implicitly
-                // via in-order NoC streams; BH may put atomics on a
-                // separate VC, so we belt-and-braces flush first.
-                noc_async_writes_flushed();
+                // BH: full barrier (reads + writes + atomics) before the
+                // semaphore inc. See paired comment in the prime block
+                // above for the rationale. WH keeps the cheaper write
+                // barrier — its NoC orders write+inc implicitly.
+                noc_async_full_barrier();
+#else
+                noc_async_write_barrier();
 #endif
                 noc_semaphore_inc(np_sm, 1);
             } else {
