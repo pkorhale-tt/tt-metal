@@ -11,13 +11,13 @@
 
 #include "tt-metalium/distributed.hpp"
 #include "tt-metalium/mesh_device.hpp"
+#include <tt-metalium/assert.hpp>
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <complex>
 #include <cstdint>
-#include <cstdio>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -115,27 +115,18 @@ inline std::vector<Complex> fft_impl(
 
     // K >= 4 (N > 1G) needs recursion through fft_universal_xl::fft for
     // the inner length-M sub-problem; not implemented yet.
-    if (M > 1024u * 1024u) {
-        std::fprintf(stderr,
-            "[fft_universal_xl] N=%u: inner length M=%u exceeds the 1M cap of "
-            "fft_stockham. K=%u plans (N > 1G) require recursive dispatch — "
-            "not yet implemented.\n",
-            p.N, M, p.k());
-        std::abort();
-    }
+    TT_FATAL(M <= 1024u * 1024u,
+        "fft_universal_xl: N={} inner length M={} exceeds the 1M cap of "
+        "fft_stockham. K={} plans (N > 1G) require recursive dispatch — "
+        "not yet implemented.",
+        p.N, M, p.k());
 
     const uint32_t n_ceiling = xl_max_n_fp32(md);
-    if (p.N > n_ceiling) {
-        std::fprintf(stderr,
-            "[fft_universal_xl] N=%u above the practical %uM ceiling for this arch "
-            "(F1=%u, host Step-3 cost ~F1^2 * N ops). The algorithm is "
-            "correct here, but the host outer DFT would dominate wall-clock. "
-            "To lift this ceiling, implement the packed batch_fft_xl kernel "
-            "described in fft_universal_xl/option_a_pass2_xl_design.md and "
-            "raise kXlMaxNFp32_{WH,BH} to 1u << 30.\n",
-            p.N, n_ceiling >> 20, F1);
-        std::abort();
-    }
+    TT_FATAL(p.N <= n_ceiling,
+        "fft_universal_xl: N={} above the practical {}M ceiling for this arch "
+        "(F1={}, host Step-3 cost ~F1^2 * N ops). The algorithm is correct "
+        "here, but the host outer DFT would dominate wall-clock.",
+        p.N, n_ceiling >> 20, F1);
 
     // (dev-time stdout printf removed.)
 
