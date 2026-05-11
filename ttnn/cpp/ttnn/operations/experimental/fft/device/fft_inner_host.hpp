@@ -252,9 +252,7 @@ inline void run_fft(
                         "For larger N you need multi-tile state per core or a "
                         "multi-device mesh.");
 
-    std::printf(
-        "[run_fft] N=%u  P=%u  grid=%ux%u  local_stages=%u  cross_core_stages=%u\n",
-        z.N, z.P, z.grid_cols, z.grid_rows, z.log2N_local, z.log2P);
+    // (dev-time stdout printf removed.)
 
     MeshCommandQueue& cq = md->mesh_command_queue();
 

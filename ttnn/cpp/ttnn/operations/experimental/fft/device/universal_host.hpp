@@ -383,12 +383,9 @@ inline std::shared_ptr<PackedDFTPlan> make_packed_dft_plan(
     pp->num_tiles      = num_tiles;
     std::tie(pp->grid_cols, pp->grid_rows) = fft_stockham::pick_batch_grid(num_cores, grid_x);
 
-    std::printf(
-        "[packed_dft] N=%u  count=%u  =>  num_tiles=%u  cores=%u  grid=%ux%u  "
-        "tiles/core=%u  tile-eff=%.1f%%\n",
-        N, count, num_tiles, num_cores, pp->grid_cols, pp->grid_rows,
-        tiles_per_core,
-        100.0 * static_cast<double>(N * kRowsPerTile) / 1024.0);
+    // (dev-time stdout printf removed — plan summary is internal detail and
+    // shouldn't leak into user output. Re-enable temporarily under a local
+    // #if 0 guard if you need to debug a new dispatch shape.)
 
     MeshCommandQueue& cq = md->mesh_command_queue();
 

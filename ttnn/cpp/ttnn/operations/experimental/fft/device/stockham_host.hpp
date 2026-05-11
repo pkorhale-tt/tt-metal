@@ -281,11 +281,7 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
     assert(bp->num_cores * bp->batch_per_core == batch);
     std::tie(bp->grid_cols, bp->grid_rows) = pick_batch_grid(bp->num_cores, dev_grid.x);
 
-    std::printf(
-        "[batch_fft] sub_N=%u  batch=%u  =>  cores=%u  grid=%ux%u  "
-        "sub-FFTs/core=%u\n",
-        sub_N, batch, bp->num_cores, bp->grid_cols, bp->grid_rows,
-        bp->batch_per_core);
+    // (dev-time stdout printf removed.)
 
     MeshCommandQueue& cq = md->mesh_command_queue();
 
@@ -632,10 +628,7 @@ inline std::shared_ptr<Pass2Plan> make_pass2_plan(
     assert(pp->num_cores * pp->tiles_per_core == N1);
     std::tie(pp->grid_cols, pp->grid_rows) = pick_batch_grid(pp->num_cores, dev_grid.x);
 
-    std::printf(
-        "[pass2] N1=%u N2=%u  =>  cores=%u  grid=%ux%u  tiles/core=%u\n",
-        N1, N2, pp->num_cores, pp->grid_cols, pp->grid_rows,
-        pp->tiles_per_core);
+    // (dev-time stdout printf removed.)
 
     MeshCommandQueue& cq = md->mesh_command_queue();
 
@@ -869,10 +862,7 @@ inline std::vector<Complex> fft(
         return fft_example::fft(md, signal);
     }
 
-    std::printf(
-        "[fft_stockham] N=%u  =>  N1=%u  x  N2=%u   (batch FFT: pass-1 = "
-        "%u x len %u, pass-3 = %u x len %u; 64 cores per dispatch)\n",
-        p.N, p.N1, p.N2, p.N1, p.N2, p.N2, p.N1);
+    // (dev-time stdout printf removed.)
 
     const auto A = pass1_row_ffts        (md, signal, p);
     const auto C = pass2_twiddle_transpose(md, A,      p);

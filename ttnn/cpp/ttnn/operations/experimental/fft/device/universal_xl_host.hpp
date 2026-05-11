@@ -210,14 +210,7 @@ inline std::vector<Complex> fft_impl(
         std::abort();
     }
 
-    std::printf(
-        "[fft_universal_xl] N=%u  factors=[", p.N);
-    for (size_t i = 0; i < p.factors.size(); ++i) {
-        std::printf("%s%u", (i ? ", " : ""), p.factors[i]);
-    }
-    std::printf("]  outer F1=%u, inner M=%u  "
-                "(Option B: host outer twiddle + host F1-pt butterfly)\n",
-                F1, M);
+    // (dev-time stdout printf removed.)
 
     // ── Step 0: strided pre-pack ──────────────────────────────────────
     // T[n1, n2] = signal[n2 * F1 + n1].  Each row n1 (length M) holds the
