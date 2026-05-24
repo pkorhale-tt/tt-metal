@@ -109,16 +109,6 @@ def test_polyphase_correctness(device, batch, c_in, c_out, k, s, t_in, label, cu
     out_torch = _from_ttnn(out_tt)
     assert out_torch.shape == ref.shape, f"shape mismatch: got {out_torch.shape}, want {ref.shape}"
 
-    if label == "tiny_k8_s4":
-        torch.set_printoptions(precision=4, sci_mode=False, linewidth=200)
-        print(f"\n[DBG {label}] x_torch          = {x_torch.flatten().tolist()}")
-        print(f"[DBG {label}] w_torch          = {w_torch.flatten().tolist()}")
-        print(f"[DBG {label}] reference y[0..]={ref.flatten().tolist()}")
-        print(f"[DBG {label}] polyphase y[0..]={out_torch.flatten().tolist()}")
-        diff = (ref - out_torch).abs().flatten()
-        print(f"[DBG {label}] abs diff         = {diff.tolist()}")
-        print(f"[DBG {label}] ratio (poly/ref) = {(out_torch.flatten() / ref.flatten()).tolist()}")
-
     pcc_ok, pcc_msg = comp_pcc(ref, out_torch, pcc=0.99)
     assert pcc_ok, f"[{label}] polyphase PCC failed: {pcc_msg}"
 
@@ -128,8 +118,11 @@ def test_polyphase_correctness(device, batch, c_in, c_out, k, s, t_in, label, cu
 def test_polyphase_vs_current(device, batch, c_in, c_out, k, s, t_in, label, current_works):
     """Side-by-side: polyphase vs the existing ttnn.conv_transpose2d path.
 
-    For shapes where the current path is known to fail at compile time
-    (NOC burst limit), it is wrapped in try/except and reported as xfail.
+    Shapes where the current path is known to die (e.g. SIGSEGV in
+    op_slicing for the iSTFT envelope shape) are NOT exercised on the
+    current path -- a hard C++ crash is not catchable from Python and
+    would tear down the entire pytest process. For those shapes we only
+    measure polyphase and report "skipped" for current.
     """
     x_torch, w_torch = _build_inputs(batch, c_in, c_out, k, t_in)
     ref = _torch_reference(x_torch, w_torch, stride=s)
@@ -138,33 +131,36 @@ def test_polyphase_vs_current(device, batch, c_in, c_out, k, s, t_in, label, cur
     cur_status = "ok"
     cur_t_ms = float("inf")
     cur_pcc = 0.0
-    try:
-        x_tt, w_tt = _to_ttnn(x_torch, w_torch, device)
-        t0 = time.perf_counter()
-        out_cur = ttnn.conv_transpose2d(
-            input_tensor=x_tt,
-            weight_tensor=w_tt,
-            device=device,
-            in_channels=c_in,
-            out_channels=c_out,
-            batch_size=batch,
-            input_height=1,
-            input_width=t_in,
-            kernel_size=(1, k),
-            stride=(1, s),
-            padding=(0, 0),
-            output_padding=(0, 0),
-            dilation=(1, 1),
-            groups=1,
-            mirror_kernel=True,
-        )
-        ttnn.synchronize_device(device)
-        cur_t_ms = (time.perf_counter() - t0) * 1e3
-        out_torch_cur = _from_ttnn(out_cur)
-        cur_pcc_ok, _ = comp_pcc(ref, out_torch_cur, pcc=0.99)
-        cur_pcc = float(cur_pcc_ok)
-    except Exception as e:
-        cur_status = f"FAIL: {type(e).__name__}: {str(e)[:120]}"
+    if not current_works:
+        cur_status = "skipped (known to crash in op_slicing for this shape)"
+    else:
+        try:
+            x_tt, w_tt = _to_ttnn(x_torch, w_torch, device)
+            t0 = time.perf_counter()
+            out_cur = ttnn.conv_transpose2d(
+                input_tensor=x_tt,
+                weight_tensor=w_tt,
+                device=device,
+                in_channels=c_in,
+                out_channels=c_out,
+                batch_size=batch,
+                input_height=1,
+                input_width=t_in,
+                kernel_size=(1, k),
+                stride=(1, s),
+                padding=(0, 0),
+                output_padding=(0, 0),
+                dilation=(1, 1),
+                groups=1,
+                mirror_kernel=True,
+            )
+            ttnn.synchronize_device(device)
+            cur_t_ms = (time.perf_counter() - t0) * 1e3
+            out_torch_cur = _from_ttnn(out_cur)
+            cur_pcc_ok, _ = comp_pcc(ref, out_torch_cur, pcc=0.99)
+            cur_pcc = float(cur_pcc_ok)
+        except Exception as e:
+            cur_status = f"FAIL: {type(e).__name__}: {str(e)[:120]}"
 
     # --- polyphase path ---
     x_tt, w_tt = _to_ttnn(x_torch, w_torch, device)
