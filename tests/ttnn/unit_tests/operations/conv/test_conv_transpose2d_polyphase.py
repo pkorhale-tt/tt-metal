@@ -109,6 +109,16 @@ def test_polyphase_correctness(device, batch, c_in, c_out, k, s, t_in, label, cu
     out_torch = _from_ttnn(out_tt)
     assert out_torch.shape == ref.shape, f"shape mismatch: got {out_torch.shape}, want {ref.shape}"
 
+    if label == "tiny_k8_s4":
+        torch.set_printoptions(precision=4, sci_mode=False, linewidth=200)
+        print(f"\n[DBG {label}] x_torch          = {x_torch.flatten().tolist()}")
+        print(f"[DBG {label}] w_torch          = {w_torch.flatten().tolist()}")
+        print(f"[DBG {label}] reference y[0..]={ref.flatten().tolist()}")
+        print(f"[DBG {label}] polyphase y[0..]={out_torch.flatten().tolist()}")
+        diff = (ref - out_torch).abs().flatten()
+        print(f"[DBG {label}] abs diff         = {diff.tolist()}")
+        print(f"[DBG {label}] ratio (poly/ref) = {(out_torch.flatten() / ref.flatten()).tolist()}")
+
     pcc_ok, pcc_msg = comp_pcc(ref, out_torch, pcc=0.99)
     assert pcc_ok, f"[{label}] polyphase PCC failed: {pcc_msg}"
 
