@@ -179,7 +179,7 @@ Tensor transform_weights_for_conv_transpose2d(const Tensor& conv_weight_tensor, 
 
 bool is_polyphase_friendly(
     uint32_t in_channels,
-    uint32_t out_channels,
+    [[maybe_unused]] uint32_t out_channels,
     uint32_t kernel_h,
     uint32_t kernel_w,
     uint32_t stride_h,

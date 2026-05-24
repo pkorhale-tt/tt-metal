@@ -95,11 +95,13 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
     // ------------------------------------------------------------------
     // V1 preconditions
     // ------------------------------------------------------------------
+    // get_pair_n4_padding returns std::array<uint32_t, 4> in
+    // {pad_top, pad_bottom, pad_left, pad_right} order.
     const auto padding_n4 = sliding_window::get_pair_n4_padding(padding_);
-    const uint32_t pad_top = padding_n4[0].first;
-    const uint32_t pad_bottom = padding_n4[0].second;
-    const uint32_t pad_left = padding_n4[1].first;
-    const uint32_t pad_right = padding_n4[1].second;
+    const uint32_t pad_top = padding_n4[0];
+    const uint32_t pad_bottom = padding_n4[1];
+    const uint32_t pad_left = padding_n4[2];
+    const uint32_t pad_right = padding_n4[3];
 
     TT_FATAL(input_height == 1, "Polyphase V1 requires input_height == 1, got {}", input_height);
     TT_FATAL(kernel_size[0] == 1, "Polyphase V1 requires kernel_h == 1, got {}", kernel_size[0]);
@@ -162,7 +164,6 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
     //     and a different per-phase weight slice. Output of each:
     //       (N, 1, T_phase, C_out)  where T_phase = padded_t - K_p + 1 = T_in + K_p - 1
     // ------------------------------------------------------------------
-    const uint32_t t_phase = padded_t - k_p + 1;
     std::vector<ttnn::Tensor> phase_outputs;
     phase_outputs.reserve(s_w);
 
