@@ -64,7 +64,7 @@ void bind_experimental_conv_transpose2d_polyphase(nb::module_& mod) {
             ttnn.Tensor or a tuple matching the return_* flags.
         )doc";
 
-    ttnn::bind_function<"conv_transpose2d_polyphase">(
+    ttnn::bind_function<"conv_transpose2d_polyphase", "ttnn.experimental.">(
         mod,
         doc,
         &ttnn::operations::experimental::conv_transpose2d_polyphase::conv_transpose2d_polyphase,
