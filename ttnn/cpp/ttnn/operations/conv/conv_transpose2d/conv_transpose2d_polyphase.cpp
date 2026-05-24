@@ -12,7 +12,6 @@
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/core/to_layout/to_layout_op.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
-#include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/data_movement/sharded/sharded_to_interleaved/sharded_to_interleaved.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
@@ -138,28 +137,21 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
     ttnn::Tensor shuffled_weights = shuffle_weights_polyphase(weight_host, s_w);
 
     // ------------------------------------------------------------------
-    // (2) Pad the input with (K_p - 1) zeros on the left and right along W.
-    //     This is the standard "same-padding" recipe for the polyphase
-    //     sub-convs so that each phase produces exactly T_in outputs.
-    // ------------------------------------------------------------------
+    // (2) "Same-padding" for the per-phase sub-convs: K_p - 1 zeros on
+    //     each side along W so that each phase produces exactly
+    //     T_in + K_p - 1 outputs (enough to interleave into T_out).
     //
-    // Input layout: NHWC = (N, 1, T_in, C_in).
-    // Pad spec is per-dim {before, after}.
-    ttnn::Tensor padded_input;
-    if (k_p > 1) {
-        ttnn::SmallVector<std::array<uint32_t, 2>> pad_spec = {
-            {0, 0},          // N
-            {0, 0},          // H
-            {k_p - 1, k_p - 1},  // W
-            {0, 0},          // C
-        };
-        padded_input = ttnn::pad(input_tensor, pad_spec, 0.0f, /*use_multicore=*/false);
-    } else {
-        padded_input = input_tensor;
-    }
-
-    const uint32_t padded_t = t_in + 2 * (k_p > 0 ? k_p - 1 : 0);
-    log_debug(tt::LogOp, "polyphase padded input width: {}", padded_t);
+    //     We let ttnn::conv2d apply the padding directly via its
+    //     `padding` parameter (top, bottom, left, right) instead of
+    //     calling ttnn::pad as a separate op. This avoids the subtle
+    //     NHWC/ROW_MAJOR pad quirks we hit before (where ttnn::pad
+    //     produced right-only padding instead of symmetric padding for
+    //     C=1 inputs) and also saves a host op + buffer round-trip.
+    // ------------------------------------------------------------------
+    const uint32_t conv_pad_left = (k_p > 0) ? (k_p - 1) : 0;
+    const uint32_t conv_pad_right = (k_p > 0) ? (k_p - 1) : 0;
+    const std::array<uint32_t, 4> conv_padding_n4 = {0u, 0u, conv_pad_left, conv_pad_right};
+    log_debug(tt::LogOp, "polyphase using conv2d-internal padding L={} R={} (K_p={})", conv_pad_left, conv_pad_right, k_p);
 
     // ------------------------------------------------------------------
     // (3) Run S_w standard conv2ds. Each consumes the same padded input
@@ -180,17 +172,17 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
             (phase == 0) ? bias_tensor : std::optional<const ttnn::Tensor>{};
 
         auto conv_result = ttnn::conv2d(
-            padded_input,
+            input_tensor,
             phase_w,
             device,
             in_channels,
             out_channels,
             batch_size,
             /*input_height=*/1,
-            /*input_width=*/padded_t,
+            /*input_width=*/t_in,
             /*kernel_size=*/std::array<uint32_t, 2>{1, k_p},
             /*stride=*/std::array<uint32_t, 2>{1, 1},
-            /*padding=*/std::array<uint32_t, 2>{0, 0},
+            /*padding=*/conv_padding_n4,
             /*dilation=*/std::array<uint32_t, 2>{1, 1},
             /*groups=*/1,
             /*dtype=*/dtype,
