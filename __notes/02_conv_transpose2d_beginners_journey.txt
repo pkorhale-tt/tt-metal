@@ -1,0 +1,590 @@
+================================================================================
+  CONV_TRANSPOSE2D — THE COMPLETE BEGINNER'S JOURNEY
+  From "what even is this op?" to "how does it run on a Tenstorrent chip?"
+================================================================================
+
+  Audience: Someone who knows Python and PyTorch a little, but has never
+            touched accelerator internals before.
+
+  Promise:  By the end of this file you will understand:
+              - What a normal convolution does (the kid-friendly version).
+              - What a TRANSPOSE convolution does (and why it has that weird
+                name).
+              - The clever trick that lets ttnn implement it WITHOUT a
+                dedicated kernel.
+              - What a "Tensix core", "L1", "NoC", and "shard" mean.
+              - The full journey a tensor takes from your `pytest` call
+                down to the silicon and back.
+              - How to reason about correctness AND performance for any
+                conv_transpose2d shape.
+
+  Format:   Lots of pictures, lots of analogies, very few formulas.
+
+================================================================================
+  CHAPTER 0 — A 60-SECOND TENSOR REFRESHER
+================================================================================
+
+  A tensor is just a multi-dimensional grid of numbers. PyTorch labels the
+  axes with letters like:
+
+      N  = batch size       (how many examples)
+      C  = channels         (how many "colors" or "features")
+      H  = height           (rows)
+      W  = width            (columns)
+      T  = time / length    (for audio / 1D signals)
+
+  An image is usually [N, C, H, W].
+  An audio signal is usually [N, C, T] (just one spatial dim).
+
+  ttnn (Tenstorrent's library) prefers a different order called NHWC:
+      [N, H, W, C]
+  ...because it makes channel-vector access linear in memory, which is
+  faster on Tensix cores.
+
+================================================================================
+  CHAPTER 1 — WHAT IS A NORMAL CONVOLUTION? (the cookie-cutter analogy)
+================================================================================
+
+  Imagine you have a sheet of cookie dough (= your image) and a small
+  cookie cutter (= the kernel / weight). You:
+
+      1. Place the cutter at the top-left.
+      2. Multiply each dough cell by the matching cutter cell.
+      3. Sum them all up -> that's ONE output number.
+      4. Slide the cutter to the right (or down) by `stride` cells.
+      5. Repeat until you've covered the whole sheet.
+
+  Tiny example (1D, stride=1, kernel=3):
+
+      Input:  [10, 20, 30, 40, 50]
+      Kernel: [ 1,  2,  3]
+
+      Output[0] = 10*1 + 20*2 + 30*3 = 10 + 40 + 90  = 140
+      Output[1] = 20*1 + 30*2 + 40*3 = 20 + 60 + 120 = 200
+      Output[2] = 30*1 + 40*2 + 50*3 = 30 + 80 + 150 = 260
+
+      Output:  [140, 200, 260]    <-- the input got SHORTER
+
+  Key fact: regular convolution USUALLY makes the output smaller (or same
+  size if you pad).
+
+================================================================================
+  CHAPTER 2 — WHAT IS A TRANSPOSE CONVOLUTION? (and why the silly name)
+================================================================================
+
+  Transpose convolution does the OPPOSITE: it makes the output BIGGER.
+
+  Think of it as:
+
+      "Each input number tells me where to STAMP a copy of the kernel
+       (scaled by that number) into a bigger output canvas."
+
+  Tiny example (1D, stride=2, kernel=3):
+
+      Input:  [3, 5]                <- only 2 numbers
+      Kernel: [1, 2, 1]
+      Output canvas (start with zeros, length = (2-1)*2 + 3 = 5):
+              [0, 0, 0, 0, 0]
+
+      Step 1: stamp kernel*3 at position 0:
+              kernel*3 = [3, 6, 3]
+              canvas  += [3, 6, 3, 0, 0]
+              canvas   = [3, 6, 3, 0, 0]
+
+      Step 2: jump forward by `stride=2` and stamp kernel*5 at position 2:
+              kernel*5 = [5, 10, 5]
+              canvas  += [0, 0, 5, 10, 5]
+              canvas   = [3, 6, 8, 10, 5]
+
+      Output: [3, 6, 8, 10, 5]      <- the input got LONGER
+
+  Notice three things:
+      1. Each input value is "spread" by the kernel into the output.
+      2. Where stamps overlap, they SUM up (this is "overlap-add").
+      3. The output is bigger than the input -- this is UPSAMPLING.
+
+  ----------------------------------------------------------------------
+  WHY IS IT CALLED "TRANSPOSE"?
+  ----------------------------------------------------------------------
+  Because if you write the convolution as a matrix multiplication
+  (a "Toeplitz matrix" times the input), then the transpose convolution
+  is the SAME operation but with the matrix TRANSPOSED.
+
+      forward conv:        out = K     @ in    (K is wide & short)
+      transpose conv:      out = K^T   @ in    (K^T is tall & narrow)
+
+  You don't need to memorize this; just remember:
+      "transpose conv = upsampler with overlap-add"
+
+  ----------------------------------------------------------------------
+  WHERE IS IT USED?
+  ----------------------------------------------------------------------
+  - U-Net image segmentation (decoder upsamples back to image size).
+  - GANs (turn a small noise vector into a big image).
+  - Speech vocoders (turn small spectrogram into long audio).
+  - **iSTFT** (turn STFT frames back into a waveform). <-- our case!
+
+
+================================================================================
+  CHAPTER 3 — WHY iSTFT USES TRANSPOSE CONVOLUTION
+================================================================================
+
+  STFT (forward) chops audio into overlapping windows of length n_fft,
+  multiplies each by a Hann window, and runs FFT on each.
+
+  iSTFT (inverse) does the opposite:
+      1. Inverse-FFT each frame  -> a time-domain windowed segment.
+      2. Multiply by the synthesis window again.
+      3. Lay the segments down at positions 0, hop, 2*hop, 3*hop, ...
+      4. SUM the overlapping parts -> reconstructed audio.
+
+  Steps 3 + 4 are EXACTLY a transpose convolution with:
+      kernel_size = n_fft
+      stride      = hop_length
+
+  Bonus problem: the windows overlap so the reconstruction is biased by
+  the "envelope" (overlap-add of window^2). To fix this we run the SAME
+  transpose conv on an all-ones (or window^2) signal -- that gives us the
+  envelope -- and divide.
+
+  For our test:
+      n_fft = 640      -> kernel_size = 640
+      hop   = 160      -> stride      = 160
+      T     = 96       -> 96 input frames
+      env   : in=1, out=1   (the envelope only needs one channel)
+      cos   : in=321, out=1 (the spectral magnitude has 321 freq bins)
+
+
+================================================================================
+  CHAPTER 4 — THE CLEVER TRICK: TRANSPOSE CONV = ZERO-PAD + NORMAL CONV
+================================================================================
+
+  Implementing transpose conv directly (the "stamping" idea) is awkward
+  on hardware because each input touches multiple outputs and they overlap.
+
+  But there's a beautiful identity:
+
+      A transpose conv with stride=S is exactly the same as
+      a NORMAL conv with stride=1 on an UPSAMPLED input where you've
+      inserted (S-1) zeros between every original element.
+
+  Pictures!
+
+      Original input (stride=2):     [ A     B     C ]
+
+      Insert 1 zero between each:    [ A  0  B  0  C ]
+
+      Now run a normal conv (stride=1, kernel size unchanged):
+          - The kernel sees the zeros as "nothing to add" at those spots.
+          - The result is identical to the stamping picture above.
+
+  Add a small zero pad on each side equal to (kernel_size - 1) so the
+  output size matches the transpose-conv formula.
+
+  This is the trick ttnn uses. It NEVER writes a "transpose convolution"
+  kernel. Instead:
+
+      transpose conv  =  HALO (zero-interleave + pad)  +  normal conv2d
+
+
+================================================================================
+  CHAPTER 5 — TENSORS ON A TENSTORRENT CHIP (the hardware basics)
+================================================================================
+
+  A Wormhole chip looks like this from above:
+
+      +---+---+---+---+---+---+---+---+
+      |T  |T  |T  |T  |T  |T  |T  |T  |   <- row 0 (8 Tensix cores)
+      +---+---+---+---+---+---+---+---+
+      |T  |T  |T  |T  |T  |T  |T  |T  |   <- row 1
+      +---+---+---+---+---+---+---+---+
+      |T  |T  |T  |T  |T  |T  |T  |T  |   <- row 2
+      +---+---+---+---+---+---+---+---+
+      |T  |T  |T  |T  |T  |T  |T  |T  |   <- row 3
+      +---+---+---+---+---+---+---+---+
+      |T  |T  |T  |T  |T  |T  |T  |T  |   <- row 4
+      +---+---+---+---+---+---+---+---+
+      |T  |T  |T  |T  |T  |T  |T  |T  |   <- row 5
+      +---+---+---+---+---+---+---+---+
+      |T  |T  |T  |T  |T  |T  |T  |T  |   <- row 6
+      +---+---+---+---+---+---+---+---+
+      |T  |T  |T  |T  |T  |T  |T  |T  |   <- row 7
+      +---+---+---+---+---+---+---+---+
+
+  (T = Tensix core; total = 64 compute cores arranged in an 8x8 grid.)
+
+  Each Tensix core has:
+
+      +---------------------------------------+
+      |  Tensix core                          |
+      |  +-----------------------+            |
+      |  |  L1 SRAM  (~1.5 MB)   |  <-- fast local memory
+      |  +-----------------------+            |
+      |  +-----------+-----------+            |
+      |  | math unit | data unit |  <-- compute + DMA
+      |  +-----------+-----------+            |
+      +-------|-----------------|-------------+
+              |                 |
+              v                 v
+            NoC links to its 4 neighbors (up, down, left, right)
+
+  Two extra things on the chip but OFF the core:
+
+      DRAM        : large, slow, shared by all cores (multi-GB)
+      NoC         : Network on Chip; the wires between cores
+
+  Rule of thumb performance:
+      DRAM  read = SLOW           (microseconds)
+      NoC   read = MEDIUM         (hundreds of nanoseconds)
+      L1    read = FAST           (tens of nanoseconds)
+      math  op   = VERY FAST      (single cycle)
+
+  Goal of every op: get the data INTO the right cores' L1, then COMPUTE
+  there, then write back.
+
+================================================================================
+  CHAPTER 6 — WHAT IS "SHARDING"?
+================================================================================
+
+  Sharding = splitting one big tensor into pieces and giving each piece
+  to a different core's L1.
+
+  Three main ways to slice for an [N, H, W, C] tensor:
+
+      HEIGHT_SHARDED   : slice along the spatial (H*W) axis.
+                         Each core owns ALL channels for SOME positions.
+
+      WIDTH_SHARDED    : slice along channels (C).
+                         Each core owns SOME channels for ALL positions.
+
+      BLOCK_SHARDED    : slice along BOTH (a 2D grid of cores).
+
+  Picture (HEIGHT_SHARDED across 4 cores, tensor has 8 "rows"):
+
+      [row0, row1, row2, row3, row4, row5, row6, row7]
+        |     |     |     |     |     |     |     |
+        v     v     v     v     v     v     v     v
+       C0    C0    C1    C1    C2    C2    C3    C3
+
+  HEIGHT_SHARDED is the default for conv-style ops because each core
+  produces a contiguous block of output rows.
+
+================================================================================
+  CHAPTER 7 — THE PROBLEM SHARDING CREATES, AND WHY HALO EXISTS
+================================================================================
+
+  When core C1 wants to compute output for, say, row 3, the convolution's
+  kernel (let's say 3x3) needs rows 2, 3, AND 4. But row 2 lives on core
+  C0! Without help, C1 would have to read row 2 across the NoC for every
+  output it produces -- super slow.
+
+  HALO is a one-shot data-movement op that fixes this BEFORE conv2d runs.
+  It rearranges the sharded tensor so each core's local L1 already
+  contains:
+
+      (a) Its own rows (untiled to row-major).
+      (b) The neighbor rows it will need (the "halo").
+      (c) Pad zeros at the boundaries.
+      (d) For TRANSPOSE conv: interleaved zeros between every input row
+          (this implements the upsampling trick from Chapter 4).
+
+  Picture: BEFORE halo (each core has only its own data):
+
+      C0: [r0 r1]    C1: [r2 r3]    C2: [r4 r5]    C3: [r6 r7]
+
+  AFTER halo (each core also has the neighbor rows it needs):
+
+      C0: [P  r0 r1 r2]
+      C1: [r1 r2 r3 r4]    <- borrowed r1 from C0 and r4 from C2
+      C2: [r3 r4 r5 r6]
+      C3: [r5 r6 r7 P ]
+
+      (P = pad zeros)
+
+  Now every core can run conv2d ENTIRELY on its local L1 data. Zero NoC
+  traffic during compute.
+
+================================================================================
+  CHAPTER 8 — THE FULL JOURNEY OF ONE conv_transpose2d CALL
+================================================================================
+
+  Let's trace what happens when this Python line runs:
+
+      y = ttnn.conv_transpose2d(input=..., weight=..., kernel=(1, 4),
+                                stride=(1, 2), in_channels=1, out_channels=1,
+                                input_height=1, input_width=4, ...)
+
+  STEP 1: PYTHON ENTRY
+  ---------------------
+  `ttnn.conv_transpose2d` is NOT defined in any .py file. At Python import
+  time, ttnn walks its compiled C++ module and auto-attaches every C++ op
+  that has the `__ttnn_operation__` marker. So calling
+  `ttnn.conv_transpose2d(...)` jumps straight into a nanobind-bound
+  C++ function.
+
+      File: ttnn/cpp/ttnn/operations/conv/conv_transpose2d/
+            conv_transpose2d_nanobind.cpp
+
+  STEP 2: C++ DISPATCH
+  ---------------------
+  Inside C++ `ttnn::conv_transpose2d` figures out which path to use:
+
+      if (input fits in L1)   -> conv_transpose2d_L1   (the common path)
+      else                    -> conv_transpose2d_DRAM (slice + loop)
+
+      File: conv_transpose2d.cpp, function determine_conv_transpose2d_execution_path
+
+  STEP 3: COMPUTE THE GEOMETRY
+  -----------------------------
+  Call `compute_conv_transpose2d_dimensions(...)` to figure out:
+
+      output_h, output_w               <- size of the result
+      strided_input_h/w                <- input AFTER zero-interleaving
+      full_input_h/w                   <- strided + outer pad (what halo
+                                          will produce)
+      input_pad_top/bottom/left/right  <- how big the outer pad is
+
+  Tiny example (in=1, out=1, K=4, S=2, T=4):
+
+      output_w        = (4-1)*2 - 0 + 1*(4-1) + 0 + 1 = 10
+      strided_input_w = (4-1)*2 + 1                   = 7    (X . X . X . X)
+      full_input_w    = output_w + (K-1)              = 13   (PPP X.X.X.X PPP)
+
+  STEP 4: AUTO-SHARD (if no shard layout was specified)
+  ------------------------------------------------------
+  Try HEIGHT, BLOCK, WIDTH; pick the one with smallest L1 footprint per
+  core. For most 1D-ish problems HEIGHT_SHARDED wins.
+
+  How many cores?
+      `find_closest_largest_divisor_with_num_padding_and_mult(...)` picks
+      the largest divisor of (output_ntiles) that is <= 64 and keeps
+      padding waste below a threshold.
+
+  STEP 5: RE-SHARD INPUT FROM DRAM TO L1
+  ---------------------------------------
+  `shard_or_reshard_tensor_if_required(...)` moves the input tensor from
+  big-slow DRAM into the chosen sharding layout in the cores' L1.
+
+  STEP 6: PREPARE WEIGHTS
+  ------------------------
+  `transform_weights_for_conv_transpose2d(weight, mirror_kernel=True)`:
+      - Mirrors the kernel left-right (so ttnn matches PyTorch's
+        ConvTranspose orientation).
+      - Converts from layout [in, out, K_h, K_w] to the layout the
+        conv2d kernel expects.
+      - Tile-izes and uploads to device.
+
+  STEP 7: HALO
+  ------------
+  `ttnn::halo(input, sliding_window_config_with_is_transpose_true)`.
+  This is THE key step. It produces a new sharded tensor where:
+      - Each core's L1 holds its slice of the FULL input
+        (zero-interleaved + padded + halo from neighbors).
+      - Layout is ROW_MAJOR (no tiles).
+
+  STEP 8: CONV2D PRIMITIVE
+  -------------------------
+  `ttnn::prim::conv2d(halo_output, weight, stride={1,1}, padding=0, ...)`.
+
+  Each core now runs the conv loop locally:
+      for each output stick j the core owns:
+          acc = 0
+          for k in [0..K_w):
+              acc += halo_local[j + k] * weight[k]
+          output_local[j] = acc + bias
+
+  STEP 9: RETURN
+  ---------------
+  The output tensor is sharded across the same cores (HEIGHT_SHARDED).
+  When you call `ttnn.to_torch(y)`, ttnn DMAs the shards back to DRAM,
+  reassembles them, and copies into a CPU torch tensor.
+
+
+================================================================================
+  CHAPTER 9 — A WORKED MINI-EXAMPLE (small enough to do by hand)
+================================================================================
+
+  Take the test case:
+      pytest.param(8, 8, 4, 2, 16, True, id="small_k4_s2_T16_bias")
+
+  Mapped:
+      in_channels  = 8
+      out_channels = 8
+      kernel_size  = 4
+      stride       = 2
+      T            = 16
+      with_bias    = True
+
+  Reshape into NHWC for ttnn:
+      x : [B=1, H=1, W=16, C=8]
+      w : [in=8, out=8, K_h=1, K_w=4]
+
+  Geometry:
+      output_h        = 1
+      output_w        = (16-1)*2 - 0 + (4-1) + 1 = 30 + 4 = 34
+      strided_input_w = (16-1)*2 + 1            = 31
+      full_input_w    = output_w + (K_w - 1)    = 34 + 3 = 37
+      pad each side   = (4-1)/2 (split)         = effectively 3 total
+
+  Auto-shard:
+      out_ntiles = ceil(1 * 1 * 34 / 32) = 2 tiles
+      With 64 cores available the divisor search would shrink quickly.
+      For this tiny problem ttnn might pick something like 2 cores with
+      BLOCK_SHARDED to also slice the 8 channels. Numbers depend on the
+      exact L1 calculation, but let's say num_cores_nhw = 2 for the
+      illustration.
+
+  Per-core BEFORE halo (HEIGHT_SHARDED, 2 cores):
+      Total input rows = 16 (W axis).
+      C0 holds W positions [0..7], C1 holds W positions [8..15].
+      Each "stick" is 8 channels wide.
+
+      C0 L1: [s0 s1 s2 s3 s4 s5 s6 s7]      (sticks 0-7, each 8 floats)
+      C1 L1: [s8 s9 s10 s11 s12 s13 s14 s15]
+
+  After halo (zero-interleave for stride=2, plus 3 pad):
+      Strided full input length = 37.
+      C0 owns roughly the first half + 3 halo positions from C1.
+      C1 owns roughly the second half + 3 halo positions from C0.
+
+      C0 L1: [P P P  s0 .  s1 .  s2 .  s3 .  s4 .  s5 .  s6 .  s7 .   s8 . s9]
+                                                                          ^^^^
+                                                              borrowed from C1
+      C1 L1: [s7 . s8  .  s9  . s10 . s11 . s12 . s13 . s14 . s15  P  P  P]
+
+      (P = pad zero, . = interleaved zero, sX = real stick of 8 floats)
+
+  Per-core compute:
+      For each owned output stick j, slide a window of K_w=4 over the
+      local halo data and dot-product with weight[k=0..3] (each weight
+      itself is in_ch x out_ch = 8x8). Add bias (8 floats).
+
+      Output sticks per core: about 17 each (34 total, padded a bit).
+
+  This case actually PASSES (the small-case test in the file expects
+  PCC > 0.99). The data fits comfortably in L1 and the coalesced reads
+  are well within the NoC burst limit.
+
+================================================================================
+  CHAPTER 10 — WHY THE iSTFT ENVELOPE CASE BREAKS
+================================================================================
+
+  The "envelope" pytest case is:
+      in=1, out=1, K=640, stride=160, T=96, no bias
+
+  Same algorithm. Same journey. But:
+
+      - K_w = 640 (huge)
+      - C_in = 1 (tiny)
+
+  The conv2d reader kernel wants to issue ONE NoC read per kernel row
+  per output tile, of size:
+
+      coalesced_read_bytes ~= K_w  *  in_ch_padded  *  dtype_bytes
+
+  For 1-channel fp32 the alignment padding inflates `in_ch_padded` to 16,
+  giving:
+
+      coalesced_read_bytes ~= 640 * 16 * 4 = 40,960 bytes
+
+  Wormhole's NOC_MAX_BURST_SIZE is 8,192 bytes (8 KB).
+
+  The kernel has a `static_assert(coalesced_read_bytes <= 8192)` that
+  fails at COMPILE time. The program is never built. The test errors
+  out before any data flows.
+
+  Fix paths (for the curious; not implemented yet):
+      - Split the reader into multiple smaller bursts.
+      - Use a different shard scheme that reduces per-burst size.
+      - Tile the kernel across the K_w dimension (act_block_w_div).
+
+================================================================================
+  CHAPTER 11 — MENTAL MODEL CHEAT SHEET
+================================================================================
+
+  Whenever you see a conv_transpose2d call, ask yourself in this order:
+
+      1) GEOMETRY
+         output_w = (T-1)*stride + (K-1) + 1
+         full_input_w = output_w + (K-1)
+         Will this fit in L1?
+
+      2) SHARDING
+         How many cores will it pick?
+         Are most of my cores going to hold mostly zeros / pad?
+
+      3) HALO
+         How many sticks does each core need = own + (K-1)?
+         Are the channels small (alignment padding bites)?
+
+      4) READER
+         coalesced_read_bytes ~ K_w * in_ch_padded * dtype
+         Is that under 8 KB?
+
+      5) COMPUTE
+         MACs per core = own_output_sticks * K_w * in_ch * out_ch
+         Reasonable?
+
+  If everything is "yes", the op runs. If step 4 fails, you'll hit a
+  static_assert before runtime.
+
+================================================================================
+  CHAPTER 12 — GLOSSARY
+================================================================================
+
+  Stick           : one channel-vector at one (h, w) position.
+                    Shape = [C] (one float per channel).
+
+  Tile            : a 32x32 block of values. ttnn's compute likes things
+                    in tile multiples.
+
+  Halo            : the "neighbor data borrowed from other cores" plus
+                    the op that does the borrowing.
+
+  Sliding-window  : the family of ops (conv, pool, transpose conv) that
+                    move a kernel across an input.
+
+  Sharding        : splitting a tensor across cores' L1.
+
+  L1              : the SRAM inside each Tensix core. Small but very fast.
+
+  DRAM            : large, slow, off-core, shared memory.
+
+  NoC             : Network-on-Chip; the buses between cores.
+
+  Tensix          : the name of one compute core on Wormhole/Blackhole.
+
+  is_transpose    : a flag on `SlidingWindowConfig` telling halo + conv2d
+                    to do the upsampling-via-zero-interleaving trick.
+
+  Mirror kernel   : flipping the weights left-right so ttnn's output
+                    matches PyTorch's ConvTranspose orientation.
+
+================================================================================
+  CHAPTER 13 — RECOMMENDED STUDY ORDER (if you want to dig in)
+================================================================================
+
+  1. Read the SMALL test cases in
+     models/demos/inworld_tts/tt/test_conv_transpose1d.py
+     to see PASSING examples.
+
+  2. Read this file's Chapter 4 trick again. That ONE identity is the
+     entire algorithmic basis.
+
+  3. Read conv_transpose2d.cpp top-down, focusing on
+     conv_transpose2d_L1.
+
+  4. Read sliding_window.cpp::generate_pad_metadata to see how the
+     interleaved-zero trick is encoded in metadata.
+
+  5. Read halo_device_operation.cpp + untilize_with_halo_program_factory.cpp
+     to see the actual data movement.
+
+  6. Read 01_conv_transpose2d_istft_envelope.txt (in this folder) for the
+     deep numeric trace of the failing case.
+
+================================================================================
+  THE END -- you now know everything from "what's a convolution" all the
+  way to "why the static_assert on line ___ of the conv2d reader fires
+  for these specific shapes." Go forth and shard.
+================================================================================

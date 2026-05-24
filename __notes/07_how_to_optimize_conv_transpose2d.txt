@@ -1,0 +1,507 @@
+================================================================================
+  HOW TO OPTIMIZE CONV_TRANSPOSE2D
+  A practical menu of optimization opportunities, ordered by impact and
+  implementation difficulty. Source-aware: every recommendation cites the
+  exact file/function it would touch.
+================================================================================
+
+  Audience:   Someone who has read notes 01-06 and now wants to make
+              ttnn.conv_transpose2d run faster (or run AT ALL for the
+              currently-failing iSTFT shapes).
+
+  Format:     For each optimization, you will see:
+                  WHAT      - what the change does
+                  WHY       - the underlying inefficiency it fixes
+                  WHERE     - which files / functions to touch
+                  IMPACT    - rough order-of-magnitude speedup
+                  EFFORT    - rough implementation cost
+                  RISK      - what can break
+
+  Sections:
+      1. Quick-win micro-optimizations    (low effort, modest gain)
+      2. Reader & memory-layout fixes      (medium effort, big gain)
+      3. Algorithmic restructuring         (high effort, huge gain)
+      4. Auto-shard / heuristic improvements (medium effort, situational)
+      5. Special-case fast paths           (medium effort, situational)
+      6. Per-dtype / precision strategies  (low effort, situational)
+      7. System-level wins                 (medium effort, modest gain)
+      8. Recommended priority order
+      9. iSTFT-specific recipe
+
+
+================================================================================
+  SECTION 1 - QUICK-WIN MICRO-OPTIMIZATIONS
+================================================================================
+
+  ------------------------------------------------------------------
+  1.1  Cache halo metadata across calls with the same SlidingWindowConfig
+  ------------------------------------------------------------------
+  WHAT:   Persist `generate_halo_kernel_config_tensors` output across
+          program runs (not just per-process).
+  WHY:    Real models call conv_transpose2d in a loop with the SAME
+          shapes per layer per inference. Currently the per-process
+          cache rebuilds metadata every fresh launch.
+  WHERE:  ttnn/cpp/.../sliding_window/halo/device/halo_device_operation.cpp
+                line 16: `thread_local static std::unordered_map ...`
+  IMPACT: 1.05-1.10x for short ops, near zero for long ops.
+  EFFORT: Small (3 days).
+  RISK:   Cache invalidation if hardware config changes.
+
+  ------------------------------------------------------------------
+  1.2  Greedier stick coalescing in halo
+  ------------------------------------------------------------------
+  WHAT:   Pack adjacent halo transfers into larger noc_async_writes.
+  WHY:    Each NoC packet has fixed header overhead. The current code
+          (sliding_window.cpp:727-733) only extends contiguous transfers
+          where BOTH src AND dst are sequential. Sometimes dst is not
+          contiguous but you can interleave with same-stride writes.
+  WHERE:  ttnn/cpp/.../sliding_window/sliding_window.cpp:694-803
+                (generate_halo_kernel_config_tensors)
+  IMPACT: 1.10-1.20x for halo-bound layers.
+  EFFORT: Medium (1-2 weeks; tricky correctness).
+  RISK:   New corner cases for unusual sharding.
+
+  ------------------------------------------------------------------
+  1.3  Dispatch the prim::halo CB tables into DRAM by default
+  ------------------------------------------------------------------
+  WHAT:   Use config_tensors_in_dram=true when L1 pressure is high.
+  WHY:    For large kernels the gather/padding tables take significant
+          L1 each, leaving less for activations.
+  WHERE:  ttnn/cpp/.../conv_transpose2d/conv_transpose2d.cpp:296
+                (the call to ttnn::halo passes
+                 conv_config.config_tensors_in_dram)
+  IMPACT: Enables larger ops to fit; modest perf cost from extra DRAM read.
+  EFFORT: Trivial (heuristic flip).
+  RISK:   Slightly more DRAM bandwidth.
+
+  ------------------------------------------------------------------
+  1.4  Skip halo when stride=1 AND padding=0 AND kernel=1
+  ------------------------------------------------------------------
+  WHAT:   When the conv is effectively a per-stick scale, skip halo
+          and use ttnn::linear (already done for 1x1 conv).
+  WHY:    Halo overhead has no payoff in this case.
+  WHERE:  Already handled by `use_matmul_for_1x1_conv` in
+          ttnn/cpp/.../conv2d/conv2d_utils.cpp:515. Verify the
+          conv_transpose2d path detects this via `mm_conv` flag.
+  IMPACT: 2-5x for trivial 1x1 transpose convs.
+  EFFORT: Trivial; mostly already done. Just unit-test it.
+  RISK:   None.
+
+
+================================================================================
+  SECTION 2 - READER & MEMORY-LAYOUT FIXES  (medium effort, BIG gain)
+================================================================================
+
+  ------------------------------------------------------------------
+  2.1  Auto-split the conv2d reader's coalesced read when K_w is large
+  ------------------------------------------------------------------
+  WHAT:   Replace the static_assert(coalesced_read_bytes <=
+          NOC_MAX_BURST_SIZE) with a constexpr-driven loop that splits
+          the read into multiple bursts of <= 8 KB each.
+  WHY:    Today, K_w * in_ch_padded * dtype > 8 KB makes the kernel
+          fail to compile. This blocks ALL iSTFT shapes.
+  WHERE:  ttnn/cpp/.../conv2d/device/kernels/conv_reader_common.hpp
+                line 82-88 (read_kernel_w)
+                line 93/113 in the various reader kernels (where
+                coalesced_read_bytes is computed)
+          Also: ttnn/cpp/.../conv2d/device/conv2d_op_sharded_program_factory.cpp
+                (program factory needs to choose the split).
+  IMPACT: UNBLOCKS the iSTFT envelope and cos/sin tests entirely.
+          Once unblocked, perf hit is small (a few extra packet headers).
+  EFFORT: Medium (2-3 weeks). Non-trivial because the writer + compute
+          depend on the reader's coalesced size. Easiest if you tile
+          in the K_w direction (act_block_w_div).
+  RISK:   Compute and writer kernels need matching changes.
+
+  ------------------------------------------------------------------
+  2.2  Smarter in_channels alignment when C_in is tiny
+  ------------------------------------------------------------------
+  WHAT:   For C_in <= 4, instead of padding up to 16 (the alignment
+          floor), use a special "packed-stick" layout that puts multiple
+          time positions in one aligned word.
+  WHY:    Today, C_in=1 fp32 means each stick is 4 bytes of data + 60
+          bytes of padding (16x inflation). All NoC traffic is 16x
+          bigger than necessary.
+  WHERE:  ttnn/cpp/.../conv2d/conv2d_utils.cpp:77 (get_input_channels_alignment)
+          ttnn/cpp/.../sliding_window/halo/device/kernels/dataflow/halo_gather.cpp
+                (would need a new "packed" mode)
+          Reader and writer kernels would need an unpacked-output mode.
+  IMPACT: 4-16x for tiny-channel shapes (iSTFT envelope = 16x).
+  EFFORT: High (3-6 weeks). Touches halo, reader, writer, compute.
+  RISK:   Big surface area; needs careful test coverage.
+
+  ------------------------------------------------------------------
+  2.3  Use bf16 instead of fp32 wherever accuracy allows
+  ------------------------------------------------------------------
+  WHAT:   Cast inputs/weights to bf16 (or int8 for inference) and run
+          the conv in lower precision; accumulate in fp32 if needed.
+  WHY:    bf16 halves both the bytes-per-stick and the
+          coalesced_read_bytes. For iSTFT envelope this drops the
+          burst from 40,960 to 20,480 (still over 8 KB, but closer).
+  WHERE:  Caller: pass dtype=ttnn.bfloat16 to ttnn.conv_transpose2d
+                  and ttnn.from_torch.
+          fp32 accumulation: already configurable via
+                  ttnn.init_device_compute_kernel_config(
+                      fp32_dest_acc_en=True).
+  IMPACT: 2x reduction in NoC traffic; combined with 2.1 unblocks
+          the iSTFT envelope case.
+  EFFORT: Trivial (caller-side change).
+  RISK:   Some precision loss; check PCC.
+
+  ------------------------------------------------------------------
+  2.4  Avoid materializing the zero-interleaved halo buffer
+  ------------------------------------------------------------------
+  WHAT:   Don't physically write the (S-1) zeros between every real
+          stick. Instead, mark them in metadata and have the conv
+          kernel skip them.
+  WHY:    For stride=160 the halo'd buffer has ~99.4% zeros (16,479
+          sticks for 96 real values). All those zero stores and zero
+          MACs are wasted work AND wasted L1 capacity.
+  WHERE:  ttnn/cpp/.../sliding_window/sliding_window.cpp::generate_pad_metadata
+                (currently marks them as PAD; would need to mark them
+                 as SKIP and adjust trace metadata accordingly)
+          Reader: skip strided positions in the inner loop.
+  IMPACT: Up to S-1 reduction in halo time (160x for iSTFT) AND
+          equivalent reduction in MAC count.
+  EFFORT: High (4-8 weeks). Reader/writer kernels need a sparse mode.
+  RISK:   Complicates the kernel logic; needs polyphase analysis to
+          stay correct.
+
+
+================================================================================
+  SECTION 3 - ALGORITHMIC RESTRUCTURING  (high effort, HUGE gain)
+================================================================================
+
+  ------------------------------------------------------------------
+  3.1  POLYPHASE DECOMPOSITION  (the canonical iSTFT speedup)
+  ------------------------------------------------------------------
+  WHAT:   Replace the single (K_w=640, stride=160) transpose conv with
+          160 parallel "sub-convs" each with K_w=4 and stride=1.
+          (For stride S, you get S sub-convs each of length K/S.)
+          Their outputs are then INTERLEAVED to form the final result.
+
+          Mathematically:
+              y[n] = sum_k  x[n/S] * w[k]
+          can be split into S separate per-phase sums by splitting
+          the kernel into S strided sub-kernels:
+              w_phase_p[k'] = w[k' * S + p]  for p = 0..S-1
+              y[n*S + p]    = sum_{k'} x[n - k'] * w_phase_p[k']
+
+          This is the standard "polyphase filter bank" identity used
+          by every audio resampler and iSTFT implementation.
+
+  WHY:    Eliminates ALL the wasted zero-MACs that the
+          zero-interleave-then-conv approach produces. For iSTFT
+          envelope: cuts MACs from 10M to 60K (a 165x reduction).
+
+  WHERE:  This would be a NEW execution path inside conv_transpose2d.cpp
+          (alongside _L1 and _DRAM). Detector function:
+
+              bool is_polyphase_friendly(stride, K_w, output_w, in_channels) {
+                  return stride > 1
+                      && K_w >= 4 * stride
+                      && in_channels <= 32
+                      && output_w >= 16 * stride;
+              }
+
+          Then run S separate small conv2ds (no halo zeros needed),
+          and a final interleave step (cheap, in halo or post-pass).
+
+  IMPACT: 10-200x for large-stride transpose convs (iSTFT, vocoders,
+          super-resolution).
+  EFFORT: Very high (2-3 months). It is a new code path.
+  RISK:   Bookkeeping for output stitching; weight pre-shuffling.
+
+  ------------------------------------------------------------------
+  3.2  FFT-based conv for very large kernels
+  ------------------------------------------------------------------
+  WHAT:   When K_w is large (> ~32) and stride=1, use the convolution
+          theorem: conv = IFFT( FFT(x) * FFT(w) ).
+  WHY:    FFT conv is O(N log N) vs the direct method's O(N * K).
+          For K=640 and N=16480 that is roughly a 30x asymptotic win.
+  WHERE:  Brand-new device op. Does not fit naturally into the
+          halo+conv2d pipeline.
+  IMPACT: 5-30x for huge-kernel cases.
+  EFFORT: Very high (3-6 months). Requires an on-device FFT op.
+  RISK:   Numerical precision for low-precision dtypes; large constant
+          overhead means it loses for small N.
+
+  ------------------------------------------------------------------
+  3.3  Direct stamping kernel  (skip halo entirely)
+  ------------------------------------------------------------------
+  WHAT:   Write a dedicated kernel that does the original "stamp the
+          weighted kernel onto the canvas at every input stride" idea
+          directly, with overlap-add.
+  WHY:    Halo + conv2d has overhead (the metadata, the gather phase).
+          For very small inputs and modest kernels a direct kernel can
+          be simpler AND faster.
+  WHERE:  Brand-new program factory under
+          ttnn/cpp/.../conv_transpose2d/device/.
+  IMPACT: 1.5-3x for small input + medium kernel.
+  EFFORT: High (1-2 months).
+  RISK:   Needs all the same auto-shard machinery rebuilt.
+
+  ------------------------------------------------------------------
+  3.4  Fuse multiple conv_transpose2d into one program
+  ------------------------------------------------------------------
+  WHAT:   When a model does conv_transpose -> bias -> activation
+          -> conv2d, fuse them all into one program (no DRAM round trip).
+  WHY:    Each op currently writes to L1, then the next op re-reads.
+          Fusion keeps everything in CBs.
+  WHERE:  Op-fusion lives at the model graph level; ttnn already has
+          activation fusion in Conv2dConfig.activation. Could be
+          extended.
+  IMPACT: 1.3-2x for chains of small ops.
+  EFFORT: High (multi-month).
+  RISK:   Compiler complexity.
+
+
+================================================================================
+  SECTION 4 - AUTO-SHARD / HEURISTIC IMPROVEMENTS
+================================================================================
+
+  ------------------------------------------------------------------
+  4.1  Better cost model for shard layout selection
+  ------------------------------------------------------------------
+  WHAT:   Today determine_conv_config_for_auto_shard picks the layout
+          with smallest L1 footprint. Replace with a cost model that
+          also considers NoC traffic and num_cores utilization.
+  WHY:    For tiny-input + huge-output cases (like iSTFT envelope),
+          the L1-only heuristic picks 62 cores even though only ~3
+          will hold real data. A NoC-aware model might pick FEWER
+          cores with more output per core to reduce halo traffic.
+  WHERE:  ttnn/cpp/.../conv2d/conv2d_utils.cpp:1083-1167
+                (determine_conv_config_for_auto_shard)
+  IMPACT: 1.2-2x for sparse-input cases.
+  EFFORT: Medium (2-4 weeks).
+  RISK:   Could regress some shapes; needs broad test coverage.
+
+  ------------------------------------------------------------------
+  4.2  Adaptive num_cores: don't waste cores on padding
+  ------------------------------------------------------------------
+  WHAT:   When input is much smaller than output, reduce num_cores so
+          each core has more useful work.
+  WHY:    iSTFT envelope wastes 59 of 62 cores on padding zeros.
+          Better to use 16 cores with 4x more output per core.
+  WHERE:  ttnn/cpp/.../conv2d/conv2d_utils.cpp:65
+                (find_closest_largest_divisor_with_num_padding_and_mult)
+                + heuristic in determine_parallel_config.
+  IMPACT: Cleaner per-core utilization; modest perf gain (1.1-1.3x).
+  EFFORT: Small-medium (1-2 weeks).
+  RISK:   Same as 4.1.
+
+  ------------------------------------------------------------------
+  4.3  Per-shape benchmarked heuristic
+  ------------------------------------------------------------------
+  WHAT:   Build a small lookup table from (kernel, stride, in_ch,
+          out_ch, T, dtype) -> best (shard layout, num_cores,
+          act_block_h, act_block_w_div). Use ML-style autotuning.
+  WHY:    The current heuristic is a static formula. A learned
+          heuristic could be 1.5x better on average across all shapes.
+  WHERE:  Tooling: a sweep over a representative shape grid; codegen
+          a constexpr table or runtime LUT.
+  IMPACT: 1.2-1.5x on average.
+  EFFORT: Medium (2-4 weeks of tooling + sweep time).
+  RISK:   Database maintenance.
+
+
+================================================================================
+  SECTION 5 - SPECIAL-CASE FAST PATHS
+================================================================================
+
+  ------------------------------------------------------------------
+  5.1  iSTFT detector + polyphase
+  ------------------------------------------------------------------
+  WHAT:   Detect (large K, large stride, C_in <= 32) and dispatch to
+          the polyphase path (Section 3.1).
+  IMPACT: 100x for iSTFT.
+  EFFORT: Builds on 3.1.
+
+  ------------------------------------------------------------------
+  5.2  Stride=2 nearest-neighbor upsample fast path
+  ------------------------------------------------------------------
+  WHAT:   For (K=2, stride=2) just write each input value 2x in the
+          output. Skip halo, skip conv2d.
+  WHY:    This is a common decoder upsample; today it is overkill to
+          run the full halo+conv2d.
+  WHERE:  Add a detect-and-divert in conv_transpose2d_L1.
+  IMPACT: 5-10x for this exact pattern.
+  EFFORT: Small.
+
+  ------------------------------------------------------------------
+  5.3  Symmetric kernel detection (separable convs)
+  ------------------------------------------------------------------
+  WHAT:   When the K_h x K_w kernel is rank-1 separable, decompose
+          into two 1D convs.
+  IMPACT: K times reduction in MACs for the rare cases this applies.
+  EFFORT: Medium (host weight analysis).
+
+
+================================================================================
+  SECTION 6 - PER-DTYPE / PRECISION STRATEGIES
+================================================================================
+
+  ------------------------------------------------------------------
+  6.1  bfloat16 by default for inference
+  ------------------------------------------------------------------
+  WHAT:   Have a "Conv2dConfig::auto_dtype = INFERENCE" mode that
+          quietly downgrades fp32 to bf16 when accuracy testing
+          shows acceptable PCC.
+  IMPACT: 2x on NoC traffic, often free on accuracy.
+  EFFORT: Small.
+
+  ------------------------------------------------------------------
+  6.2  int8 quantized transpose conv
+  ------------------------------------------------------------------
+  WHAT:   Add an int8 path. 4x reduction vs fp32 in NoC traffic.
+  WHERE:  Reader/compute kernels would need int8 variants.
+  EFFORT: High (multi-month).
+
+  ------------------------------------------------------------------
+  6.3  Mixed-precision: bf16 weights + fp32 accumulate
+  ------------------------------------------------------------------
+  WHAT:   Already supported. Just make it the documented default.
+
+
+================================================================================
+  SECTION 7 - SYSTEM-LEVEL WINS
+================================================================================
+
+  ------------------------------------------------------------------
+  7.1  Pre-tilize and cache weights once per model load
+  ------------------------------------------------------------------
+  WHAT:   transform_weights_for_conv_transpose2d runs per call.
+          Cache the result keyed on (weight pointer, mirror flag).
+  IMPACT: 1.05x for short ops in repeated inference.
+  EFFORT: Small.
+  WHERE:  ttnn/cpp/.../prepare_conv_transpose2d_weights.cpp
+
+  ------------------------------------------------------------------
+  7.2  Trace + replay for static models
+  ------------------------------------------------------------------
+  WHAT:   Use ttnn's existing trace API to record the conv_transpose2d
+          program once and replay (skipping host overhead).
+  WHERE:  Caller-side. Already supported by ttnn for many ops.
+  IMPACT: 5-20x for very small kernels (host-bound regime).
+  EFFORT: Small.
+
+  ------------------------------------------------------------------
+  7.3  Better DRAM-slice config picker
+  ------------------------------------------------------------------
+  WHAT:   When conv_transpose2d_DRAM is used, the slice height/width
+          is currently a heuristic. Make it dependent on actual
+          per-slice L1 budget and NoC efficiency.
+  WHERE:  ttnn/cpp/.../conv_transpose2d/conv_transpose2d.cpp::
+          conv_transpose2d_DRAM and Conv2dSliceConfig.
+  IMPACT: 1.2-1.5x for DRAM-path workloads.
+  EFFORT: Medium.
+
+
+================================================================================
+  SECTION 8 - RECOMMENDED PRIORITY ORDER
+================================================================================
+
+  If you (or the team) have to rank these by "biggest bang per
+  engineering hour," do them in this order:
+
+      P0  (week 1)
+        - 2.3  Switch to bf16 wherever accuracy allows (free 2x).
+        - 7.2  Use trace + replay for static models (free 5-20x for
+               short ops).
+
+      P1  (month 1)
+        - 2.1  Auto-split coalesced reads (UNBLOCKS iSTFT cases).
+        - 4.1  NoC-aware shard layout cost model.
+        - 7.1  Cache prepared weights.
+
+      P2  (month 2-3)
+        - 3.1  Polyphase decomposition (100x for iSTFT; correctness
+               of the algorithm is well-established, just an
+               engineering effort).
+        - 5.1  iSTFT detector that dispatches to polyphase.
+        - 4.2  Adaptive num_cores for sparse cases.
+
+      P3  (long term)
+        - 2.2  Packed-stick layout for tiny channels.
+        - 2.4  Sparse halo (skip materializing zeros).
+        - 3.2  FFT-based conv for huge kernels.
+        - 6.2  Quantized int8 path.
+        - 3.4  Conv-transpose + bias + activation + next-conv fusion.
+
+
+================================================================================
+  SECTION 9 - iSTFT-SPECIFIC RECIPE  (quickest path to a working test)
+================================================================================
+
+  Goal: get pytest.param(1, 1, 640, 160, 96, False, id="istft_envelope")
+  to run, even before any speed work.
+
+  Step 1: Switch the test to bf16.
+      In test_conv_transpose1d.py, change all dtype=ttnn.float32 to
+      dtype=ttnn.bfloat16 and re-run. Coalesced read becomes:
+          640 * 16 * 2 = 20,480 bytes  (still over 8 KB)
+
+  Step 2: Add act_block_w_div = 4 (or whatever divides the burst
+          below 8 KB) in the Conv2dConfig:
+          640 / 4 = 160 -> burst = 160 * 16 * 2 = 5,120 bytes. Fits!
+      This requires Conv2dConfig.act_block_w_div to be plumbed through
+      the conv_transpose2d path. Verify in
+      ttnn/cpp/.../conv2d/conv2d_utils.cpp::determine_per_core_conv_block_config
+      and that the program factory uses it.
+
+  Step 3: If step 2 still fails (because act_block_w_div is not
+          consumed by the transpose path), then implement option 2.1
+          (auto-split bursts in the reader kernel).
+
+  Step 4 (long-term): Once it runs, move to polyphase (3.1) for the
+          real 10-200x speedup.
+
+  Realistic milestones:
+      - Day 1: Switch to bf16; see if it passes (probably no; still
+        over the burst limit).
+      - Week 1-2: Plumb act_block_w_div for transpose path -> test passes.
+      - Month 1-2: Implement polyphase fast path for big speedup.
+
+
+================================================================================
+  CHEATSHEET: WHICH FILES TO TOUCH FOR EACH OPTIMIZATION
+================================================================================
+
+  Optimization                              | File(s)
+  ------------------------------------------+--------------------------------
+  Auto-split coalesced reads (2.1)          | conv_reader_common.hpp,
+                                            | conv2d_op_sharded_program_factory.cpp
+  bf16 default (2.3, 6.1)                   | Caller; Conv2dConfig docs
+  Sparse halo (2.4)                         | sliding_window.cpp,
+                                            | halo_gather.cpp, conv_reader_common.hpp
+  Polyphase (3.1, 5.1)                      | conv_transpose2d.cpp (new path),
+                                            | prepare_conv_transpose2d_weights.cpp
+  NoC-aware shard pick (4.1)                | conv2d_utils.cpp:1083+
+  Cache halo metadata (1.1)                 | halo_device_operation.cpp:16
+  Greedy stick coalesce (1.2)               | sliding_window.cpp:694+
+  bf16 + act_block_w_div for iSTFT (S9)     | Caller + conv2d_utils.cpp +
+                                            | sharded program factory
+
+
+================================================================================
+  KEY INSIGHT
+================================================================================
+
+  Almost every opportunity above falls into ONE of two categories:
+
+      (A) Make the EXISTING halo + conv2d path more flexible
+          (auto-split bursts, packed sticks, smarter shard picks).
+          These unblock the failing cases and give 1.5-3x.
+
+      (B) Replace the halo + conv2d path entirely with a smarter
+          algorithm for the cases where it is wasteful (polyphase
+          for big stride, FFT for big kernel).
+          These give 10-200x.
+
+  For YOUR iSTFT use case, the right answer is (B) -- polyphase. But
+  the right INTERIM fix is (A.2.1 + 2.3) so the test runs at all
+  while you build (B).
+
+================================================================================
+  END OF FILE
+================================================================================

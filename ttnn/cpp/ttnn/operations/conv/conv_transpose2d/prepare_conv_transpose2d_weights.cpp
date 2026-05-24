@@ -158,6 +158,165 @@ Tensor transform_weights_for_conv_transpose2d(const Tensor& conv_weight_tensor, 
     }
 };
 
+// ============================================================================
+// Polyphase decomposition helpers (V1)
+// ============================================================================
+//
+// V1 scope: 1D-as-2D only (H_in = 1, K_h = 1, S_h = 1).
+// Polyphase replaces one large transpose-conv along W with S_w parallel
+// standard convolutions, each with kernel width K_p = ceil(K_w / S_w).
+// This avoids the (a) zero-multiplication waste of halo zero-interleaving
+// and (b) the NOC_MAX_BURST_SIZE limit hit by very large K_w.
+//
+// Detector heuristic (conservative -- never regress the default path):
+//   - stride_w > 1                  (S_w = 1 has no waste to recover)
+//   - 1D-as-2D: input_h == 1 and kernel_h == 1 and stride_h == 1
+//   - kernel_w >= 4 * stride_w      (sub-kernel K_p must be meaningful)
+//   - in_channels <= 64             (channel-heavy work isn't bottlenecked
+//                                    by K_w, current path is fine)
+//   - input_w * stride_w >= 32      (need enough per-phase output to fill
+//                                    a tile efficiently)
+
+bool is_polyphase_friendly(
+    uint32_t in_channels,
+    uint32_t out_channels,
+    uint32_t kernel_h,
+    uint32_t kernel_w,
+    uint32_t stride_h,
+    uint32_t stride_w,
+    uint32_t input_h,
+    uint32_t input_w) {
+    // V1 requires 1D-as-2D
+    if (input_h != 1 || kernel_h != 1 || stride_h != 1) {
+        return false;
+    }
+    // Polyphase only helps when there are zeros to eliminate
+    if (stride_w <= 1) {
+        return false;
+    }
+    // Sub-kernel must be at least size 4 to be worth launching a sub-conv2d
+    if (kernel_w < 4 * stride_w) {
+        return false;
+    }
+    // Channel-heavy convs don't benefit -- current path is already MAC-bound
+    // on channels, not K_w
+    if (in_channels > 64) {
+        return false;
+    }
+    // Each phase produces ~input_w output elements; want at least a tile
+    if (input_w < 8) {
+        return false;
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// shuffle_weights_polyphase
+// ----------------------------------------------------------------------------
+//
+// See header for full math derivation. Per-phase formula:
+//
+//   shuffled[phase, c_out, c_in, 0, kp]
+//       = w[c_in, c_out, 0, phase + (K_p - 1 - kp) * S_w]   (or 0 if OOB)
+//
+// where K_p = ceil(K_w / S_w). This combines:
+//   - IOHW -> OIHW transpose (channel-axis swap)
+//   - Polyphase decomposition (split K_w axis into S_w phases of K_p elements)
+//   - Cross-correlation reversal (kp <- K_p - 1 - kp on the kernel axis)
+//   - Right zero-padding of last sub-kernel when K_w is not a multiple of S_w
+//
+// The output is ready to feed slice-by-slice to ttnn::conv2d.
+
+template <typename T>
+ttnn::Tensor _shuffle_weights_polyphase_impl(const Tensor& iohw_weight_tensor, uint32_t stride_w) {
+    TT_FATAL(is_cpu_tensor(iohw_weight_tensor), "shuffle_weights_polyphase only supports host tensors");
+
+    const auto& in_shape = iohw_weight_tensor.padded_shape();
+    TT_FATAL(
+        in_shape.rank() == 4,
+        "Polyphase shuffle expects 4D weight tensor [C_in, C_out, 1, K_w], got rank {}",
+        in_shape.rank());
+    TT_FATAL(in_shape[2] == 1, "Polyphase shuffle V1 requires kernel_h == 1, got {}", in_shape[2]);
+
+    const uint32_t c_in = in_shape[0];
+    const uint32_t c_out = in_shape[1];
+    const uint32_t k_h = in_shape[2];  // = 1 in V1
+    const uint32_t k_w = in_shape[3];
+    const uint32_t s_w = stride_w;
+    const uint32_t k_p = (k_w + s_w - 1) / s_w;
+
+    // Output layout: [S_w, C_out, C_in, 1, K_p] -- per-phase slice is OIHW.
+    const ttnn::Shape output_shape{s_w, c_out, c_in, k_h, k_p};
+
+    auto compute = [&output_shape, c_in, c_out, k_h, k_w, s_w, k_p](
+                       const tt::tt_metal::HostBuffer& input_host_buffer) {
+        auto input_buffer = tt::tt_metal::host_buffer::get_as<T>(input_host_buffer);
+        auto owned_buffer = std::vector<T>(output_shape.volume(), T{});  // zero-init for OOB pad
+
+        // Input IOHW strides
+        const uint64_t in_stride_cin = static_cast<uint64_t>(c_out) * k_h * k_w;
+        const uint64_t in_stride_cout = static_cast<uint64_t>(k_h) * k_w;
+        // (k_h stride = k_w, but k_h = 1 so unused)
+
+        // Output [S_w, C_out, C_in, 1, K_p] strides
+        const uint64_t out_stride_phase = static_cast<uint64_t>(c_out) * c_in * k_h * k_p;
+        const uint64_t out_stride_cout = static_cast<uint64_t>(c_in) * k_h * k_p;
+        const uint64_t out_stride_cin = static_cast<uint64_t>(k_h) * k_p;
+
+        for (uint32_t phase = 0; phase < s_w; ++phase) {
+            for (uint32_t kp = 0; kp < k_p; ++kp) {
+                // Reversed K_p axis (cross-correlation orientation)
+                const int64_t src_kw = static_cast<int64_t>(phase) +
+                                       static_cast<int64_t>(k_p - 1 - kp) * static_cast<int64_t>(s_w);
+                if (src_kw < 0 || src_kw >= static_cast<int64_t>(k_w)) {
+                    continue;  // OOB -- leave as zero
+                }
+                for (uint32_t cout = 0; cout < c_out; ++cout) {
+                    for (uint32_t cin = 0; cin < c_in; ++cin) {
+                        const uint64_t in_idx = static_cast<uint64_t>(cin) * in_stride_cin +
+                                                static_cast<uint64_t>(cout) * in_stride_cout +
+                                                static_cast<uint64_t>(src_kw);
+                        const uint64_t out_idx = static_cast<uint64_t>(phase) * out_stride_phase +
+                                                 static_cast<uint64_t>(cout) * out_stride_cout +
+                                                 static_cast<uint64_t>(cin) * out_stride_cin +
+                                                 static_cast<uint64_t>(kp);
+                        owned_buffer[out_idx] = input_buffer[in_idx];
+                    }
+                }
+            }
+        }
+        return tt::tt_metal::HostBuffer(std::move(owned_buffer));
+    };
+
+    const TensorSpec output_spec(
+        output_shape,
+        tt::tt_metal::TensorLayout(
+            iohw_weight_tensor.dtype(), tt::tt_metal::PageConfig(Layout::ROW_MAJOR), MemoryConfig{}));
+
+    return Tensor(
+        iohw_weight_tensor.host_storage().transform(compute),
+        output_spec,
+        iohw_weight_tensor.tensor_topology());
+}
+
+ttnn::Tensor shuffle_weights_polyphase(const ttnn::Tensor& iohw_weight_tensor, uint32_t stride_w) {
+    Tensor host_tensor;
+    if (tt::tt_metal::is_device_tensor(iohw_weight_tensor)) {
+        log_warning(
+            tt::LogOp,
+            "shuffle_weights_polyphase needs weights on host, but they are on device. Moving back to host.");
+        host_tensor = ttnn::operations::core::from_device(iohw_weight_tensor);
+    } else {
+        host_tensor = iohw_weight_tensor;
+    }
+    switch (host_tensor.dtype()) {
+        case DataType::BFLOAT16: return _shuffle_weights_polyphase_impl<::bfloat16>(host_tensor, stride_w);
+        case DataType::FLOAT32: return _shuffle_weights_polyphase_impl<float>(host_tensor, stride_w);
+        case DataType::UINT32: return _shuffle_weights_polyphase_impl<uint32_t>(host_tensor, stride_w);
+        default: TT_THROW("Unsupported data type for shuffle_weights_polyphase: {}", host_tensor.dtype());
+    }
+}
+
 ttnn::Tensor prepare_conv_transpose2d_weights(
     const ttnn::Tensor& weight_tensor,
     ttnn::MemoryConfig input_memory_config,
