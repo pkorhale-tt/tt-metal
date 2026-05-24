@@ -206,6 +206,14 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
         // We passed false/false so we know it's just the tensor variant.
         ttnn::Tensor phase_out = std::get<ttnn::Tensor>(conv_result);
 
+        log_info(
+            tt::LogOp,
+            "[polyphase DBG] phase={} raw conv2d out: logical_shape={} layout={} is_sharded={}",
+            phase,
+            phase_out.logical_shape(),
+            phase_out.layout(),
+            phase_out.memory_config().is_sharded());
+
         // conv2d typically returns a TILE-layout, sharded-memory tensor.
         // Reshape/concat on tile-layout tensors does NOT preserve logical
         // element order (the tile structure aliases the dims).  To make the
@@ -226,6 +234,13 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
                 tt::tt_metal::MemoryConfig{
                     tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM});
         }
+        log_info(
+            tt::LogOp,
+            "[polyphase DBG] phase={} after layout: logical_shape={} layout={} is_sharded={}",
+            phase,
+            phase_out.logical_shape(),
+            phase_out.layout(),
+            phase_out.memory_config().is_sharded());
         phase_outputs.push_back(std::move(phase_out));
 
         if (phase == 0) {
@@ -281,8 +296,15 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
         ttnn::Shape new_shape{n, w, 1u, c};
         reshaped_phases.push_back(ttnn::reshape(po, new_shape));
     }
+    log_info(
+        tt::LogOp,
+        "[polyphase DBG] before concat: each reshaped phase shape (rank {})",
+        reshaped_phases[0].logical_shape().rank());
+    log_info(tt::LogOp, "[polyphase DBG] reshaped_phases[0].logical_shape() = {}", reshaped_phases[0].logical_shape());
+
     // (N, T_phase, S_w, C_out)
     ttnn::Tensor stacked = ttnn::concat(reshaped_phases, /*dim=*/2);
+    log_info(tt::LogOp, "[polyphase DBG] after concat: logical_shape = {}", stacked.logical_shape());
 
     // (N, 1, T_phase * S_w, C_out)
     const auto& ss = stacked.logical_shape();
