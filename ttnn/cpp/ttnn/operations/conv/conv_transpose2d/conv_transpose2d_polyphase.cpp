@@ -10,9 +10,11 @@
 #include "ttnn/operations/conv/conv2d/conv2d.hpp"
 #include "ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.hpp"
 #include "ttnn/operations/core/core.hpp"
+#include "ttnn/operations/core/to_layout/to_layout_op.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+#include "ttnn/operations/data_movement/sharded/sharded_to_interleaved/sharded_to_interleaved.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/data_movement/transpose/transpose.hpp"
 #include "ttnn/operations/sliding_window/sliding_window.hpp"
@@ -203,6 +205,27 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
         // conv2d returns either a Tensor or a tuple depending on the last two flags.
         // We passed false/false so we know it's just the tensor variant.
         ttnn::Tensor phase_out = std::get<ttnn::Tensor>(conv_result);
+
+        // conv2d typically returns a TILE-layout, sharded-memory tensor.
+        // Reshape/concat on tile-layout tensors does NOT preserve logical
+        // element order (the tile structure aliases the dims).  To make the
+        // downstream interleave operate on element-major data, convert to
+        // ROW_MAJOR layout in interleaved DRAM memory before we touch it.
+        if (phase_out.memory_config().is_sharded()) {
+            phase_out = ttnn::sharded_to_interleaved(
+                phase_out,
+                tt::tt_metal::MemoryConfig{
+                    tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM});
+        }
+        if (phase_out.layout() != Layout::ROW_MAJOR) {
+            phase_out = ttnn::to_layout(
+                phase_out,
+                Layout::ROW_MAJOR,
+                /*dtype=*/std::nullopt,
+                /*memory_config=*/
+                tt::tt_metal::MemoryConfig{
+                    tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM});
+        }
         phase_outputs.push_back(std::move(phase_out));
 
         if (phase == 0) {
