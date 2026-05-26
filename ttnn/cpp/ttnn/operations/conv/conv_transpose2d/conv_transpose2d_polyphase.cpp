@@ -93,9 +93,7 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
     const std::optional<const DeviceComputeKernelConfig>& compute_config,
     const std::optional<const MemoryConfig>& memory_config,
     bool mirror_kernel) {
-    // ------------------------------------------------------------------
-    // V1 preconditions
-    // ------------------------------------------------------------------
+   
     // get_pair_n4_padding returns std::array<uint32_t, 4> in
     // {pad_top, pad_bottom, pad_left, pad_right} order.
     const auto padding_n4 = sliding_window::get_pair_n4_padding(padding_);
@@ -121,43 +119,26 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
 
     log_debug(tt::LogOp, "conv_transpose2d_polyphase: T={}, K={}, S={}, K_p={}, T_out={}", t_in, k_w, s_w, k_p, t_out);
 
-    // ------------------------------------------------------------------
-    // (1) Shuffle weights once on host: [C_in, C_out, 1, K_w] -> [S_w, C_out, C_in, 1, K_p]
-    //     Each per-phase slice is in OIHW orientation and ready for ttnn::conv2d.
-    // ------------------------------------------------------------------
+    // Shuffle weights once on host: [C_in, C_out, 1, K_w] -> [S_w, C_out, C_in, 1, K_p]
+    
     ttnn::Tensor weight_host = tt::tt_metal::is_device_tensor(weight_tensor)
                                    ? ttnn::operations::core::from_device(weight_tensor)
                                    : weight_tensor;
-    if (!mirror_kernel) {
+    if (!mirror_kernel) {//need to handle this case when mirror is true.
         log_warning(
             tt::LogOp,
             "polyphase: mirror_kernel=false is not supported in V1, treating as mirror_kernel=true. "
             "(Pre-mirrored weights would need to be un-mirrored first.)");
     }
+    
     ttnn::Tensor shuffled_weights = shuffle_weights_polyphase(weight_host, s_w);
 
-    // ------------------------------------------------------------------
-    // (2) "Same-padding" for the per-phase sub-convs: K_p - 1 zeros on
-    //     each side along W so that each phase produces exactly
-    //     T_in + K_p - 1 outputs (enough to interleave into T_out).
-    //
-    //     We let ttnn::conv2d apply the padding directly via its
-    //     `padding` parameter (top, bottom, left, right) instead of
-    //     calling ttnn::pad as a separate op. This avoids the subtle
-    //     NHWC/ROW_MAJOR pad quirks we hit before (where ttnn::pad
-    //     produced right-only padding instead of symmetric padding for
-    //     C=1 inputs) and also saves a host op + buffer round-trip.
-    // ------------------------------------------------------------------
     const uint32_t conv_pad_left = (k_p > 0) ? (k_p - 1) : 0;
     const uint32_t conv_pad_right = (k_p > 0) ? (k_p - 1) : 0;
     const std::array<uint32_t, 4> conv_padding_n4 = {0u, 0u, conv_pad_left, conv_pad_right};
     log_debug(tt::LogOp, "polyphase using conv2d-internal padding L={} R={} (K_p={})", conv_pad_left, conv_pad_right, k_p);
 
-    // ------------------------------------------------------------------
-    // (3) Run S_w standard conv2ds. Each consumes the same padded input
-    //     and a different per-phase weight slice. Output of each:
-    //       (N, 1, T_phase, C_out)  where T_phase = padded_t - K_p + 1 = T_in + K_p - 1
-    // ------------------------------------------------------------------
+  
     std::vector<ttnn::Tensor> phase_outputs;
     phase_outputs.reserve(s_w);
 
@@ -225,39 +206,7 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
         }
     }
 
-    // ------------------------------------------------------------------
-    // (4) Interleave the S_w phase outputs into the final (N, 1, T_out, C_out) tensor.
-    //
-    //     We stack along a NEW phase axis, then transpose so the phase axis
-    //     becomes the innermost-after-W axis, then reshape to merge phase*W
-    //     into a single time dimension.
-    //
-    //     phase_outputs[p] : (N, 1, T_phase, C_out)
-    //
-    //     Step A: concat along a new leading dim ->  (S_w, N, 1, T_phase, C_out)
-    //             (implemented as: unsqueeze each + concat dim=0)
-    //     Step B: transpose so we end up with (N, 1, T_phase, S_w, C_out)
-    //             We want time = phase + S_w * i  -> innermost time is phase changes fastest.
-    //             So order along the W axis becomes:
-    //                 [i=0,p=0], [i=0,p=1], ..., [i=0,p=S_w-1], [i=1,p=0], ...
-    //             which requires phase to be the FAST axis -- yes, p innermost on W.
-    //             We transpose the phase axis to be just before C.
-    //     Step C: reshape (N, 1, T_phase * S_w, C_out)
-    //     Step D: slice to (N, 1, T_out, C_out)
-    //
-    //     V1 uses straightforward host-friendly ops; can be fused later (V2).
-    // ------------------------------------------------------------------
-    //
-    // To keep V1 simple, we use a simpler interleave: reshape each phase
-    // output to (N*T_phase, C_out), stack to (N*T_phase, S_w, C_out),
-    // reshape to (N*T_phase*S_w, C_out), then reshape to (N, 1, T_phase*S_w, C_out).
-    // Finally slice to (N, 1, T_out, C_out).
-    //
-    // Actually the cleanest sequence (operating on (N, 1, T_phase, C_out) shapes):
-    //   1) reshape each phase to (N, T_phase, 1, C_out)   [insert phase axis after T]
-    //   2) concat all phases along dim=2 ->  (N, T_phase, S_w, C_out)
-    //   3) reshape to (N, 1, T_phase * S_w, C_out)
-    //   4) slice along W: [:, :, 0:T_out, :]
+    
     std::vector<ttnn::Tensor> reshaped_phases;
     reshaped_phases.reserve(s_w);
     for (auto& po : phase_outputs) {

@@ -18,22 +18,6 @@ namespace ttnn::operations::conv::conv_transpose2d {
 
 using ttnn::prim::Conv2dConfig;
 
-// ============================================================================
-// Polyphase conv_transpose2d (V1)
-// ============================================================================
-//
-// Computes ttnn::conv_transpose2d via polyphase decomposition:
-//   - Shuffle the (mirrored) weight tensor into S_w sub-kernels of width K_p
-//     = ceil(K_w / S_w).
-//   - Pad the input with K_p - 1 zeros on the left and right along W.
-//   - Run S_w standard 2D convolutions, each producing every S_w-th output.
-//   - Interleave the S_w sub-outputs into the final output.
-//
-// V1 ONLY supports the 1D-as-2D regime:
-//   input_h == 1, kernel_size[0] == 1, stride[0] == 1, padding_h == 0
-//
-// is_polyphase_friendly() (declared in prepare_conv_transpose2d_weights.hpp)
-// should be checked first; this function asserts the V1 preconditions.
 
 ConvTranspose2dResult conv_transpose2d_polyphase(
     const ttnn::Tensor& input_tensor,
