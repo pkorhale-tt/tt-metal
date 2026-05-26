@@ -1,0 +1,307 @@
+================================================================================
+12_ttnn_operators_used_by_polyphase.txt
+================================================================================
+
+This note enumerates EVERY ttnn::* operator that the V1 polyphase
+implementation actually calls at runtime, with line numbers and the role
+each operator plays in the end-to-end algorithm.
+
+It is the "API surface" complement to note 11 (which lists WHERE files
+were added/edited). Reading 11 + 12 together tells you the complete story
+of what we wrote and what existing ttnn machinery it leans on.
+
+--------------------------------------------------------------------------------
+SECTION 1 - QUICK SUMMARY TABLE
+--------------------------------------------------------------------------------
+
+Polyphase uses ONLY existing, production ttnn operators. No new device
+kernels were written.
+
+Compute operator (the heavy lifter):
+    1. ttnn::conv2d                                <- per phase
+
+Data-movement operators (gluing pieces together):
+    2. ttnn::sharded_to_interleaved                <- after each conv2d
+    3. ttnn::to_layout (TILE -> ROW_MAJOR)         <- after each conv2d
+    4. ttnn::reshape                               <- per phase + once after concat
+    5. ttnn::concat                                <- once
+    6. ttnn::slice                                 <- once at end
+
+Host-side helpers (run on CPU, not on device):
+    7. shuffle_weights_polyphase(...)              <- ours, in prepare_conv_*.cpp
+    8. slice_phase_weights(...)                    <- ours, in polyphase.cpp
+    9. ttnn::operations::core::from_device(...)    <- as needed
+   10. sliding_window::get_pair_n4_padding(...)    <- as needed
+
+Total UNIQUE ttnn device-side ops used: SIX.
+That's it. Polyphase is implemented entirely as an orchestration of
+existing primitives.
+
+--------------------------------------------------------------------------------
+SECTION 2 - INCLUDE-FILE PROOF
+--------------------------------------------------------------------------------
+
+These are the ttnn operator headers our orchestrator pulls in:
+
+  conv_transpose2d_polyphase.cpp lines 10-19:
+
+      #include "ttnn/operations/conv/conv2d/conv2d.hpp"
+      #include "ttnn/operations/conv/conv_transpose2d/
+                   prepare_conv_transpose2d_weights.hpp"
+      #include "ttnn/operations/core/core.hpp"
+      #include "ttnn/operations/core/to_layout/to_layout_op.hpp"
+      #include "ttnn/operations/data_movement/concat/concat.hpp"
+      #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+      #include "ttnn/operations/data_movement/sharded/
+                   sharded_to_interleaved/sharded_to_interleaved.hpp"
+      #include "ttnn/operations/data_movement/slice/slice.hpp"
+      #include "ttnn/operations/data_movement/transpose/transpose.hpp"
+      #include "ttnn/operations/sliding_window/sliding_window.hpp"
+
+Of those, transpose.hpp is currently included but not actually used at
+runtime (left in for future reorderings); the rest each correspond to
+exactly one ttnn::* call inside the orchestrator.
+
+--------------------------------------------------------------------------------
+SECTION 3 - WHEN AND WHY EACH OPERATOR IS CALLED
+--------------------------------------------------------------------------------
+
+Below: call-sites traced through conv_transpose2d_polyphase.cpp in the
+order they fire at runtime for a typical V1 input.
+
+== STEP 0: host-side weight prep (NO device op) ==
+
+  Code:
+      ttnn::Tensor weight_host =
+          tt::tt_metal::is_device_tensor(weight_tensor)
+              ? ttnn::operations::core::from_device(weight_tensor)
+              : weight_tensor;
+      ttnn::Tensor shuffled_weights =
+          shuffle_weights_polyphase(weight_host, s_w);
+
+  Operators used:
+      - ttnn::operations::core::from_device(...)     [optional, copy back]
+      - shuffle_weights_polyphase(...)                [ours, host loop]
+
+  Why: IOHW user weight -> [S_w, C_out, C_in, 1, K_p] tensor with the
+       cross-correlation reversal + phase split + channel transpose
+       baked in. Runs once per op invocation.
+
+== STEP 1: per-phase weight slice (host-side, no device op) ==
+
+  Code:
+      ttnn::Tensor phase_w = slice_phase_weights(shuffled_weights, phase);
+
+  Operators used:
+      - slice_phase_weights(...)                      [ours, host memcpy]
+
+  Why: Pulls the p-th sub-kernel out of the shuffled tensor as a
+       standalone OIHW [C_out, C_in, 1, K_p] weight tensor ready for
+       ttnn::conv2d. Runs S_w times.
+
+== STEP 2: the per-phase convolution =====================================
+
+  Code (lines 174-197):
+      auto conv_result = ttnn::conv2d(
+          input_tensor, phase_w, device,
+          in_channels, out_channels, batch_size,
+          /*input_height=*/1, /*input_width=*/t_in,
+          /*kernel_size=*/{1, k_p},
+          /*stride=*/{1, 1},
+          /*padding=*/{0, 0, k_p-1, k_p-1},
+          /*dilation=*/{1, 1}, /*groups=*/1,
+          dtype, bias_for_call, conv_config, compute_config,
+          memory_config, /*dram_slice_config=*/std::nullopt,
+          /*return_output_dim=*/false,
+          /*return_weights_and_bias=*/false);
+
+  Operator used:
+      - ttnn::conv2d(...)                             <- the heavy lifter
+
+  Why: This is THE work of polyphase. Each phase is a tiny standard
+       conv2d (kernel = K_p, stride = 1) that produces T_in + K_p - 1
+       output samples for one phase of the strided output. The
+       symmetric "same" padding (K_p-1 on each side) is delivered via
+       conv2d's own padding parameter, NOT via a separate ttnn::pad.
+
+  Notes:
+      - Called S_w times (once per phase).
+      - For the iSTFT envelope shape: 160 calls each with K_p=4,
+        in_channels=1. Tiny convs that don't hit the NoC burst limit.
+      - Bias plumbing in V1: bias_for_call is set to bias_tensor ONLY
+        for phase 0. This is a known gap (see note 11 section 6) -
+        proper behaviour is to apply bias on every phase.
+
+== STEP 3: bring the phase output into a sane layout =====================
+
+  Code (lines 199-219):
+      ttnn::Tensor phase_out = std::get<ttnn::Tensor>(conv_result);
+      if (phase_out.memory_config().is_sharded()) {
+          phase_out = ttnn::sharded_to_interleaved(
+              phase_out,
+              {TensorMemoryLayout::INTERLEAVED, BufferType::DRAM});
+      }
+      if (phase_out.layout() != Layout::ROW_MAJOR) {
+          phase_out = ttnn::to_layout(
+              phase_out, Layout::ROW_MAJOR, ...,
+              {TensorMemoryLayout::INTERLEAVED, BufferType::DRAM});
+      }
+
+  Operators used:
+      - ttnn::sharded_to_interleaved(...)             [conditional]
+      - ttnn::to_layout(..., ROW_MAJOR, ...)          [conditional]
+
+  Why: ttnn::conv2d typically returns a TILE-layout, sharded tensor.
+       Our downstream reshape/concat/slice expects element-major
+       ROW_MAJOR data; otherwise the 32x32 tile-internal padding
+       gets in the way of the interleave (we hit PCC = 0.097 from
+       this bug during bring-up - see note 11 section 5, bug 4).
+
+  Notes:
+      - Called up to 2 * S_w times (twice per phase, both conditional
+        on the actual output layout/memory).
+      - Both ops are cheap data-movement copies, but they ARE the
+        thing that lets the V1 interleave work at all.
+
+== STEP 4: reshape each phase's output ===================================
+
+  Code (lines 265-274):
+      for (auto& po : phase_outputs) {
+          const auto& s = po.logical_shape();
+          ttnn::Shape new_shape{n, w, 1u, c};
+          reshaped_phases.push_back(ttnn::reshape(po, new_shape));
+      }
+
+  Operator used:
+      - ttnn::reshape(...)                            <- one per phase
+
+  Why: Each phase output is (N, 1, T_phase, C). We re-shape it to
+       (N, T_phase, 1, C) to insert a new "phase" axis right before
+       the C axis. That sets us up for a one-shot concat in the next
+       step.
+
+  Notes:
+      - Called S_w times.
+      - On a ROW_MAJOR tensor this is a metadata-only operation
+        (no copy).
+
+== STEP 5: concatenate all phases ========================================
+
+  Code (line 277):
+      ttnn::Tensor stacked = ttnn::concat(reshaped_phases, /*dim=*/2);
+
+  Operator used:
+      - ttnn::concat(...)                             <- the interleaver
+
+  Why: Concatenating along dim=2 produces shape (N, T_phase, S_w, C).
+       Because phase is now the FAST axis just before C, flattening
+       T_phase * S_w into a single time dimension naturally yields
+       the correct interleaved output order:
+           [phase_0[0], phase_1[0], ..., phase_{S-1}[0],
+            phase_0[1], phase_1[1], ..., phase_{S-1}[1], ...]
+       which is exactly y[t] = phase_p[j] with t = j*S + p.
+
+  Notes:
+      - Called once per op invocation.
+      - Always operates on ROW_MAJOR/interleaved tensors (we forced
+        that in Step 3).
+
+== STEP 6: flatten back into NHWC =======================================
+
+  Code (line 285):
+      ttnn::Tensor flattened = ttnn::reshape(
+          stacked, ttnn::Shape{n, 1u, merged_t, c});
+
+  Operator used:
+      - ttnn::reshape(...)
+
+  Why: Merges the (T_phase, S_w) axes into a single W-axis of length
+       T_phase * S_w, so we end up with (N, 1, T_phase*S_w, C).
+
+== STEP 7: trim to exact T_out ==========================================
+
+  Code (lines 287-294):
+      if (merged_t > t_out) {
+          const std::array<uint32_t, 4> begins = {0u, 0u, 0u, 0u};
+          const std::array<uint32_t, 4> ends   = {n, 1u, t_out, c};
+          const std::array<uint32_t, 4> steps  = {1u, 1u, 1u, 1u};
+          output = ttnn::slice(flattened, begins, ends, steps);
+      } else {
+          output = flattened;   // already exact size, no slice needed
+      }
+
+  Operator used:
+      - ttnn::slice(...)                              [conditional]
+
+  Why: T_phase * S_w is always >= T_out, sometimes by exactly K_p - 1
+       extra elements (these are the "tail" outputs that fall past
+       the valid transpose-conv output range). The slice trims those
+       so the final shape matches the math: (N, 1, T_out, C).
+
+--------------------------------------------------------------------------------
+SECTION 4 - PER-INVOCATION OP COUNT FOR THE iSTFT SHAPE
+--------------------------------------------------------------------------------
+
+For the iSTFT envelope case (N=1, K=640, S=160, T_in=96, C_in=1, C_out=1):
+
+  K_p     = ceil(640 / 160)        = 4
+  S_w     = 160
+  T_phase = 96 + 4 - 1             = 99
+  T_out   = (96 - 1) * 160 + 640   = 15840
+
+  Device-side op invocations:
+
+    ttnn::conv2d                  : 160         (one per phase)
+    ttnn::sharded_to_interleaved  : <=160       (one per phase, conditional)
+    ttnn::to_layout (-> ROW_MAJOR): <=160       (one per phase, conditional)
+    ttnn::reshape                 : 161         (160 per-phase + 1 final)
+    ttnn::concat                  : 1
+    ttnn::slice                   : <=1         (conditional)
+
+  Total: ~640 op invocations, dominated by the 160 tiny conv2ds.
+
+  By comparison, the existing ttnn.conv_transpose2d for this shape
+  does ONE conv2d with K_w = 640. That single op is what hit the
+  NOC_MAX_BURST_SIZE static_assert. Polyphase trades 1 huge op for
+  ~160 trivially-small ones, none of which approach any per-op limit.
+
+--------------------------------------------------------------------------------
+SECTION 5 - OPERATORS WE DELIBERATELY DO NOT USE
+--------------------------------------------------------------------------------
+
+These are commonly-mentioned ttnn ops that polyphase intentionally
+AVOIDS, plus the reason:
+
+  ttnn::pad(input, ...) -- not used
+      Initially we used it to "same-pad" the input by K_p-1 on each
+      side along W. It turned out to produce right-only padding for
+      NHWC ROW_MAJOR C=1 inputs (bug 5 in note 11), so we switched
+      to letting ttnn::conv2d apply the padding via its own padding
+      parameter. Both work in theory; the latter is one-fewer-op
+      AND is the well-trodden path in the rest of ttnn.
+
+  ttnn.halo / sliding_window halo gather -- not used
+      This is the operator that the existing conv_transpose2d uses
+      to insert S-1 zeros between input samples and gather neighbors.
+      Polyphase EXISTS specifically to avoid this op (and the wasted
+      zero MAC work it represents).
+
+  ttnn::prim::conv2d (the low-level conv2d device op) -- not used
+      We call the user-facing ttnn::conv2d wrapper, which itself
+      drives ttnn::prim::conv2d internally. We don't need to bypass
+      the wrapper - it handles weight prep, dispatch, slicing, etc.
+      for us.
+
+  ttnn::transpose -- declared but not called
+      transpose.hpp is included for a possible V2 interleave that
+      uses a true transpose op instead of reshape+concat. Currently
+      unused; left in to make the V2 patch smaller.
+
+  ttnn::experimental.* anything -- not used
+      All ops the orchestrator calls are stable production ttnn ops.
+      Polyphase is the experimental thing in this chain; everything
+      it calls is non-experimental.
+
+================================================================================
+end of file
+================================================================================
