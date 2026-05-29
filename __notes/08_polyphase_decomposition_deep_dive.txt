@@ -1,0 +1,951 @@
+================================================================================
+  POLYPHASE DECOMPOSITION FOR CONV_TRANSPOSE
+  The single highest-leverage optimization for ttnn.conv_transpose2d.
+  This file: WHY, the MATH, the PICTURES, what it REPLACES, and a step-
+  by-step IMPLEMENTATION PLAN.
+================================================================================
+
+  Audience:   You've read notes 01-07. You understand halo + conv2d.
+              Now you want to know exactly how polyphase works and
+              what code lines it would replace.
+
+  TL;DR up front:
+      The current approach inserts (S-1) zeros between every input
+      stick and runs a normal conv. Polyphase does the math
+      equivalently WITHOUT inventing any zeros. For our iSTFT case
+      this drops the MAC count from 10,158,080 to 61,440 -- a 165x
+      reduction -- AND naturally fits within the NoC burst limit.
+
+
+================================================================================
+  CHAPTER 1 - THE MATHEMATICAL INSIGHT  (why polyphase exists)
+================================================================================
+
+  Recall the definition of 1D transpose convolution:
+
+      y[n]  =  sum over t of  x[t] * w[n - t*S]
+                                                  for t in [0, T)
+                                                  for n in [0, T_out)
+                                                  with T_out = (T-1)*S + K
+
+  Read it as "each input x[t] places a copy of the kernel, scaled by
+  x[t], at output position t*S."
+
+  Now do a CHANGE OF VARIABLES on the output index n. Write it as:
+
+      n = m*S + p                  where p in [0, S)
+                                   and   m in [0, T_out/S)
+
+  In words: split each output index into "which group of S" (m) and
+  "position within that group" (p).
+
+  Substitute:
+
+      y[m*S + p]  =  sum over t of  x[t] * w[(m-t)*S + p]
+
+  Define the p-th POLYPHASE COMPONENT of the kernel as
+
+      w_p[k']  =  w[k' * S + p]            for k' = 0, 1, ..., K_p - 1
+                                           where K_p = ceil((K - p) / S)
+
+  Then
+
+      y[m*S + p]  =  sum over k' of  x[m - k'] * w_p[k']    (***)
+
+  This is a NORMAL conv1d (not transpose!) of x with kernel w_p,
+  stride=1.
+
+  We have one such conv per phase p = 0, 1, ..., S-1.
+
+  After computing all S phases, INTERLEAVE the results:
+
+      y[n] = y_p[m]                where n = m*S + p
+
+  So:
+
+      One transpose conv (stride S, kernel K)
+              ===   S parallel normal convs (stride 1, kernel ~K/S)
+                    + a final interleave.
+
+
+================================================================================
+  CHAPTER 2 - WHY THIS IS BIG  (and why it's the right answer)
+================================================================================
+
+  Look at the numbers for iSTFT envelope:
+
+      Original:                                      Polyphase:
+      ---------                                      ----------
+      1 transpose conv                               S = 160 normal convs
+      kernel = 640                                   kernel = 4
+      stride = 160 (inserts 159 zeros each)          stride = 1 (no zeros)
+      input length = 96                              input length = 96
+      output length = 15,840                         each output length = 99
+      total MACs ~ 10,158,080                        total MACs ~ 61,440
+                                                     (165x fewer!)
+
+  Why does this happen? Because in the original approach the
+  multiplications by the (S-1) interleaved zero positions per step
+  produce zero -- a complete waste. Polyphase factorizes the kernel so
+  that no zero ever participates in any product.
+
+  Bonus wins:
+      - K per sub-conv is K/S = 4 (vs 640).
+        That makes coalesced_read_bytes = 4 * 16 * 4 = 256 bytes,
+        well under NOC_MAX_BURST_SIZE (8 KB).
+        => The NoC burst issue evaporates by construction.
+      - L1 pressure drops dramatically (no zero-padded halo buffer).
+      - Better core utilization (each phase can be sharded fully).
+      - Existing conv2d kernel is reused -- no new compute kernel needed.
+
+
+================================================================================
+  CHAPTER 3 - TINY WORKED EXAMPLE  (by hand, to prove the math)
+================================================================================
+
+  Take a tiny case:
+      Input:   x = [3, 5]          (T = 2)
+      Kernel:  w = [1, 2, 3, 4]    (K = 4)
+      Stride:  S = 2
+
+  Output length: T_out = (2-1)*2 + 4 = 6.
+
+  ----------------------------------------------------------------------
+  Method A: ORIGINAL (stamp + overlap-add)
+  ----------------------------------------------------------------------
+  Output canvas starts as [0, 0, 0, 0, 0, 0].
+
+  Stamp w*3 at position 0:
+      [3, 6, 9, 12, 0, 0]
+
+  Stamp w*5 at position 2:
+      [3, 6, 9+5, 12+10, 15, 20]
+      [3, 6, 14, 22, 15, 20]
+
+  y = [3, 6, 14, 22, 15, 20].
+
+  ----------------------------------------------------------------------
+  Method B: POLYPHASE (S = 2 sub-convs)
+  ----------------------------------------------------------------------
+  Split w into S = 2 polyphase components:
+
+      w_0 = [w[0], w[2]] = [1, 3]       (even positions)
+      w_1 = [w[1], w[3]] = [2, 4]       (odd  positions)
+
+  Each w_p has K_p = K/S = 2 taps.
+
+  Run normal conv1d on x with each:
+
+      y_0[m] = x[m]*w_0[0] + x[m-1]*w_0[1]
+             = x[m]*1 + x[m-1]*3
+
+      y_1[m] = x[m]*w_1[0] + x[m-1]*w_1[1]
+             = x[m]*2 + x[m-1]*4
+
+  Pad x with one zero on each side so that y_p has T_out / S = 3
+  outputs per phase (m = 0, 1, 2):
+
+      x_padded = [0, 3, 5, 0]
+
+  Compute y_0 (kernel = [1, 3]):
+      y_0[0] = 0*1 + 0    = 0     (wait -- m=0 means x[0]*1 + x[-1]*3.
+                                   In "valid" conv on x_padded with
+                                   kernel [1, 3]:)
+      With x_padded = [0, 3, 5, 0]:
+          y_0[0] = 0*1 + 3*3 = 9          <-- corresponds to m=1 of "true" formula?
+
+  Let me redo this carefully. The polyphase output positions are:
+
+      y[0] = y_0[0]            <-- p=0, m=0
+      y[1] = y_1[0]            <-- p=1, m=0
+      y[2] = y_0[1]            <-- p=0, m=1
+      y[3] = y_1[1]            <-- p=1, m=1
+      y[4] = y_0[2]            <-- p=0, m=2
+      y[5] = y_1[2]            <-- p=1, m=2
+
+  Using y_p[m] = sum_{k'} x[m - k'] * w_p[k']:
+
+      y_0[0] = x[0]*1            = 3*1 = 3        (k'=0 only; k'=1 needs x[-1]=0)
+      y_0[1] = x[1]*1 + x[0]*3   = 5*1 + 3*3 = 14
+      y_0[2] = x[2]*1 + x[1]*3   = 0  + 5*3 = 15  (x[2]=0 by zero-pad)
+
+      y_1[0] = x[0]*2            = 3*2 = 6
+      y_1[1] = x[1]*2 + x[0]*4   = 5*2 + 3*4 = 22
+      y_1[2] = x[2]*2 + x[1]*4   = 0  + 5*4 = 20  (x[2]=0 by zero-pad)
+
+  Interleave: y = [y_0[0], y_1[0], y_0[1], y_1[1], y_0[2], y_1[2]]
+                = [   3,        6,      14,      22,      15,      20  ]
+
+  EXACT MATCH with Method A. The math is provably equivalent.
+
+  Note that the polyphase computation did:
+      4 MACs for y_0 + 4 MACs for y_1 = 8 MACs
+  while Method A did:
+      4 + 4 + (4 overlap-add adds) = 12 ops
+
+  For tiny cases the savings are modest. For S = 160 and K = 640 the
+  savings are massive because the "zero positions" multiply out.
+
+
+================================================================================
+  CHAPTER 3.5 - TRACING THE SAME EXAMPLE THROUGH BOTH PIPELINES
+                (TTNN-current vs Polyphase), STICK-BY-STICK
+================================================================================
+
+  Chapter 3 showed the mathematical equivalence. This chapter goes one
+  level deeper: it traces a SMALL example through EXACTLY what ttnn
+  does today, then through what polyphase WOULD do, then compares
+  every operation count side by side.
+
+  ----------------------------------------------------------------------
+  SETUP (tiny, hand-traceable)
+  ----------------------------------------------------------------------
+
+      Input:    x = [1, 2]              shape: [T = 2]
+      Kernel:   w = [1, 2, 3, 4]        shape: [K = 4]
+      Stride:   S = 2
+      Padding:  user_pad = 0,  output_pad = 0,  dilation = 1
+      C_in = C_out = 1,  bias = None,  dtype = fp32 (for arithmetic clarity)
+
+      Reshaped for ttnn (NHWC, H = 1):
+          x_nhwc:  [B=1, H=1, W=2, C=1]
+          w_2d  :  [in=1, out=1, K_h=1, K_w=4]
+
+  ----------------------------------------------------------------------
+  PyTorch REFERENCE  (ground truth)
+  ----------------------------------------------------------------------
+
+      ref = F.conv_transpose1d(x, w, stride=2)
+
+      Output length: T_out = (T-1)*S + K = 1*2 + 4 = 6
+
+      Stamp w*1 at position 0:    [1, 2, 3, 4, 0, 0]
+      Stamp w*2 at position 2:    [_, _, +2,+4,+6,+8]
+      Add (overlap):              [1, 2, 5, 8, 6, 8]
+
+      Reference: y = [1, 2, 5, 8, 6, 8]
+
+
+  ======================================================================
+  PIPELINE A: WHAT TTNN DOES TODAY
+  ======================================================================
+
+  STEP A1: compute_conv_transpose2d_dimensions
+  ---------------------------------------------
+      output_w        = (T-1)*S - 2*pad + (K-1) + out_pad + 1
+                      = 1*2 - 0 + 3 + 0 + 1
+                      = 6
+      strided_input_w = (T-1)*S + 1
+                      = 1*2 + 1
+                      = 3
+      full_input_w    = output_w + (K - 1)
+                      = 6 + 3
+                      = 9
+      input_pad_left  = K - 1 - user_pad_left = 3 - 0 = 3
+      input_pad_right = K - 1 - user_pad_right + out_pad = 3
+
+      Verify: full_input_w = input_pad_left + strided_input_w + input_pad_right
+                           = 3 + 3 + 3 = 9.  Wait, that gives 9 only if we
+                           account for the fact that left + right is K-1
+                           SPLIT between sides; for symmetric calc it is
+                           actually 3 + 3 + 3 with a tiny correction at
+                           one end. For this small case, halo allocates
+                           a 9-stick buffer regardless.
+
+  STEP A2: weight prep (mirror + tile)
+  ------------------------------------
+      Because PyTorch ConvTranspose1d uses the FLIPPED kernel in its
+      equivalent-conv formulation, ttnn passes `mirror_kernel = True`
+      and conv2d sees the flipped weight:
+
+          w_flipped = [4, 3, 2, 1]
+
+  STEP A3: halo materializes the strided+padded buffer
+  ----------------------------------------------------
+      Real positions inside the strided region (stride=2 -> insert 1
+      zero between sticks): [x[0], 0, x[1]] = [1, 0, 2]
+
+      Outer pad: 3 zeros on each side (= K - 1).
+
+      Halo'd buffer (length 9):
+
+          index :  0   1   2   3   4   5   6   7   8
+          value :  0   0   0   1   0   2   0   0   0
+          kind  :  P   P   P   R   I   R   I   P   P
+                                           ^
+                  (P = outer pad zero, I = interleaved zero, R = real)
+
+      Out of 9 sticks: 2 real, 7 zeros (78% zero).
+
+  STEP A4: conv2d (stride=1, kernel=4) on the halo'd buffer
+  ---------------------------------------------------------
+      Output length = 9 - 4 + 1 = 6.   Good.
+
+      Compute every output stick. For each output position j:
+
+          out[j] = sum_{k=0..3} halo[j+k] * w_flipped[k]
+
+      Tracing all 6 outputs and ALL 24 multiplications:
+
+      out[0] = halo[0]*4 + halo[1]*3 + halo[2]*2 + halo[3]*1
+             =    0*4   +    0*3   +    0*2   +    1*1
+             =    0     +    0     +    0     +    1
+             = 1
+             (3 zero-MACs, 1 real-MAC)
+
+      out[1] = halo[1]*4 + halo[2]*3 + halo[3]*2 + halo[4]*1
+             =    0*4   +    0*3   +    1*2   +    0*1
+             = 2
+             (3 zero-MACs, 1 real-MAC)
+
+      out[2] = halo[2]*4 + halo[3]*3 + halo[4]*2 + halo[5]*1
+             =    0*4   +    1*3   +    0*2   +    2*1
+             = 5
+             (2 zero-MACs, 2 real-MACs)
+
+      out[3] = halo[3]*4 + halo[4]*3 + halo[5]*2 + halo[6]*1
+             =    1*4   +    0*3   +    2*2   +    0*1
+             = 8
+             (2 zero-MACs, 2 real-MACs)
+
+      out[4] = halo[4]*4 + halo[5]*3 + halo[6]*2 + halo[7]*1
+             =    0*4   +    2*3   +    0*2   +    0*1
+             = 6
+             (3 zero-MACs, 1 real-MAC)
+
+      out[5] = halo[5]*4 + halo[6]*3 + halo[7]*2 + halo[8]*1
+             =    2*4   +    0*3   +    0*2   +    0*1
+             = 8
+             (3 zero-MACs, 1 real-MAC)
+
+      Final:   y = [1, 2, 5, 8, 6, 8]    <-- matches PyTorch
+      Total MACs:     24
+      Real MACs:       8
+      Zero MACs:      16    (16/24 = 67% wasted)
+
+
+  ======================================================================
+  PIPELINE B: WHAT POLYPHASE WOULD DO INSTEAD
+  ======================================================================
+
+  STEP B1: build polyphase kernels
+  --------------------------------
+      Original kernel:  w = [1, 2, 3, 4],  S = 2
+
+      Phase 0: pick every S-th tap starting at offset 0
+          w_0 = [w[0], w[2]] = [1, 3]
+      Phase 1: starting at offset 1
+          w_1 = [w[1], w[3]] = [2, 4]
+
+      Each w_p has K_p = K / S = 2 taps.
+
+  STEP B2: pad input to T_per_phase + K_p - 1 elements
+  ----------------------------------------------------
+      T_per_phase = T_out / S = 6 / 2 = 3 outputs per phase
+      Padded length needed = T_per_phase + K_p - 1 = 3 + 1 = 4? Actually
+      we just need enough left- and right-pad so the convolution formula
+      y_p[m] = sum_{k'} x[m-k'] * w_p[k'] is well-defined for m = 0..2.
+
+      Right-pad x with one zero (the m=2 case needs x[2]):
+
+          x_padded = [1, 2, 0]    (length T + 1 = 3)
+
+      No left-pad needed in this simple case.
+
+  STEP B3: two sub-convs (each: stride=1, kernel=2, no zero interleave)
+  --------------------------------------------------------------------
+
+      PHASE 0:  y_0[m] = x_padded[m] * w_0[0] + x_padded[m-1] * w_0[1]
+                        (with x_padded[-1] = 0)
+
+          y_0[0] = x_padded[0]*1 + 0          *3 = 1*1 + 0  = 1
+                   (1 real-MAC, 1 boundary-zero-MAC)
+          y_0[1] = x_padded[1]*1 + x_padded[0]*3 = 2*1 + 1*3 = 5
+                   (2 real-MACs)
+          y_0[2] = x_padded[2]*1 + x_padded[1]*3 = 0*1 + 2*3 = 6
+                   (1 real-MAC, 1 right-pad-zero-MAC)
+
+          y_0 = [1, 5, 6]
+          Phase-0 MACs total: 6   (4 real, 2 boundary-zero)
+
+      PHASE 1:  y_1[m] = x_padded[m] * w_1[0] + x_padded[m-1] * w_1[1]
+
+          y_1[0] = x_padded[0]*2 + 0          *4 = 1*2 + 0  = 2
+                   (1 real-MAC, 1 boundary-zero-MAC)
+          y_1[1] = x_padded[1]*2 + x_padded[0]*4 = 2*2 + 1*4 = 8
+                   (2 real-MACs)
+          y_1[2] = x_padded[2]*2 + x_padded[1]*4 = 0*2 + 2*4 = 8
+                   (1 real-MAC, 1 right-pad-zero-MAC)
+
+          y_1 = [2, 8, 8]
+          Phase-1 MACs total: 6   (4 real, 2 boundary-zero)
+
+  STEP B4: interleave the two phases
+  ----------------------------------
+      Position rule: y[n] = y_p[m] where n = m*S + p
+
+          y[0] = y_0[0] = 1
+          y[1] = y_1[0] = 2
+          y[2] = y_0[1] = 5
+          y[3] = y_1[1] = 8
+          y[4] = y_0[2] = 6
+          y[5] = y_1[2] = 8
+
+      Final:   y = [1, 2, 5, 8, 6, 8]    <-- matches PyTorch
+      Total MACs:    12
+      Real MACs:      8   (same 8 useful MACs as the current approach)
+      Boundary MACs:  4   (4/12 = 33% wasted from input-pad zeros)
+
+
+  ======================================================================
+  SIDE-BY-SIDE COMPARISON
+  ======================================================================
+
+  +------------------------------+---------------------+---------------------+
+  | Quantity                     | TTNN current        | Polyphase           |
+  |                              | (halo+conv2d)       |                     |
+  +------------------------------+---------------------+---------------------+
+  | Halo buffer length           | 9 sticks            | 0 (no halo needed)  |
+  | Input pad applied            | none (input direct) | 1 zero on right     |
+  | Effective conv kernel        | 4 taps              | 2 taps (per phase)  |
+  | Number of conv passes        | 1                   | 2 (one per phase)   |
+  | Outputs computed             | 6                   | 6 (= 3 + 3)         |
+  | Total MAC operations         | 24                  | 12                  |
+  | Useful (real-x * real-w) MACs| 8                   | 8                   |
+  | Wasted (zero-multiply) MACs  | 16  (67%)           | 4   (33%)           |
+  | Coalesced read bytes         | K*in_pad*dt         | K/S*in_pad*dt       |
+  |   (4 * 16 * 4 fp32 example)  | = 256               | = 128 per phase     |
+  | Memory for activation buffer | 9 sticks            | 3 sticks            |
+  | Result                       | [1,2,5,8,6,8]       | [1,2,5,8,6,8]       |
+  | Matches PyTorch?             | YES                 | YES                 |
+  +------------------------------+---------------------+---------------------+
+
+  Even for this trivial 2-input case polyphase HALVES the MAC count.
+
+  ----------------------------------------------------------------------
+  WHY THE SAVINGS GROW WITH S
+  ----------------------------------------------------------------------
+
+  Ratio of wasted MACs in the current approach:
+
+      wasted / total  =  (S - 1) / S      asymptotically
+
+  For S = 2:    50% would be wasted (we measured 67% due to small T+K).
+  For S = 4:    75% wasted.
+  For S = 8:    87.5% wasted.
+  For S = 16:   93.75% wasted.
+  For S = 160:  99.375% wasted.   <-- our iSTFT envelope case.
+
+  Polyphase's waste is only the boundary input-pad MACs, which is
+  small and FIXED (does NOT grow with S):
+
+      polyphase_wasted  ~  S * (K_p - 1)  =  K - S
+                        ~  K
+
+  For our iSTFT case:
+      Current wasted:    ~ S/(S+1) * total  =  ~99.4% of ~10 million
+                                            =  ~10,096,640
+      Polyphase wasted:  ~ K = ~640         <<<  10,096,640
+      Reduction in wasted work: ~15,000x
+
+  ----------------------------------------------------------------------
+  BONUS: WHAT THE NoC SEES (the reason ttnn currently crashes)
+  ----------------------------------------------------------------------
+
+  Recall the NoC burst formula from note 04:
+
+      coalesced_read_bytes = K_w * in_ch_padded * dtype_size
+
+  For our tiny example (in=1 fp32 -> in_ch_padded = 16 due to alignment):
+
+      Current:    coalesced = 4 * 16 * 4 = 256 bytes   (fits)
+      Polyphase:  coalesced = 2 * 16 * 4 = 128 bytes   (fits)
+
+  For the real iSTFT envelope case:
+
+      Current:    coalesced = 640 * 16 * 4 = 40,960 bytes
+                  (exceeds NOC_MAX_BURST_SIZE = 8,192 -> static_assert,
+                   kernel does not compile, op cannot run AT ALL today.)
+
+      Polyphase:  coalesced = 4   * 16 * 4 =   256 bytes
+                  (perfectly fine -> kernel compiles -> op runs.)
+
+  So polyphase does TWO things at once:
+      (1) Eliminates the wasted zero-MACs (algorithmic win).
+      (2) Shrinks coalesced read size by factor S (hardware win that
+          incidentally side-steps the NoC limit entirely).
+
+
+  ======================================================================
+  KEY TAKEAWAY FROM THIS WORKED COMPARISON
+  ======================================================================
+
+  Both approaches are MATHEMATICALLY CORRECT and give the SAME output.
+  But the CURRENT approach pays for that correctness by:
+      - Materializing a (mostly-zero) halo buffer S times larger than
+        needed.
+      - Issuing K-tap-wide NoC bursts (which the hardware caps at 8 KB).
+      - Doing S times more multiplications than necessary.
+
+  Polyphase pays NONE of those costs. The only price is one extra
+  shuffle pass at weight-load time (one-time, cached) and one final
+  interleave pass (cheap reshape).
+
+  For S = 2 the current approach is 2x slower than polyphase.
+  For S = 160 the current approach is ~165x slower than polyphase --
+       AND will not even compile on Wormhole.
+
+  THAT is why polyphase is the right answer.
+
+
+================================================================================
+  CHAPTER 4 - PICTURE: WHAT GETS REPLACED IN THE CODE
+================================================================================
+
+  Here's the current pipeline (from notes 01, 03):
+
+         ttnn.conv_transpose2d(x, w, stride=160, kernel=640, ...)
+           |
+           v
+         [A] determine_conv_config_for_auto_shard            <-- keep
+           |
+           v
+         [B] shard_or_reshard_tensor_if_required              <-- keep
+           |
+           v
+         [C] transform_weights_for_conv_transpose2d           <-- REPLACE
+                (mirror + IOHW->OIHW + tile)                      with polyphase
+                                                                  weight shuffle
+           |
+           v
+         [D] sliding_window_config (is_transpose=true)        <-- REPLACE
+                                                                  with S normal
+                                                                  configs
+           |
+           v
+         [E] halo(input, ...is_transpose=true...)             <-- REPLACE
+                produces 16,479-stick buffer with                 with simple
+                15,201 zeros + 1,278 pad zeros                    zero-pad of x
+                = 99.4% zeros
+           |
+           v
+         [F] prim::conv2d(halo_out, weight, k=1x640, ...)     <-- REPLACE
+                Reader does 40,960-byte bursts                    with S calls to
+                (FAILS: > 8 KB NoC limit).                        prim::conv2d
+                Total MACs: 10,158,080                            with k=1x4 each
+                (Most are 0 * something.)                         Total MACs: 61,440
+           |
+           v
+         output                                               <-- ADD
+                                                                  output interleave
+                                                                  pass
+
+  So three pieces get replaced:
+
+      [C] -- new weight shuffle that builds the S polyphase kernels.
+      [D] -- one transpose SlidingWindowConfig becomes S normal ones.
+      [E] -- halo (with is_transpose) becomes a simple pad-only halo.
+      [F] -- one huge conv2d becomes S tiny conv2ds.
+
+  And one piece is added:
+      OUTPUT INTERLEAVE -- a cheap pass that gathers the S phase
+      outputs and stripes them into the final output.
+
+  Three pieces are KEPT untouched:
+      [A] auto-shard heuristic (works fine for the sub-convs).
+      [B] tensor sharding into L1.
+      The conv2d device op itself (reused as-is for the sub-convs).
+
+
+================================================================================
+  CHAPTER 5 - THE ALGORITHM, STEP BY STEP
+================================================================================
+
+  Given: x [B, H=1, W=T, C_in], w [C_in, C_out, 1, K], stride S, padding P.
+
+  POLYPHASE EXECUTION:
+
+  STEP 1: WEIGHT SHUFFLE (host-side, one-time per layer)
+      for p in 0 .. S-1:
+          K_p = ceil((K - p) / S)
+          w_p = empty [C_in, C_out, 1, K_p]
+          for k' in 0 .. K_p - 1:
+              w_p[:, :, 0, k'] = w[:, :, 0, k'*S + p]
+
+      Note: this can be done once and cached per weight pointer
+      (see notes/07_..., section 7.1).
+
+  STEP 2: INPUT PADDING (cheap)
+      Pad x with appropriate zeros to make each phase produce
+      T_out / S outputs:
+          pad_amount = K_p - 1 + (extra for boundary alignment)
+          x_padded = ttnn.pad(x, (pad_left, pad_right))
+
+      For most cases pad_left = 0 and pad_right = ceil(K/S) - 1.
+      Match PyTorch exactly with the boundary formula:
+          T_per_phase = (T_out + S - 1) / S
+          right_pad   = T_per_phase - 1 - T + K_p
+
+  STEP 3: S SUB-CONVOLUTIONS (parallel, reuses prim::conv2d)
+      for p in 0 .. S-1:
+          y_p = ttnn::prim::conv2d(
+                    x_padded, w_p,
+                    kernel = 1 x K_p,
+                    stride = 1,
+                    padding = 0,
+                    ...)
+      (These S calls can be batched into a single device op by
+       concatenating phases along the batch or channel axis. See
+       Chapter 8 for the batching trick.)
+
+  STEP 4: INTERLEAVE OUTPUTS (cheap)
+      Output y has shape [B, H=1, W=T_out, C_out].
+      For each (b, n, c):
+          n = m*S + p
+          y[b, 0, n, c] = y_p[b, 0, m, c]
+      Implemented as a single reshape + transpose:
+          stack y_0..y_{S-1} along a new axis     -> [B, T_per_phase, S, C_out]
+          flatten the (T_per_phase, S) axes        -> [B, T_per_phase*S, C_out]
+          slice to the requested T_out             -> [B, T_out, C_out]
+      No real data movement on Tenstorrent if the phases were already
+      computed sharded along the right axis.
+
+
+================================================================================
+  CHAPTER 6 - NUMBERS: BEFORE vs AFTER for iSTFT ENVELOPE
+================================================================================
+
+  Parameters: in=1, out=1, K=640, stride=160, T=96, fp32.
+
+  +---------------------------+--------------------+--------------------+
+  | Quantity                  | Current (halo+conv)| Polyphase          |
+  +---------------------------+--------------------+--------------------+
+  | Sub-convolutions          | 1                  | 160                |
+  | Effective kernel each     | 640                | 4                  |
+  | Effective stride each     | 1 (post-halo)      | 1                  |
+  | Total real MACs           | 10,158,080         | 61,440             |
+  | Wasted MACs (x * 0)       | 10,096,640         | 0                  |
+  | Halo buffer (sticks)      | 16,479 (~99% zero) | 99 (~3% pad)       |
+  | L1 per core (activations) | ~5 KB              | ~50 bytes          |
+  | Coalesced read bytes      | 40,960 (> 8 KB)    | 256 (< 8 KB)       |
+  | Reader compiles?          | NO                 | YES                |
+  | Cores doing real work     | 3 of 62            | up to 64           |
+  | NoC traffic               | huge (zero sticks) | tiny (real only)   |
+  | Speedup vs current        | 1x (baseline)      | ~100-200x          |
+  +---------------------------+--------------------+--------------------+
+
+  Why "100-200x" instead of just "165x"?
+      Pure MAC count says 165x. But polyphase ALSO removes the:
+          - L1 pressure -> larger act_block_h -> better tile reuse
+          - NoC traffic -> less stalling on data movement
+          - Halo overhead -> no zero-stick gathers
+      So end-to-end speedup is typically larger than the MAC-only
+      ratio. A conservative range is 100-200x.
+
+
+================================================================================
+  CHAPTER 7 - WHAT GETS REPLACED LINE-BY-LINE  (precise code map)
+================================================================================
+
+  Edits centered in:
+      ttnn/cpp/ttnn/operations/conv/conv_transpose2d/conv_transpose2d.cpp
+      ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp
+
+  -------------------------------------------------------------------
+  EDIT 1: New detection function
+  -------------------------------------------------------------------
+  In conv_transpose2d.cpp, near `determine_conv_transpose2d_execution_path`:
+
+      enum class ConvT2dExecutionPath {
+          L1,
+          DRAM,
+          POLYPHASE,        // NEW
+      };
+
+      bool is_polyphase_friendly(
+          const std::array<uint32_t,2>& kernel,
+          const std::array<uint32_t,2>& stride,
+          uint32_t in_channels,
+          uint32_t input_width,
+          uint32_t output_width) {
+          // Heuristic: large stride relative to kernel, tiny channels,
+          // big enough output to amortize the per-phase overhead.
+          const uint32_t S = stride[1];
+          const uint32_t K = kernel[1];
+          return S > 1
+              && K >= 4 * S
+              && in_channels <= 32
+              && output_width >= 16 * S;
+      }
+
+  In `conv_transpose2d` (the dispatcher), add the early branch:
+
+      if (is_polyphase_friendly(kernel_size, stride, in_channels,
+                                input_width, output_width)) {
+          return conv_transpose2d_POLYPHASE(...);
+      }
+
+  -------------------------------------------------------------------
+  EDIT 2: New file conv_transpose2d_polyphase.cpp/hpp
+  -------------------------------------------------------------------
+
+  Public function:
+      Tensor conv_transpose2d_POLYPHASE(
+          const Tensor& input,
+          const Tensor& weight,
+          MeshDevice* device,
+          /* same args as conv_transpose2d_L1 */);
+
+  Internals:
+      1. Compute dimensions: K_p = (K + S - 1) / S, T_per_phase = ...
+      2. Build polyphase weights:
+             weights_polyphase = shuffle_weights_polyphase(weight, S)
+         Shape: [S, in, out, 1, K_p]
+      3. Pad input on host or via ttnn::pad:
+             x_padded = ttnn::pad(input, pad_top=0, pad_bot=0,
+                                  pad_left=0, pad_right=K_p-1)
+      4. Run S sub-convs (Chapter 8 discusses how to batch them).
+      5. Interleave outputs -> final tensor.
+
+  -------------------------------------------------------------------
+  EDIT 3: Weight shuffle in prepare_conv_transpose2d_weights
+  -------------------------------------------------------------------
+
+  Add new function alongside `transform_weights_for_conv_transpose2d`:
+
+      Tensor shuffle_weights_polyphase(const Tensor& weight, uint32_t S);
+
+  Behavior:
+      weight in:    [in, out, K_h=1, K]
+      weight out:   [in, out, K_h=1, K_p] x S   (or stacked along channels)
+
+  -------------------------------------------------------------------
+  EDIT 4: Output interleave
+  -------------------------------------------------------------------
+
+  Either:
+      (a) Use existing ttnn::reshape + transpose + slice, OR
+      (b) Write a tiny dedicated kernel that copies S phase outputs
+          into one strided buffer.
+
+  Option (a) is fine for a first pass; option (b) is a perf
+  refinement.
+
+  -------------------------------------------------------------------
+  EDIT 5: Pythonic wiring (none required!)
+  -------------------------------------------------------------------
+  Because polyphase lives inside `ttnn::conv_transpose2d`, the Python
+  API is UNCHANGED. The user's existing test:
+
+      pytest.param(1, 1, 640, 160, 96, False, id="istft_envelope")
+
+  starts passing automatically once the detector fires.
+
+
+================================================================================
+  CHAPTER 8 - HOW TO RUN ALL S SUB-CONVS EFFICIENTLY
+================================================================================
+
+  Naive approach: launch S separate prim::conv2d calls. Works but has
+  S times the host overhead.
+
+  Better approaches:
+
+  -----------------
+  Option A: "Batch trick"
+  -----------------
+  Reshape so that the S phases become the BATCH dimension. Then one
+  conv2d call processes all phases in parallel:
+
+      x_batched      shape  [B*S, H=1, W=T_padded, C_in]
+                            (broadcast x across the S batch slots)
+      w_batched      shape  [in, out*S, 1, K_p]
+                            (concatenate the S polyphase kernels
+                             along out-channels; not quite right for
+                             true per-phase outputs but close)
+
+  Caveat: PyTorch-style "grouped" semantics may be cleaner. Use
+  groups = S to keep phases independent:
+      x_grouped      shape  [B, H=1, W=T_padded, C_in * S]
+                            (replicate x across the S groups)
+      w_grouped      shape  [C_in * S, out, 1, K_p]
+      conv (groups=S)
+      output         shape  [B, H=1, W_phase, out * S]
+
+  Then a reshape from [..., out*S] to [..., out, S] gives you the per-
+  phase outputs in one shot, ready to interleave.
+
+  -----------------
+  Option B: "Phase-as-channel"
+  -----------------
+  Pack the S phases into the channel axis directly. This is what cuDNN
+  does internally for its native transpose-conv path. Works best when
+  out_channels is small.
+
+  -----------------
+  Option C: "Independent launches with async streams"
+  -----------------
+  Easier to debug, slightly slower. Use it for the first prototype.
+
+
+================================================================================
+  CHAPTER 9 - EDGE CASES YOU MUST HANDLE
+================================================================================
+
+  Edge case                          | Polyphase response
+  -----------------------------------+---------------------------------------
+  S does not divide K                | K_p varies per phase: K_p = ceil((K-p)/S)
+                                     | Some phases have K_p, some K_p - 1.
+                                     | Handle by max-K_p kernel with explicit
+                                     | zero-padding inside the last tap, OR
+                                     | by running phases of different sizes.
+  -----------------------------------+---------------------------------------
+  padding > 0                        | Subtract padding from output positions
+                                     | before/after interleave (standard
+                                     | conv-transpose accounting).
+  -----------------------------------+---------------------------------------
+  output_padding > 0                 | Append that many trailing positions in
+                                     | the interleave step (filled per
+                                     | PyTorch convention).
+  -----------------------------------+---------------------------------------
+  dilation_w > 1                     | Substitute "effective kernel" K_eff
+                                     | = (K-1)*dilation + 1 in the math.
+                                     | Polyphase indices become
+                                     | w_p[k'] = w[k'*S + (p / dilation)].
+  -----------------------------------+---------------------------------------
+  groups > 1                         | Run polyphase independently per group.
+  -----------------------------------+---------------------------------------
+  H > 1 (true 2D transpose)          | Apply polyphase per spatial axis. For
+                                     | stride (S_h, S_w) decomposition you get
+                                     | S_h * S_w phases. Each is a normal 2D
+                                     | conv with kernel (K_h/S_h, K_w/S_w).
+  -----------------------------------+---------------------------------------
+  bias                               | Add bias once at the end (after
+                                     | interleave). Could also add to each
+                                     | sub-conv divided by S; same result.
+  -----------------------------------+---------------------------------------
+  mirror_kernel = True               | Apply the mirror to w BEFORE the
+                                     | polyphase shuffle.
+  -----------------------------------+---------------------------------------
+  Small K relative to S              | K < S means some phases have K_p = 0.
+                                     | Skip those phases (they output zeros).
+
+
+================================================================================
+  CHAPTER 10 - HOW TO VERIFY CORRECTNESS
+================================================================================
+
+  Test plan:
+
+      1. Unit test against PyTorch F.conv_transpose1d for:
+          - K = 640, S = 160, T = 96  (iSTFT envelope)
+          - K = 640, S = 160, T = 96, C_in = 321  (iSTFT cos/sin)
+          - K = 4,   S = 2,   T = 16, C_in = 8    (small_k4_s2_T16)
+          - K = 8,   S = 4,   T = 32                  (small_k8_s4_T32)
+          - K = 16,  S = 8,   T = 32                  (envelope_like)
+          - Random shapes with S | K (clean) and S |/ K (messy boundary)
+
+      2. PCC threshold: > 0.9999 for fp32, > 0.999 for bf16.
+
+      3. Boundary test: ensure the FIRST and LAST output samples of
+         each phase match PyTorch (boundary handling is the most
+         common bug source).
+
+      4. Compare not just shapes but exact values for small cases.
+
+      5. Hold-out test: an actual iSTFT against torchaudio's iSTFT
+         on a real audio waveform. Ensure SNR > 80 dB.
+
+
+================================================================================
+  CHAPTER 11 - WHY NOT JUST PRE-COMPUTE THE WEIGHT REORDER ON HOST?
+================================================================================
+
+  You could shuffle the weights at the Python level and call ttnn.conv2d
+  S times manually. That works (~10 lines of Python).
+
+  However:
+      - It pushes the responsibility to every caller.
+      - It defeats halo's coalescing for the sub-convs.
+      - It does not exploit batching (Chapter 8).
+
+  Putting polyphase INSIDE ttnn::conv_transpose2d means:
+      - Every existing caller of conv_transpose2d benefits with no
+        code change.
+      - Auto-detect ensures no surprise: small/normal shapes still
+        use the existing path.
+      - Tightly integrated -> can batch the S sub-convs efficiently
+        (Option A in Chapter 8).
+      - Weight shuffle is cached across calls.
+
+
+================================================================================
+  CHAPTER 12 - HISTORICAL CONTEXT  (why every audio library does this)
+================================================================================
+
+  Polyphase decomposition for resampling and transpose convolution is
+  THE standard technique in:
+
+      * DSP textbooks (Crochiere & Rabiner, 1983 -- foundational).
+      * MATLAB's `upfirdn` function.
+      * scipy.signal.upfirdn / resample_poly.
+      * torchaudio.functional.fftconvolve and ISTFT.
+      * cuDNN's internal conv transpose for large strides.
+      * Every voice-cloning / TTS vocoder (HiFi-GAN, MelGAN, WaveRNN).
+
+  TT-Metal is one of the few accelerator stacks that does NOT yet
+  exploit this for transpose conv. Adding it puts us in line with
+  the rest of the ecosystem and unlocks the ~50% of "transpose conv"
+  workloads that have large stride.
+
+
+================================================================================
+  CHAPTER 13 - EFFORT ESTIMATE  (concrete plan)
+================================================================================
+
+  Milestone                                         | Effort
+  --------------------------------------------------+--------------
+  P1.1  Add detection function                      | 1 day
+  P1.2  Implement weight polyphase shuffle (host)   | 3 days
+  P1.3  Wire pad + S parallel conv2ds (naive)       | 1 week
+  P1.4  Output interleave via reshape+transpose     | 2 days
+  P1.5  Pass small_k* tests                         | 2 days
+  P1.6  Pass iSTFT envelope test (PCC)              | 3 days
+  --------------------------------------------------+--------------
+  P2.1  Batch the S sub-convs (Option A grouped)    | 1 week
+  P2.2  Dedicated interleave kernel                 | 1 week
+  P2.3  Edge cases: padding, output_padding,        |
+              dilation, groups, mirror_kernel       | 1 week
+  P2.4  2D transpose (apply per-axis polyphase)     | 2 weeks
+  --------------------------------------------------+--------------
+  P3    Tune detector thresholds, regression suite  | 2 weeks
+        across all shape categories
+  --------------------------------------------------+--------------
+  TOTAL  end-to-end                                 | ~8 weeks
+
+  This brings ttnn.conv_transpose2d to a "competitive with cuDNN /
+  XLA polyphase" state.
+
+
+================================================================================
+  CHAPTER 14 - SUMMARY  (the one-page sales pitch)
+================================================================================
+
+   WHAT      polyphase decomposition turns ONE transpose conv with
+             stride S into S NORMAL convs with kernel K/S.
+   WHY       eliminates the (S-1)/S fraction of MACs that the current
+             approach wastes multiplying by interleaved zeros.
+   REPLACES  [C] weight prep (different shuffle)
+             [D] sliding-window config (S normal ones, no is_transpose)
+             [E] halo (no zero interleave needed -- simple pad-only)
+             [F] one huge conv2d (S tiny conv2ds)
+   ADDS      output interleave pass (cheap, reshape-only)
+   KEEPS     auto-shard, sharding, prim::conv2d kernel, Python API
+   GAIN      for iSTFT envelope: 165x fewer MACs, unblocks NoC limit,
+             100-200x end-to-end.
+   EFFORT    ~8 weeks for a complete production-quality implementation.
+             First passing test in ~2 weeks.
+
+================================================================================
+  END OF FILE
+================================================================================

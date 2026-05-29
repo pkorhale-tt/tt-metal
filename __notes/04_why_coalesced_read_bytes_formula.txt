@@ -1,0 +1,443 @@
+================================================================================
+  WHY  coalesced_read_bytes = K_w  *  in_ch_padded  *  dtype_size
+  Deep dive on the conv2d reader's NoC burst formula and why it caps at 8 KB.
+================================================================================
+
+  Audience: Same as the rest of the notes. You already know what halo,
+            sharding, and a Tensix core are.
+  Goal:     Explain - line by line - why this exact formula exists and
+            why it explodes for the iSTFT envelope case.
+
+
+================================================================================
+  CHAPTER 1 — THE EXACT LINE IN THE CODE
+================================================================================
+
+  The formula lives in every conv2d activation reader kernel. Example:
+
+  File:
+    ttnn/cpp/ttnn/operations/conv/conv2d/device/kernels/
+    reader_writer_tiled_out_1d_mcast_sender_conv_weights_tiled_col_to_rm_blocks.cpp
+
+      constexpr uint32_t stride_w_bytes = dilation_w * conv_act_c_read_bytes;
+      constexpr uint32_t coalesced_read_bytes =
+          ((dilation_w == 1) ? weight_size_w * conv_act_c_read_bytes
+                             : conv_act_c_read_bytes);
+
+  In words:
+
+      if dilation_w == 1:
+          coalesced_read_bytes = weight_size_w * conv_act_c_read_bytes
+      else:
+          coalesced_read_bytes = conv_act_c_read_bytes
+
+  Decoding the symbols:
+
+      weight_size_w        = K_w  (kernel width)
+      conv_act_c_read_bytes = bytes for ONE stick
+                            = in_channels_padded * dtype_size
+
+  So the practical formula in the dilation_w == 1 case (i.e. the normal
+  case for both conv2d and conv_transpose2d):
+
+      coalesced_read_bytes = K_w * in_channels_padded * dtype_size
+
+  That is the formula we keep referring to.
+
+
+================================================================================
+  CHAPTER 2 — WHAT EACH FACTOR MEANS GEOMETRICALLY
+================================================================================
+
+  A picture says it best. Take this conv:
+      kernel_h = 1, kernel_w = 4, stride_w = 1, in_channels = 8, fp16.
+
+  Conceptually each output stick is computed by sliding a 1x4 window over
+  the activation tensor (post-halo). The window is:
+
+       window
+       <----  K_w = 4  ---->
+      +-----+-----+-----+-----+
+      | s_j | s_j+1| s_j+2| s_j+3|     <- 4 contiguous sticks in W direction
+      +-----+-----+-----+-----+
+        |     |     |     |
+        v     v     v     v
+      8-channel  8-channel etc.       <- each stick has C channels
+      vector     vector
+
+  Sizes:
+      one stick   = in_channels_padded * dtype_size
+                  = 8 * 2 = 16 bytes        (fp16)
+      whole window= K_w sticks
+                  = 4 * 16 = 64 bytes
+
+  The reader's whole reason to exist is to copy that 64-byte block from
+  the halo'd activation buffer (in some core's L1) into the local
+  circular buffer that feeds the math engine.
+
+  THE THREE FACTORS:
+
+      K_w
+          How many sticks tall the window is along W.
+          In transpose conv we run with K_w unchanged (stride is what
+          changes). For iSTFT envelope: K_w = 640 sticks.
+
+      in_channels_padded
+          How wide each stick is in the channel direction, AFTER any
+          alignment padding. For C=1 fp32, alignment forces this up
+          to 16 channels. For C=8 fp16, alignment is already met.
+
+      dtype_size
+          Bytes per channel value. 2 for fp16/bf16, 4 for fp32, 1 for u8.
+
+  Multiplying them gives the byte count of ONE coalesced read.
+
+
+================================================================================
+  CHAPTER 3 — WHY THE READER COALESCES IN THE FIRST PLACE
+================================================================================
+
+  Why not do K_w separate one-stick reads? Because NoC reads have
+  per-transaction overhead (header bytes, address setup, latency). Doing
+  one big burst is dramatically faster than many small ones.
+
+  Per-burst cost model (simplified):
+      time(burst) = ALPHA + BETA * size_bytes
+      ALPHA = fixed overhead (large)
+      BETA  = per-byte cost (small)
+
+  Two strategies for K_w = 4 sticks of 16 bytes:
+
+      A. Many small reads (4 transactions):
+             cost = 4 * (ALPHA + 16 * BETA) = 4*ALPHA + 64*BETA
+
+      B. One coalesced read (1 transaction):
+             cost = 1 * (ALPHA + 64 * BETA) =   ALPHA + 64*BETA
+
+      Difference = 3 * ALPHA. Big savings when ALPHA dominates.
+
+  The reader exploits the fact that the K_w sticks of one window are
+  CONTIGUOUS in memory (because halo laid out the activation in
+  ROW_MAJOR for exactly this reason). So they CAN be coalesced into one
+  burst.
+
+  Picture of memory layout post-halo (1 row of W direction):
+
+      stick_0  stick_1  stick_2  stick_3  stick_4 ... stick_(W-1)
+      [c0..c_C-1] [c0..c_C-1] [c0..c_C-1] [c0..c_C-1]  ...
+      ^                                            ^
+      |                                            |
+      |   contiguous K_w sticks = one burst        |
+      +--------------------------------------------+
+
+  This is also why ttnn's halo always outputs in ROW_MAJOR (not TILE):
+  contiguity is essential for coalescing.
+
+
+================================================================================
+  CHAPTER 4 — WHY in_channels_padded INSTEAD OF in_channels
+================================================================================
+
+  The L1 alignment on Wormhole is 16 bytes. NoC transactions also
+  prefer aligned starts. So the reader pads `in_channels` up to keep
+  every stick start aligned.
+
+  See conv2d_utils.cpp::get_input_channels_alignment:
+
+      For fp16/bf16 the smallest valid alignment is 8 channels
+          (8 * 2 bytes = 16 bytes  -> one L1 word).
+      For fp32       the smallest valid alignment is 4 channels
+          (4 * 4 bytes = 16 bytes).
+      But the conv reader actually uses TILE_WIDTH (32) when the shard
+      width is tile-multiple, and falls back to 16 / 8 only otherwise.
+
+  Concrete examples of in_channels_padded:
+
+      C_in = 1   fp32  -> padded to 16   (a whole tile's worth, since
+                                          1 channel is so tiny)
+      C_in = 1   fp16  -> padded to 16
+      C_in = 8   fp16  -> stays 8
+      C_in = 8   fp32  -> padded to 16   (tile alignment kicks in)
+      C_in = 32  fp16  -> stays 32       (tile-multiple)
+      C_in = 64  fp32  -> stays 64
+
+  WHY this matters for the iSTFT envelope case:
+
+      You have C_in = 1 with fp32. The math only needs 4 bytes per stick.
+      But the reader reads 16 channels worth = 64 bytes per stick (the
+      other 15 channels are zero padding). That's a 16x inflation.
+
+      For the burst calculation:
+          coalesced_read_bytes = 640 * 16 * 4
+                               = 640 * 64
+                               = 40,960 bytes      (huge!)
+
+      Without channel padding it would have been:
+          coalesced_read_bytes = 640 * 1 * 4 = 2,560 bytes  (would fit)
+
+  This is why "tiny channels + huge kernel" is uniquely painful.
+
+
+================================================================================
+  CHAPTER 5 — THE NOC HARDWARE LIMIT (8 KB per burst on Wormhole)
+================================================================================
+
+  Hardware spec from
+      tt_metal/hw/inc/internal/tt-1xx/wormhole/noc/noc_parameters.h:
+
+      NOC_PAYLOAD_WIDTH    = 256 bits          (NoC bus width)
+      NOC_WORD_BYTES       = 256 / 8 = 32 bytes (one "NoC word")
+      NOC_MAX_BURST_WORDS  = 256
+      NOC_MAX_BURST_SIZE   = 256 * 32 = 8192 bytes
+
+  Why is there a per-burst cap at all?
+
+      The NoC routes a burst as a single packet. Each packet has a
+      header that includes a length field. That field is finite. On
+      Wormhole the cap is 8 KB. On Blackhole it is larger. On other
+      generations it varies.
+
+      The hardware cannot start a transfer larger than 8 KB. A request
+      that asks for more is illegal. The kernel catches it at COMPILE
+      time with a static_assert so you don't end up with corrupt reads
+      at runtime.
+
+  Where the assert lives (conceptually; exact line varies):
+
+      static_assert(coalesced_read_bytes <= NOC_MAX_BURST_SIZE,
+                    "Conv reader burst exceeds NOC_MAX_BURST_SIZE.");
+
+  Failure mode for the iSTFT envelope case:
+
+      coalesced_read_bytes = 40,960
+      NOC_MAX_BURST_SIZE   =  8,192
+
+      40,960 > 8,192       -> static_assert fails -> kernel does not
+      compile -> test errors out before any program runs.
+
+
+================================================================================
+  CHAPTER 6 — A WORKING CASE vs A FAILING CASE, SIDE BY SIDE
+================================================================================
+
+  Use the "small" passing test from your test file:
+
+      pytest.param(8, 8, 4, 2, 16, True, id="small_k4_s2_T16_bias")
+
+  Mapped:
+      in_channels       = 8
+      kernel_size (K_w) = 4
+      stride            = 2 (irrelevant for the burst formula)
+      dtype             = fp32 in your test (4 bytes)
+
+  Compute coalesced_read_bytes:
+
+      in_channels_padded = max(8, alignment) = 16  (TILE for fp32 = 16
+                                                    when shard_w is
+                                                    tile-multiple)
+      coalesced_read_bytes = K_w * in_channels_padded * dtype_size
+                           = 4 * 16 * 4
+                           = 256 bytes      <- tiny, fits easily.
+
+  Now the iSTFT envelope:
+
+      in_channels  = 1
+      K_w          = 640
+      dtype        = fp32
+
+      in_channels_padded   = 16     (alignment forces it up)
+      coalesced_read_bytes = 640 * 16 * 4 = 40,960 bytes   <- 5x over.
+
+  And the iSTFT cos/sin case (in=321, out=1):
+
+      in_channels = 321 (rounded up to next multiple of 32 = 352?
+                         depends on shard alignment; conservatively use 352)
+      K_w         = 640
+      dtype       = fp32
+
+      coalesced_read_bytes = 640 * 352 * 4 = 901,120 bytes  <- 110x over.
+      Even worse.
+
+  In ALL the failing cases the culprit is the same: a very large K_w
+  multiplied by something that is not tiny, blowing past 8 KB.
+
+
+================================================================================
+  CHAPTER 7 — WHAT EACH ASSEMBLY-LEVEL READ ACTUALLY DOES
+================================================================================
+
+  Inside the read loop (see read_kernel_w in conv_reader_common.hpp):
+
+      template <uint32_t coalesced_read_bytes, uint32_t stride_h_bytes>
+      FORCE_INLINE void read_kernel_w(experimental::Noc noc,
+                                      uint32_t& l1_write_addr_act,
+                                      uint32_t& act_l1_offset) {
+          experimental::read_with_state(noc, l1_write_addr_act, act_l1_offset);
+          l1_write_addr_act += coalesced_read_bytes;
+          act_l1_offset    += stride_h_bytes;
+      }
+
+  Per call this issues ONE NoC read of size `coalesced_read_bytes`.
+  The destination pointer advances by that many bytes (so the next
+  read appends to the same buffer).
+
+  Picture of one call's effect:
+
+      BEFORE:
+        L1 write pointer:  ----v
+        L1 buffer:         | ... |             |             |
+                                ^
+        Source addr:    *======== K_w sticks contiguous =========*
+                        (in halo'd activation, somewhere in L1
+                         on this core or a neighbor's core)
+
+      AFTER one read_kernel_w:
+        L1 write pointer:                     ----v
+        L1 buffer:         | ... | KKKKKKKKKKKKKK |       |
+                                  ^^^^^^^^^^^^^^^
+                                  exactly coalesced_read_bytes copied
+
+  With kernel_h > 1, the reader calls read_kernel_w `weight_size_h`
+  times per output stick, each with a different `act_l1_offset`
+  (advanced by stride_h_bytes between calls).
+
+  Total bytes per output stick ~= K_h * coalesced_read_bytes.
+
+
+================================================================================
+  CHAPTER 8 — WHY DILATION_W != 1 TAKES A DIFFERENT PATH
+================================================================================
+
+  Look at the formula again:
+
+      constexpr uint32_t coalesced_read_bytes =
+          ((dilation_w == 1) ? weight_size_w * conv_act_c_read_bytes
+                             : conv_act_c_read_bytes);
+
+  When dilation_w > 1, the K_w sticks of the window are NOT contiguous
+  in memory. They are spaced (dilation_w * stick_size) bytes apart.
+
+  Picture (K_w=4, dilation_w=2):
+
+      [s0][s1][s2][s3][s4][s5][s6]
+       ^       ^       ^       ^
+       |       |       |       |
+       window samples (every 2nd stick)
+
+  You CANNOT coalesce these into one burst because there are gaps
+  containing other data.
+
+  So the kernel falls back to ONE STICK PER READ:
+      coalesced_read_bytes = conv_act_c_read_bytes
+      (and an inner loop issues K_w * dilation_w reads instead.)
+
+  This is much slower per stick, but each read is small so you do not
+  hit the 8 KB cap. There is a perf vs correctness trade-off here.
+
+
+================================================================================
+  CHAPTER 9 — THE FULL FORMULA WITH OPTIMIZATIONS (advanced)
+================================================================================
+
+  In the more sophisticated reader template
+  `read_image_row_window_with_reuse` you'll see another variable:
+
+      constexpr uint32_t outer_coalesced_read_bytes =
+          (window_outer - 1) * coalesced_read_bytes;
+
+  This handles a window-reuse optimization: when consecutive output
+  sticks within the same image row share a lot of input, the reader
+  copies the SHARED part once (size = outer_coalesced_read_bytes) and
+  then reads only the NEW kernel column needed for the next output.
+
+  In other words there are two coalesced sizes in play in some kernels:
+
+      coalesced_read_bytes        = K_w * conv_act_c_read_bytes
+      outer_coalesced_read_bytes  = (window_outer - 1) * coalesced_read_bytes
+                                   ~ for the reused part across output sticks
+
+  Both must individually be <= NOC_MAX_BURST_SIZE.
+
+  And there is a related helper `act_block_w_extra_align_bytes` (passed
+  to the reader from the program factory) that pads to keep the
+  activation-block-w boundary aligned. That can add a few bytes per
+  copy, but it does not change the dominant K_w * channels term.
+
+  Bottom line: the back-of-envelope formula `K_w * in_ch_padded * dtype`
+  is accurate to first order. All other terms either equal it (the
+  per-stick base) or are small alignment fudges.
+
+
+================================================================================
+  CHAPTER 10 — KNOBS YOU CAN TURN TO MAKE A FAILING CASE FIT
+================================================================================
+
+  Given:
+      coalesced_read_bytes = K_w * in_channels_padded * dtype_size
+
+  To squeeze under NOC_MAX_BURST_SIZE = 8192 you can attack each factor:
+
+      A. Reduce K_w (kernel width)
+         - Can't change the model, but you CAN slice the kernel
+           dimension across multiple conv ops (K_w_eff per call < K_w).
+         - The ttnn knob `act_block_w_div` splits the K dimension into
+           chunks for the reader.
+
+      B. Reduce in_channels_padded
+         - Hard for C_in = 1 because alignment forces it to 16.
+         - Sometimes you can artificially pack channels to avoid the
+           padding penalty. Not common.
+         - Pick a dtype with bigger channel coverage at the same byte
+           count (bf16 packs 2 channels in 4 bytes vs fp32's 1).
+
+      C. Reduce dtype_size
+         - Use bf16 (2 bytes) instead of fp32 (4 bytes) when accuracy
+           allows. For iSTFT this halves the burst.
+
+      D. Force dilation_w > 1 (NOT useful for transpose conv, but
+         possible for a reformulated op).
+
+      E. Use the DRAM slicing path in conv_transpose2d instead of L1.
+         Each slice has a smaller K_w_eff that fits in L1 -> the reader
+         per-slice is smaller too.
+
+  For the iSTFT envelope (C=1 fp32 K=640) only A or C realistically
+  help. Switching the test to bf16 halves the burst:
+
+      bf16: 640 * 16 * 2 = 20,480 bytes      (still over 8 KB, but
+                                              2.5x instead of 5x)
+
+  Both bf16 and a kernel-split would be needed to make it fit. That is
+  why the test docstring marks it xfail.
+
+
+================================================================================
+  CHAPTER 11 — RECAP
+================================================================================
+
+  The formula
+      coalesced_read_bytes = K_w * in_channels_padded * dtype_size
+  is the size of ONE NoC burst that the conv2d reader issues to copy a
+  full kernel-window worth of contiguous activation sticks from the
+  halo'd buffer into the math-engine input CB.
+
+  Each multiplicand is non-negotiable:
+      K_w                  comes from the model (kernel width).
+      in_channels_padded   comes from L1 alignment + tile rules.
+      dtype_size           comes from the chosen precision.
+
+  The 8 KB cap comes from the NoC hardware (NOC_MAX_BURST_SIZE on
+  Wormhole = 256 NoC words * 32 bytes/word).
+
+  Coalescing exists because per-burst overhead would otherwise dominate
+  and tank performance. The reader trades one big read for many small
+  reads.
+
+  When the formula exceeds 8 KB the kernel does not compile and you
+  see static_assert failures. The fix is to attack any of the three
+  factors above (kernel width, channel padding, dtype size) or to use
+  the DRAM-slicing path that keeps each per-slice K_w smaller.
+
+================================================================================
+  END OF FILE
+================================================================================

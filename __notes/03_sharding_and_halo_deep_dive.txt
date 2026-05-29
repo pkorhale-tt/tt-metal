@@ -1,0 +1,591 @@
+================================================================================
+  SHARDING + HALO — THE TWO IDEAS THAT MAKE TT-METAL CONVS WORK
+  Deep dive with lots of ASCII diagrams.
+================================================================================
+
+  Goal of this file:
+      Forget about ttnn for a moment. Just understand the two ideas that
+      make ALL conv-style ops on Tenstorrent fast:
+
+        (1) SHARDING  -- how a tensor is split across many cores.
+        (2) HALO      -- how cores cooperate at the boundaries.
+
+      We will draw EVERYTHING. By the end you will be able to look at any
+      conv2d or conv_transpose2d call and immediately picture in your head
+      what each core holds, what each core reads, and what each core writes.
+
+  Reading order:
+      Chapter 1 -> The chip and its grid of cores.
+      Chapter 2 -> What "sharding" means and the three flavors.
+      Chapter 3 -> How sticks get distributed (the actual math).
+      Chapter 4 -> The "boundary problem" that breaks naive sharding.
+      Chapter 5 -> Halo: definition, the three jobs it does.
+      Chapter 6 -> Halo's three jobs drawn step-by-step.
+      Chapter 7 -> Halo for transpose conv (the zero-interleave magic).
+      Chapter 8 -> Worked mini-example you can trace by hand.
+      Chapter 9 -> The iSTFT case scaled up (62 cores, K=640).
+      Chapter 10 -> Edge cases, anti-patterns, and rules of thumb.
+
+================================================================================
+  CHAPTER 1 — THE CHIP IS A GRID OF CORES
+================================================================================
+
+  Wormhole (and Blackhole) compute is laid out as an X-by-Y grid of Tensix
+  cores. Wormhole is 8x8 = 64 compute cores.
+
+      Top-down view of compute grid (x = column, y = row):
+
+         x=0   x=1   x=2   x=3   x=4   x=5   x=6   x=7
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+   y=0 |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+   y=1 |  8  |  9  | 10  | 11  | 12  | 13  | 14  | 15  |
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+   y=2 | 16  | 17  | 18  | 19  | 20  | 21  | 22  | 23  |
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+   y=3 | 24  | 25  | 26  | 27  | 28  | 29  | 30  | 31  |
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+   y=4 | 32  | 33  | 34  | 35  | 36  | 37  | 38  | 39  |
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+   y=5 | 40  | 41  | 42  | 43  | 44  | 45  | 46  | 47  |
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+   y=6 | 48  | 49  | 50  | 51  | 52  | 53  | 54  | 55  |
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+   y=7 | 56  | 57  | 58  | 59  | 60  | 61  | 62  | 63  |
+       +-----+-----+-----+-----+-----+-----+-----+-----+
+
+  Two important physical facts:
+
+      (a) Each core has a small, fast SRAM called "L1" (~1.5 MB).
+      (b) Cores talk to each other through a "Network on Chip" (NoC).
+          NoC reads cost ~10x what an L1 read costs.
+          DRAM reads cost ~10x what a NoC read costs.
+
+  Goal of every op: do as much work as possible from L1, with as few
+  NoC reads as possible during compute.
+
+================================================================================
+  CHAPTER 2 — WHAT SHARDING MEANS  (and the three flavors)
+================================================================================
+
+  "Sharding" = chopping a tensor into pieces and parking each piece in
+  a different core's L1.
+
+  For a conv-style op our tensor has the layout [N, H, W, C]:
+
+      N = batch
+      H = height
+      W = width
+      C = channels
+
+  A "stick" = the full C-vector at one (h, w) location.
+              Shape = [C].
+
+  We have three ways to slice the tensor across cores:
+
+  ----------------------------------------------------------------------
+  (a) HEIGHT_SHARDED
+  ----------------------------------------------------------------------
+      Slice along the H*W axis. Each core owns ALL channels of SOME
+      sticks.
+
+      Tensor [N=1, H=1, W=8, C=4]   (8 sticks of 4 channels each):
+
+         W:    0    1    2    3    4    5    6    7
+              +----+----+----+----+----+----+----+----+
+              | s0 | s1 | s2 | s3 | s4 | s5 | s6 | s7 |
+              +----+----+----+----+----+----+----+----+
+                |    |    |    |    |    |    |    |
+                v    v    v    v    v    v    v    v
+               C0   C0   C1   C1   C2   C2   C3   C3      (4 cores)
+
+      Each core gets 2 sticks. If you compute output by output, each
+      output stick is produced entirely by the core that owns it.
+
+      USE WHEN: you have lots of (H*W) work and small channels.
+      THIS IS THE DEFAULT for most convs and ALL of our 1D-as-2D cases.
+
+  ----------------------------------------------------------------------
+  (b) WIDTH_SHARDED
+  ----------------------------------------------------------------------
+      Slice along the C axis. Each core owns SOME channels of ALL sticks.
+
+      Same tensor:
+
+              +----+----+----+----+----+----+----+----+
+         C0:  | c0 | c0 | c0 | c0 | c0 | c0 | c0 | c0 |   (channel 0 of every stick)
+         C1:  | c1 | c1 | c1 | c1 | c1 | c1 | c1 | c1 |
+         C2:  | c2 | c2 | c2 | c2 | c2 | c2 | c2 | c2 |
+         C3:  | c3 | c3 | c3 | c3 | c3 | c3 | c3 | c3 |
+              +----+----+----+----+----+----+----+----+
+
+      USE WHEN: lots of channels, small spatial size (deep tensors).
+
+  ----------------------------------------------------------------------
+  (c) BLOCK_SHARDED
+  ----------------------------------------------------------------------
+      Slice along BOTH. Each core owns some channels of some sticks.
+
+      Tensor [N=1, H=1, W=8, C=4] on a 2x2 core grid:
+
+                W:0   1   2   3   4   5   6   7
+                  +---+---+---+---+---+---+---+---+
+              C0  | a | a | a | a | b | b | b | b |     a = core (0,0)
+              C1  | a | a | a | a | b | b | b | b |     b = core (0,1)
+                  +---+---+---+---+---+---+---+---+
+              C2  | c | c | c | c | d | d | d | d |     c = core (1,0)
+              C3  | c | c | c | c | d | d | d | d |     d = core (1,1)
+                  +---+---+---+---+---+---+---+---+
+
+      USE WHEN: medium-sized tensors with both axes meaningfully large.
+
+  ----------------------------------------------------------------------
+  Which one wins?
+  ----------------------------------------------------------------------
+  When you don't pass `shard_layout` explicitly, ttnn's auto-sharder
+  computes the L1 footprint per core for ALL three layouts and picks
+  the smallest. For skinny 1D-style tensors, HEIGHT_SHARDED almost
+  always wins.
+
+================================================================================
+  CHAPTER 3 — HOW STICKS GET DISTRIBUTED  (the actual math)
+================================================================================
+
+  Once a layout is chosen, ttnn picks the NUMBER OF CORES.
+
+  For HEIGHT_SHARDED on N cores:
+
+      total_sticks_needed (output-side) = B * H_out * W_out
+      sticks_in_tile_units              = ceil(total_sticks / 32)
+      num_cores_nhw = largest divisor of `sticks_in_tile_units` that is
+                      <= max_cores AND keeps padding waste low.
+
+  Code: find_closest_largest_divisor_with_num_padding_and_mult.
+
+  Example A — small case, output_w = 34 sticks
+  --------------------------------------------
+      out_ntiles = ceil(34 / 32) = 2 tiles
+      With 64 cores available, picking 2 wastes nothing (2 cores * 1 tile each).
+      num_cores = 2
+
+      Distribution:
+                  W: 0...15  16...33
+                     +------+--------+
+                     | C0   |  C1    |       (each core gets ~17 output sticks)
+                     +------+--------+
+
+  Example B — iSTFT case, output_w = 15840 sticks
+  -----------------------------------------------
+      out_ntiles = ceil(15840 / 32) = 495 tiles
+      Try 64: pad to 512, waste 17, ratio bad -> shrink
+      Try 63: pad to 504, waste  9, ratio bad -> shrink
+      Try 62: pad to 496, waste  1, ratio ok -> STOP
+      num_cores = 62
+
+      Distribution (pictured at ~256 sticks per core):
+            output stick range
+            -------------------
+            [    0 ..   255 ]  -> C0
+            [  256 ..   511 ]  -> C1
+            [  512 ..   767 ]  -> C2
+            ...
+            [15616 ..  15871 ]  -> C61   (last 32 are pad, real ends at 15839)
+
+  Example C — when input is TINY but output is BIG
+  ------------------------------------------------
+      In transpose conv this happens often: the OUTPUT side decides the
+      shard count, but the INPUT side may have very few sticks.
+
+      For iSTFT envelope: input has only 96 sticks, but we're using 62
+      cores. So:
+
+            input_padded = round_up(96, 62 * 32) = 1984
+            per-core input shard = 1984 / 62 = 32 sticks
+
+            Distribution of the input:
+              C0: input sticks  [ 0..31]   <- all 32 are real
+              C1: input sticks  [32..63]   <- all 32 are real
+              C2: input sticks  [64..95]   <- all 32 are real
+              C3: input sticks  [..]       <- all PAD ZEROS
+              ...
+              C61:                         <- all PAD ZEROS
+
+      That's 3 cores with real data and 59 cores holding nothing but
+      padding. This is wasteful but unavoidable when output >> input.
+
+================================================================================
+  CHAPTER 4 — THE BOUNDARY PROBLEM (why naive sharding breaks)
+================================================================================
+
+  Once we shard the input across cores, here's the trouble.
+
+  Picture a normal conv with kernel size 3 sliding across width 8,
+  stride 1. We sharded the 8 input sticks across 4 cores (2 each).
+
+  The input from each core's point of view:
+
+        C0       C1       C2       C3
+      [s0,s1] [s2,s3] [s4,s5] [s6,s7]
+
+  Output stick j needs input sticks j, j+1, j+2 (a window of 3).
+
+      Output 0 needs s0, s1, s2.   <- C0 owns s0,s1, but s2 is on C1!
+      Output 1 needs s1, s2, s3.   <- s1 on C0, s2 and s3 on C1.
+      Output 2 needs s2, s3, s4.   <- spans C1 and C2.
+      Output 3 needs s3, s4, s5.   <- spans C1 and C2.
+      Output 4 needs s4, s5, s6.   <- spans C2 and C3.
+      Output 5 needs s5, s6, s7.   <- spans C2 and C3.
+
+  Three options to deal with this:
+
+      (A) Every core does NoC reads on the fly during compute.
+          PROBLEM: NoC is ~10x slower than L1. Conv compute is
+          read-heavy. Performance dies.
+
+      (B) Replicate everything to every core. Cores are independent.
+          PROBLEM: L1 is small. Doesn't scale.
+
+      (C) BORROW the boundary sticks from neighbors ONCE, BEFORE
+          compute starts. Then compute is purely local.
+          THIS IS HALO.
+
+================================================================================
+  CHAPTER 5 — HALO: WHAT IT IS, WHY IT EXISTS
+================================================================================
+
+  Definition:
+      Halo is a one-shot, sharded-to-sharded data-movement op that
+      RE-LAYS OUT the input tensor so that EACH CORE'S L1 contains:
+
+        (a) Its own sticks, untiled (in row-major).
+        (b) The boundary sticks borrowed from neighbors (the "halo").
+        (c) Pad zeros at the outer edges.
+        (d) For TRANSPOSE conv: interleaved zero sticks between every
+            real stick (the "stride-2 upsample" trick).
+
+  After halo:
+      Each core has everything it needs. The downstream conv2d kernel
+      runs ENTIRELY on local L1 data. ZERO NoC reads during compute.
+
+  Cost of halo:
+      One pass of NoC reads to gather neighbors. Pays for itself
+      because compute is many MACs per stick.
+
+  Picture: BEFORE vs AFTER halo (kernel=3, stride=1, 4 cores):
+
+      BEFORE:
+          C0       C1       C2       C3
+        [s0,s1] [s2,s3] [s4,s5] [s6,s7]
+
+      AFTER (each core also has boundary sticks from its neighbor):
+          C0:  [P, s0, s1, s2]
+          C1:  [s1, s2, s3, s4]      <- borrowed s1 from C0, s4 from C2
+          C2:  [s3, s4, s5, s6]
+          C3:  [s5, s6, s7, P]
+
+          (P = pad zero)
+
+      Now C0 alone can compute outputs 0..1 without any NoC reads.
+      C1 alone can compute outputs 2..3, etc.
+
+================================================================================
+  CHAPTER 6 — HALO'S THREE JOBS, DRAWN
+================================================================================
+
+  Halo is implemented by ONE op with the misleadingly long name
+  `UntilizeWithHaloProgramFactory`. The name is a clue: it really does
+  three things in one sweep.
+
+  ----------------------------------------------------------------------
+  Job 1: UNTILIZE
+  ----------------------------------------------------------------------
+  Input may be in TILE layout (32x32 blocks). Sliding-window addressing
+  is much easier in ROW_MAJOR. So halo first untilizes.
+
+      TILE input (logical 32x32 viewed as a packed block):
+
+            +----------------+
+            |     TILE 0     |   one 32x32 block packed into linear memory
+            +----------------+
+
+      becomes ROW_MAJOR:
+
+            row 0 -> [c0 c1 c2 ... c31]
+            row 1 -> [c0 c1 c2 ... c31]
+            ...
+            row 31-> [c0 c1 c2 ... c31]
+
+  ----------------------------------------------------------------------
+  Job 2: PAD
+  ----------------------------------------------------------------------
+  Wherever the metadata table says "this position is padding", halo
+  writes pad_val (default 0).
+
+      Outer pad ring around a 4x4 input with kernel=3, padding=1:
+
+          P P P P P P
+          P x x x x P              x = real input
+          P x x x x P              P = pad zero
+          P x x x x P
+          P x x x x P
+          P P P P P P
+
+  ----------------------------------------------------------------------
+  Job 3: HALO GATHER
+  ----------------------------------------------------------------------
+  This is the cooperative part. Each core figures out which neighbor
+  sticks it needs, and pulls them in via NoC.
+
+      Cores arranged top-to-bottom (each owns 2 rows):
+
+          Row idx     Owner
+          0           C0
+          1           C0
+          --------    -----
+          2           C1     <- C1 needs row 1 from C0 for the kernel
+          3           C1     <- C2 needs row 2 from C1
+          --------    -----
+          4           C2     <- (and so on)
+          5           C2
+          --------    -----
+          6           C3
+          7           C3
+
+      Halo NoC traffic for kernel=3:
+          C0 -> C1: send rows {1}
+          C1 -> C2: send rows {3}
+          C2 -> C3: send rows {5}
+          C1 -> C0: send rows {2}    (kernels needing rows past the bottom)
+          C2 -> C1: send rows {4}
+          C3 -> C2: send rows {6}
+
+      The result is each core's L1 holds a contiguous halo region:
+
+          C0 L1 (after halo):  [P  r0 r1 r2]      borrowed r2 from C1
+          C1 L1:               [r1 r2 r3 r4]      borrowed r1, r4
+          C2 L1:               [r3 r4 r5 r6]      borrowed r3, r6
+          C3 L1:               [r5 r6 r7 P]       borrowed r5
+
+  ----------------------------------------------------------------------
+  How does halo know what to do?
+  ----------------------------------------------------------------------
+  HOST code precomputes three metadata tables before halo runs:
+
+      generate_pad_metadata(config)    -> bool[]
+            For every position in the full padded input,
+            true means "this is pad" (write zero).
+
+      generate_op_trace_metadata(cfg)  -> uint32[]
+            For every output stick, which input stick to read.
+
+      generate_shard_boundaries(cfg)   -> per-core (start, end)
+            What range of output sticks each core owns.
+
+  These tables are uploaded to L1 (or DRAM) and the halo dataflow
+  kernel reads them to drive its work.
+
+================================================================================
+  CHAPTER 7 — HALO FOR TRANSPOSE CONV (the zero-interleave magic)
+================================================================================
+
+  Transpose conv with stride S is mathematically equivalent to a normal
+  conv with stride 1 on an upsampled input where (S-1) zeros are
+  inserted between every original stick.
+
+  Halo implements this trick by adding extra "padding" rules in
+  generate_pad_metadata when the SlidingWindowConfig has
+  is_transpose=true:
+
+      Position is marked as PADDING if EITHER:
+          - it is in the outer pad ring, OR
+          - (h - pad_top) % stride_h != 0,    OR
+          - (w - pad_left) % stride_w != 0
+
+  The second/third rules catch the gaps between real sticks and stuff
+  zeros there.
+
+  Picture: stride=2 upsample of input [A, B, C, D] with kernel=3:
+
+      Original sticks:           A  B  C  D
+
+      After "is_transpose halo": P P A . B . C . D P P
+                                 ^^^         ^         ^^^
+                                 outer pad   one zero   outer pad
+                                             between
+                                             real
+
+      Now run normal conv (stride=1, kernel=3) on this 11-element
+      buffer:
+
+          Output 0 = w0*P + w1*P + w2*A      = w2*A
+          Output 1 = w0*P + w1*A + w2*0      = w1*A
+          Output 2 = w0*A + w1*0 + w2*B      = w0*A + w2*B    <- overlap!
+          Output 3 = w0*0 + w1*B + w2*0      = w1*B
+          Output 4 = w0*B + w1*0 + w2*C      = w0*B + w2*C
+          Output 5 = w0*0 + w1*C + w2*0      = w1*C
+          Output 6 = w0*C + w1*0 + w2*D      = w0*C + w2*D
+          Output 7 = w0*0 + w1*D + w2*P      = w1*D
+          Output 8 = w0*D + w1*P + w2*P      = w0*D
+
+      Same numbers you'd get from the "stamping" definition of
+      transpose conv. The trick works.
+
+================================================================================
+  CHAPTER 8 — A WORKED EXAMPLE YOU CAN TRACE BY HAND
+================================================================================
+
+  Setup:
+      Input [B=1, H=1, W=8, C=1] = [10, 20, 30, 40, 50, 60, 70, 80]
+      Conv_transpose1d  kernel = [1, 2, 3], stride = 1.
+      4 cores, HEIGHT_SHARDED, 2 sticks per core.
+
+  Output size:
+      output_w = (8 - 1)*1 + (3 - 1) + 1 = 10
+
+  Distribution BEFORE halo:
+      C0 input: [10, 20]
+      C1 input: [30, 40]
+      C2 input: [50, 60]
+      C3 input: [70, 80]
+
+  Geometry for halo:
+      stride = 1, so NO zero interleaving (just kernel-edge padding).
+      pad_left = pad_right = K - 1 = 2.
+      Full input length = 8 + 2 + 2 = 12.
+      Each core needs to produce ~3 output sticks (10/4 ~ 2-3 each,
+      with rounding).
+
+  Distribution AFTER halo (each core's L1):
+
+      C0:  [P P 10 20 30 40]                 <- borrowed 30,40 from C1
+      C1:  [10 20 30 40 50 60]               <- borrowed 10,20 from C0,
+                                                50,60 from C2
+      C2:  [30 40 50 60 70 80]               <- borrowed 30,40 from C1,
+                                                70,80 from C3
+      C3:  [50 60 70 80 P P]                 <- borrowed 50,60 from C2
+
+      (Each core has more than it strictly needs for its 3 outputs;
+       that's normal because halo over-fetches a bit to keep boundaries
+       simple.)
+
+  Per-core compute (kernel = [1, 2, 3]):
+
+      C0 outputs (stick j = 0,1,2 of the 10-long output):
+          out[0] = P*1 + P*2 + 10*3 = 30
+          out[1] = P*1 + 10*2 + 20*3 = 80
+          out[2] = 10*1 + 20*2 + 30*3 = 140
+
+      C1 outputs (sticks 3,4,5):
+          out[3] = 20*1 + 30*2 + 40*3 = 200
+          out[4] = 30*1 + 40*2 + 50*3 = 260
+          out[5] = 40*1 + 50*2 + 60*3 = 320
+
+      C2 outputs (sticks 6,7):
+          out[6] = 50*1 + 60*2 + 70*3 = 380
+          out[7] = 60*1 + 70*2 + 80*3 = 440
+
+      C3 outputs (sticks 8,9):
+          out[8] = 70*1 + 80*2 + P*3 = 230
+          out[9] = 80*1 + P*2 + P*3 = 80
+
+  Verify with PyTorch:
+      F.conv1d(F.pad([10,20,30,40,50,60,70,80], (2,2)), [1,2,3], stride=1)
+        = [30, 80, 140, 200, 260, 320, 380, 440, 230, 80]   <-  matches!
+
+  Notice: each core read ONLY local L1 during compute. The only NoC
+  traffic happened ONCE during halo, not per output.
+
+================================================================================
+  CHAPTER 9 — SCALED UP: THE iSTFT ENVELOPE PICTURE
+================================================================================
+
+  Same algorithm, but with:
+      input W = 96, output W = 15840, kernel = 640, stride = 160.
+      62 cores chosen by the auto-sharder.
+
+  Per-core picture (drawn small; in reality each core has ~256 outputs):
+
+      Input distribution (BEFORE halo):
+
+         output sticks per core ~ 256
+         input sticks per core  ~ 32 (only 96 real, in cores 0,1,2)
+
+         C0: [32 real input sticks]                  -> will produce outs 0..255
+         C1: [32 real input sticks]                  -> will produce outs 256..511
+         C2: [32 real input sticks]                  -> will produce outs 512..767
+         C3: [32 PAD]                                -> will produce outs 768..1023
+         C4: [32 PAD]                                -> ...
+         ...
+         C61: [32 PAD]                               -> will produce outs 15616..15871
+
+      AFTER halo (each core's L1 holds its slice of the 16479-long
+      strided+padded buffer, plus 639 sticks of overhang for the kernel):
+
+         C0:  [outer pad zeros, real value 0,
+               159 zeros, real value 1, 159 zeros, ...]      ~905 sticks
+         C1:  [...]
+         ...
+
+      Most positions are zeros; only ~96 real values total are sprinkled
+      across 62 cores.
+
+      Per-core compute:
+         For each of the 256 owned output sticks j:
+             out[j] = sum_{k=0..639} halo_local[j + k] * weight[k]
+         = 256 * 640 = 163,840 MACs per core, all from local L1.
+
+  Why this case currently FAILS:
+      The conv2d reader kernel issues coalesced NoC reads sized
+      (K_w * in_ch_padded * dtype) ~= 640 * 16 * 4 = 40,960 bytes.
+      That exceeds NOC_MAX_BURST_SIZE (8 KB) -> static_assert fails
+      at compile time.
+
+      The math + halo + sharding plan is correct. Only the per-burst
+      size is the blocker.
+
+================================================================================
+  CHAPTER 10 — RULES OF THUMB AND ANTI-PATTERNS
+================================================================================
+
+  RULES OF THUMB (good):
+      - HEIGHT_SHARDED is the safest default for skinny tensors.
+      - Always think OUTPUT-FIRST: shard count is decided from the
+        OUTPUT size, not input.
+      - Halo's overhead per stick goes UP as kernel size goes up.
+        For huge kernels, consider DRAM slicing to reduce per-core
+        kernel overhang.
+      - The fewer the channels, the more padding bites you. With
+        C=1 fp32 you get alignment-padded to 16 channels in the
+        coalesced-read calculation.
+
+  ANTI-PATTERNS (bad):
+      - Tiny input + huge output: most cores hold pad zeros.
+        L1 is wasted. Performance is bottlenecked on the few cores
+        that hold real data.
+      - Huge K_w with small C_in: the conv2d reader's coalesced
+        burst exceeds NOC_MAX_BURST_SIZE. The kernel won't compile.
+      - Forgetting that transpose conv's "input" to halo is the
+        ZERO-INTERLEAVED expanded buffer, not the original W. Sizing
+        L1 by the original W is incorrect and over-estimates capacity.
+
+  FAST DEBUG CHECKLIST:
+      1. What is num_cores_nhw? (compute_log_debug shows it)
+      2. What is full_input_w?  (output_w + K_w - 1)
+      3. What is per-core halo shard size?
+         (output_per_core + K_w - 1)
+      4. What is coalesced_read_bytes ~ K_w * in_ch_padded * dtype?
+         If > 8 KB, reader will not compile.
+      5. How many real values per core?
+         (For transpose: most cells are zeros; this is normal.)
+
+================================================================================
+  END OF FILE
+================================================================================
+
+  TL;DR for the impatient:
+      Sharding splits the WORK across cores.
+      Halo moves the DATA so each core's work is purely local.
+      Together they let conv-style ops run at near-L1 speed.
+      For transpose conv, halo also injects the zeros that make
+      transpose-via-normal-conv work.
+================================================================================

@@ -11,11 +11,9 @@
 #include "ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/core/to_layout/to_layout_op.hpp"
-#include "ttnn/operations/data_movement/concat/concat.hpp"
-#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/data_movement/sharded/sharded_to_interleaved/sharded_to_interleaved.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
-#include "ttnn/operations/data_movement/transpose/transpose.hpp"
+#include "ttnn/operations/experimental/slice_write/slice_write.hpp"
 #include "ttnn/operations/sliding_window/sliding_window.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/tensor_ops.hpp"
@@ -138,11 +136,23 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
     const std::array<uint32_t, 4> conv_padding_n4 = {0u, 0u, conv_pad_left, conv_pad_right};
     log_debug(tt::LogOp, "polyphase using conv2d-internal padding L={} R={} (K_p={})", conv_pad_left, conv_pad_right, k_p);
 
-  
-    std::vector<ttnn::Tensor> phase_outputs;
-    phase_outputs.reserve(s_w);
+    // Pre-allocate the merged output buffer once and scatter every phase's
+    // result directly into the right strided positions via slice_write.
+    // This replaces the old reshape + concat + reshape + slice chain with
+    // a single allocation plus S_w cheap data-movement writes.
+    //
+    //   Per-phase output : (N, 1, T_phase, C_out) where T_phase = T_in + K_p - 1
+    //   Merged output    : (N, 1, T_phase * S_w, C_out)
+    //   Interleave law   : merged[..., p + j * S_w, :] = phase_p[..., j, :]
+    //
+    // slice_write with begins=(0,0,p,0), ends=(N,1,merged_t,C_out),
+    // step=(1,1,S_w,1) implements exactly that scatter for phase p.
+    const uint32_t merged_t = (t_in + k_p - 1u) * s_w;
 
-    ttnn::Tensor first_weight_on_device;  // captured for return tuple
+    ttnn::Tensor output_buffer;
+    bool output_allocated = false;
+
+    ttnn::Tensor first_weight_on_device;
     std::optional<ttnn::Tensor> first_bias_on_device;
 
     for (uint32_t phase = 0; phase < s_w; ++phase) {
@@ -175,14 +185,10 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
             /*return_output_dim=*/false,
             /*return_weights_and_bias=*/false);
 
-        // conv2d returns either a Tensor or a tuple depending on the last two flags.
-        // We passed false/false so we know it's just the tensor variant.
         ttnn::Tensor phase_out = std::get<ttnn::Tensor>(conv_result);
 
-        // conv2d returns a TILE-layout, optionally-sharded tensor. The
-        // downstream reshape+concat needs ROW_MAJOR element-major data so
-        // the logical (N, H, W, C) order of values is preserved across the
-        // interleave; otherwise tile-internal padding mangles the W axis.
+        // slice_write requires both tensors in ROW_MAJOR interleaved layout
+        // (sharded outputs are unsupported for the strided-write path).
         if (phase_out.memory_config().is_sharded()) {
             phase_out = ttnn::sharded_to_interleaved(
                 phase_out,
@@ -198,7 +204,39 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
                 tt::tt_metal::MemoryConfig{
                     tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM});
         }
-        phase_outputs.push_back(std::move(phase_out));
+
+        // Allocate the merged DRAM buffer the first time around, using the
+        // actual dtype produced by conv2d so slice_write sees matching dtypes.
+        if (!output_allocated) {
+            const uint32_t t_phase_actual = phase_out.logical_shape()[2];
+            TT_FATAL(
+                t_phase_actual * s_w == merged_t,
+                "Unexpected T_phase={} from conv2d; expected {} (K_p={}, T_in={}, S_w={})",
+                t_phase_actual,
+                merged_t / s_w,
+                k_p,
+                t_in,
+                s_w);
+            output_buffer = tt::tt_metal::create_device_tensor(
+                tt::tt_metal::TensorSpec(
+                    ttnn::Shape{batch_size, 1u, merged_t, out_channels},
+                    tt::tt_metal::TensorLayout(
+                        phase_out.dtype(),
+                        tt::tt_metal::PageConfig(Layout::ROW_MAJOR),
+                        tt::tt_metal::MemoryConfig{
+                            tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
+                            tt::tt_metal::BufferType::DRAM})),
+                device);
+            output_allocated = true;
+        }
+
+        // Scatter phase `p`'s elements into output_buffer[..., p :: S_w, :].
+        ttnn::experimental::slice_write(
+            phase_out,
+            output_buffer,
+            ttnn::SmallVector<uint32_t>{0u, 0u, phase, 0u},
+            ttnn::SmallVector<uint32_t>{batch_size, 1u, merged_t, out_channels},
+            ttnn::SmallVector<uint32_t>{1u, 1u, s_w, 1u});
 
         if (phase == 0) {
             first_weight_on_device = phase_w;
@@ -206,43 +244,17 @@ ConvTranspose2dResult conv_transpose2d_polyphase(
         }
     }
 
-    
-    std::vector<ttnn::Tensor> reshaped_phases;
-    reshaped_phases.reserve(s_w);
-    for (auto& po : phase_outputs) {
-        // (N, 1, T_phase, C_out) -> (N, T_phase, 1, C_out)
-        const auto& s = po.logical_shape();
-        TT_FATAL(s.rank() == 4, "phase output expected rank 4, got {}", s.rank());
-        const uint32_t n = s[0];
-        const uint32_t h = s[1];
-        const uint32_t w = s[2];
-        const uint32_t c = s[3];
-        TT_FATAL(h == 1, "phase output expected H == 1, got {}", h);
-        ttnn::Shape new_shape{n, w, 1u, c};
-        reshaped_phases.push_back(ttnn::reshape(po, new_shape));
-    }
-
-    // (N, T_phase, S_w, C_out)
-    ttnn::Tensor stacked = ttnn::concat(reshaped_phases, /*dim=*/2);
-
-    // (N, 1, T_phase * S_w, C_out)
-    const auto& ss = stacked.logical_shape();
-    TT_FATAL(ss.rank() == 4, "stacked tensor expected rank 4, got {}", ss.rank());
-    const uint32_t n = ss[0];
-    const uint32_t merged_t = ss[1] * ss[2];
-    const uint32_t c = ss[3];
-    ttnn::Tensor flattened = ttnn::reshape(stacked, ttnn::Shape{n, 1u, merged_t, c});
-
-    // Slice to exactly T_out elements along W
+    // Trim trailing positions when K_w is not divisible by S_w
+    // (merged_t = (T_in + K_p - 1) * S_w >= T_out = (T_in - 1) * S_w + K_w).
     ttnn::Tensor output;
     if (merged_t > t_out) {
         const std::array<uint32_t, 4> begins = {0u, 0u, 0u, 0u};
-        const std::array<uint32_t, 4> ends = {n, 1u, t_out, c};
+        const std::array<uint32_t, 4> ends = {batch_size, 1u, t_out, out_channels};
         const std::array<uint32_t, 4> steps = {1u, 1u, 1u, 1u};
-        output = ttnn::slice(flattened, begins, ends, steps);
+        output = ttnn::slice(output_buffer, begins, ends, steps);
     } else {
         TT_FATAL(merged_t == t_out, "merged_t {} != t_out {}", merged_t, t_out);
-        output = flattened;
+        output = output_buffer;
     }
 
     return ConvTranspose2dResult{output, /*OH=*/1, /*OW=*/t_out, first_weight_on_device, first_bias_on_device};
