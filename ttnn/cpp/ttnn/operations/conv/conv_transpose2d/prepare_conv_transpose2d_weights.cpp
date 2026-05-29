@@ -171,13 +171,18 @@ Tensor transform_weights_for_conv_transpose2d(const Tensor& conv_weight_tensor, 
 // and (b) the NOC_MAX_BURST_SIZE limit hit by very large K_w.
 //
 // Detector heuristic (conservative -- never regress the default path):
+//   Hard preconditions:
 //   - stride_w > 1                  (S_w = 1 has no waste to recover)
 //   - 1D-as-2D: input_h == 1 and kernel_h == 1 and stride_h == 1
 //   - kernel_w >= 4 * stride_w      (sub-kernel K_p must be meaningful)
-//   - in_channels <= 64             (channel-heavy work isn't bottlenecked
-//                                    by K_w, current path is fine)
-//   - input_w * stride_w >= 32      (need enough per-phase output to fill
-//                                    a tile efficiently)
+//   - input_w >= 8                  (need enough per-phase output to fill a tile)
+//
+//   Friendliness:
+//   - in_channels <= 64 (small-channel case where dispatch overhead of the
+//     halo path dominates and polyphase's fewer launches win), OR
+//   - The existing halo path would crash (coalesced_read_bytes for the conv2d
+//     reader kernel would exceed NOC_MAX_BURST_SIZE = 8192). When that happens
+//     polyphase is not just faster, it's the ONLY working option.
 
 bool is_polyphase_friendly(
     uint32_t in_channels,
@@ -200,16 +205,23 @@ bool is_polyphase_friendly(
     if (kernel_w < 4 * stride_w) {
         return false;
     }
-    // Channel-heavy convs don't benefit -- current path is already MAC-bound
-    // on channels, not K_w
-    if (in_channels > 64) {
-        return false;
-    }
     // Each phase produces ~input_w output elements; want at least a tile
     if (input_w < 8) {
         return false;
     }
-    return true;
+    // Small channel count: always a clear win (dispatch-bound case).
+    if (in_channels <= 64) {
+        return true;
+    }
+    // Larger channel count: only worth it if the existing halo + conv2d path
+    // would hit the NoC burst-size ceiling. The conv2d reader kernel issues
+    // one NoC burst of size `K_w * in_ch_padded * sizeof(activation)`.
+    // We use the worst-case bf16 (2 bytes) and round in_channels up to the
+    // TILE_WIDTH (32) since that's what the conv2d input-prep does internally.
+    const uint32_t in_ch_padded = ((in_channels + 31u) / 32u) * 32u;
+    const uint32_t coalesced_read_bytes = kernel_w * in_ch_padded * 2u;  // bf16
+    constexpr uint32_t NOC_MAX_BURST_SIZE = 8192u;
+    return coalesced_read_bytes > NOC_MAX_BURST_SIZE;
 }
 
 // ----------------------------------------------------------------------------

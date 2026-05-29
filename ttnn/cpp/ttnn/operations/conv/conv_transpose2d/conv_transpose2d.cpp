@@ -14,6 +14,7 @@
 #include "ttnn/operations/conv/conv2d/conv2d.hpp"
 #include "ttnn/operations/conv/conv2d/conv2d_utils.hpp"
 #include "ttnn/operations/conv/conv2d/device/conv2d_device_operation.hpp"
+#include "ttnn/operations/conv/conv_transpose2d/conv_transpose2d_polyphase.hpp"
 #include "ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/data_movement/move/move.hpp"
@@ -1091,6 +1092,58 @@ Result conv_transpose2d_DRAM(
     return {dram_output_tensor, dims.output_height, dims.output_width, weight_tensor_on_device, bias_tensor_on_device};
 }
 
+// Auto-routing helper for the POLYPHASE path.
+//
+// Returns true when:
+//   - The shape passes the is_polyphase_friendly() heuristic, AND
+//   - The user did NOT explicitly request DRAM slicing (we don't want to
+//     override an explicit slice config), AND
+//   - All V2.1 preconditions are satisfied (no padding, no output_padding,
+//     no dilation, no groups, mirror_kernel == true).
+//
+// If any check fails we fall through to the standard L1/DRAM halo path.
+bool should_route_to_polyphase(
+    uint32_t in_channels,
+    uint32_t out_channels,
+    uint32_t input_height,
+    uint32_t input_width,
+    const std::array<uint32_t, 2>& kernel_size,
+    const std::array<uint32_t, 2>& stride,
+    const std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>& padding,
+    const std::array<uint32_t, 2>& output_padding,
+    const std::array<uint32_t, 2>& dilation,
+    uint32_t groups,
+    bool mirror_kernel,
+    const std::optional<const Conv2dSliceConfig>& dram_slice_config) {
+    // Don't override an explicit user slice-config decision.
+    if (dram_slice_config.has_value()) {
+        return false;
+    }
+    // V2.1 preconditions (mirror_kernel == false would give incorrect results).
+    if (!mirror_kernel || groups != 1) {
+        return false;
+    }
+    if (dilation[0] != 1 || dilation[1] != 1) {
+        return false;
+    }
+    if (output_padding[0] != 0 || output_padding[1] != 0) {
+        return false;
+    }
+    const auto pad_n4 = sliding_window::get_pair_n4_padding(padding);
+    if (pad_n4[0] != 0 || pad_n4[1] != 0 || pad_n4[2] != 0 || pad_n4[3] != 0) {
+        return false;
+    }
+    return is_polyphase_friendly(
+        in_channels,
+        out_channels,
+        kernel_size[0],
+        kernel_size[1],
+        stride[0],
+        stride[1],
+        input_height,
+        input_width);
+}
+
 ConvT2dExecutionPath determine_conv_transpose2d_execution_path(
     const ttnn::Tensor& input_tensor, const std::optional<const Conv2dSliceConfig>& slice_config) {
     return determine_conv_transpose2d_execution_path(
@@ -1239,6 +1292,58 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
     bool return_output_dim,
     bool return_weights_and_bias) {
     using namespace operations::conv::conv_transpose2d;
+
+    // POLYPHASE auto-routing: for 1D-as-2D shapes with large stride and small
+    // channel count (e.g. iSTFT), polyphase decomposition is dramatically
+    // faster than (and sometimes the only working) alternative to the
+    // standard halo + conv2d path. The detector below is intentionally
+    // conservative -- if any V2.1 precondition is unmet, fall through.
+    if (should_route_to_polyphase(
+            in_channels,
+            out_channels,
+            input_height,
+            input_width,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            dilation,
+            groups,
+            mirror_kernel,
+            dram_slice_config_)) {
+        log_trace(
+            tt::LogOp,
+            "ConvTranspose2d auto-routed to POLYPHASE (K_w={}, S_w={}, C_in={}, C_out={})",
+            kernel_size[1],
+            stride[1],
+            in_channels,
+            out_channels);
+        return result_to_result_with_options(
+            conv_transpose2d_polyphase(
+                input_tensor,
+                weight_tensor,
+                device,
+                in_channels,
+                out_channels,
+                batch_size,
+                input_height,
+                input_width,
+                kernel_size,
+                stride,
+                padding,
+                output_padding,
+                dilation,
+                groups,
+                dtype,
+                bias_tensor,
+                conv_config_,
+                compute_config_,
+                memory_config_,
+                mirror_kernel),
+            return_output_dim,
+            return_weights_and_bias);
+    }
+
     // Determine execution path based on configuration and input properties
     ConvT2dExecutionPath path = determine_conv_transpose2d_execution_path(input_tensor, dram_slice_config_);
 
