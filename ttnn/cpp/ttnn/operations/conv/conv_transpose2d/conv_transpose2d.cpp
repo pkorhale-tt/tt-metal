@@ -1115,8 +1115,11 @@ bool should_route_to_polyphase(
     uint32_t groups,
     bool mirror_kernel,
     const std::optional<const Conv2dSliceConfig>& dram_slice_config) {
-    // Don't override an explicit user slice-config decision.
-    if (dram_slice_config.has_value()) {
+    // Don't override an explicit user slice-config decision -- but L1_FULL
+    // means "don't slice", which is compatible with polyphase. Only bail out
+    // if the user asked for genuine DRAM slicing.
+    if (dram_slice_config.has_value() &&
+        dram_slice_config->slice_type != Conv2dSliceConfig::SliceType::L1_FULL) {
         return false;
     }
     // V2.1 preconditions (mirror_kernel == false would give incorrect results).
