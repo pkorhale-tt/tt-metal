@@ -150,15 +150,34 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
     TT_FATAL(in_r_buf != nullptr && out_r_buf != nullptr && out_i_buf != nullptr,
         "BatchedStockhamFactory: input/output tensors must be on device.");
 
-    // ── MeshDevice (no-op deleter — tensor owns lifetime) ──────────────
+    // ── Imag input (commit 3c): if the caller provided an imag tensor
+    //    we use ITS buffer; otherwise we fall back to the cached B-tile
+    //    zero scratch (real-only forward FFT, original commit-3a path).
     auto* device_raw = in_real.device();
     auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
 
     // ── Cached fp32 twiddles (same per-N twiddle table, reused) ────────
     auto plan = fft_stockham::get_cached_batch_plan(md, /*sub_N=*/N, /*batch=*/1u);
 
-    // ── Cached batched zero-imag scratch (B tiles of zeros, per dtype) ─
-    auto zscratch = get_or_create_batched_zero_scratch(md, dtype, B);
+    const bool have_imag = tensor_args.input_imag.has_value();
+    auto* const in_i_buf = have_imag
+            ? tensor_args.input_imag->buffer()
+            : nullptr;
+    std::shared_ptr<BatchedZeroScratch> zscratch;
+    if (!have_imag) {
+        zscratch = get_or_create_batched_zero_scratch(md, dtype, B);
+    } else {
+        TT_FATAL(in_i_buf != nullptr,
+            "BatchedStockhamFactory: input_imag must be on device.");
+    }
+    const uint32_t in_i_addr = have_imag
+            ? in_i_buf->address()
+            : fft_stockham::buf_addr(zscratch->buf);
+    // ROW_MAJOR imag (when provided by caller) has the same page_size as
+    // the real input; zero scratch is tile-sized so override = 0 there.
+    const uint32_t in_i_page_size_override = have_imag
+            ? static_cast<uint32_t>(in_i_buf->aligned_page_size())
+            : 0u;
 
     // ── Pick core grid: num_cores must divide B and fit grid ───────────
     const auto dev_grid = md->compute_with_storage_grid_size();
@@ -286,7 +305,7 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
             logical,
             KernelDescriptor::CoreRuntimeArgs{
                 in_r_buf->address(),
-                fft_stockham::buf_addr(zscratch->buf),
+                in_i_addr,
                 fft_stockham::buf_addr(plan->tw_r_buf),
                 fft_stockham::buf_addr(plan->tw_i_buf),
                 base,
@@ -294,7 +313,7 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
                 static_cast<uint32_t>(physical.x),
                 static_cast<uint32_t>(physical.y),
                 /*in_page_size_override=*/in_page_size_bytes,
-                /*in_imag_page_size_override=*/0u,  // scratch is tile-sized
+                /*in_imag_page_size_override=*/in_i_page_size_override,
             });
 
         writer.runtime_args.emplace_back(

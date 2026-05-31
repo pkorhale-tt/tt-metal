@@ -58,20 +58,37 @@ FFTDeviceOperation::program_factory_t FFTDeviceOperation::select_program_factory
         B *= static_cast<uint32_t>(shape[d]);
     }
 
-    // New ProgramDescriptor paths: fp32 OR bf16, real-input forward FFT,
-    // N<=1024, pow-2. Gated by TT_FFT_NATIVE=1 during rollout.
-    //   B == 1 → SingleTileStockhamFactory (commits 1, 2)
-    //   B  > 1 → BatchedStockhamFactory    (commit 3a, foundation for two-pass)
+    // New ProgramDescriptor paths: fp32 OR bf16, forward FFT, N<=1024,
+    // pow-2.  Gated by TT_FFT_NATIVE=1 during rollout.
+    //   B == 1, real-only       → SingleTileStockhamFactory (commits 1, 2)
+    //   B  > 1, real-only       → BatchedStockhamFactory    (commit 3a)
+    //   B >= 1, complex (re+im) → BatchedStockhamFactory    (commit 3c —
+    //                              uses caller's imag buffer instead of
+    //                              the cached zero scratch; needed for
+    //                              the Pass-2 step of the two-pass
+    //                              composite, which feeds an already-
+    //                              transformed complex tensor in).
     const auto dt = input.dtype();
     const bool dtype_ok =
         dt == tt::tt_metal::DataType::FLOAT32 ||
         dt == tt::tt_metal::DataType::BFLOAT16;
     if (native_path_enabled() &&
         !attrs.inverse &&
-        !args.input_imag.has_value() &&
         dtype_ok &&
         is_pow2(N) && N >= 2u && N <= 1024u &&
         is_pow2(B) && B >= 1u) {
+        // Verify imag (if present) is layout/dtype/shape-compatible —
+        // the BatchedStockham kernels assume both buffers are wire-
+        // identical except for content.
+        if (args.input_imag.has_value()) {
+            const auto& imag = *args.input_imag;
+            if (imag.dtype() != dt ||
+                imag.layout() != input.layout() ||
+                imag.padded_shape() != shape) {
+                return FFTProgramFactory{};   // fall back, safer than asserting
+            }
+            return BatchedStockhamFactory{};
+        }
         if (B == 1u) return SingleTileStockhamFactory{};
         return BatchedStockhamFactory{};
     }
