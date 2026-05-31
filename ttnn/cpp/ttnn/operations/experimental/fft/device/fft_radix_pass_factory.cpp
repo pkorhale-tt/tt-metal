@@ -257,10 +257,11 @@ tt::tt_metal::ProgramDescriptor FftRadixPassFactory::create_descriptor(
         }
     }
 
-    // Post-twiddle staging CBs 21..22.  Always allocated (so the reader
-    // can take an unconditional CB pointer without branching at runtime)
-    // but only USED when APPLY_POST_TWIDDLE=1.  Tile-sized fp32.
-    {
+    // Post-twiddle staging CBs 21..22.  Allocated ONLY when
+    // APPLY_POST_TWIDDLE=1 so the pure-FFT path keeps a bit-identical
+    // CB layout to BatchedStockhamFactory (avoids any L1-placement
+    // sensitivity for that path).  Tile-sized fp32.
+    if (apply_pt) {
         constexpr uint32_t kPtCbIds[2] = { 21u, 22u };
         for (uint32_t i = 0; i < 2; ++i) {
             desc.cbs.push_back(CBDescriptor{
