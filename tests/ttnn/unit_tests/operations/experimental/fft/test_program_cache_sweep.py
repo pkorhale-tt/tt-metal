@@ -77,11 +77,16 @@ def test_cache_apply_twiddles(device, dtype):
 
 
 # ─── 2. apply_twiddles_xl ───────────────────────────────────────────────
+# `M` must be a positive multiple of `big_modulus`.  Smallest valid
+# config (matches the first row of _XL_CASES in test_apply_twiddles_xl):
+#   P=32, big_modulus=1024, full_N=32*1024, M=1024.
 @pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
                          ids=["fp32", "bf16"])
 def test_cache_apply_twiddles_xl(device, dtype):
     torch.manual_seed(1)
-    P, big_modulus, full_N, M = 32, 1024, 32768, 64
+    P, big_modulus = 32, 1024
+    full_N         = P * big_modulus     # 32768
+    M              = big_modulus         # one period — smallest valid
     xr = torch.randn(M, P, dtype=torch.float32)
     xi = torch.randn(M, P, dtype=torch.float32)
 
@@ -108,15 +113,26 @@ def test_cache_transpose_rm(device, dtype):
 # ─── 4. fft_radix_pass — all parameter variations ───────────────────────
 # Each variation below MUST produce a distinct cache entry on first call
 # and then NO new entries on the repeat call.
+#
+# Constraints (from device-op validation):
+#   * twiddle_N2 == 0     → no post-twiddle (sentinel, APPLY_POSTTWIDDLE=0)
+#   * twiddle_N2 ∈ {1,2,4,…,1024}, pow-2 → with post-twiddle
+#   * (M / stride) % twiddle_N2 == 0      (when twiddle_N2 != 0)
+# We pick M=32, twiddle_N2=16, stride∈{1,2} so all combinations satisfy
+# the constraint.
+_RX_M, _RX_P, _RX_N2 = 32, 128, 16
+
+
 @pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
                          ids=["fp32", "bf16"])
 def test_cache_radix_pass_no_twiddle(device, dtype):
+    """`twiddle_N2 = 0` is the no-post-twiddle sentinel; this is the
+    APPLY_POSTTWIDDLE=0 kernel variant."""
     torch.manual_seed(3)
-    M, P, N2 = 16, 128, 1   # twiddle_N2=1 → APPLY_POSTTWIDDLE=0
-    x = torch.randn(M, P, dtype=torch.float32)
+    x = torch.randn(_RX_M, _RX_P, dtype=torch.float32)
     def fn():
         ttnn.experimental.fft_radix_pass(_rm(x, device, dtype),
-                                         P=P, twiddle_N2=N2)
+                                         P=_RX_P, twiddle_N2=0)
     _assert_cache_hit(device, f"fft_radix_pass-noPT-{dtype}", fn)
 
 
@@ -124,11 +140,10 @@ def test_cache_radix_pass_no_twiddle(device, dtype):
                          ids=["fp32", "bf16"])
 def test_cache_radix_pass_with_twiddle(device, dtype):
     torch.manual_seed(4)
-    M, P, N2 = 16, 128, 16  # twiddle_N2=16 → APPLY_POSTTWIDDLE=1
-    x = torch.randn(M, P, dtype=torch.float32)
+    x = torch.randn(_RX_M, _RX_P, dtype=torch.float32)
     def fn():
         ttnn.experimental.fft_radix_pass(_rm(x, device, dtype),
-                                         P=P, twiddle_N2=N2)
+                                         P=_RX_P, twiddle_N2=_RX_N2)
     _assert_cache_hit(device, f"fft_radix_pass-PT-{dtype}", fn)
 
 
@@ -139,11 +154,12 @@ def test_cache_radix_pass_with_stride(device, dtype):
     `(r/stride) % twiddle_N2`.  Must be a distinct cache entry from the
     default `stride = 1` path."""
     torch.manual_seed(5)
-    M, P, N2, stride = 16, 128, 16, 2
-    x = torch.randn(M, P, dtype=torch.float32)
+    stride = 2
+    x = torch.randn(_RX_M, _RX_P, dtype=torch.float32)
     def fn():
         ttnn.experimental.fft_radix_pass(_rm(x, device, dtype),
-                                         P=P, twiddle_N2=N2, stride=stride)
+                                         P=_RX_P, twiddle_N2=_RX_N2,
+                                         stride=stride)
     _assert_cache_hit(device, f"fft_radix_pass-stride{stride}-{dtype}", fn)
 
 
@@ -153,12 +169,11 @@ def test_cache_radix_pass_with_output_scale(device, dtype):
     """Commit 6c addition — `output_scale != 1.0` enables the
     APPLY_SCALE kernel variant.  Distinct cache entry from default."""
     torch.manual_seed(6)
-    M, P, N2 = 16, 128, 16
-    x = torch.randn(M, P, dtype=torch.float32)
+    x = torch.randn(_RX_M, _RX_P, dtype=torch.float32)
     def fn():
         ttnn.experimental.fft_radix_pass(
             _rm(x, device, dtype),
-            P=P, twiddle_N2=N2, output_scale=0.0625)
+            P=_RX_P, twiddle_N2=_RX_N2, output_scale=0.0625)
     _assert_cache_hit(device, f"fft_radix_pass-scale-{dtype}", fn)
 
 
@@ -168,13 +183,12 @@ def test_cache_radix_pass_complex_input(device, dtype):
     """Commit 6a — complex input (input_imag present) is its own
     compute path."""
     torch.manual_seed(7)
-    M, P, N2 = 16, 128, 16
-    xr = torch.randn(M, P, dtype=torch.float32)
-    xi = torch.randn(M, P, dtype=torch.float32)
+    xr = torch.randn(_RX_M, _RX_P, dtype=torch.float32)
+    xi = torch.randn(_RX_M, _RX_P, dtype=torch.float32)
     def fn():
         ttnn.experimental.fft_radix_pass(
             _rm(xr, device, dtype), _rm(xi, device, dtype),
-            P=P, twiddle_N2=N2)
+            P=_RX_P, twiddle_N2=_RX_N2)
     _assert_cache_hit(device, f"fft_radix_pass-complex-{dtype}", fn)
 
 
@@ -277,18 +291,24 @@ def test_cache_fft_three_pass(device, dtype):
 # and verify each combination's cache-hit independently — i.e. confirm
 # the per-combination caches don't interfere with each other.
 def test_cache_radix_pass_orthogonality(device):
-    """Cross-product of (twiddle_N2={1,16}, stride={1,2}, scale={1.0, 0.5})
-    must produce 2*2*2 = 8 DISTINCT cache entries on first warmup, and
-    every entry must hit on repeat without contaminating its neighbours."""
+    """Cross-product of (twiddle_N2={0, 16}, stride={1, 2},
+    output_scale={1.0, 0.5}) must produce 2*2*2 = 8 DISTINCT cache
+    entries on first warmup, and every entry must hit on repeat without
+    contaminating its neighbours.
+
+    M=32, twiddle_N2=16, stride∈{1,2} all satisfy
+    `(M/stride) % twiddle_N2 == 0`.  twiddle_N2=0 is the no-PT sentinel
+    so the constraint is vacuously true there.
+    """
     torch.manual_seed(14)
-    M, P = 16, 128
+    M, P = 32, 128
     x_t = _rm(torch.randn(M, P, dtype=torch.float32), device, ttnn.float32)
 
     configs = [
         (n2, st, sc)
-        for n2 in (1, 16)
-        for st in (1, 2)
-        for sc in (1.0, 0.5)
+        for n2 in (0, 16)            # no-PT vs PT
+        for st in (1, 2)             # stride={1,2}
+        for sc in (1.0, 0.5)         # no-scale vs scale
     ]
 
     # Warmup pass — populate one cache entry per config.
