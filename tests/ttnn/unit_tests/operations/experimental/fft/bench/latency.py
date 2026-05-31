@@ -56,16 +56,32 @@ import ttnn
 # matches the realistic deployment story.
 _TWO_PASS_MAX_N = 16 * 1024
 
-# Three-pass factorizations: full_N = N1 * N2 * N3, N3 must be 1024.
-_THREE_PASS_FACTOR = {
-    1 <<  6 * 0 + 16: (8,    8, 1024),  # placeholder, never used
-    1 << 16: (8,    8, 1024),  #  64 K
-    1 << 18: (16,  16, 1024),  # 256 K
-    1 << 20: (32,  32, 1024),  #   1 M
-    1 << 21: (64,  32, 1024),  #   2 M
-    1 << 22: (64,  64, 1024),  #   4 M
-    1 << 24: (128,128, 1024),  #  16 M
-}
+# fft_three_pass lower bound: the C++ pick_three_factorization requires
+# log2(N) in [15, 30] (i.e., N in [32K, 1G]) AND each of N1, N2, N3 must
+# be in [32, 1024].  So the smallest three-pass N is 32 K.
+_THREE_PASS_MIN_N = 32 * 1024
+
+
+def _pick_three_factorization(N: int) -> tuple[int, int, int]:
+    """Mirror of ttnn::operations::experimental::pick_three_factorization
+    in fft.cpp.  Picks (N1, N2, N3) with each in [32, 1024], product = N.
+
+      log2_N3 = min(10, log2N - 10)
+      log2_rest = log2N - log2_N3
+      log2_N1 = ceil(log2_rest / 2)
+      log2_N2 = log2_rest - log2_N1
+    """
+    log2N = N.bit_length() - 1
+    assert (1 << log2N) == N, f"N must be a power of 2 (got {N})"
+    assert 15 <= log2N <= 30, f"three-pass needs log2N in [15, 30] (got {log2N})"
+
+    log2_N3 = 10
+    if log2N - log2_N3 < 10:
+        log2_N3 = log2N - 10
+    log2_rest = log2N - log2_N3
+    log2_N1 = (log2_rest + 1) // 2
+    log2_N2 = log2_rest - log2_N1
+    return (1 << log2_N1, 1 << log2_N2, 1 << log2_N3)
 
 
 def _make_input_rm(B: int, N: int, dtype, device):
@@ -75,9 +91,7 @@ def _make_input_rm(B: int, N: int, dtype, device):
 
 
 def _make_input_three_pass(N: int, dtype, device):
-    if N not in _THREE_PASS_FACTOR:
-        raise ValueError(f"No three-pass factorization tabulated for N={N}")
-    N1, N2, N3 = _THREE_PASS_FACTOR[N]
+    N1, N2, N3 = _pick_three_factorization(N)
     torch.manual_seed(0xA11CE)
     x = torch.randn(N1 * N2, N3, dtype=torch.float32)
     return ttnn.from_torch(x, dtype=dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
@@ -166,7 +180,10 @@ TRACE   = [False, True]
 def _config_supported(N, B, dtype_label):
     # Whenever we route to fft_three_pass (N > 16K), the current build
     # supports fp32 only and B=1 only (matches the unit-test gating).
+    # Also: three-pass C++ requires N >= 32K (log2N >= 15).
     if N > _TWO_PASS_MAX_N:
+        if N < _THREE_PASS_MIN_N:
+            return False          # 16K < N < 32K gap
         if dtype_label != "fp32" or B != 1:
             return False
     return True
