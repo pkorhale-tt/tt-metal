@@ -263,11 +263,16 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
     // batch_per_core sequence; no host glue between sub-FFTs.
     //
     // ROW_MAJOR ttnn tensors use page_size = N*elem_size (NOT one full tile),
-    // so we pass that as a runtime override.  The scratch / twiddle buffers
-    // are tile-sized (we allocated them ourselves), so they use the kernel's
-    // default ts = get_tile_size(CB_*) — pass 0 to opt out of the override.
-    const uint32_t in_page_size_bytes  = static_cast<uint32_t>(in_r_buf->page_size());
-    const uint32_t out_page_size_bytes = static_cast<uint32_t>(out_r_buf->page_size());
+    // and the allocator places pages with `aligned_page_size` stride per bank
+    // — that's the value InterleavedAddrGenFast must use for its within-bank
+    // offset calculation.  page_size == aligned_page_size when the row is
+    // already DRAM-aligned (32 B on Wormhole), but the safe call is
+    // aligned_page_size() — matches what sdpa_decode / others use.
+    //
+    // The scratch / twiddle buffers we allocate ourselves are tile-sized,
+    // so they use the kernel's default ts (override = 0).
+    const uint32_t in_page_size_bytes  = static_cast<uint32_t>(in_r_buf->aligned_page_size());
+    const uint32_t out_page_size_bytes = static_cast<uint32_t>(out_r_buf->aligned_page_size());
     reader.runtime_args.reserve(num_cores);
     writer.runtime_args.reserve(num_cores);
     compute.runtime_args.reserve(num_cores);

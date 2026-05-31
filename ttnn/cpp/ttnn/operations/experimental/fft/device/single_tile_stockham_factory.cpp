@@ -244,7 +244,7 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
                     /*batch_per_core=*/1u,
                     static_cast<uint32_t>(phys.x),
                     static_cast<uint32_t>(phys.y),
-                    /*in_page_size_override=*/static_cast<uint32_t>(in_r_buf->page_size()),
+                    /*in_page_size_override=*/static_cast<uint32_t>(in_r_buf->aligned_page_size()),
                     /*in_imag_page_size_override=*/0u,  // scratch uses tile-sized pages
                 },
             },
@@ -268,7 +268,7 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
                     out_i_buf->address(),
                     /*base=*/0u,
                     /*batch_per_core=*/1u,
-                    /*out_page_size_override=*/static_cast<uint32_t>(out_r_buf->page_size()),
+                    /*out_page_size_override=*/static_cast<uint32_t>(out_r_buf->aligned_page_size()),
                 },
             },
         },
