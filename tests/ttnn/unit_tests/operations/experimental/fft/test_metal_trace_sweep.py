@@ -295,20 +295,23 @@ def test_trace_ifft(device, N, dtype):
     )
 
 
-# Documented legacy-path limitation — kept as an explicit xfail so the
-# paper's "every NEW op is trace-safe" claim is auditable and the legacy
-# carve-out is explicit, not silent.
+# Documented legacy-path limitation — SKIPPED (not xfail) because the
+# legacy FFTProgramFactory's host-read during trace capture leaves the
+# device in a corrupted state that takes down the rest of the test
+# session at teardown. We carve it out explicitly here so the paper's
+# "every NEW op is trace-safe" claim is auditable and the legacy
+# carve-out is visible in test output, not silent.
 @pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
                          ids=["fp32", "bf16"])
-@pytest.mark.xfail(
-    strict=True,
+@pytest.mark.skip(
     reason="N<=1024 IFFT routes through the legacy FFTProgramFactory "
-           "(commit 6c only added forward inverse=false to the new "
-           "SingleTileStockhamFactory). The legacy dispatch does host "
-           "reads and is not Metal-Trace safe. Will be lifted when "
-           "SingleTileStockhamFactory grows inverse=true support."
+           "(commit 6c added forward inverse=false to the new "
+           "SingleTileStockhamFactory only). The legacy dispatch does "
+           "host reads and is not Metal-Trace safe; running it inside "
+           "begin_trace_capture corrupts the device. Will be lifted "
+           "when SingleTileStockhamFactory grows inverse=true support."
 )
-def test_trace_ifft_small_n_legacy_xfail(device, dtype):
+def test_trace_ifft_small_n_legacy_skip(device, dtype):
     N = 16
     torch.manual_seed(11 + N)
     xr = torch.randn(1, N, dtype=torch.float32)
