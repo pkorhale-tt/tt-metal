@@ -254,16 +254,20 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
             .processor    = DataMovementProcessor::RISCV_0,
             .noc          = NOC::RISCV_0_default,
             // 3rd arg = BIT_REVERSE_ON_LOAD = 0: legacy path bit-reverses on
-            // host before WriteShard, so kernel sees pre-bit-reversed input.
-            .compile_args = {sub_N, bp->log2_sub_N, 0u}});
+            //          host before WriteShard, so kernel sees pre-bit-reversed input.
+            // 4th arg = INPUT_BF16 = 0: legacy path is fp32-only.
+            .compile_args = {sub_N, bp->log2_sub_N, 0u, 0u}});
 
     auto wk = CreateKernel(
         prog,
         "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/batch_fft_writer.cpp",
         cr,
         DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_1,
-            .noc       = NOC::RISCV_1_default});
+            .processor    = DataMovementProcessor::RISCV_1,
+            .noc          = NOC::RISCV_1_default,
+            // 1st arg = OUTPUT_BF16 = 0: legacy path is fp32-only.
+            // 2nd arg = SUB_N (unused when OUTPUT_BF16=0 but kept for symmetry).
+            .compile_args = {0u, sub_N}});
 
     std::vector<UnpackToDestMode> u2d(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
     for (uint32_t id = 0; id < kBatchNumCbs; ++id) {

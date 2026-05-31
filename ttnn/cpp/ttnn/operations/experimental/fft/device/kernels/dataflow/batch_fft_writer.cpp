@@ -14,13 +14,27 @@ void kernel_main() {
     const uint32_t base_tile_idx   = get_arg_val<uint32_t>(2);
     const uint32_t batch_per_core  = get_arg_val<uint32_t>(3);
 
+    // OUTPUT_BF16: when set, convert fp32 STATE → bf16 in CB_OUT_*_BF16 and
+    // write bf16 tiles (2048 B) to the output buffers. Default 0 preserves
+    // the legacy fp32 fast path.
+    constexpr uint32_t OUTPUT_BF16 = get_compile_time_arg_val(0);
+    // SUB_N (only needed for OUTPUT_BF16 conversion loop; harmless when 0).
+    constexpr uint32_t SUB_N = get_compile_time_arg_val(1);
+
     const DataFormat df = get_dataformat(CB_STATE_R);
     const uint32_t   ts = get_tile_size(CB_STATE_R);
 
-    InterleavedAddrGenFast<true> out_r_gen = {
-        .bank_base_address = out_r_addr, .page_size = ts, .data_format = df};
-    InterleavedAddrGenFast<true> out_i_gen = {
-        .bank_base_address = out_i_addr, .page_size = ts, .data_format = df};
+    // Output generators: pick fp32-tile or bf16-tile addressing.
+    InterleavedAddrGenFast<true> out_r_gen, out_i_gen;
+    if constexpr (OUTPUT_BF16) {
+        const DataFormat df_bf16 = get_dataformat(CB_OUT_R_BF16);
+        const uint32_t   ts_bf16 = get_tile_size(CB_OUT_R_BF16);
+        out_r_gen = {.bank_base_address = out_r_addr, .page_size = ts_bf16, .data_format = df_bf16};
+        out_i_gen = {.bank_base_address = out_i_addr, .page_size = ts_bf16, .data_format = df_bf16};
+    } else {
+        out_r_gen = {.bank_base_address = out_r_addr, .page_size = ts, .data_format = df};
+        out_i_gen = {.bank_base_address = out_i_addr, .page_size = ts, .data_format = df};
+    }
 
     for (uint32_t k = 0; k < batch_per_core; ++k) {
         const uint32_t tile_idx = base_tile_idx + k;
@@ -29,9 +43,42 @@ void kernel_main() {
         cb_wait_front(CB_STATE_R, 1);
         cb_wait_front(CB_STATE_I, 1);
 
-        noc_async_write_tile(tile_idx, out_r_gen, get_read_ptr(CB_STATE_R));
-        noc_async_write_tile(tile_idx, out_i_gen, get_read_ptr(CB_STATE_I));
-        noc_async_write_barrier();
+        if constexpr (OUTPUT_BF16) {
+            // Convert fp32 STATE → bf16 in CB_OUT_*_BF16, then DMA bf16 tile.
+            cb_reserve_back(CB_OUT_R_BF16, 1);
+            cb_reserve_back(CB_OUT_I_BF16, 1);
+            const uint32_t out_r_bf16_l1 = get_write_ptr(CB_OUT_R_BF16);
+            const uint32_t out_i_bf16_l1 = get_write_ptr(CB_OUT_I_BF16);
+
+            volatile tt_l1_ptr uint32_t* const src_r =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(CB_STATE_R));
+            volatile tt_l1_ptr uint32_t* const src_i =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(CB_STATE_I));
+            volatile tt_l1_ptr uint16_t* const dst_r =
+                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(out_r_bf16_l1);
+            volatile tt_l1_ptr uint16_t* const dst_i =
+                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(out_i_bf16_l1);
+            // Truncation (drop low 16 bits). Round-to-nearest-even costs
+            // one add + one mask per element; truncation is fine for the
+            // first cut and avoids any RNE corner cases.
+            for (uint32_t i = 0; i < SUB_N; ++i) {
+                dst_r[i] = static_cast<uint16_t>(src_r[i] >> 16);
+                dst_i[i] = static_cast<uint16_t>(src_i[i] >> 16);
+            }
+            cb_push_back(CB_OUT_R_BF16, 1);
+            cb_push_back(CB_OUT_I_BF16, 1);
+
+            noc_async_write_tile(tile_idx, out_r_gen, out_r_bf16_l1);
+            noc_async_write_tile(tile_idx, out_i_gen, out_i_bf16_l1);
+            noc_async_write_barrier();
+
+            cb_pop_front(CB_OUT_R_BF16, 1);
+            cb_pop_front(CB_OUT_I_BF16, 1);
+        } else {
+            noc_async_write_tile(tile_idx, out_r_gen, get_read_ptr(CB_STATE_R));
+            noc_async_write_tile(tile_idx, out_i_gen, get_read_ptr(CB_STATE_I));
+            noc_async_write_barrier();
+        }
 
         cb_pop_front(CB_SYNC, 1);
         cb_pop_front(CB_STATE_R, 1);

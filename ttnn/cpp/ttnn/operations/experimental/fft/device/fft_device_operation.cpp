@@ -50,12 +50,17 @@ FFTDeviceOperation::program_factory_t FFTDeviceOperation::select_program_factory
     const auto& input = args.input_real;
     const uint32_t N  = static_cast<uint32_t>(input.padded_shape()[-1]);
 
-    // New ProgramDescriptor path: fp32 real-input forward FFT, N<=1024,
-    // pow-2. Gated by TT_FFT_NATIVE=1 during rollout.
+    // New ProgramDescriptor path: fp32 OR bf16 real-input forward FFT,
+    // N<=1024, pow-2. Gated by TT_FFT_NATIVE=1 during rollout.
+    // (commit 2 of refactor: bf16 added on top of commit 1's fp32 path.)
+    const auto dt = input.dtype();
+    const bool dtype_ok =
+        dt == tt::tt_metal::DataType::FLOAT32 ||
+        dt == tt::tt_metal::DataType::BFLOAT16;
     if (native_path_enabled() &&
         !attrs.inverse &&
         !args.input_imag.has_value() &&
-        input.dtype() == tt::tt_metal::DataType::FLOAT32 &&
+        dtype_ok &&
         is_pow2(N) && N >= 2u && N <= 1024u) {
         return SingleTileStockhamFactory{};
     }

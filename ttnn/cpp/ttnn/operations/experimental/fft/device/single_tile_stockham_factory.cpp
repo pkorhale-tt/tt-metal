@@ -42,7 +42,8 @@ namespace {
 
 constexpr uint32_t kTileHW    = 32u;
 constexpr uint32_t kTileElems = kTileHW * kTileHW;   // 1024
-constexpr uint32_t kTileBytesFp32 = kTileElems * sizeof(float);  // 4096
+constexpr uint32_t kTileBytesFp32 = kTileElems * sizeof(float);     // 4096
+constexpr uint32_t kTileBytesBf16 = kTileElems * sizeof(uint16_t);  // 2048
 
 constexpr uint32_t log2u(uint32_t n) {
     uint32_t r = 0;
@@ -59,36 +60,51 @@ constexpr bool is_pow2_st(uint32_t n) {
 
 // ── Zero-imag scratch buffer cache ─────────────────────────────────────
 // For forward FFT of REAL input, the kernel still expects an imag input
-// buffer. We allocate ONE tile of zeros per device and reuse it forever.
-// Category B work: one-time setup, no per-call host arithmetic.
+// buffer. We allocate ONE tile of zeros per device PER dtype and reuse it
+// forever. Category B work: one-time setup, no per-call host arithmetic.
 using MeshBufferPtr = std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>;
 
 struct ZeroScratch {
     MeshBufferPtr buf;
 };
 
-inline std::unordered_map<uintptr_t, std::shared_ptr<ZeroScratch>>&
+// Keyed by (device, dtype) — fp32 and bf16 zero tiles differ in size.
+inline std::unordered_map<uint64_t, std::shared_ptr<ZeroScratch>>&
 zero_scratch_cache() {
-    static std::unordered_map<uintptr_t, std::shared_ptr<ZeroScratch>> c;
+    static std::unordered_map<uint64_t, std::shared_ptr<ZeroScratch>> c;
     return c;
 }
 
+inline uint64_t zero_scratch_key(
+    tt::tt_metal::distributed::MeshDevice* md,
+    tt::tt_metal::DataType                 dtype)
+{
+    return reinterpret_cast<uint64_t>(md)
+         ^ (static_cast<uint64_t>(dtype) * 0x9E3779B97F4A7C15ull);
+}
+
 std::shared_ptr<ZeroScratch> get_or_create_zero_scratch(
-    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> md)
+    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> md,
+    tt::tt_metal::DataType                                 dtype)
 {
     using namespace tt::tt_metal::distributed;
-    const uintptr_t key = reinterpret_cast<uintptr_t>(md.get());
+    const uint64_t key = zero_scratch_key(md.get(), dtype);
     auto& cache = zero_scratch_cache();
     auto it = cache.find(key);
     if (it != cache.end()) return it->second;
 
     auto z = std::make_shared<ZeroScratch>();
-    z->buf = fft_example::make_mesh_buf(md, kTileBytesFp32, kTileBytesFp32);
-
-    // One-time zero-fill via WriteShard (Category B: setup, cached forever).
-    std::vector<float> zeros(kTileElems, 0.0f);
     MeshCommandQueue& cq = md->mesh_command_queue();
-    WriteShard(cq, z->buf, zeros, MeshCoordinate(0, 0), /*blocking=*/true);
+
+    if (dtype == tt::tt_metal::DataType::BFLOAT16) {
+        z->buf = fft_example::make_mesh_buf(md, kTileBytesBf16, kTileBytesBf16);
+        std::vector<uint16_t> zeros(kTileElems, 0u);
+        WriteShard(cq, z->buf, zeros, MeshCoordinate(0, 0), /*blocking=*/true);
+    } else {
+        z->buf = fft_example::make_mesh_buf(md, kTileBytesFp32, kTileBytesFp32);
+        std::vector<float> zeros(kTileElems, 0.0f);
+        WriteShard(cq, z->buf, zeros, MeshCoordinate(0, 0), /*blocking=*/true);
+    }
 
     cache.emplace(key, z);
     return z;
@@ -111,9 +127,11 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
 
     TT_FATAL(is_pow2_st(N) && N >= 2u && N <= kTileElems,
         "SingleTileStockhamFactory: requires pow-2 N in [2, 1024] (got N={}).", N);
-    TT_FATAL(in_real.dtype() == DataType::FLOAT32,
-        "SingleTileStockhamFactory: fp32 only (got dtype {}).",
-        static_cast<int>(in_real.dtype()));
+    const DataType dtype = in_real.dtype();
+    TT_FATAL(dtype == DataType::FLOAT32 || dtype == DataType::BFLOAT16,
+        "SingleTileStockhamFactory: only fp32 / bf16 supported (got dtype {}).",
+        static_cast<int>(dtype));
+    const bool is_bf16 = (dtype == DataType::BFLOAT16);
 
     // ── Output tensor buffer addresses (already created by framework) ──
     const auto& out_r_tensor = std::get<0>(tensor_return_value);
@@ -131,10 +149,12 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
     auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
 
     // ── Reuse legacy plan's twiddle MeshBuffers (Category B, cached) ──
+    // Twiddles are always fp32 — internal compute happens in fp32 even on
+    // the bf16 I/O path (state expanded bf16→fp32 in the reader).
     auto plan = fft_stockham::get_cached_batch_plan(md, /*sub_N=*/N, /*batch=*/1u);
 
-    // ── Zero-imag scratch buffer (Category B, one-time per device) ────
-    auto zscratch = get_or_create_zero_scratch(md);
+    // ── Zero-imag scratch buffer (Category B, one-time per device, per dtype)
+    auto zscratch = get_or_create_zero_scratch(md, dtype);
 
     ProgramDescriptor desc;
 
@@ -175,15 +195,41 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
         });
     }
 
+    // ── bf16 I/O staging CBs (only when dtype == BFLOAT16) ─────────────
+    // Reader pulls bf16 tiles into CB_IN_*_BF16, then expands to fp32 in
+    // CB_STATE_R/I before running the Stockham stages. Writer converts
+    // fp32 STATE → bf16 in CB_OUT_*_BF16 before DMAing to DRAM.
+    // Matches CB IDs 17..20 in batch_fft_common.h.
+    if (is_bf16) {
+        constexpr uint32_t kBf16CbIds[4] = { 17u, 18u, 19u, 20u };
+        for (uint32_t i = 0; i < 4; ++i) {
+            desc.cbs.push_back(CBDescriptor{
+                .total_size = kTileBytesBf16,   // 1 tile
+                .core_ranges = crs,
+                .format_descriptors = {
+                    CBFormatDescriptor{
+                        .buffer_index = static_cast<uint8_t>(kBf16CbIds[i]),
+                        .data_format  = tt::DataFormat::Float16_b,
+                        .page_size    = kTileBytesBf16,
+                    }
+                },
+            });
+        }
+    }
+
     // ── Kernels ────────────────────────────────────────────────────────
+    const uint32_t input_bf16_flag  = is_bf16 ? 1u : 0u;
+    const uint32_t output_bf16_flag = is_bf16 ? 1u : 0u;
+
     // Reader (BRISC0): pulls input + twiddle tiles, bit-reverses, fills CBs.
     desc.kernels.push_back(KernelDescriptor{
         .kernel_source =
             "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/batch_fft_reader.cpp",
         .core_ranges = crs,
         // 3rd compile arg = BIT_REVERSE_ON_LOAD = 1: we pass the input tensor
-        // in NATURAL order; kernel will bit-reverse on load.
-        .compile_time_args = {N, log2N, 1u},
+        //                  in NATURAL order; kernel will bit-reverse on load.
+        // 4th compile arg = INPUT_BF16: 1 for bf16 input tensor, 0 for fp32.
+        .compile_time_args = {N, log2N, 1u, input_bf16_flag},
         .runtime_args = {
             // {in_r, in_i, tw_r, tw_i, base, batch_per_core, phys_x, phys_y}
             std::pair<CoreCoord, std::vector<uint32_t>>{
@@ -208,7 +254,9 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
         .kernel_source =
             "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/batch_fft_writer.cpp",
         .core_ranges = crs,
-        .compile_time_args = {},
+        // 1st compile arg = OUTPUT_BF16: 1 for bf16 output tensor, 0 for fp32.
+        // 2nd compile arg = SUB_N (needed for OUTPUT_BF16 conversion loop).
+        .compile_time_args = {output_bf16_flag, N},
         .runtime_args = {
             std::pair<CoreCoord, std::vector<uint32_t>>{
                 core,

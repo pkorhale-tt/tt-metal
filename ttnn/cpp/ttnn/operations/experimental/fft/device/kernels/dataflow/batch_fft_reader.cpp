@@ -37,14 +37,30 @@ void kernel_main() {
     // WriteShard). The new SingleTileStockhamFactory path sets this to 1
     // so the input tensor can be passed straight through with no host work.
     constexpr uint32_t BIT_REVERSE_ON_LOAD = get_compile_time_arg_val(2);
+    // INPUT_BF16: when set, input tiles are bfloat16 (2048-byte tile). We
+    // load them into CB_IN_R_BF16/CB_IN_I_BF16, then bit-shift expand to fp32
+    // in CB_STATE_R/CB_STATE_I before running the standard Stockham stages.
+    // Default 0 preserves the legacy fp32 fast path.
+    constexpr uint32_t INPUT_BF16 = get_compile_time_arg_val(3);
 
+    // ── fp32 (compute / twiddle) format & tile size ─────────────────────
     const DataFormat df = get_dataformat(CB_EVEN_R);
     const uint32_t   ts = get_tile_size(CB_EVEN_R);
 
-    InterleavedAddrGenFast<true> in_r_gen = {
-        .bank_base_address = in_r_addr, .page_size = ts, .data_format = df};
-    InterleavedAddrGenFast<true> in_i_gen = {
-        .bank_base_address = in_i_addr, .page_size = ts, .data_format = df};
+    // ── Input generators: pick fp32-tile or bf16-tile addressing ───────
+    // For fp32: read straight into STATE (4096 B). For bf16: read into the
+    // dedicated CB_IN_*_BF16 staging tile (2048 B), then expand to fp32.
+    InterleavedAddrGenFast<true> in_r_gen, in_i_gen;
+    if constexpr (INPUT_BF16) {
+        const DataFormat df_bf16 = get_dataformat(CB_IN_R_BF16);
+        const uint32_t   ts_bf16 = get_tile_size(CB_IN_R_BF16);
+        in_r_gen = {.bank_base_address = in_r_addr, .page_size = ts_bf16, .data_format = df_bf16};
+        in_i_gen = {.bank_base_address = in_i_addr, .page_size = ts_bf16, .data_format = df_bf16};
+    } else {
+        in_r_gen = {.bank_base_address = in_r_addr, .page_size = ts, .data_format = df};
+        in_i_gen = {.bank_base_address = in_i_addr, .page_size = ts, .data_format = df};
+    }
+
     InterleavedAddrGenFast<true> tw_r_gen = {
         .bank_base_address = tw_r_addr, .page_size = ts, .data_format = df};
     InterleavedAddrGenFast<true> tw_i_gen = {
@@ -53,14 +69,47 @@ void kernel_main() {
     for (uint32_t k = 0; k < batch_per_core; ++k) {
         const uint32_t tile_idx = base_tile_idx + k;
 
-        // ── Load bit-reversed input tile into STATE ──────────────────────
+        // ── Load input tile into STATE (fp32 fast path or bf16 → fp32) ──
         cb_reserve_back(CB_STATE_R, 1);
         cb_reserve_back(CB_STATE_I, 1);
         const uint32_t state_r_l1 = get_write_ptr(CB_STATE_R);
         const uint32_t state_i_l1 = get_write_ptr(CB_STATE_I);
-        noc_async_read_tile(tile_idx, in_r_gen, state_r_l1);
-        noc_async_read_tile(tile_idx, in_i_gen, state_i_l1);
-        noc_async_read_barrier();
+
+        if constexpr (INPUT_BF16) {
+            // Stage 1: pull bf16 tile (2048 B) into CB_IN_*_BF16.
+            cb_reserve_back(CB_IN_R_BF16, 1);
+            cb_reserve_back(CB_IN_I_BF16, 1);
+            const uint32_t in_r_bf16_l1 = get_write_ptr(CB_IN_R_BF16);
+            const uint32_t in_i_bf16_l1 = get_write_ptr(CB_IN_I_BF16);
+            noc_async_read_tile(tile_idx, in_r_gen, in_r_bf16_l1);
+            noc_async_read_tile(tile_idx, in_i_gen, in_i_bf16_l1);
+            noc_async_read_barrier();
+            cb_push_back(CB_IN_R_BF16, 1);
+            cb_push_back(CB_IN_I_BF16, 1);
+
+            // Stage 2: bf16 → fp32 expand (bf16 IS the high 16 bits of fp32,
+            // low 16 bits zero → bit-shift by 16 is the exact conversion).
+            volatile tt_l1_ptr uint16_t* const sb_r =
+                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(in_r_bf16_l1);
+            volatile tt_l1_ptr uint16_t* const sb_i =
+                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(in_i_bf16_l1);
+            volatile tt_l1_ptr uint32_t* const dst_r =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(state_r_l1);
+            volatile tt_l1_ptr uint32_t* const dst_i =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(state_i_l1);
+            for (uint32_t k = 0; k < SUB_N; ++k) {
+                dst_r[k] = static_cast<uint32_t>(sb_r[k]) << 16;
+                dst_i[k] = static_cast<uint32_t>(sb_i[k]) << 16;
+            }
+
+            cb_pop_front(CB_IN_R_BF16, 1);
+            cb_pop_front(CB_IN_I_BF16, 1);
+        } else {
+            noc_async_read_tile(tile_idx, in_r_gen, state_r_l1);
+            noc_async_read_tile(tile_idx, in_i_gen, state_i_l1);
+            noc_async_read_barrier();
+        }
+
         cb_push_back(CB_STATE_R, 1);
         cb_push_back(CB_STATE_I, 1);
 
