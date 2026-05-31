@@ -32,17 +32,21 @@ void kernel_main() {
     // hardcoded tile size.  Otherwise ROW_MAJOR tensors with page_size <
     // tile_size scribble at the wrong bank offset once tile_idx wraps
     // past the number of DRAM banks (12 on WH, 8 on BH).
-    InterleavedAddrGen<true> out_r_gen, out_i_gen;
+    //
+    // NOTE: InterleavedAddrGen has `const` members → no default ctor and
+    // no operator= ; construct directly with the right page_size.
+    // Use `if constexpr` so the fp32 build never references CB_OUT_R_BF16.
+    uint32_t fallback_ts;
     if constexpr (OUTPUT_BF16) {
-        const uint32_t   ts_bf16 = get_tile_size(CB_OUT_R_BF16);
-        const uint32_t out_ps = out_page_size_override ? out_page_size_override : ts_bf16;
-        out_r_gen = {.bank_base_address = out_r_addr, .page_size = out_ps};
-        out_i_gen = {.bank_base_address = out_i_addr, .page_size = out_ps};
+        fallback_ts = get_tile_size(CB_OUT_R_BF16);
     } else {
-        const uint32_t out_ps = out_page_size_override ? out_page_size_override : ts;
-        out_r_gen = {.bank_base_address = out_r_addr, .page_size = out_ps};
-        out_i_gen = {.bank_base_address = out_i_addr, .page_size = out_ps};
+        fallback_ts = ts;
     }
+    const uint32_t out_ps = out_page_size_override ? out_page_size_override : fallback_ts;
+    const InterleavedAddrGen<true> out_r_gen = {
+            .bank_base_address = out_r_addr, .page_size = out_ps};
+    const InterleavedAddrGen<true> out_i_gen = {
+            .bank_base_address = out_i_addr, .page_size = out_ps};
 
     for (uint32_t k = 0; k < batch_per_core; ++k) {
         const uint32_t tile_idx = base_tile_idx + k;

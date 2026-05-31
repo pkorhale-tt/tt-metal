@@ -69,19 +69,22 @@ void kernel_main() {
     // dedicated CB_IN_*_BF16 staging tile (2048 B), then expand to fp32.
     // The override is the ttnn buffer's page_size (set when caller passes
     // !=0 in args 8/9); legacy callers pass 0 → fall back to ts / ts_bf16.
-    InterleavedAddrGen<true> in_r_gen, in_i_gen;
+    //
+    // NOTE: InterleavedAddrGen has `const` members → no default ctor and
+    // no operator= ; we must construct it once with the right page_size.
+    // Use `if constexpr` so the fp32 build never references CB_IN_R_BF16.
+    uint32_t fallback_ts;
     if constexpr (INPUT_BF16) {
-        const uint32_t   ts_bf16 = get_tile_size(CB_IN_R_BF16);
-        const uint32_t in_r_ps = in_page_size_override      ? in_page_size_override      : ts_bf16;
-        const uint32_t in_i_ps = in_imag_page_size_override ? in_imag_page_size_override : ts_bf16;
-        in_r_gen = {.bank_base_address = in_r_addr, .page_size = in_r_ps};
-        in_i_gen = {.bank_base_address = in_i_addr, .page_size = in_i_ps};
+        fallback_ts = get_tile_size(CB_IN_R_BF16);
     } else {
-        const uint32_t in_r_ps = in_page_size_override      ? in_page_size_override      : ts;
-        const uint32_t in_i_ps = in_imag_page_size_override ? in_imag_page_size_override : ts;
-        in_r_gen = {.bank_base_address = in_r_addr, .page_size = in_r_ps};
-        in_i_gen = {.bank_base_address = in_i_addr, .page_size = in_i_ps};
+        fallback_ts = ts;
     }
+    const uint32_t in_r_ps = in_page_size_override      ? in_page_size_override      : fallback_ts;
+    const uint32_t in_i_ps = in_imag_page_size_override ? in_imag_page_size_override : fallback_ts;
+    const InterleavedAddrGen<true> in_r_gen = {
+            .bank_base_address = in_r_addr, .page_size = in_r_ps};
+    const InterleavedAddrGen<true> in_i_gen = {
+            .bank_base_address = in_i_addr, .page_size = in_i_ps};
 
     // Twiddles are tile-sized buffers we allocate ourselves — *Fast is fine.
     InterleavedAddrGenFast<true> tw_r_gen = {
