@@ -48,10 +48,23 @@ import ttnn
 
 
 # ───────────────────────── routing helpers ──────────────────────────────
+# Practical L1 cap: fft_two_pass keeps both passes' working sets resident
+# in 1.49 MB of L1.  Empirically that's good for N <= 16 K (fp32);
+# beyond that the static CB allocation overflows.  The C++ auto-routing
+# claims up to 1 M but is over-optimistic — for the paper sweep we
+# explicitly hand off to fft_three_pass at N > 16 K so the bench
+# matches the realistic deployment story.
+_TWO_PASS_MAX_N = 16 * 1024
+
+# Three-pass factorizations: full_N = N1 * N2 * N3, N3 must be 1024.
 _THREE_PASS_FACTOR = {
-    1 << 21: (64, 32, 1024),   # 2 M
-    1 << 22: (64, 64, 1024),   # 4 M
-    1 << 24: (128, 128, 1024), # 16 M
+    1 <<  6 * 0 + 16: (8,    8, 1024),  # placeholder, never used
+    1 << 16: (8,    8, 1024),  #  64 K
+    1 << 18: (16,  16, 1024),  # 256 K
+    1 << 20: (32,  32, 1024),  #   1 M
+    1 << 21: (64,  32, 1024),  #   2 M
+    1 << 22: (64,  64, 1024),  #   4 M
+    1 << 24: (128,128, 1024),  #  16 M
 }
 
 
@@ -71,8 +84,14 @@ def _make_input_three_pass(N: int, dtype, device):
 
 
 def _make_op(B: int, N: int, dtype, device) -> tuple[tuple, Callable]:
-    """Return (input_tensors, op_callable). op_callable(*input_tensors)."""
-    if N > (1 << 20):
+    """Return (input_tensors, op_callable). op_callable(*input_tensors).
+
+    Routing for the bench (intentionally explicit, not relying on the
+    C++ auto-router so we match the paper's claimed deployment chart):
+      N <= 16K          → ttnn.experimental.fft        (single-tile or two-pass)
+      16K < N <= 16M    → ttnn.experimental.fft_three_pass (explicit)
+    """
+    if N > _TWO_PASS_MAX_N:
         tt_x = _make_input_three_pass(N, dtype, device)
         return (tt_x,), (lambda x: ttnn.experimental.fft_three_pass(x, full_N=N))
     tt_x = _make_input_rm(B, N, dtype, device)
@@ -145,8 +164,9 @@ TRACE   = [False, True]
 
 
 def _config_supported(N, B, dtype_label):
-    if N > (1 << 20):
-        # three-pass: fp32 only, B=1 only.
+    # Whenever we route to fft_three_pass (N > 16K), the current build
+    # supports fp32 only and B=1 only (matches the unit-test gating).
+    if N > _TWO_PASS_MAX_N:
         if dtype_label != "fp32" or B != 1:
             return False
     return True
