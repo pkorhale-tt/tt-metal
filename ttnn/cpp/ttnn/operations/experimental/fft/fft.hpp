@@ -39,4 +39,25 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ifft(
     const ttnn::Tensor& spectrum_imag,
     FFTPrecision precision = FFTPrecision::Precise);
 
+// Three-pass Cooley–Tukey composite for very large N (2^20 < N ≤ 2^30).
+//
+// ⚠ The input MUST already be pre-shaped to (B·N1·N2, N3) where
+// N3 ≤ 1024 (see pick_three_factorization for the factorization rule).
+// We expose this requirement because the (B, N) → (B·N1·N2, N3) reshape
+// requires moving an N-element row through a single CB tile per core,
+// which blows L1 for N > ~256K.  The caller is expected to do the
+// equivalent `torch.view(B·N1·N2, N3)` on the host before
+// `ttnn.from_torch`, so the device buffer is allocated with small
+// page_size from the start.
+//
+// Output is returned in the factored shape (B·N1, N2, N3) — caller can
+// `to_torch().reshape(B, full_N)` to recover natural-order (B, full_N).
+//
+// TODO (commit 7): add a streaming DRAM→DRAM rebank kernel so the
+// public `fft()` API can transparently route (B, N) → fft_three_pass.
+std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
+    const ttnn::Tensor& input_real,
+    uint32_t full_N,
+    FFTPrecision precision = FFTPrecision::Precise);
+
 }  // namespace ttnn::operations::experimental

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent Inc.
 # SPDX-License-Identifier: Apache-2.0
 """
-Tests for the three-pass Cooley–Tukey composite FFT path (commit 5a).
+Tests for the three-pass Cooley–Tukey composite FFT path (commit 5).
 
-For pow-2 N with 2^20 < N ≤ 2^28 (commit 5a ceiling; 5b extends to 2^30),
-ttnn.experimental.fft factors N = N1·N2·N3 (max-N3 then balance N1/N2,
-each pow-2 in [32, 1024]) and runs a 12-op device-side chain:
+For pow-2 N with 2^20 < N ≤ 2^30, ttnn.experimental.fft_three_pass
+factors N = N1·N2·N3 (max-N3 then balance N1/N2, each pow-2 in [32, 1024])
+and runs a 10-op device-side chain:
 
     fft_radix_pass(P=N3, twiddle_N2=0)             # pass-1, pure FFT
     apply_twiddles_xl(P=N3, big_mod=N1·N2)         # twiddle-1 (large mod)
@@ -17,11 +17,21 @@ each pow-2 in [32, 1024]) and runs a 12-op device-side chain:
 
 (plus zero-cost reshape views around each).  Activated by TT_FFT_NATIVE=1.
 
+⚠ API NOTE: fft_three_pass takes its input PRE-SHAPED as (B·N1·N2, N3).
+   The (B, N) → (B·N1·N2, N3) reshape would require streaming an
+   N-element row through one CB tile per core, which blows L1 for
+   N > ~256K.  Tests do the equivalent torch view on the host before
+   ttnn.from_torch, so the device buffer is allocated with small
+   page_size from the start.  Output is returned in the factored shape
+   (B·N1, N2, N3); tests reshape to (B, N) on host after to_torch().
+   Commit 7 will add a streaming rebank kernel so the public fft()
+   API can transparently route (B, N) → fft_three_pass.
+
 Coverage:
-  - correctness vs torch.fft on the conservative band (N ≤ 2^22) for
-    fp32/bf16, B ∈ {1, 2};
-  - aggressive band (N ∈ {2^24, 2^26, 2^28}) gated behind --run-aggressive
-    or TT_FFT_AGGRESSIVE=1 — these are minutes-long, fp32-only, B=1;
+  - correctness vs torch.fft on the conservative band (N ∈ {2^21, 2^22})
+    for fp32/bf16, B ∈ {1, 2};
+  - aggressive band (N ∈ {2^24, 2^26, 2^28}) gated behind
+    TT_FFT_AGGRESSIVE=1 — these are minutes-long, fp32-only, B=1;
   - program-cache hit on repeat (small N);
   - Metal-Trace is skipped (host-orchestrated composite, like fft_two_pass).
 """
@@ -64,6 +74,12 @@ def _expected_three_factorization(N: int) -> tuple[int, int, int]:
 # ─── 1. Correctness — conservative band (N ≤ 2^22) ─────────────────────────
 # Three N points exercise three distinct factorizations and three sizes of
 # the XL twiddle modulus (N1·N2 = 2^11, 2^12, 2^13).
+#
+# IMPORTANT: fft_three_pass takes the input PRE-SHAPED as (B·N1·N2, N3) —
+# see the C++ docstring for why (host-side metadata view avoids an L1-
+# busting (B, N) → (B·N1·N2, N3) reshape on device).  The torch
+# `.view(B·N1·N2, N3)` here is metadata-only (no copy) since the
+# allocation is contiguous.
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
                          ids=[d[2] for d in _DTYPES])
 @pytest.mark.parametrize("B", [1, 2])
@@ -78,10 +94,15 @@ def test_three_pass_correctness(device, B, N, tt_dtype, torch_dtype, label, tol)
     x_fp32 = torch.randn(B, N, dtype=torch.float32)
     x = x_fp32.to(torch_dtype)
 
+    # Pre-shape to (B·N1·N2, N3) on the host (torch view, no copy) so
+    # the ttnn allocation has small per-row page_size from the start.
+    x_preshaped = x.reshape(B * N1 * N2, N3).contiguous()
+
     tt_x = ttnn.from_torch(
-        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+        x_preshaped, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    re, im = ttnn.experimental.fft(tt_x)
+    re, im = ttnn.experimental.fft_three_pass(tt_x, full_N=N)
+    # Output shape is (B·N1, N2, N3); flatten and reshape to (B, N) on host.
     got_r = ttnn.to_torch(re).reshape(B, N).to(torch.float32)
     got_i = ttnn.to_torch(im).reshape(B, N).to(torch.float32)
     got = torch.complex(got_r, got_i)
@@ -133,10 +154,11 @@ def test_three_pass_correctness_large(
     torch.manual_seed(101)
     x = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
 
+    x_preshaped = x.reshape(N1 * N2, N3).contiguous()
     tt_x = ttnn.from_torch(
-        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+        x_preshaped, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    re, im = ttnn.experimental.fft(tt_x)
+    re, im = ttnn.experimental.fft_three_pass(tt_x, full_N=N)
     got_r = ttnn.to_torch(re).reshape(N).to(torch.float32)
     got_i = ttnn.to_torch(im).reshape(N).to(torch.float32)
     got = torch.complex(got_r, got_i)
@@ -165,19 +187,21 @@ def test_three_pass_correctness_large(
                          ids=[d[2] for d in _DTYPES])
 def test_three_pass_program_cache_hit(device, tt_dtype, torch_dtype, label, tol):
     B, N = 1, 1 << 21
+    N1, N2, N3 = _expected_three_factorization(N)
     torch.manual_seed(0)
     x = torch.randn(B, N, dtype=torch.float32).to(torch_dtype)
+    x_preshaped = x.reshape(B * N1 * N2, N3).contiguous()
 
     tt_x = ttnn.from_torch(
-        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+        x_preshaped, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    ttnn.experimental.fft(tt_x)
+    ttnn.experimental.fft_three_pass(tt_x, full_N=N)
     n_after_warmup = device.num_program_cache_entries()
 
     tt_x2 = ttnn.from_torch(
-        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+        x_preshaped, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
-    ttnn.experimental.fft(tt_x2)
+    ttnn.experimental.fft_three_pass(tt_x2, full_N=N)
     n_after_repeat = device.num_program_cache_entries()
 
     assert n_after_repeat == n_after_warmup, (

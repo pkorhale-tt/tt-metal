@@ -151,6 +151,21 @@ bool two_pass_eligible(const ttnn::Tensor& input_real) {
 // ───────────────────────────────────────────────────────────────────────
 // Three-pass Cooley–Tukey composite (commit 5)
 //
+// ⚠ API NOTE: fft_three_pass takes its input ALREADY PRE-SHAPED as
+//   (B·N1·N2, N3) [i.e. with last dim = N3 ≤ 1024], NOT as (B, N).
+//   This is because the (B, N) → (B·N1·N2, N3) reshape requires
+//   moving an N-element row through a single CB tile per core, which
+//   blows L1 for N > ~256K.  The caller is expected to do the equivalent
+//   `torch.view(B·N1·N2, N3)` on the host (it's a metadata-only torch
+//   view) BEFORE `ttnn.from_torch`, so the device buffer is allocated
+//   with small page_size from the start.  Output is returned in the
+//   factored shape (B·N1, N2, N3) — caller can reshape on host to
+//   recover (B, N) since the data is in natural Cooley–Tukey order.
+//
+//   TODO (commit 7): write an L1-friendly DRAM→DRAM rebank kernel that
+//   handles the page-size change in chunks, so the public `fft()` API
+//   can transparently route (B, N) inputs into the three-pass composite.
+//
 // For pow-2 N with 2^20 < N ≤ 2^30, factor N = N1 · N2 · N3 (each pow-2
 // in [32, 1024], picked "max-N3 then balance N1/N2" for best memory
 // coalescing on the innermost pass).  Decompose the length-N DFT as:
@@ -212,34 +227,53 @@ std::tuple<uint32_t, uint32_t, uint32_t> pick_three_factorization(uint32_t N) {
     return {1u << log2_N1, 1u << log2_N2, 1u << log2_N3};
 }
 
+}  // namespace
+
+// ────────────────────────────────────────────────────────────────────
+// Public entrypoint — caller-visible.  Input is REQUIRED to be pre-
+// shaped as (B·N1·N2, N3) [last dim = N3 ≤ 1024]; the (B, N) → factored
+// reshape would otherwise blow L1 (commit 7 will add a rebank kernel
+// to lift this restriction).  Output is returned in the factored shape
+// (B·N1, N2, N3) — caller can `to_torch().reshape(B, N)` to recover
+// natural-order (B, N) on host.
+// ────────────────────────────────────────────────────────────────────
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
-    const ttnn::Tensor& input_real, FFTPrecision precision) {
+    const ttnn::Tensor& input_real,
+    uint32_t full_N,
+    FFTPrecision precision) {
     const auto& in_shape = input_real.padded_shape();
-    const uint32_t N = static_cast<uint32_t>(in_shape[-1]);
+    TT_FATAL(in_shape.size() >= 2,
+        "fft_three_pass: pre-shaped input must be ≥2-D, e.g. (M, N3). Got {}-D.",
+        in_shape.size());
+    const uint32_t P_in = static_cast<uint32_t>(in_shape[-1]);
+    const uint32_t M_in = static_cast<uint32_t>(in_shape[-2]);
+    // Allow extra leading dims as implicit batch (rare; tests use 2-D inputs).
     uint32_t B = 1u;
-    for (int d = 0; d < static_cast<int>(in_shape.size()) - 1; ++d) {
+    for (int d = 0; d < static_cast<int>(in_shape.size()) - 2; ++d) {
         B *= static_cast<uint32_t>(in_shape[d]);
     }
 
-    const auto [N1, N2, N3] = pick_three_factorization(N);
-
-    // ── Step 1: reshape input (B, N) → (B·N1·N2, N3)   [metadata-only]
-    auto x_p1 = ttnn::reshape(input_real, make_shape({B * N1 * N2, N3}));
+    const auto [N1, N2, N3] = pick_three_factorization(full_N);
+    TT_FATAL(P_in == N3 && M_in == N1 * N2,
+        "fft_three_pass: pre-shaped input mismatch — expected (..., M=N1·N2={}, "
+        "P=N3={}) for full_N={} (N1={}, N2={}, N3={}), got (..., {}, {}).",
+        N1 * N2, N3, full_N, N1, N2, N3, M_in, P_in);
 
     // ── Step 2: Pass-1 batched length-N3 real FFT, NO twiddle.
     //   fft_radix_pass treats input as (M=B·N1·N2 rows, N3 cols) and
     //   emits FFT_N3 of each row.  twiddle_N2=0 → pure FFT path.
+    //   (Input is already in this shape — no reshape needed.)
     auto [r1, i1] = ttnn::prim::fft_radix_pass(
-        x_p1, /*input_imag=*/std::nullopt,
+        input_real, /*input_imag=*/std::nullopt,
         /*P=*/N3, /*twiddle_N2=*/0u);
 
     // ── Step 3: between-pass-1-and-2 twiddle (LARGE modulus N1·N2).
     //   Multiplies y[r=b·N1·N2 + n1·N2 + n2, k3] by
-    //       exp(-2πi · (r % (N1·N2)) · k3 / N)
-    //     = exp(-2πi · (n1·N2 + n2) · k3 / N)              (for B=1)
+    //       exp(-2πi · (r % (N1·N2)) · k3 / full_N)
+    //     = exp(-2πi · (n1·N2 + n2) · k3 / full_N)              (for B=1)
     //   which is Cooley–Tukey twiddle 1 broadcast over B replicas.
     auto [r2, i2] = ttnn::prim::apply_twiddles_xl(
-        r1, i1, /*P=*/N3, /*big_modulus=*/N1 * N2, /*full_N=*/N);
+        r1, i1, /*P=*/N3, /*big_modulus=*/N1 * N2, /*full_N=*/full_N);
 
     // ── Steps 4-6: bring n2 to last axis, ready for Pass-2.
     //   (B·N1·N2, N3) → (B·N1, N2, N3) → transpose → (B·N1, N3, N2)
@@ -293,44 +327,24 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     auto r4t2   = ttnn::prim::transpose_rm(r4t1f);
     auto i4t2   = ttnn::prim::transpose_rm(i4t1f);
 
-    // ── Final reshape back to (..., N).
-    auto out_r = ttnn::reshape(r4t2, in_shape);
-    auto out_i = ttnn::reshape(i4t2, in_shape);
-    return {std::move(out_r), std::move(out_i)};
+    // NOTE: NO final reshape back to (B, N).  That would require
+    // an L1-busting page_size change (N3·elem → full_N·elem).  Output
+    // shape is the factored (B·N1, N2, N3) — caller is expected to do
+    // `to_torch().reshape(B, full_N)` on host to recover natural-order
+    // (B, full_N).  This is cheap (just a torch view) since the FFT
+    // chain already arranges k = k1·N2·N3 + k2·N3 + k3 naturally.
+    return {std::move(r4t2), std::move(i4t2)};
 }
-
-bool three_pass_eligible(const ttnn::Tensor& input_real) {
-    if (!native_path_enabled()) return false;
-    const auto& shape = input_real.padded_shape();
-    if (shape.size() < 1) return false;
-    const uint32_t N = static_cast<uint32_t>(shape[-1]);
-    uint32_t B = 1u;
-    for (int d = 0; d < static_cast<int>(shape.size()) - 1; ++d) {
-        B *= static_cast<uint32_t>(shape[d]);
-    }
-    const auto dt = input_real.dtype();
-    const bool dtype_ok =
-        dt == tt::tt_metal::DataType::FLOAT32 ||
-        dt == tt::tt_metal::DataType::BFLOAT16;
-    const bool layout_ok =
-        input_real.layout() == tt::tt_metal::Layout::ROW_MAJOR;
-    return dtype_ok && layout_ok &&
-           is_pow2(N) && N > (1u << 20) && N <= (1u << 30) &&
-           is_pow2(B) && B >= 1u;
-}
-
-}  // namespace
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     const ttnn::Tensor& input_real, FFTPrecision precision) {
     // Routing (TT_FFT_NATIVE=1):
     //   N ≤ 1024            → SingleTileStockhamFactory  (via prim::fft)
     //   1024 < N ≤ 2^20     → fft_two_pass               (commit 3/4)
-    //   2^20 < N ≤ 2^30     → fft_three_pass             (commit 5)
+    //   N > 2^20            → caller MUST invoke fft_three_pass
+    //                         explicitly with pre-shaped input
+    //                         (until commit 7 adds rebank kernel)
     //   N > 2^30            → falls through to prim::fft (will TT_FATAL)
-    if (three_pass_eligible(input_real)) {
-        return fft_three_pass(input_real, precision);
-    }
     if (two_pass_eligible(input_real)) {
         return fft_two_pass(input_real, precision);
     }

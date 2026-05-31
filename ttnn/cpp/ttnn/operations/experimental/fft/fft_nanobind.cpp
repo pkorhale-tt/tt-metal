@@ -102,6 +102,14 @@ TensorPair fft_radix_pass_complex_trampoline(
         input_real, input_imag, P, twiddle_N2, stride);
 }
 
+TensorPair fft_three_pass_trampoline(
+    const ttnn::Tensor& input_real,
+    uint32_t full_N,
+    std::string precision) {
+    return ttnn::operations::experimental::fft_three_pass(
+        input_real, full_N, parse_precision(precision));
+}
+
 }  // namespace
 
 void bind_experimental_fft_operation(nb::module_& mod) {
@@ -351,6 +359,64 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             nb::arg("P"),
             nb::arg("twiddle_N2") = 0u,
             nb::arg("stride")     = 1u));
+
+    const auto* fft_three_pass_doc =
+        R"doc(
+            Three-pass Cooley–Tukey composite FFT for very large N
+            (2^20 < ``full_N`` ≤ 2^30).
+
+            ⚠ **Pre-shaped input required**: the input must already be
+            shaped as ``(B·N1·N2, N3)`` (or with extra leading batch dims
+            collapsed; last two dims = ``(N1·N2, N3)``).  The
+            factorization is auto-picked from ``full_N`` via "max-N3 then
+            balance N1/N2"; both ``N1, N2, N3`` are pow-2 in ``[32, 1024]``.
+
+            Why: the implicit ``(B, full_N) → (B·N1·N2, N3)`` reshape
+            would require streaming an ``full_N``-element row through one
+            CB tile per core, which blows L1 for ``full_N > ~256K``.
+            Callers do the equivalent ``torch.view(B·N1·N2, N3)`` on the
+            host (a metadata-only torch view) before ``ttnn.from_torch``,
+            so the device buffer is allocated with the small per-row
+            page_size from the start.
+
+            Output: returned in the factored shape ``(B·N1, N2, N3)``.
+            Recover natural-order ``(B, full_N)`` via
+            ``to_torch().reshape(B, full_N)`` on the host (cheap — the
+            FFT chain already arranges ``k = k1·N2·N3 + k2·N3 + k3``
+            naturally, so the host reshape is a torch view).
+
+            Args:
+                * :attr:`input_real`: Float32 or BFloat16 ROW_MAJOR tensor.
+                  Shape must end in ``(N1·N2, N3)`` for the
+                  ``pick_three_factorization(full_N)`` factorization.
+                * :attr:`full_N`: logical FFT length.  Pow-2 in
+                  ``[2^21, 2^30]``.  Must factor as ``N1·N2·N3`` with each
+                  factor pow-2 in ``[32, 1024]``.
+                * :attr:`precision` (default ``"precise"``): same as
+                  :func:`ttnn.experimental.fft`.
+
+            Returns:
+                Tuple ``(real, imag)`` of Tensors, shape ``(B·N1, N2, N3)``.
+
+            Example::
+
+                N = 1 << 21
+                N1, N2, N3 = pick_three_factorization(N)   # (64, 32, 1024)
+                x = torch.randn(1, N).view(N1 * N2, N3)    # host view, no copy
+                tt_x = ttnn.from_torch(x, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+                re, im = ttnn.experimental.fft_three_pass(tt_x, full_N=N)
+                out = (torch.complex(ttnn.to_torch(re), ttnn.to_torch(im))
+                       .reshape(1, N))
+        )doc";
+
+    ttnn::bind_function<"fft_three_pass", ttnn::unique_string{"ttnn.experimental."}>(
+        mod,
+        fft_three_pass_doc,
+        ttnn::overload_t(
+            &fft_three_pass_trampoline,
+            nb::arg("input_real").noconvert(),
+            nb::arg("full_N"),
+            nb::arg("precision") = std::string("precise")));
 }
 
 }  // namespace ttnn::operations::experimental::fft_binding::detail
