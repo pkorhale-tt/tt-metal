@@ -90,6 +90,12 @@ ttnn::Shape make_shape(std::initializer_list<uint32_t> dims) {
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     const ttnn::Tensor& input_real, FFTPrecision precision) {
+    // precision is currently unused — both passes route through
+    // prim::fft_radix_pass which keeps its compute precision implicit
+    // (fp32 input → fp32 compute, bf16 input → packed bf16).  Kept in
+    // the signature for API symmetry with fft_three_pass and for the
+    // future tile-quant lowering knob (commit 6+).
+    (void)precision;
     const auto& in_shape = input_real.padded_shape();
     const uint32_t N = static_cast<uint32_t>(in_shape[-1]);
     uint32_t B = 1u;
