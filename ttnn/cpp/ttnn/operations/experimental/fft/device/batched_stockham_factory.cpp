@@ -33,19 +33,20 @@ namespace ttnn::experimental::prim {
 
 namespace {
 
-constexpr uint32_t kTileHW    = 32u;
-constexpr uint32_t kTileElems = kTileHW * kTileHW;   // 1024
-constexpr uint32_t kTileBytesFp32 = kTileElems * sizeof(float);     // 4096
-constexpr uint32_t kTileBytesBf16 = kTileElems * sizeof(uint16_t);  // 2048
+// All `_bs` suffix is to avoid Unity-build ODR collision with the same-named
+// anonymous-namespace symbols in single_tile_stockham_factory.cpp (Unity
+// concatenates them into one TU).
+constexpr uint32_t kTileHW_bs        = 32u;
+constexpr uint32_t kTileElems_bs     = kTileHW_bs * kTileHW_bs;            // 1024
+constexpr uint32_t kTileBytesFp32_bs = kTileElems_bs * sizeof(float);      // 4096
+constexpr uint32_t kTileBytesBf16_bs = kTileElems_bs * sizeof(uint16_t);   // 2048
 
-constexpr uint32_t log2u(uint32_t n) {
+constexpr uint32_t log2u_bs(uint32_t n) {
     uint32_t r = 0;
     while ((1u << r) < n) ++r;
     return r;
 }
 
-// Renamed `is_pow2_bs` to avoid Unity-build ODR collision with other TUs in
-// this library (each has its own anonymous-namespace `is_pow2`).
 constexpr bool is_pow2_bs(uint32_t n) {
     return n != 0u && (n & (n - 1u)) == 0u;
 }
@@ -93,14 +94,14 @@ std::shared_ptr<BatchedZeroScratch> get_or_create_batched_zero_scratch(
     MeshCommandQueue& cq = md->mesh_command_queue();
 
     if (dtype == tt::tt_metal::DataType::BFLOAT16) {
-        const uint32_t total = B * kTileBytesBf16;
-        z->buf = fft_example::make_mesh_buf(md, total, kTileBytesBf16);
-        std::vector<uint16_t> zeros(static_cast<size_t>(B) * kTileElems, 0u);
+        const uint32_t total = B * kTileBytesBf16_bs;
+        z->buf = fft_example::make_mesh_buf(md, total, kTileBytesBf16_bs);
+        std::vector<uint16_t> zeros(static_cast<size_t>(B) * kTileElems_bs, 0u);
         WriteShard(cq, z->buf, zeros, MeshCoordinate(0, 0), /*blocking=*/true);
     } else {
-        const uint32_t total = B * kTileBytesFp32;
-        z->buf = fft_example::make_mesh_buf(md, total, kTileBytesFp32);
-        std::vector<float> zeros(static_cast<size_t>(B) * kTileElems, 0.0f);
+        const uint32_t total = B * kTileBytesFp32_bs;
+        z->buf = fft_example::make_mesh_buf(md, total, kTileBytesFp32_bs);
+        std::vector<float> zeros(static_cast<size_t>(B) * kTileElems_bs, 0.0f);
         WriteShard(cq, z->buf, zeros, MeshCoordinate(0, 0), /*blocking=*/true);
     }
 
@@ -122,14 +123,14 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
     const auto& in_real = tensor_args.input_real;
     const auto& shape   = in_real.padded_shape();
     const uint32_t N    = static_cast<uint32_t>(shape[-1]);
-    const uint32_t log2N = log2u(N);
+    const uint32_t log2N = log2u_bs(N);
 
     uint32_t B = 1u;
     for (int d = 0; d < static_cast<int>(shape.size()) - 1; ++d) {
         B *= static_cast<uint32_t>(shape[d]);
     }
 
-    TT_FATAL(is_pow2_bs(N) && N >= 2u && N <= kTileElems,
+    TT_FATAL(is_pow2_bs(N) && N >= 2u && N <= kTileElems_bs,
         "BatchedStockhamFactory: requires pow-2 N in [2, 1024] (got N={}).", N);
     TT_FATAL(is_pow2_bs(B) && B >= 1u,
         "BatchedStockhamFactory: requires pow-2 batch (got B={}).", B);
@@ -185,13 +186,13 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
     };
     for (uint32_t id = 0; id < kNumCbs; ++id) {
         desc.cbs.push_back(CBDescriptor{
-            .total_size = kCbTiles[id] * kTileBytesFp32,
+            .total_size = kCbTiles[id] * kTileBytesFp32_bs,
             .core_ranges = crs,
             .format_descriptors = {
                 CBFormatDescriptor{
                     .buffer_index = static_cast<uint8_t>(id),
                     .data_format  = tt::DataFormat::Float32,
-                    .page_size    = kTileBytesFp32,
+                    .page_size    = kTileBytesFp32_bs,
                 }
             },
         });
@@ -201,13 +202,13 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
         constexpr uint32_t kBf16CbIds[4] = { 17u, 18u, 19u, 20u };
         for (uint32_t i = 0; i < 4; ++i) {
             desc.cbs.push_back(CBDescriptor{
-                .total_size = kTileBytesBf16,
+                .total_size = kTileBytesBf16_bs,
                 .core_ranges = crs,
                 .format_descriptors = {
                     CBFormatDescriptor{
                         .buffer_index = static_cast<uint8_t>(kBf16CbIds[i]),
                         .data_format  = tt::DataFormat::Float16_b,
-                        .page_size    = kTileBytesBf16,
+                        .page_size    = kTileBytesBf16_bs,
                     }
                 },
             });
