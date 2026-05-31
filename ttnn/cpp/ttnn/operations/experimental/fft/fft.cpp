@@ -21,31 +21,47 @@ namespace ttnn::operations::experimental {
 namespace {
 
 // ───────────────────────────────────────────────────────────────────────
-// Two-pass Cooley–Tukey composite (commit 3c)
+// Two-pass Cooley–Tukey composite (commit 3c, corrected commit 5c)
 //
-// For pow-2 N with 1024 < N ≤ 1M, factor N = N1 * N2 (both pow-2, both
-// in [32, 1024]) and decompose the length-N DFT as:
+// For pow-2 N with 1024 < N ≤ 1M, factor N = N1 · N2 (both pow-2, both
+// in [32, 1024]).  We use the standard mixed-radix DIT decomposition
+// that — for natural-order input AND natural-order output — requires
+// pre- and post-transposes so each pass FFTs along the LAST axis.
 //
-//   X[k1·N2 + k2] = Σ_{n1} W_N1^(n1·k1) · ω^(n1·k2) · ( Σ_{n2} x[n1,n2]·W_N2^(n2·k2) )
-//                    ╰── Pass-2 ──╯  ╰─ twiddle ─╯   ╰─────── Pass-1 ────────╯
+// Index packing (input n natural, output K natural):
+//   n = n1·N2 + n2   (n1 OUTER, n2 INNER of the (B, N) row)
+//   K = k2·N1 + k1   (k1 INNER, k2 OUTER  of the (B, N) row)
 //
-// where ω = exp(-2πi / N).
+// With this packing every (n_i, k_j) cross-term in n·K/N is either
+// integer (vanishes) or matches a clean FFT/twiddle factor:
 //
-// Implementation as a chain of FIVE device ops (commit 4 fused Pass-1
-// + between-pass twiddle into ONE dispatch via prim::fft_radix_pass):
-//   1. reshape (B, N) -> (B*N1, N2)               [metadata-only, free]
-//   2. fft_radix_pass(P=N2, twiddle_N2=N1)        → (R2, I2) shape (B*N1, N2)
-//                                                  fused [batched FFT
-//                                                  + post-twiddle cmul]
-//   3. reshape + transpose_rm + reshape           → (R3, I3) shape (B*N2, N1)
-//   4. Pass-2 batched length-N1 complex FFT       → (R4, I4) shape (B*N2, N1)
-//   5. reshape + transpose_rm + reshape           → final (B, N) tensors
+//   X[k2·N1 + k1] = Σ_{n2} W_{N2}^{n2·k2} · ( exp(-2πi·n2·k1/N) ·
+//                       Σ_{n1} W_{N1}^{n1·k1} · x[n1, n2] )
+//                     ╰── Pass-2 ──╯ ╰─ twiddle ─╯  ╰── Pass-1 ──╯
 //
-// Reduces the per-call dispatch count from 6 to 5 in the host path
-// (Step 2 used to be prim::fft followed by prim::apply_twiddles).
+// Implementation chain (3 transposes + 2 fft_radix_pass dispatches):
+//   1. reshape (B, N) → (B, N1, N2)              [view, free]
+//   2. transpose_rm   → (B, N2, N1)              [data movement]
+//   3. view as (B·N2, N1)                        [view]
+//   4. fft_radix_pass(P=N1, twiddle_N2=N2)       [Pass-1 FFT_N1 fused with
+//                                                 twiddle exp(-2πi·n2·k1/N)]
+//   5. view + transpose_rm + view → (B·N1, N2)   [data movement]
+//   6. fft_radix_pass(P=N2, twiddle_N2=0)        [Pass-2 pure FFT_N2]
+//   7. view + transpose_rm → (B, N2, N1)         [data movement]
+//   8. reshape → (B, N)                          [view, free]
 //
-// Gated by TT_FFT_NATIVE=1 like the rest of the new path.  Falls back to
-// the legacy CachedProgram path otherwise.
+// NOTE: the EARLIER version of fft_two_pass (commit 4) did the inner
+// FFT first WITHOUT the initial transpose and applied the twiddle on
+// pass 2 with arguments (P=N2, twiddle_N2=N1).  That doesn't correspond
+// to any valid Cooley–Tukey decomposition with natural I/O; on N=4 it
+// produced [10, -1+i, -4, -1-i] instead of the correct
+// [10, -2+2i, -2, -2-2i].  The diagnostic at N=2048/4096 showed
+// rel_err ≈ √2 (output uncorrelated with reference) — symptom of an
+// algorithm that sums elements correctly (DC bin matched) but applies
+// the wrong twiddles everywhere else.
+//
+// Gated by TT_FFT_NATIVE=1.  Falls back to legacy CachedProgram path
+// (prim::fft) when not enabled.
 // ───────────────────────────────────────────────────────────────────────
 
 bool native_path_enabled() {
@@ -83,48 +99,53 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
 
     const auto [N1, N2] = pick_factorization(N);
 
-    // ── Step 1: reshape input  (B, N)  →  (B*N1, N2)  (metadata-only)
-    auto x_p1 = ttnn::reshape(input_real, make_shape({B * N1, N2}));
+    // ── Step 1: reshape input (B, N) → (B, N1, N2).  View, free.
+    //   x_3d[b, n1, n2] = x_orig[b, n1·N2 + n2].
+    auto x_3d = ttnn::reshape(input_real, make_shape({B, N1, N2}));
 
-    // ── Step 2: Pass-1 batched length-N2 real FFT + between-pass
-    //   twiddle multiply, FUSED into a single device dispatch.
-    //
-    //   fft_radix_pass treats input as (M, P) and outputs
-    //       y[r, k] = FFT_P(x[r, :])[k]
-    //               * exp(-2πi · (r % twiddle_N2) · k / (P · twiddle_N2))
-    //
-    //   We want the row-index r to range over [0, B·N1) and the post-
-    //   twiddle modulus to be N1, so the twiddle T[n1, k2] =
-    //   exp(-2πi·n1·k2 / (N1·N2)) is broadcast correctly across
-    //   the B replicas.  Hence: P = N2, twiddle_N2 = N1.
-    //
-    //   Replaces the old (prim::fft → prim::apply_twiddles) pair —
-    //   1 dispatch instead of 2, no intermediate L1↔DRAM round-trip.
-    auto [r2, i2] = ttnn::prim::fft_radix_pass(
+    // ── Step 2: initial transpose (B, N1, N2) → (B, N2, N1).
+    //   So that Pass-1 (FFT_N1) sees stride-N1 sub-samples as
+    //   contiguous rows.  This is the bit-reversal-equivalent step
+    //   that the earlier (commit 4) version was missing.
+    auto x_t = ttnn::prim::transpose_rm(x_3d);
+    auto x_p1 = ttnn::reshape(x_t, make_shape({B * N2, N1}));
+
+    // ── Step 3: Pass-1 batched length-N1 real FFT + between-pass
+    //   twiddle.  Row r = b·N2 + n2, so (r % twiddle_N2=N2) = n2:
+    //       post-twiddle = exp(-2πi · n2 · k1 / (N1·N2))
+    //                    = exp(-2πi · n2 · k1 / N)        ← Cooley–Tukey twiddle
+    auto [r1, i1] = ttnn::prim::fft_radix_pass(
         x_p1, /*input_imag=*/std::nullopt,
-        /*P=*/N2, /*twiddle_N2=*/N1);
+        /*P=*/N1, /*twiddle_N2=*/N2);
 
-    // ── Step 3: transpose (B*N1, N2) → (B*N2, N1) via (B, N1, N2) view.
-    auto r2_3d = ttnn::reshape(r2, make_shape({B, N1, N2}));
-    auto i2_3d = ttnn::reshape(i2, make_shape({B, N1, N2}));
-    auto r3_3d = ttnn::prim::transpose_rm(r2_3d);
-    auto i3_3d = ttnn::prim::transpose_rm(i2_3d);
-    auto r3 = ttnn::reshape(r3_3d, make_shape({B * N2, N1}));
-    auto i3 = ttnn::reshape(i3_3d, make_shape({B * N2, N1}));
+    // ── Step 4: transpose (B, N2, N1) → (B, N1, N2) to bring n2 to
+    //   the last axis ready for Pass-2.
+    auto r1_3d = ttnn::reshape(r1, make_shape({B, N2, N1}));
+    auto i1_3d = ttnn::reshape(i1, make_shape({B, N2, N1}));
+    auto r2t = ttnn::prim::transpose_rm(r1_3d);
+    auto i2t = ttnn::prim::transpose_rm(i1_3d);
+    auto r2 = ttnn::reshape(r2t, make_shape({B * N1, N2}));
+    auto i2 = ttnn::reshape(i2t, make_shape({B * N1, N2}));
 
-    // ── Step 4: Pass-2 batched length-N1 complex FFT.
-    auto [r4, i4] = ttnn::prim::fft(
-        r3, /*inverse=*/false, /*input_imag=*/i3, precision);
+    // ── Step 5: Pass-2 batched length-N2 complex FFT, NO twiddle
+    //   (all Cooley–Tukey twiddles were absorbed into Pass-1 above).
+    auto [r3, i3] = ttnn::prim::fft_radix_pass(
+        r2, /*input_imag=*/i2,
+        /*P=*/N2, /*twiddle_N2=*/0u);
 
-    // ── Step 5: undo the row/col flip to restore natural ordering.
-    auto r4_3d = ttnn::reshape(r4, make_shape({B, N2, N1}));
-    auto i4_3d = ttnn::reshape(i4, make_shape({B, N2, N1}));
-    auto r5_3d = ttnn::prim::transpose_rm(r4_3d);
-    auto i5_3d = ttnn::prim::transpose_rm(i4_3d);
+    // ── Step 6: final transpose (B, N1, N2) → (B, N2, N1) to put
+    //   the output in natural-K order under flat reshape.
+    //   Recall: algorithm produces X[K = k2·N1 + k1] at position
+    //   (b, k1, k2) of the (B, N1, N2) post-Pass-2 tensor.  After this
+    //   transpose, element (b, k2, k1) lives at flat (b·N + k2·N1 + k1)
+    //   = (b·N + K), i.e. natural K-ordered output.
+    auto r3_3d = ttnn::reshape(r3, make_shape({B, N1, N2}));
+    auto i3_3d = ttnn::reshape(i3, make_shape({B, N1, N2}));
+    auto r4t = ttnn::prim::transpose_rm(r3_3d);
+    auto i4t = ttnn::prim::transpose_rm(i3_3d);
 
-    // ── Final reshape back to the caller-visible (..., N) shape.
-    auto out_r = ttnn::reshape(r5_3d, in_shape);
-    auto out_i = ttnn::reshape(i5_3d, in_shape);
+    auto out_r = ttnn::reshape(r4t, in_shape);
+    auto out_i = ttnn::reshape(i4t, in_shape);
     return {std::move(out_r), std::move(out_i)};
 }
 
