@@ -68,10 +68,22 @@ tt::tt_metal::ProgramDescriptor ComplexMulFactory::create_descriptor(
 
     auto* device_raw = a_r_tensor.device();
 
-    // ── Pick core grid: pow-2 num_cores dividing M (matches apply_twiddles).
+    // ── Pick core grid: pow-2 num_cores dividing M.
+    //   Unlike apply_twiddles[_xl] which guarantees M is a pow-2 multiple
+    //   of big_modulus, complex_mul accepts arbitrary M (the chirp
+    //   pre-multiply in Bluestein has last-dim P = N which can be any
+    //   length).  We must therefore (a) FLOOR num_cores to a pow-2 first
+    //   (else for M=37 we'd hit `num_cores = 37`, a non-pow-2 → invalid
+    //   batch grid → dispatch-core placement TT_FATAL), then (b) shrink
+    //   that pow-2 until it divides M.  Worst case (M odd prime)
+    //   collapses to num_cores=1, which is correct.
     const auto dev_grid = device_raw->compute_with_storage_grid_size();
     const uint32_t max_cores = fft_stockham::max_cores_for_grid(dev_grid.x, dev_grid.y);
-    uint32_t num_cores = (M < max_cores) ? M : max_cores;
+    const uint32_t cap = (M < max_cores) ? M : max_cores;
+    uint32_t num_cores = 1u;
+    while ((num_cores << 1) <= cap) {
+        num_cores <<= 1;
+    }
     while (num_cores > 1u && (M % num_cores) != 0u) {
         num_cores >>= 1;
     }
