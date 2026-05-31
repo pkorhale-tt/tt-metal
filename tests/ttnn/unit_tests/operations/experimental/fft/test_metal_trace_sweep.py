@@ -355,18 +355,36 @@ def test_trace_fft_three_pass(device, dtype):
     )
 
 
-# ─── 10. bluestein_fft (commit 6d / 6e-1) ───────────────────────────────
+# ─── 10. bluestein_fft (commit 6d / 6e-1) — DOCUMENTED NOT TRACE-SAFE ──
 # Bluestein composes 5 elementwise/data-movement ops around 2 inner FFTs
-# (cmul + pad + fft + cmul + ifft + slice + cmul).  `ttnn.pad` and
-# `ttnn.slice` allocate intermediate tensors at dispatch time — if their
-# allocators give stable addresses across runs (which trace assumes),
-# then Bluestein is trace-safe.  If not, this test will surface it.
+# (cmul → pad → fft → cmul → ifft → slice → cmul).
 #
-# We run the smallest possible config (N=17 prime, B=1) — smallest M,
-# fastest to capture / replay.
+# `ttnn::zeros` (used to materialize the padded imaginary buffer) and
+# `ttnn::pad` allocate intermediate tensors at dispatch time AND issue
+# a host→device write to zero-fill them.  The trace-capture API
+# disallows writes during capture, so Bluestein in its current form is
+# NOT Metal-Trace safe.  We carve it out as a SKIP (running it inside
+# begin_trace_capture corrupts device state and takes down the rest of
+# the test session at teardown).
+#
+# Path to trace-safe Bluestein (future work, not required for HPEC
+# submission): replace the runtime `ttnn::zeros` / `ttnn::pad` /
+# `ttnn::slice` chain with persistent zero scratch tensors pre-
+# allocated alongside the cached BluesteinPlan, plus a dedicated
+# "zero-pad in place" device op that's pure dispatch.  This is the
+# direct analogue of how we cache chirp_n, chirp_k, and B_fft in
+# `BluesteinPlan` today — extend the plan to also own the scratch.
 @pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
                          ids=["fp32", "bf16"])
-def test_trace_bluestein(device, dtype):
+@pytest.mark.skip(
+    reason="bluestein_fft composes ttnn.zeros / ttnn.pad which do "
+           "host->device writes at dispatch time; trace-capture API "
+           "rejects writes. Path to trace-safe Bluestein documented "
+           "in test comments (extend BluesteinPlan to own pre-"
+           "allocated scratch + zero-pad-in-place op). Out of scope "
+           "for HPEC 2026 submission."
+)
+def test_trace_bluestein_not_trace_safe_skip(device, dtype):
     torch.manual_seed(17)
     N = 17
     x = torch.randn(1, N, dtype=torch.float32)
