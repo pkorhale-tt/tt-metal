@@ -294,10 +294,10 @@ tt::tt_metal::ProgramDescriptor FftRadixPassFactory::create_descriptor(
 
     KernelDescriptor writer{
         .kernel_source =
-            "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/batch_fft_writer.cpp",
+            "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/radix_pass_writer.cpp",
         .core_ranges = crs,
-        // {OUTPUT_BF16, SUB_N}
-        .compile_time_args = {output_bf16_flag, N},
+        // {OUTPUT_BF16, SUB_N, APPLY_POST_TWIDDLE}
+        .compile_time_args = {output_bf16_flag, N, apply_pt_flag},
         .runtime_args = {},
         .config = WriterConfigDescriptor{},
     };

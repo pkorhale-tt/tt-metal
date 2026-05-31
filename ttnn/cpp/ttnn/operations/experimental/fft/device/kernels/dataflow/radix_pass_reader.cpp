@@ -5,15 +5,19 @@
 //
 // Functionally identical to batch_fft_reader.cpp (same bit-reversal,
 // same per-stage scatter/gather, same bf16 expansion at the DRAM
-// boundary) PLUS — when APPLY_POST_TWIDDLE=1 — an in-place scalar fp32
-// complex-multiply against an externally-provided twiddle table after
-// the final FFT stage.  This fuses [batched_fft → apply_twiddles] into
-// a single dispatch with no intermediate L1↔DRAM round-trip.
+// boundary) PLUS — when APPLY_POST_TWIDDLE=1 — it ALSO loads the
+// post-twiddle tile T[tile_idx % pt_modulus, :] into CB_PT_R/I so the
+// writer (BRISC1) can perform the in-place complex-multiply RIGHT
+// BEFORE issuing the noc_async_write_tile out to DRAM.
 //
-// The cmul is done on BRISC (scalar fp32, ~6 ops/element, ~6 µs/tile
-// at 1 GHz) rather than on the SFPU because it is performed on the
-// FINAL STATE buffer already sitting in L1, requiring zero extra CB
-// orchestration.  Moving it to the SFPU is a follow-up optimization.
+// Why on the WRITER instead of here?  Doing the cmul here would write
+// to STATE_R/I after we have already pushed them; cross-BRISC L1
+// visibility for those late scalar stores is sensitive to the per-core
+// L1 layout and observably flaky for some (row, core) combinations
+// (e.g. row 12 on grid (4,1)).  Letting BRISC1 read, modify, and write
+// STATE within a single thread closes that gap entirely — BRISC1's
+// own scalar stores are guaranteed visible to its subsequent
+// noc_async_write_tile read of L1.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -266,38 +270,21 @@ void kernel_main() {
             cb_pop_front(CB_OUT1_I, 1);
         }
 
-        // ── NEW: in-place post-twiddle scalar cmul ──────────────────────
-        // STATE_R/I now hold the FFT output for this row.  Multiply
-        // element-wise by the twiddle row T[tile_idx % pt_modulus, :].
-        // Done BEFORE signalling CB_SYNC so the writer sees the
-        // post-multiplied state.
+        // ── Load post-twiddle tile (consumed by the writer) ─────────────
+        // STATE_R/I now hold the FFT output for this row.  We DON'T
+        // touch them here — instead, drop the broadcast twiddle row
+        // T[tile_idx % pt_modulus, :] into CB_PT_R/I so the writer can
+        // do the scalar complex-multiply right before its
+        // noc_async_write_tile (see header comment for the rationale).
         if constexpr (APPLY_POST_TWIDDLE) {
             const uint32_t pt_tile_idx = tile_idx % pt_modulus;
             cb_reserve_back(CB_PT_R, 1);
             cb_reserve_back(CB_PT_I, 1);
-            const uint32_t pt_r_l1 = get_write_ptr(CB_PT_R);
-            const uint32_t pt_i_l1 = get_write_ptr(CB_PT_I);
-            noc_async_read_tile(pt_tile_idx, pt_r_gen, pt_r_l1);
-            noc_async_read_tile(pt_tile_idx, pt_i_gen, pt_i_l1);
+            noc_async_read_tile(pt_tile_idx, pt_r_gen, get_write_ptr(CB_PT_R));
+            noc_async_read_tile(pt_tile_idx, pt_i_gen, get_write_ptr(CB_PT_I));
             noc_async_read_barrier();
             cb_push_back(CB_PT_R, 1);
             cb_push_back(CB_PT_I, 1);
-
-            volatile tt_l1_ptr float* const pt_r =
-                reinterpret_cast<volatile tt_l1_ptr float*>(pt_r_l1);
-            volatile tt_l1_ptr float* const pt_i =
-                reinterpret_cast<volatile tt_l1_ptr float*>(pt_i_l1);
-            for (uint32_t i = 0; i < SUB_N; ++i) {
-                const float sr = state_r[i];
-                const float si = state_i[i];
-                const float tr = pt_r[i];
-                const float ti = pt_i[i];
-                state_r[i] = sr * tr - si * ti;
-                state_i[i] = sr * ti + si * tr;
-            }
-
-            cb_pop_front(CB_PT_R, 1);
-            cb_pop_front(CB_PT_I, 1);
         }
 
         cb_reserve_back(CB_SYNC, 1);
