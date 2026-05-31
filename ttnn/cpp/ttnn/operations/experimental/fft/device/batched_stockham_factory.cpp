@@ -260,14 +260,25 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
     // Each core processes `batch_per_core` consecutive sub-FFTs starting at
     // base = core_idx * batch_per_core. The kernel's outer loop handles the
     // batch_per_core sequence; no host glue between sub-FFTs.
+    //
+    // ROW_MAJOR ttnn tensors use page_size = N*elem_size (NOT one full tile),
+    // so we pass that as a runtime override.  The scratch / twiddle buffers
+    // are tile-sized (we allocated them ourselves), so they use the kernel's
+    // default ts = get_tile_size(CB_*) — pass 0 to opt out of the override.
+    const uint32_t in_page_size_bytes  = static_cast<uint32_t>(in_r_buf->page_size());
+    const uint32_t out_page_size_bytes = static_cast<uint32_t>(out_r_buf->page_size());
+    reader.runtime_args.reserve(num_cores);
+    writer.runtime_args.reserve(num_cores);
+    compute.runtime_args.reserve(num_cores);
+
     for (uint32_t c = 0; c < num_cores; ++c) {
         const CoreCoord logical = fft_stockham::batch_logical_core(c, grid_cols);
         const CoreCoord physical = md->worker_core_from_logical_core(logical);
         const uint32_t base = c * batch_per_core;
 
-        reader.runtime_args.push_back(std::pair<CoreCoord, std::vector<uint32_t>>{
+        reader.runtime_args.emplace_back(
             logical,
-            std::vector<uint32_t>{
+            KernelDescriptor::CoreRuntimeArgs{
                 in_r_buf->address(),
                 fft_stockham::buf_addr(zscratch->buf),
                 fft_stockham::buf_addr(plan->tw_r_buf),
@@ -276,23 +287,23 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
                 batch_per_core,
                 static_cast<uint32_t>(physical.x),
                 static_cast<uint32_t>(physical.y),
-            },
-        });
+                /*in_page_size_override=*/in_page_size_bytes,
+                /*in_imag_page_size_override=*/0u,  // scratch is tile-sized
+            });
 
-        writer.runtime_args.push_back(std::pair<CoreCoord, std::vector<uint32_t>>{
+        writer.runtime_args.emplace_back(
             logical,
-            std::vector<uint32_t>{
+            KernelDescriptor::CoreRuntimeArgs{
                 out_r_buf->address(),
                 out_i_buf->address(),
                 base,
                 batch_per_core,
-            },
-        });
+                /*out_page_size_override=*/out_page_size_bytes,
+            });
 
-        compute.runtime_args.push_back(std::pair<CoreCoord, std::vector<uint32_t>>{
+        compute.runtime_args.emplace_back(
             logical,
-            std::vector<uint32_t>{ batch_per_core },
-        });
+            KernelDescriptor::CoreRuntimeArgs{ batch_per_core });
     }
 
     desc.kernels.push_back(std::move(reader));

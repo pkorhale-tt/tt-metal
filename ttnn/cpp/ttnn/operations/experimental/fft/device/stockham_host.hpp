@@ -295,11 +295,14 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
             base, bp->batch_per_core,
             static_cast<uint32_t>(physical.x),
             static_cast<uint32_t>(physical.y),
+            /*in_page_size_override=*/0u,        // legacy uses tile-sized pages
+            /*in_imag_page_size_override=*/0u,
         });
 
         SetRuntimeArgs(prog, wk, logical, {
             buf_addr(bp->out_r_buf), buf_addr(bp->out_i_buf),
             base, bp->batch_per_core,
+            /*out_page_size_override=*/0u,
         });
 
         SetRuntimeArgs(prog, ck, logical, {bp->batch_per_core});

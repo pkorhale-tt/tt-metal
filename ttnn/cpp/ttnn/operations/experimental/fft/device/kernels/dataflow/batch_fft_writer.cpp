@@ -13,6 +13,9 @@ void kernel_main() {
     const uint32_t out_i_addr      = get_arg_val<uint32_t>(1);
     const uint32_t base_tile_idx   = get_arg_val<uint32_t>(2);
     const uint32_t batch_per_core  = get_arg_val<uint32_t>(3);
+    // arg 4: out_page_size_override.  0 = use CB-derived tile size (legacy);
+    //        nonzero = ttnn output buffer page_size (ROW_MAJOR N*elem_size).
+    const uint32_t out_page_size_override = get_arg_val<uint32_t>(4);
 
     // OUTPUT_BF16: when set, convert fp32 STATE → bf16 in CB_OUT_*_BF16 and
     // write bf16 tiles (2048 B) to the output buffers. Default 0 preserves
@@ -24,16 +27,20 @@ void kernel_main() {
     const DataFormat df = get_dataformat(CB_STATE_R);
     const uint32_t   ts = get_tile_size(CB_STATE_R);
 
-    // Output generators: pick fp32-tile or bf16-tile addressing.
+    // Output generators: pick fp32-tile or bf16-tile addressing. For
+    // ROW_MAJOR ttnn output the buffer page_size = N*elem_size — honour the
+    // runtime override if nonzero (otherwise default to CB tile size).
     InterleavedAddrGenFast<true> out_r_gen, out_i_gen;
     if constexpr (OUTPUT_BF16) {
         const DataFormat df_bf16 = get_dataformat(CB_OUT_R_BF16);
         const uint32_t   ts_bf16 = get_tile_size(CB_OUT_R_BF16);
-        out_r_gen = {.bank_base_address = out_r_addr, .page_size = ts_bf16, .data_format = df_bf16};
-        out_i_gen = {.bank_base_address = out_i_addr, .page_size = ts_bf16, .data_format = df_bf16};
+        const uint32_t out_ps = out_page_size_override ? out_page_size_override : ts_bf16;
+        out_r_gen = {.bank_base_address = out_r_addr, .page_size = out_ps, .data_format = df_bf16};
+        out_i_gen = {.bank_base_address = out_i_addr, .page_size = out_ps, .data_format = df_bf16};
     } else {
-        out_r_gen = {.bank_base_address = out_r_addr, .page_size = ts, .data_format = df};
-        out_i_gen = {.bank_base_address = out_i_addr, .page_size = ts, .data_format = df};
+        const uint32_t out_ps = out_page_size_override ? out_page_size_override : ts;
+        out_r_gen = {.bank_base_address = out_r_addr, .page_size = out_ps, .data_format = df};
+        out_i_gen = {.bank_base_address = out_i_addr, .page_size = out_ps, .data_format = df};
     }
 
     for (uint32_t k = 0; k < batch_per_core; ++k) {

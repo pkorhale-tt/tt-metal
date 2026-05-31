@@ -231,7 +231,8 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
         // 4th compile arg = INPUT_BF16: 1 for bf16 input tensor, 0 for fp32.
         .compile_time_args = {N, log2N, 1u, input_bf16_flag},
         .runtime_args = {
-            // {in_r, in_i, tw_r, tw_i, base, batch_per_core, phys_x, phys_y}
+            // {in_r, in_i, tw_r, tw_i, base, batch_per_core, phys_x, phys_y,
+            //  in_page_size_override, in_imag_page_size_override}
             std::pair<CoreCoord, std::vector<uint32_t>>{
                 core,
                 std::vector<uint32_t>{
@@ -243,6 +244,8 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
                     /*batch_per_core=*/1u,
                     static_cast<uint32_t>(phys.x),
                     static_cast<uint32_t>(phys.y),
+                    /*in_page_size_override=*/static_cast<uint32_t>(in_r_buf->page_size()),
+                    /*in_imag_page_size_override=*/0u,  // scratch uses tile-sized pages
                 },
             },
         },
@@ -265,6 +268,7 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
                     out_i_buf->address(),
                     /*base=*/0u,
                     /*batch_per_core=*/1u,
+                    /*out_page_size_override=*/static_cast<uint32_t>(out_r_buf->page_size()),
                 },
             },
         },
