@@ -87,24 +87,35 @@ void kernel_main() {
         const uint32_t t_r_l1 = get_write_ptr(CB_T_R);
         const uint32_t t_i_l1 = get_write_ptr(CB_T_I);
 
-        // ── Step 1: scalar delta lookup into the FIRST 4 bytes of
-        //    CB_T_R/I.  We then overwrite the whole tile in step 2.
+        // ── Step 1: delta lookup.  NoC DRAM reads require 16-byte
+        //    aligned src + dst + size on WH (and 64-byte on BH).  A
+        //    naive 4-byte scalar read at an unaligned offset silently
+        //    returns garbage — manifesting as a per-row correctness
+        //    drift for any row whose delta_byte isn't a multiple of 16.
+        //    Round the source offset DOWN to 16 bytes, read a 16-byte
+        //    chunk (= 4 consecutive fp32 entries) into the start of
+        //    CB_T_R/I (tile-aligned, so dst alignment is fine), then
+        //    pick the right entry from within the chunk.
+        constexpr uint32_t kAlign = 16u;
+
         const uint32_t row_phase   = row % big_modulus;
         const uint32_t delta_tile  = row_phase / kTileElems;
         const uint32_t delta_byte  = (row_phase % kTileElems) * sizeof(float);
+        const uint32_t aligned_byte    = delta_byte & ~(kAlign - 1u);
+        const uint32_t offset_in_chunk = (delta_byte & (kAlign - 1u)) / sizeof(float);
 
-        const uint64_t noc_dr = dr_gen.get_noc_addr(delta_tile) + delta_byte;
-        const uint64_t noc_di = di_gen.get_noc_addr(delta_tile) + delta_byte;
-        noc_async_read(noc_dr, t_r_l1, sizeof(float));
-        noc_async_read(noc_di, t_i_l1, sizeof(float));
+        const uint64_t noc_dr = dr_gen.get_noc_addr(delta_tile) + aligned_byte;
+        const uint64_t noc_di = di_gen.get_noc_addr(delta_tile) + aligned_byte;
+        noc_async_read(noc_dr, t_r_l1, kAlign);
+        noc_async_read(noc_di, t_i_l1, kAlign);
         noc_async_read_barrier();
 
         volatile tt_l1_ptr float* const tw_r =
             reinterpret_cast<volatile tt_l1_ptr float*>(t_r_l1);
         volatile tt_l1_ptr float* const tw_i =
             reinterpret_cast<volatile tt_l1_ptr float*>(t_i_l1);
-        const float dr = tw_r[0];
-        const float di = tw_i[0];
+        const float dr = tw_r[offset_in_chunk];
+        const float di = tw_i[offset_in_chunk];
 
         // ── Step 2: build twiddle row by recurrence tw[k] = tw[k-1] · δ.
         //    Slots [0, P) hold the valid twiddle; slots [P, kTileElems)
