@@ -218,3 +218,123 @@ def test_bluestein_aggressive(device, N):
     # 2e-3 leaves room for that without masking real bugs.
     rel = _rel_err(got, ref)
     assert rel < 2e-3, f"N={N} rel err {rel:.2e}"
+
+
+# ─── 6e-3: comprehensive accuracy sweep (gated) ─────────────────────────
+# This block doubles as the source for the paper's accuracy table.  We
+# reference against complex128 (fp64) torch.fft so the rounding floor
+# isn't dominated by torch's own fp32 path; this gives us a clean
+# measurement of the on-device chain's accuracy.
+#
+# Gated behind TT_FFT_BLUESTEIN_SWEEP=1 because the full matrix is
+# ~140 cases and takes a few minutes.
+
+_BLUESTEIN_SWEEP_N = [
+    # primes (small)
+    3, 5, 7, 11, 13, 17, 19, 23, 31,
+    # Fermat-like primes
+    257, 65537,
+    # Mersenne prime at the cap
+    524287,
+    # pow-2 (Bluestein still works, just inefficient)
+    16, 128, 1024, 16384,
+    # just-around-pow-2 to stress padding logic
+    127, 129, 1023, 1025, 4095, 4097,
+    # composite non-pow-2 (common DSP sizes)
+    100, 384, 1000, 4096 * 3 // 2,  # 6144
+    # large prime well within cap
+    100003,
+]
+
+_BLUESTEIN_SWEEP_DTYPES = [
+    (ttnn.float32,  torch.float32,  "fp32", 1e-3),
+    (ttnn.bfloat16, torch.bfloat16, "bf16", 2.0e-1),
+]
+
+
+def _rel_err_fp64(got_fp32: torch.Tensor, ref_fp64: torch.Tensor) -> float:
+    """Use the fp64 reference but compute the relative error in fp64
+    to avoid the rounding floor of fp32 norm."""
+    got = got_fp32.to(torch.complex128)
+    diff_norm = (got - ref_fp64).abs().to(torch.float64).norm()
+    ref_norm  = ref_fp64.abs().to(torch.float64).norm().clamp_min(1e-300)
+    return float(diff_norm / ref_norm)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TT_FFT_BLUESTEIN_SWEEP", "0") != "1",
+    reason="TT_FFT_BLUESTEIN_SWEEP=1 not set; comprehensive Bluestein "
+           "sweep is gated (~140 cases, several minutes).",
+)
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _BLUESTEIN_SWEEP_DTYPES,
+                         ids=[d[2] for d in _BLUESTEIN_SWEEP_DTYPES])
+@pytest.mark.parametrize("N", _BLUESTEIN_SWEEP_N, ids=lambda v: f"N{v}")
+@pytest.mark.parametrize("B", [1, 2], ids=lambda v: f"B{v}")
+@pytest.mark.parametrize("inp", ["real", "complex"])
+def test_bluestein_sweep_accuracy(
+    device, N, B, tt_dtype, torch_dtype, label, tol, inp,
+):
+    """Full accuracy sweep for the paper's accuracy table.
+
+    Reports per-case rel-err measured against torch's complex128 FFT —
+    this is the most defensible reference because it removes torch's own
+    fp32 rounding from the comparison.
+    """
+    torch.manual_seed(N * 31 + B + (0 if inp == "real" else 1))
+    x_re_fp32 = torch.randn(B, N, dtype=torch.float32)
+
+    if inp == "complex":
+        x_im_fp32 = torch.randn(B, N, dtype=torch.float32)
+    else:
+        x_im_fp32 = None
+
+    x_re = x_re_fp32.to(torch_dtype)
+    x_im = x_im_fp32.to(torch_dtype) if x_im_fp32 is not None else None
+
+    got_r, got_i = _run_bluestein(device, x_re, x_im, N, tt_dtype, B=B)
+    got = torch.complex(got_r.to(torch.float32), got_i.to(torch.float32))
+
+    # fp64 reference (the SOURCE of truth — torch.fft promotes
+    # internally; we explicitly cast to complex128 to be sure).
+    x_ref = torch.complex(
+        x_re_fp32 if x_im_fp32 is None else x_re_fp32,
+        torch.zeros_like(x_re_fp32) if x_im_fp32 is None else x_im_fp32,
+    ).to(torch.complex128)
+    ref = torch.fft.fft(x_ref, dim=-1)
+
+    rel = _rel_err_fp64(got, ref)
+    assert rel < tol, (
+        f"[{label}] B={B} N={N} inp={inp} rel err {rel:.2e} (tol {tol:.0e})"
+    )
+
+
+# ─── 6e-3: program-cache hit across a sweep ─────────────────────────────
+# Confirms that running the same (N, dtype, B) twice in a row reuses the
+# cached BluesteinPlan AND every device op's JIT program-cache entry.
+# We don't have direct access to cache stats from Python, so we just
+# verify functional repeatability — the underlying speedup is what the
+# benchmark harness will measure.
+@pytest.mark.skipif(
+    os.environ.get("TT_FFT_BLUESTEIN_SWEEP", "0") != "1",
+    reason="TT_FFT_BLUESTEIN_SWEEP=1 not set; sweep prog-cache test gated.",
+)
+@pytest.mark.parametrize("N", [17, 257, 1009], ids=lambda v: f"N{v}")
+@pytest.mark.parametrize("B", [1, 2], ids=lambda v: f"B{v}")
+def test_bluestein_sweep_prog_cache_hit(device, N, B):
+    torch.manual_seed(0xBADF00D ^ N ^ B)
+    x = torch.randn(B, N, dtype=torch.float32)
+
+    last = None
+    for trial in range(3):
+        got_r, got_i = _run_bluestein(device, x, None, N, ttnn.float32, B=B)
+        got = torch.complex(got_r.to(torch.float32), got_i.to(torch.float32))
+
+        if last is not None:
+            # Bit-exact across calls when nothing changes (deterministic
+            # on-device pipeline).
+            diff = (got - last).abs().max().item()
+            assert diff == 0.0, (
+                f"trial={trial} N={N} B={B} non-deterministic across "
+                f"prog-cache hits, max-diff={diff:.3e}"
+            )
+        last = got
