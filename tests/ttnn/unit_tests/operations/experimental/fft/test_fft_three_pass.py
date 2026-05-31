@@ -123,6 +123,59 @@ def test_three_pass_correctness(device, B, N, tt_dtype, torch_dtype, label, tol)
         )
 
 
+# ─── 1b. Correctness — COMPLEX input (commit 6a) ───────────────────────────
+# fft_three_pass gained an optional input_imag parameter in commit 6a
+# (the complex-input form used by the Bluestein composite for its
+# intermediate length-M FFT).  When supplied, input_imag goes through
+# the SAME pre-rearrangement chain as input_real (reshape →
+# transpose_rm → reshape), adding 1 extra transpose_rm dispatch on the
+# input but otherwise reusing the same 8-op pipeline.
+#
+# Single representative N (2^21) at fp32 + bf16, B ∈ {1, 2}.  Larger N
+# is covered by the real-input tests above and would not exercise any
+# new code path here.
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("N", [1 << 21])
+def test_three_pass_complex_correctness(
+    device, B, N, tt_dtype, torch_dtype, label, tol,
+):
+    N1, N2, N3 = _expected_three_factorization(N)
+    assert N1 * N2 * N3 == N
+
+    torch.manual_seed(17)
+    x_re_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x_im_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x_re = x_re_fp32.to(torch_dtype)
+    x_im = x_im_fp32.to(torch_dtype)
+
+    x_re_pre = x_re.reshape(B * N1 * N2, N3).contiguous()
+    x_im_pre = x_im.reshape(B * N1 * N2, N3).contiguous()
+
+    tt_re = ttnn.from_torch(
+        x_re_pre, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    tt_im = ttnn.from_torch(
+        x_im_pre, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    out_re, out_im = ttnn.experimental.fft_three_pass(tt_re, tt_im, full_N=N)
+    got_r = ttnn.to_torch(out_re).reshape(B, N).to(torch.float32)
+    got_i = ttnn.to_torch(out_im).reshape(B, N).to(torch.float32)
+    got = torch.complex(got_r, got_i)
+
+    ref = torch.fft.fft(
+        torch.complex(x_re_fp32, x_im_fp32).to(torch.complex64), dim=-1,
+    )
+
+    for b in range(B):
+        rel = _rel_err(got[b], ref[b])
+        assert rel < tol, (
+            f"[{label}-complex] B={B} N={N} (N1={N1},N2={N2},N3={N3}) "
+            f"row={b} rel err {rel:.2e} (tol {tol:.0e})"
+        )
+
+
 # ─── 2. Aggressive band — gated ─────────────────────────────────────────
 # These exercise the upper end of the supported range.  Default-skipped
 # because they each take minutes and need GB of host RAM for the torch

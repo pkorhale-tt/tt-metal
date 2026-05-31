@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <optional>
 #include <tuple>
 
 #include "ttnn/tensor/tensor.hpp"
@@ -57,6 +58,17 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ifft(
 // public `fft()` API can transparently route (B, N) → fft_three_pass.
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     const ttnn::Tensor& input_real,
+    uint32_t full_N,
+    FFTPrecision precision = FFTPrecision::Precise);
+
+// Complex-input variant (commit 6a, for Bluestein's intermediate
+// length-M FFT).  `input_imag` must have the same pre-shape as
+// `input_real`.  Adds one extra transpose_rm dispatch on the imag
+// tensor at the head of the pipeline; the rest of the three-pass
+// chain already handles complex data natively.
+std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
+    const ttnn::Tensor& input_real,
+    std::optional<ttnn::Tensor> input_imag,
     uint32_t full_N,
     FFTPrecision precision = FFTPrecision::Precise);
 

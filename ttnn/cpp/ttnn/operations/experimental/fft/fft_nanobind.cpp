@@ -102,12 +102,21 @@ TensorPair fft_radix_pass_complex_trampoline(
         input_real, input_imag, P, twiddle_N2, stride);
 }
 
-TensorPair fft_three_pass_trampoline(
+TensorPair fft_three_pass_real_trampoline(
     const ttnn::Tensor& input_real,
     uint32_t full_N,
     std::string precision) {
     return ttnn::operations::experimental::fft_three_pass(
         input_real, full_N, parse_precision(precision));
+}
+
+TensorPair fft_three_pass_complex_trampoline(
+    const ttnn::Tensor& input_real,
+    const ttnn::Tensor& input_imag,
+    uint32_t full_N,
+    std::string precision) {
+    return ttnn::operations::experimental::fft_three_pass(
+        input_real, input_imag, full_N, parse_precision(precision));
 }
 
 }  // namespace
@@ -389,6 +398,14 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                 * :attr:`input_real`: Float32 or BFloat16 ROW_MAJOR tensor.
                   Shape must end in ``(N1·N2, N3)`` for the
                   ``pick_three_factorization(full_N)`` factorization.
+                * :attr:`input_imag` (optional, complex-input form): same
+                  shape / dtype / layout as ``input_real``.  When provided
+                  the input is interpreted as the complex signal
+                  ``input_real + i * input_imag`` and an additional
+                  ``transpose_rm`` is issued at the head of the pipeline
+                  to keep the imag tensor in lockstep with the real one.
+                  Used by the Bluestein composite (commit 6d) for its
+                  intermediate length-M FFT.
                 * :attr:`full_N`: logical FFT length.  Pow-2 in
                   ``[2^21, 2^30]``.  Must factor as ``N1·N2·N3`` with each
                   factor pow-2 in ``[32, 1024]``.
@@ -413,8 +430,14 @@ void bind_experimental_fft_operation(nb::module_& mod) {
         mod,
         fft_three_pass_doc,
         ttnn::overload_t(
-            &fft_three_pass_trampoline,
+            &fft_three_pass_real_trampoline,
             nb::arg("input_real").noconvert(),
+            nb::arg("full_N"),
+            nb::arg("precision") = std::string("precise")),
+        ttnn::overload_t(
+            &fft_three_pass_complex_trampoline,
+            nb::arg("input_real").noconvert(),
+            nb::arg("input_imag").noconvert(),
             nb::arg("full_N"),
             nb::arg("precision") = std::string("precise")));
 }

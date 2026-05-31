@@ -21,12 +21,21 @@ namespace ttnn::operations::experimental {
 namespace {
 
 // ───────────────────────────────────────────────────────────────────────
-// Two-pass Cooley–Tukey composite (commit 3c, corrected commit 5c)
+// Two-pass Cooley–Tukey composite (commit 3c, corrected commit 5c,
+// extended for complex input commit 6a)
 //
 // For pow-2 N with 1024 < N ≤ 1M, factor N = N1 · N2 (both pow-2, both
 // in [32, 1024]).  We use the standard mixed-radix DIT decomposition
 // that — for natural-order input AND natural-order output — requires
 // pre- and post-transposes so each pass FFTs along the LAST axis.
+//
+// COMPLEX INPUT (commit 6a, for Bluestein): the optional `input_imag`
+// is shape-matched to `input_real` and gets the same pre-transpose
+// before being threaded into Pass-1 of the radix kernel.  Pass-1
+// already supports complex input natively (the underlying Stockham
+// kernel computes a true complex FFT when both halves are provided),
+// so the only extra cost is one transpose_rm dispatch on the imag
+// tensor.
 //
 // Index packing (input n natural, output K natural):
 //   n = n1·N2 + n2   (n1 OUTER, n2 INNER of the (B, N) row)
@@ -89,7 +98,9 @@ ttnn::Shape make_shape(std::initializer_list<uint32_t> dims) {
 }
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
-    const ttnn::Tensor& input_real, FFTPrecision precision) {
+    const ttnn::Tensor& input_real,
+    std::optional<ttnn::Tensor> input_imag,
+    FFTPrecision precision) {
     // precision is currently unused — both passes route through
     // prim::fft_radix_pass which keeps its compute precision implicit
     // (fp32 input → fp32 compute, bf16 input → packed bf16).  Kept in
@@ -104,24 +115,39 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     }
 
     const auto [N1, N2] = pick_factorization(N);
+    // When input_imag is supplied (complex-input forward FFT — added in
+    // commit 6a for Bluestein) we transpose it alongside the real tensor
+    // and feed both to Pass-1.  This adds 1 extra transpose_rm dispatch
+    // (5 → 6 device ops total) but is the only correct way to keep
+    // Cooley-Tukey Method A invariants intact for complex input.
+    const bool has_imag = input_imag.has_value();
 
     // ── Step 1: reshape input (B, N) → (B, N1, N2).  View, free.
     //   x_3d[b, n1, n2] = x_orig[b, n1·N2 + n2].
-    auto x_3d = ttnn::reshape(input_real, make_shape({B, N1, N2}));
+    auto x_3d_r = ttnn::reshape(input_real, make_shape({B, N1, N2}));
+    std::optional<ttnn::Tensor> x_3d_i;
+    if (has_imag) {
+        x_3d_i = ttnn::reshape(*input_imag, make_shape({B, N1, N2}));
+    }
 
     // ── Step 2: initial transpose (B, N1, N2) → (B, N2, N1).
     //   So that Pass-1 (FFT_N1) sees stride-N1 sub-samples as
     //   contiguous rows.  This is the bit-reversal-equivalent step
     //   that the earlier (commit 4) version was missing.
-    auto x_t = ttnn::prim::transpose_rm(x_3d);
-    auto x_p1 = ttnn::reshape(x_t, make_shape({B * N2, N1}));
+    auto x_t_r  = ttnn::prim::transpose_rm(x_3d_r);
+    auto x_p1_r = ttnn::reshape(x_t_r, make_shape({B * N2, N1}));
+    std::optional<ttnn::Tensor> x_p1_i;
+    if (has_imag) {
+        auto x_t_i = ttnn::prim::transpose_rm(*x_3d_i);
+        x_p1_i = ttnn::reshape(x_t_i, make_shape({B * N2, N1}));
+    }
 
-    // ── Step 3: Pass-1 batched length-N1 real FFT + between-pass
-    //   twiddle.  Row r = b·N2 + n2, so (r % twiddle_N2=N2) = n2:
+    // ── Step 3: Pass-1 batched length-N1 (complex if has_imag else real)
+    //   FFT + between-pass twiddle.  Row r = b·N2 + n2, so (r % twiddle_N2=N2) = n2:
     //       post-twiddle = exp(-2πi · n2 · k1 / (N1·N2))
     //                    = exp(-2πi · n2 · k1 / N)        ← Cooley–Tukey twiddle
     auto [r1, i1] = ttnn::prim::fft_radix_pass(
-        x_p1, /*input_imag=*/std::nullopt,
+        x_p1_r, /*input_imag=*/x_p1_i,
         /*P=*/N1, /*twiddle_N2=*/N2);
 
     // ── Step 4: transpose (B, N2, N1) → (B, N1, N2) to bring n2 to
@@ -313,6 +339,7 @@ std::tuple<uint32_t, uint32_t, uint32_t> pick_three_factorization(uint32_t N) {
 // ────────────────────────────────────────────────────────────────────
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     const ttnn::Tensor& input_real,
+    std::optional<ttnn::Tensor> input_imag,
     uint32_t full_N,
     FFTPrecision precision) {
     (void)precision;  // see fft_two_pass note.
@@ -341,17 +368,36 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
         M_in, N1 * N2, full_N, N1, N2, N3);
     const uint32_t B = M_in / (N1 * N2);
 
+    // Complex-input mode (commit 6a, for Bluestein): when input_imag is
+    // supplied it gets the SAME pre-rearrangement chain as input_real
+    // (reshape → transpose_rm → reshape), adds 1 transpose_rm dispatch
+    // on the input.  Pass-1 then sees a true complex input.  The rest
+    // of the pipeline already handles complex (Pass-2 and Pass-3 both
+    // do) so no further changes are required.
+    const bool has_imag = input_imag.has_value();
+    if (has_imag) {
+        const auto& im_shape = input_imag->padded_shape();
+        TT_FATAL(im_shape == in_shape,
+            "fft_three_pass: input_imag shape must match input_real shape.");
+    }
+
     // ── Initial rearrangement (input n1 OUTER → n1 to LAST axis).
     //   Input (B·N1·N2, N3) is row-major with n = n1·N2·N3 + n2·N3 + n3.
     //   View as (B, N1, N2·N3) [merges (N2, N3) → page = N2·N3·elem,
     //   page-changing reshape], then transpose_rm → (B, N2·N3, N1).
-    auto x_3d = ttnn::reshape(input_real, make_shape({B, N1, N2 * N3}));
-    auto x_t  = ttnn::prim::transpose_rm(x_3d);                       // (B, N2·N3, N1)
-    auto x_p1 = ttnn::reshape(x_t, make_shape({B * N2 * N3, N1}));
+    auto x_3d_r = ttnn::reshape(input_real, make_shape({B, N1, N2 * N3}));
+    auto x_t_r  = ttnn::prim::transpose_rm(x_3d_r);                   // (B, N2·N3, N1)
+    auto x_p1_r = ttnn::reshape(x_t_r, make_shape({B * N2 * N3, N1}));
+    std::optional<ttnn::Tensor> x_p1_i;
+    if (has_imag) {
+        auto x_3d_i = ttnn::reshape(*input_imag, make_shape({B, N1, N2 * N3}));
+        auto x_t_i  = ttnn::prim::transpose_rm(x_3d_i);               // (B, N2·N3, N1)
+        x_p1_i = ttnn::reshape(x_t_i, make_shape({B * N2 * N3, N1}));
+    }
 
     // ── Stage 1: pure FFT_N1 over the (now-inner) n1 axis.
     auto [r1, i1] = ttnn::prim::fft_radix_pass(
-        x_p1, /*input_imag=*/std::nullopt,
+        x_p1_r, /*input_imag=*/x_p1_i,
         /*P=*/N1, /*twiddle_N2=*/0u);
 
     // ── Twiddle-1: exp(-2πi · (n2·N3 + n3) · k1 / N).
@@ -419,6 +465,17 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     return {std::move(r_out), std::move(i_out)};
 }
 
+// Public real-input wrapper (preserves the original commit-5 signature).
+// The complex-input form is the lower-level 3-arg overload above and is
+// what Bluestein (commit 6d) drives.
+std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
+    const ttnn::Tensor& input_real,
+    uint32_t full_N,
+    FFTPrecision precision) {
+    return fft_three_pass(input_real, /*input_imag=*/std::nullopt,
+                          full_N, precision);
+}
+
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     const ttnn::Tensor& input_real, FFTPrecision precision) {
     // Routing (TT_FFT_NATIVE=1):
@@ -429,7 +486,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     //                         (until commit 7 adds rebank kernel)
     //   N > 2^30            → falls through to prim::fft (will TT_FATAL)
     if (two_pass_eligible(input_real)) {
-        return fft_two_pass(input_real, precision);
+        return fft_two_pass(input_real, /*input_imag=*/std::nullopt, precision);
     }
     return ttnn::prim::fft(input_real, /*inverse=*/false,
                            /*input_imag=*/std::nullopt, precision);
@@ -439,6 +496,14 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     const ttnn::Tensor& input_real,
     const ttnn::Tensor& input_imag,
     FFTPrecision precision) {
+    // Same routing as the real-input overload, but the complex-input
+    // path is now plumbed through the two-pass composite when N falls
+    // in its range (added commit 6a — required for Bluestein's
+    // intermediate complex pipeline).  Small-N still goes through
+    // prim::fft which has had complex-input support since commit 0.
+    if (two_pass_eligible(input_real)) {
+        return fft_two_pass(input_real, input_imag, precision);
+    }
     return ttnn::prim::fft(input_real, /*inverse=*/false, input_imag, precision);
 }
 

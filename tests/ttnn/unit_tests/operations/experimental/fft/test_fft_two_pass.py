@@ -89,6 +89,52 @@ def test_two_pass_correctness(device, B, N, tt_dtype, torch_dtype, label, tol):
         )
 
 
+# ─── 1b. Correctness — COMPLEX input (commit 6a) ───────────────────────────
+# The composite was extended in commit 6a to forward an optional input_imag
+# all the way to Pass-1 of the radix kernel (the pre-transpose chain
+# applies to both halves; the rest of the pipeline already handled complex
+# data natively).  This is needed for the Bluestein composite's
+# intermediate length-M FFT (commit 6d).
+#
+# Dispatch chain grows from 5 → 6 device ops (one extra transpose_rm on
+# the imag input).
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("N", [2048, 4096])
+def test_two_pass_complex_correctness(device, B, N, tt_dtype, torch_dtype, label, tol):
+    N1, N2 = _expected_factorization(N)
+    assert N1 * N2 == N
+
+    torch.manual_seed(13)
+    x_re_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x_im_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x_re = x_re_fp32.to(torch_dtype)
+    x_im = x_im_fp32.to(torch_dtype)
+
+    tt_re = ttnn.from_torch(
+        x_re, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    tt_im = ttnn.from_torch(
+        x_im, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    out_re, out_im = ttnn.experimental.fft(tt_re, tt_im)
+    got_r = ttnn.to_torch(out_re).reshape(B, N).to(torch.float32)
+    got_i = ttnn.to_torch(out_im).reshape(B, N).to(torch.float32)
+    got = torch.complex(got_r, got_i)
+
+    ref = torch.fft.fft(
+        torch.complex(x_re_fp32, x_im_fp32).to(torch.complex64), dim=-1,
+    )
+
+    for b in range(B):
+        rel = _rel_err(got[b], ref[b])
+        assert rel < tol, (
+            f"[{label}-complex] B={B} N={N} (N1={N1},N2={N2}) row={b} "
+            f"rel err {rel:.2e} (tol {tol:.0e})"
+        )
+
+
 # ─── 2. Program cache hit ──────────────────────────────────────────────────
 # Two-pass dispatches four distinct device ops per call: fft_radix_pass +
 # 2× transpose_rm (different shapes → 2 entries) + fft (Pass-2).  After
