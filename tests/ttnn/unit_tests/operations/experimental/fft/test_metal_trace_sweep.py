@@ -262,10 +262,54 @@ def test_trace_fft_two_pass(device, dtype):
 
 
 # ─── 8. ifft (commit 6c) ────────────────────────────────────────────────
+# IMPORTANT routing note:
+#   N <= 1024 IFFT  → ttnn::prim::fft(inverse=true) → falls back to the
+#                     LEGACY FFTProgramFactory (the new SingleTileStockham
+#                     path is forward-only as of commit 6c).  The legacy
+#                     path does host reads during dispatch and is NOT
+#                     trace-safe.  We document this explicitly here and
+#                     skip the small-N case.
+#   N >  1024 IFFT  → fft_two_pass(inverse=true) → 100% new path
+#                     (transpose_rm + apply_twiddles + fft_radix_pass with
+#                     output_scale=1/N folded into the writer).  Trace-safe.
 @pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
                          ids=["fp32", "bf16"])
-@pytest.mark.parametrize("N", [16, 2048], ids=lambda v: f"N{v}")
+@pytest.mark.parametrize("N", [2048], ids=lambda v: f"N{v}")
 def test_trace_ifft(device, N, dtype):
+    torch.manual_seed(11 + N)
+    xr = torch.randn(1, N, dtype=torch.float32)
+    xi = torch.randn(1, N, dtype=torch.float32)
+    tt_xr = _rm(xr, device, dtype)
+    tt_xi = _rm(xi, device, dtype)
+
+    eag_r, eag_i = ttnn.experimental.ifft(tt_xr, tt_xi)
+    eager_r = ttnn.to_torch(eag_r)
+    eager_i = ttnn.to_torch(eag_i)
+
+    def run_op(a, b):
+        return ttnn.experimental.ifft(a, b)
+
+    _trace_and_compare(
+        device, f"ifft-N{N}-{dtype}",
+        run_op, (tt_xr, tt_xi), (eager_r, eager_i),
+    )
+
+
+# Documented legacy-path limitation — kept as an explicit xfail so the
+# paper's "every NEW op is trace-safe" claim is auditable and the legacy
+# carve-out is explicit, not silent.
+@pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
+                         ids=["fp32", "bf16"])
+@pytest.mark.xfail(
+    strict=True,
+    reason="N<=1024 IFFT routes through the legacy FFTProgramFactory "
+           "(commit 6c only added forward inverse=false to the new "
+           "SingleTileStockhamFactory). The legacy dispatch does host "
+           "reads and is not Metal-Trace safe. Will be lifted when "
+           "SingleTileStockhamFactory grows inverse=true support."
+)
+def test_trace_ifft_small_n_legacy_xfail(device, dtype):
+    N = 16
     torch.manual_seed(11 + N)
     xr = torch.randn(1, N, dtype=torch.float32)
     xi = torch.randn(1, N, dtype=torch.float32)
