@@ -46,16 +46,17 @@ constexpr uint32_t log2u(uint32_t n) {
     return r;
 }
 
-constexpr bool is_pow2(uint32_t n) {
+// Renamed `is_pow2_st` (single-tile prefix) so the Unity build can merge
+// this TU with fft_device_operation.cpp — which has its own anonymous-
+// namespace `is_pow2` — without ODR collision.
+constexpr bool is_pow2_st(uint32_t n) {
     return n != 0u && (n & (n - 1u)) == 0u;
 }
 
 // Twiddle factors for length-N batched Stockham, packed for the
 // batch_fft_compute kernel. Mirrors stockham_host.hpp::batch_twiddles().
-// One tile worth of twiddles per stage; LOG2N stages total.
-std::pair<std::vector<float>, std::vector<float>> batch_twiddles_fp32(
-    uint32_t N, uint32_t log2N)
-{
+// One tile worth of twiddles per stage; log2N stages total.
+std::pair<std::vector<float>, std::vector<float>> batch_twiddles_fp32(uint32_t log2N) {
     // Layout: stage s (s in [0, log2N)) holds N/2 twiddles W_N^k = exp(-2πi k / 2^(s+1))
     // packed into a single tile (kTileElems floats), zero-padded.
     const size_t total = static_cast<size_t>(log2N) * kTileElems;
@@ -82,7 +83,7 @@ std::pair<std::vector<float>, std::vector<float>> batch_twiddles_fp32(
 }  // namespace
 
 tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
-    const FFTParams& operation_attributes,
+    [[maybe_unused]] const FFTParams& operation_attributes,
     const FFTTensorArgs& tensor_args,
     std::tuple<ttnn::Tensor, ttnn::Tensor>& tensor_return_value)
 {
@@ -94,7 +95,7 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
     const uint32_t log2N = log2u(N);
 
     // Single-tile path: N must fit in one 32×32 tile.
-    TT_FATAL(is_pow2(N) && N >= 2u && N <= kTileElems,
+    TT_FATAL(is_pow2_st(N) && N >= 2u && N <= kTileElems,
         "SingleTileStockhamFactory: requires pow-2 N in [2, 1024] (got N={}).", N);
     TT_FATAL(in_real.dtype() == DataType::FLOAT32,
         "SingleTileStockhamFactory: fp32 only (got dtype {}).",
@@ -108,9 +109,6 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
     auto* const out_r_buf = out_r_tensor.buffer();
     auto* const out_i_buf = out_i_tensor.buffer();
 
-    // Forward FFT of REAL input: imag is implicit zero. For the wire-compat
-    // path we still need an imag input buffer; create one zero-filled via
-    // a small CB sink. (Cleaner future: dedicated real-only kernel variant.)
     TT_FATAL(in_r_buf != nullptr && out_r_buf != nullptr && out_i_buf != nullptr,
         "SingleTileStockhamFactory: input/output tensors must be on device.");
 
@@ -151,10 +149,12 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
     }
 
     // ── Twiddle precompute on host (Category B: constant per-N, fine) ──
-    // TODO(commit-1b): hoist into const-data CB so it isn't re-computed
-    // on cache miss for the same N. Currently regenerated each create.
-    auto [tw_r_data, tw_i_data] = batch_twiddles_fp32(N, log2N);
-    (void)tw_r_data;  // wired via runtime args in TODO below
+    // TODO(commit-1c): wire twiddles as a const-data DRAM buffer + pass
+    // its address as a runtime arg to the reader. Currently the reader's
+    // tw_r/tw_i addrs are 0u — kernel will fault when it tries to load
+    // twiddles. Commit 1B (this commit): just get scaffolding compiling.
+    auto [tw_r_data, tw_i_data] = batch_twiddles_fp32(log2N);
+    (void)tw_r_data;
     (void)tw_i_data;
 
     // ── Kernels ────────────────────────────────────────────────────────
@@ -166,21 +166,22 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
             "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/batch_fft_reader.cpp",
         .core_ranges = crs,
         .compile_time_args = {N, log2N},
-        .common_runtime_args = {},
-        .runtime_args = {{
-            // {in_r_addr, in_i_addr, tw_r_addr, tw_i_addr, base=0, batch_per_core=1, phys_x, phys_y}
-            // TODO(commit-1b): allocate twiddle DRAM buffers + write twiddle
-            //                 tables; pass real addrs here. Currently 0
-            //                 placeholders will fault at runtime.
-            in_r_buf->address(),
-            /*in_i_addr=*/0u,
-            /*tw_r_addr=*/0u,
-            /*tw_i_addr=*/0u,
-            /*base=*/0u,
-            /*batch_per_core=*/1u,
-            /*phys_x=*/0u,
-            /*phys_y=*/0u,
-        }},
+        .runtime_args = {
+            // Per-core: {core, {in_r, in_i, tw_r, tw_i, base, batch_per_core, phys_x, phys_y}}
+            std::pair<CoreCoord, std::vector<uint32_t>>{
+                core,
+                std::vector<uint32_t>{
+                    in_r_buf->address(),
+                    /*in_i_addr=*/0u,        // TODO(commit-1c)
+                    /*tw_r_addr=*/0u,        // TODO(commit-1c)
+                    /*tw_i_addr=*/0u,        // TODO(commit-1c)
+                    /*base=*/0u,
+                    /*batch_per_core=*/1u,
+                    /*phys_x=*/0u,
+                    /*phys_y=*/0u,
+                },
+            },
+        },
         .config = ReaderConfigDescriptor{},
     });
 
@@ -190,13 +191,17 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
             "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/batch_fft_writer.cpp",
         .core_ranges = crs,
         .compile_time_args = {},
-        .common_runtime_args = {},
-        .runtime_args = {{
-            out_r_buf->address(),
-            out_i_buf->address(),
-            /*base=*/0u,
-            /*batch_per_core=*/1u,
-        }},
+        .runtime_args = {
+            std::pair<CoreCoord, std::vector<uint32_t>>{
+                core,
+                std::vector<uint32_t>{
+                    out_r_buf->address(),
+                    out_i_buf->address(),
+                    /*base=*/0u,
+                    /*batch_per_core=*/1u,
+                },
+            },
+        },
         .config = WriterConfigDescriptor{},
     });
 
@@ -211,10 +216,12 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
             "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/compute/batch_fft_compute.cpp",
         .core_ranges = crs,
         .compile_time_args = {log2N},
-        .common_runtime_args = {},
-        .runtime_args = {{
-            /*batch_per_core=*/1u,
-        }},
+        .runtime_args = {
+            std::pair<CoreCoord, std::vector<uint32_t>>{
+                core,
+                std::vector<uint32_t>{ /*batch_per_core=*/1u },
+            },
+        },
         .config = ComputeConfigDescriptor{
             .math_fidelity       = MathFidelity::HiFi4,
             .fp32_dest_acc_en    = true,
