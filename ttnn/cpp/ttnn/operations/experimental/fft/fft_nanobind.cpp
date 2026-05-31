@@ -17,6 +17,7 @@
 #include "ttnn/operations/experimental/fft/fft.hpp"
 #include "ttnn/operations/experimental/fft/apply_twiddles.hpp"
 #include "ttnn/operations/experimental/fft/transpose_rm.hpp"
+#include "ttnn/operations/experimental/fft/fft_radix_pass.hpp"
 
 namespace ttnn::operations::experimental::fft_binding::detail {
 
@@ -66,6 +67,26 @@ TensorPair apply_twiddles_trampoline(
 
 ttnn::Tensor transpose_rm_trampoline(const ttnn::Tensor& input) {
     return ttnn::operations::experimental::transpose_rm(input);
+}
+
+// fft_radix_pass has two overloads (with / without imag input) — bind
+// each as its own trampoline so nanobind picks the right one based on
+// the call signature.
+TensorPair fft_radix_pass_real_trampoline(
+    const ttnn::Tensor& input_real,
+    uint32_t P,
+    uint32_t twiddle_N2) {
+    return ttnn::operations::experimental::fft_radix_pass(
+        input_real, std::nullopt, P, twiddle_N2);
+}
+
+TensorPair fft_radix_pass_complex_trampoline(
+    const ttnn::Tensor& input_real,
+    const ttnn::Tensor& input_imag,
+    uint32_t P,
+    uint32_t twiddle_N2) {
+    return ttnn::operations::experimental::fft_radix_pass(
+        input_real, input_imag, P, twiddle_N2);
 }
 
 }  // namespace
@@ -228,6 +249,52 @@ void bind_experimental_fft_operation(nb::module_& mod) {
         ttnn::overload_t(
             &transpose_rm_trampoline,
             nb::arg("input").noconvert()));
+
+    const auto* fft_radix_pass_doc =
+        R"doc(
+            Fused [batched length-P FFT  +  optional post-twiddle complex
+            multiply].  Building block for the K-pass Cooley-Tukey
+            composite that handles N > 1M.
+
+            Interprets the input as ``M`` rows of length ``P`` (where ``M``
+            is the product of all leading dims) and replaces each row
+            with its length-``P`` DFT:
+
+                y[r, k] = sum_{n=0}^{P-1} x[r, n] * exp(-2πi n k / P)
+
+            If ``twiddle_N2 != 0``, the output is then multiplied by
+
+                y[r, k] *= exp(-2πi · (r % twiddle_N2) · k / (P·twiddle_N2))
+
+            which is exactly the between-pass twiddle of a two-pass FFT
+            decomposition.  Passing ``twiddle_N2=0`` makes this a pure
+            batched FFT (equivalent to ``ttnn.experimental.fft`` on the
+            same input).
+
+            The two-arg form passes only the real input (imag implicitly
+            zero); the three-arg form takes a complex (real+imag) input.
+
+            Constraints:
+                * P pow-2 in [2, 1024]
+                * M pow-2 and >= 1
+                * twiddle_N2 == 0 or pow-2 in [1, 1024] dividing M
+                * fp32 or bf16; ROW_MAJOR layout
+        )doc";
+
+    ttnn::bind_function<"fft_radix_pass", ttnn::unique_string{"ttnn.experimental."}>(
+        mod,
+        fft_radix_pass_doc,
+        ttnn::overload_t(
+            &fft_radix_pass_real_trampoline,
+            nb::arg("input_real").noconvert(),
+            nb::arg("P"),
+            nb::arg("twiddle_N2") = 0u),
+        ttnn::overload_t(
+            &fft_radix_pass_complex_trampoline,
+            nb::arg("input_real").noconvert(),
+            nb::arg("input_imag").noconvert(),
+            nb::arg("P"),
+            nb::arg("twiddle_N2") = 0u));
 }
 
 }  // namespace ttnn::operations::experimental::fft_binding::detail
