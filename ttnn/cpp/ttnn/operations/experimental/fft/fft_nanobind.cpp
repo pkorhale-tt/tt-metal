@@ -16,6 +16,7 @@
 #include "ttnn-nanobind/bind_function.hpp"
 #include "ttnn/operations/experimental/fft/fft.hpp"
 #include "ttnn/operations/experimental/fft/apply_twiddles.hpp"
+#include "ttnn/operations/experimental/fft/transpose_rm.hpp"
 
 namespace ttnn::operations::experimental::fft_binding::detail {
 
@@ -61,6 +62,10 @@ TensorPair apply_twiddles_trampoline(
     uint32_t N1,
     uint32_t N2) {
     return ttnn::operations::experimental::apply_twiddles(input_real, input_imag, N1, N2);
+}
+
+ttnn::Tensor transpose_rm_trampoline(const ttnn::Tensor& input) {
+    return ttnn::operations::experimental::transpose_rm(input);
 }
 
 }  // namespace
@@ -195,6 +200,34 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             nb::arg("input_imag").noconvert(),
             nb::arg("N1"),
             nb::arg("N2")));
+
+    const auto* transpose_rm_doc =
+        R"doc(
+            Precision-preserving inner-axis transpose for ROW_MAJOR
+            fp32 / bf16 tensors.  Swaps the last two dims of ``input``
+            (shape ``(..., A, C)`` → ``(..., C, A)``).
+
+            Unlike the standard :func:`ttnn.transpose`, which silently
+            downcasts to bf16 for ROW_MAJOR fp32 paths, this op is pure
+            data movement (32×32 tile permute via the NoC) so fp32 input
+            yields bit-exact fp32 output.
+
+            Used as a building block in the two-pass FFT composite
+            (commit 3c) where the inter-pass data layout demands
+            full-precision transposition.
+
+            Constraints:
+                * Both ``A`` and ``C`` must be multiples of 32 and ≥ 32.
+                * Layout must be ROW_MAJOR.
+                * Dtype must be Float32 or BFloat16.
+        )doc";
+
+    ttnn::bind_function<"transpose_rm", ttnn::unique_string{"ttnn.experimental."}>(
+        mod,
+        transpose_rm_doc,
+        ttnn::overload_t(
+            &transpose_rm_trampoline,
+            nb::arg("input").noconvert()));
 }
 
 }  // namespace ttnn::operations::experimental::fft_binding::detail

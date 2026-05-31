@@ -46,8 +46,11 @@ target_sources(
         device/batched_stockham_factory.cpp
         device/apply_twiddles_device_operation.cpp
         device/apply_twiddles_factory.cpp
+        device/transpose_rm_device_operation.cpp
+        device/transpose_rm_factory.cpp
         fft.cpp
         apply_twiddles.cpp
+        transpose_rm.cpp
 )
 
 target_include_directories(ttnn_op_experimental_fft PRIVATE ${FixmeOpIncDirs})
