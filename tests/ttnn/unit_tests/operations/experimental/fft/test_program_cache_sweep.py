@@ -57,13 +57,16 @@ def _rm(t, device, dtype):
 
 
 # ─── 1. apply_twiddles ──────────────────────────────────────────────────
+# Input shape is (M, N1) — the op operates on a *single* twiddle row
+# of length N1 per (b, n2) outer pair, and M = B * N2.
 @pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
                          ids=["fp32", "bf16"])
 def test_cache_apply_twiddles(device, dtype):
     torch.manual_seed(0)
-    M, N1, N2 = 8, 32, 32
-    xr = torch.randn(M, N1 * N2, dtype=torch.float32)
-    xi = torch.randn(M, N1 * N2, dtype=torch.float32)
+    N1, N2, B = 32, 32, 1
+    M = B * N2
+    xr = torch.randn(M, N1, dtype=torch.float32)
+    xi = torch.randn(M, N1, dtype=torch.float32)
 
     def fn():
         ttnn.experimental.apply_twiddles(
