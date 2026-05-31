@@ -55,14 +55,19 @@ namespace ttnn::experimental::prim::bluestein_host {
 struct BluesteinPlan {
     uint32_t N = 0;   // logical FFT length (the user's `N`).
     uint32_t M = 0;   // padded length, next_pow2(2*N - 1).
+    uint32_t B = 1;   // batch dim of the chirp / B tensors (matches caller).
 
-    // chirp_n, chirp_k : (1, N) ROW_MAJOR, dtype = caller's dtype.
+    // chirp_n, chirp_k : (B, N) ROW_MAJOR, dtype = caller's dtype.
+    //   Each of the B rows holds the SAME chirp sequence (replicated on
+    //   the host before upload).  Replication is required because our
+    //   complex_mul is shape-strict (no broadcast).
     ttnn::Tensor chirp_n_re;
     ttnn::Tensor chirp_n_im;
     ttnn::Tensor chirp_k_re;
     ttnn::Tensor chirp_k_im;
 
-    // B = FFT_M(b_cyc) : (1, M) ROW_MAJOR.
+    // B_fft = FFT_M(b_cyc) replicated to (B, M) ROW_MAJOR.
+    //   (Same value across batch rows; replicated for the same reason.)
     ttnn::Tensor B_re;
     ttnn::Tensor B_im;
 };
@@ -127,32 +132,48 @@ build_b_cyc(uint32_t N, uint32_t M) {
 
 // ── Device-tensor upload helper ──────────────────────────────────────────
 //
-// Builds a (1, length) ROW_MAJOR Tensor of `dtype` from a host fp32 vector.
-// Narrows fp32 → bf16 on the host when dtype = BFLOAT16.
-inline ttnn::Tensor upload_row(
-    std::vector<float>&& buf,
+// Builds a (B, length) ROW_MAJOR Tensor of `dtype` by REPLICATING the
+// length-`length` host buffer across B rows.  Narrows fp32 → bf16 on the
+// host when dtype = BFLOAT16.
+//
+// Replication is done on the host before upload — simpler than a per-row
+// device-side broadcast, and chirp tensors are tiny relative to per-call
+// activations (chirp = O(B*N) floats, activations = O(B*M) ≥ 4× larger).
+inline ttnn::Tensor upload_replicated_rows(
+    const std::vector<float>& row,
+    uint32_t B,
     uint32_t length,
     tt::tt_metal::DataType dtype,
     tt::tt_metal::distributed::MeshDevice* device)
 {
     using namespace tt::tt_metal;
-    TT_FATAL(buf.size() == length,
-        "bluestein_host::upload_row: buffer size {} != expected length {}.",
-        buf.size(), length);
+    TT_FATAL(row.size() == length,
+        "bluestein_host::upload_replicated_rows: row size {} != expected "
+        "length {}.", row.size(), length);
 
-    ttnn::Shape shape{ttnn::SmallVector<uint32_t>{1u, length}};
+    ttnn::Shape shape{ttnn::SmallVector<uint32_t>{B, length}};
     TensorSpec spec(
         shape,
         TensorLayout(dtype, PageConfig(Layout::ROW_MAJOR), MemoryConfig{}));
 
+    const size_t total = static_cast<size_t>(B) * length;
+
     if (dtype == DataType::BFLOAT16) {
-        std::vector<bfloat16> bf(buf.size());
-        for (size_t i = 0; i < buf.size(); ++i) {
-            bf[i] = bfloat16(buf[i]);
+        std::vector<bfloat16> bf(total);
+        for (uint32_t b = 0; b < B; ++b) {
+            for (uint32_t i = 0; i < length; ++i) {
+                bf[static_cast<size_t>(b) * length + i] = bfloat16(row[i]);
+            }
         }
         return Tensor::from_vector(std::move(bf), spec, device);
     }
-    return Tensor::from_vector(std::move(buf), spec, device);
+
+    std::vector<float> rep(total);
+    for (uint32_t b = 0; b < B; ++b) {
+        std::copy(row.begin(), row.end(),
+                  rep.begin() + static_cast<ptrdiff_t>(b) * length);
+    }
+    return Tensor::from_vector(std::move(rep), spec, device);
 }
 
 // ── Cache ────────────────────────────────────────────────────────────────
@@ -162,40 +183,48 @@ inline std::unordered_map<uint64_t, std::shared_ptr<BluesteinPlan>>& cache() {
     return c;
 }
 
-// Hash key: (device-ptr, N, dtype).  We DO include dtype because the
-// chirp / B tensors are stored at the requested dtype (different bit
-// patterns at bf16 vs fp32).  Different B (batch) values share the
-// SAME plan — chirp shape is (1, N), independent of the caller's B.
+// Hash key: (device-ptr, N, dtype, B).  We include B because chirp / B
+// tensors are stored at the caller's batch shape — complex_mul is
+// shape-strict, so a (1, N) chirp can't be multiplied against a (4, N)
+// activation.  Different B values get their own cache entries; in
+// practice most workloads use a single fixed B so this is fine.
 inline uint64_t make_key(
     tt::tt_metal::distributed::MeshDevice* md,
     uint32_t N,
-    tt::tt_metal::DataType dtype)
+    tt::tt_metal::DataType dtype,
+    uint32_t B)
 {
     return reinterpret_cast<uint64_t>(md)
          ^ (static_cast<uint64_t>(N)              * 0x9E3779B97F4A7C15ull)
-         ^ (static_cast<uint64_t>(dtype)          * 0xBF58476D1CE4E5B9ull);
+         ^ (static_cast<uint64_t>(dtype)          * 0xBF58476D1CE4E5B9ull)
+         ^ (static_cast<uint64_t>(B)              * 0x94D049BB133111EBull);
 }
 
-// Get or build the per-N Bluestein plan for `device` + `dtype`.
+// Get or build the per-(N, dtype, B) Bluestein plan for `device`.
 //
 // On miss we:
-//   1. Build chirp_n, chirp_k host arrays (cos/sin of -π·n²/N).
+//   1. Build chirp_n, chirp_k host arrays (cos/sin of -π·n²/N), length N.
 //   2. Build b_cyc host array (cyclic kernel of length M).
-//   3. Upload all three to device as (1, N) and (1, M) ROW_MAJOR tensors.
-//   4. Run a SINGLE forward FFT_M on b_cyc to produce B.  This uses the
-//      same on-device FFT chain we'll use for the per-call inner FFT —
-//      precision matches by construction.
+//   3. Replicate each to B rows on the host and upload as (B, N) and
+//      (B, M) ROW_MAJOR tensors.
+//   4. Run a SINGLE forward FFT_M on the (B, M) b_cyc to produce B.
+//      The FFT operates on each batch row independently, so all B rows
+//      of the output are identical — that's intentional, they'll be
+//      used to multiply the per-call (B, M) activations row-wise.
+//      Precision matches by construction (same on-device FFT chain).
 inline std::shared_ptr<BluesteinPlan> get_or_create(
     tt::tt_metal::distributed::MeshDevice* md,
     uint32_t N,
     tt::tt_metal::DataType dtype,
+    uint32_t B = 1u,
     ttnn::operations::experimental::FFTPrecision precision =
         ttnn::operations::experimental::FFTPrecision::Precise)
 {
     TT_FATAL(N >= 2u, "bluestein_host: N must be ≥ 2 (got {}).", N);
+    TT_FATAL(B >= 1u, "bluestein_host: B must be ≥ 1 (got {}).", B);
 
     const uint32_t M = bluestein_M(N);
-    const uint64_t key = make_key(md, N, dtype);
+    const uint64_t key = make_key(md, N, dtype, B);
     auto& c = cache();
     auto it = c.find(key);
     if (it != c.end()) return it->second;
@@ -203,43 +232,33 @@ inline std::shared_ptr<BluesteinPlan> get_or_create(
     auto plan = std::make_shared<BluesteinPlan>();
     plan->N = N;
     plan->M = M;
+    plan->B = B;
 
     // ── (1) chirp_n  (sign = -1).  Build host arrays ONCE; chirp_k uses
     //   the same math so we reuse those vectors.
     auto [chirp_r, chirp_i] = build_chirp(N, /*sign=*/-1);
-    {
-        std::vector<float> r_copy = chirp_r;
-        plan->chirp_n_re = upload_row(std::move(r_copy), N, dtype, md);
-    }
-    {
-        std::vector<float> i_copy = chirp_i;
-        plan->chirp_n_im = upload_row(std::move(i_copy), N, dtype, md);
-    }
+
+    plan->chirp_n_re = upload_replicated_rows(chirp_r, B, N, dtype, md);
+    plan->chirp_n_im = upload_replicated_rows(chirp_i, B, N, dtype, md);
 
     // ── (2) chirp_k = chirp_n (same expression).
-    {
-        std::vector<float> r_copy = chirp_r;
-        plan->chirp_k_re = upload_row(std::move(r_copy), N, dtype, md);
-    }
-    {
-        std::vector<float> i_copy = std::move(chirp_i);
-        plan->chirp_k_im = upload_row(std::move(i_copy), N, dtype, md);
-    }
+    plan->chirp_k_re = upload_replicated_rows(chirp_r, B, N, dtype, md);
+    plan->chirp_k_im = upload_replicated_rows(chirp_i, B, N, dtype, md);
 
-    // ── (3) b_cyc → upload → FFT_M  ⇒  B  (length-M complex).
+    // ── (3) b_cyc → upload (replicated to B rows) → FFT_M  ⇒  B_fft.
     ttnn::Tensor b_cyc_re;
     ttnn::Tensor b_cyc_im;
     {
         auto [r, i] = build_b_cyc(N, M);
-        b_cyc_re = upload_row(std::move(r), M, dtype, md);
-        b_cyc_im = upload_row(std::move(i), M, dtype, md);
+        b_cyc_re = upload_replicated_rows(r, B, M, dtype, md);
+        b_cyc_im = upload_replicated_rows(i, B, M, dtype, md);
     }
 
     // Run the same device FFT chain we'll use per-call so the B we
     // multiply against has exactly matching numerics.  For M ≤ 1024
     // this is the SingleTileStockham path; for 1024 < M ≤ 1M it's
     // fft_two_pass.  M > 1M not yet supported here (Bluestein for
-    // N > ~500K → M > 1M is a commit-6e+ extension via fft_three_pass).
+    // N > ~500K → M > 1M is the 6e-2 extension via fft_three_pass).
     auto [B_re, B_im] =
         ttnn::operations::experimental::fft(b_cyc_re, b_cyc_im, precision);
     plan->B_re = std::move(B_re);

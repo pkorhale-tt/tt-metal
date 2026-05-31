@@ -535,8 +535,8 @@ void bind_experimental_fft_operation(nb::module_& mod) {
     const auto* bluestein_fft_doc =
         R"doc(
             Arbitrary-length 1-D forward DFT via Bluestein's chirp-Z
-            transform (commit 6d).  Handles **non-pow-2 N** by reducing
-            the length-N DFT to a length-M cyclic convolution where
+            transform.  Handles **non-pow-2 N** by reducing the length-N
+            DFT to a length-M cyclic convolution where
             ``M = next_pow2(2*N - 1)``.  The inner length-M FFT and IFFT
             are dispatched through the existing pow-2 chain
             (SingleTileStockham for M ≤ 1024, fft_two_pass otherwise).
@@ -556,18 +556,20 @@ void bind_experimental_fft_operation(nb::module_& mod) {
 
             Args:
                 * :attr:`input_real`: Float32 or BFloat16 ROW_MAJOR tensor
-                  of shape ``(1, N)``.  Batched input (B > 1) is not yet
-                  supported by this overload (commit 6d limitation).
+                  of shape ``(B, N)``.  ``B`` (batch) can be any positive
+                  integer; chirp tables are replicated to ``(B, N)`` and
+                  cached per ``(device, N, dtype, B)`` on first call.
                 * :attr:`input_imag` (optional): same shape / dtype /
                   layout as ``input_real``.  Implicit zero if omitted.
                 * :attr:`N`: logical FFT length (arbitrary integer ≥ 2).
                   Constrained to ``N ≤ 524_288`` for now (so
-                  ``M = next_pow2(2*N - 1) ≤ 2^20``).
+                  ``M = next_pow2(2*N - 1) ≤ 2^20``); larger N coming in
+                  6e-2 via fft_three_pass routing.
                 * :attr:`precision` (default ``"precise"``): same as
                   :func:`ttnn.experimental.fft`.
 
             Returns:
-                Tuple ``(real, imag)`` of Tensors, shape ``(1, N)``.
+                Tuple ``(real, imag)`` of Tensors, shape ``(B, N)``.
 
             Example::
 

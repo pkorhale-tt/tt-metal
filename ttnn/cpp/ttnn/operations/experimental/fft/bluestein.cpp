@@ -64,12 +64,11 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     // ── Validation ──────────────────────────────────────────────────────
     const auto& in_shape = input_real.padded_shape();
     TT_FATAL(in_shape.size() == 2u,
-        "bluestein_fft: input must be 2-D (1, N).  Got rank {}.",
+        "bluestein_fft: input must be 2-D (B, N).  Got rank {}.",
         in_shape.size());
-    TT_FATAL(static_cast<uint32_t>(in_shape[0]) == 1u,
-        "bluestein_fft: batched input (B > 1) is not yet supported (commit "
-        "6d only).  Got B = {}.",
-        static_cast<uint32_t>(in_shape[0]));
+    const uint32_t B = static_cast<uint32_t>(in_shape[0]);
+    TT_FATAL(B >= 1u,
+        "bluestein_fft: batch dim must be ≥ 1 (got {}).", B);
     TT_FATAL(static_cast<uint32_t>(in_shape[1]) == N,
         "bluestein_fft: input last-dim must equal N = {} (got {}).",
         N, static_cast<uint32_t>(in_shape[1]));
@@ -81,8 +80,10 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
 
     const uint32_t M = bluestein_M(N);
     TT_FATAL(M <= (1u << 20),
-        "bluestein_fft: padded length M = {} exceeds commit-6d cap of 2^20 = "
-        "1M.  N must satisfy 2*N - 1 ≤ 2^20, i.e. N ≤ 524_288. (got N = {}).",
+        "bluestein_fft: padded length M = {} exceeds current cap of 2^20 = "
+        "1M.  N must satisfy 2*N - 1 ≤ 2^20, i.e. N ≤ 524_288. (got N = {}).  "
+        "Lifting this cap is the 6e-2 work item (route inner FFT through "
+        "fft_three_pass).",
         M, N);
 
     if (input_imag.has_value()) {
@@ -93,11 +94,12 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
             "shape/dtype/layout.");
     }
 
-    // ── Get plan (chirp_n, chirp_k, B) ─────────────────────────────────
+    // ── Get plan (chirp_n, chirp_k, B_fft) — cached per (device, N, dtype, B).
     auto plan = get_or_create(
         input_real.device(),
         N,
         input_real.dtype(),
+        B,
         precision);
 
     // ── Materialise an explicit zero imag input when omitted ───────────
@@ -138,7 +140,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     //   the first N indices — the trailing M-N indices are cyclic-
     //   wrap-around garbage).
     ttnn::SmallVector<uint32_t> begins = {0u, 0u};
-    ttnn::SmallVector<uint32_t> ends   = {1u, N};
+    ttnn::SmallVector<uint32_t> ends   = {B,  N};
     ttnn::SmallVector<uint32_t> step   = {1u, 1u};
     auto c_re_n = ttnn::slice(c_re, begins, ends, step, c_re.memory_config());
     auto c_im_n = ttnn::slice(c_im, begins, ends, step, c_im.memory_config());

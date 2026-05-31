@@ -7,11 +7,13 @@
 //
 // See device/bluestein_host.hpp for the algorithm and caching scheme.
 //
-// ─ Supported sizes (commit 6d) ─
+// ─ Supported sizes ─
 //   N ≥ 2 with M := next_pow2(2*N - 1) ≤ 2^20 (1M).
-//   → N up to ~ 524_288.
-//   N > ~500K (M > 1M) deferred to commit 6d+ once the inner FFT can route
-//   through fft_three_pass with the pre-shaped-input rebank trick.
+//     → N up to ~ 524_288.
+//     N > ~500K (M > 1M) deferred to 6e-2 once the inner FFT can route
+//     through fft_three_pass with the pre-shaped-input rebank trick.
+//   B (batch) ≥ 1 — chirp / B tensors are replicated to (B, N) / (B, M)
+//     and cached per (device, N, dtype, B) on first call.
 
 #pragma once
 
@@ -24,13 +26,12 @@
 
 namespace ttnn::operations::experimental {
 
-// Forward Bluestein FFT.  `input_real` is shape (1, N); `input_imag`, if
-// supplied, must match.  Returns (out_real, out_imag) of shape (1, N).
+// Forward Bluestein FFT.  `input_real` is shape (B, N); `input_imag`, if
+// supplied, must match.  Returns (out_real, out_imag) of shape (B, N).
 //
-// Batched input (B > 1) is NOT yet supported by this overload — the
-// chirp tensors are cached at shape (1, N) and complex_mul requires
-// matching shapes.  A future revision will either broadcast the chirp
-// or re-cache per-B (commit 6e+).
+// `B` can be any positive integer.  Chirp / B_fft tensors are replicated
+// to (B, ·) on cache miss; subsequent calls with the same (N, dtype, B)
+// hit the cache.
 std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     const ttnn::Tensor& input_real,
     std::optional<ttnn::Tensor> input_imag,
