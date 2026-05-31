@@ -321,17 +321,25 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
         "fft_three_pass: pre-shaped input must be ≥2-D, e.g. (M, N3). Got {}-D.",
         in_shape.size());
     const uint32_t P_in = static_cast<uint32_t>(in_shape[-1]);
-    const uint32_t M_in = static_cast<uint32_t>(in_shape[-2]);
-    uint32_t B = 1u;
-    for (int d = 0; d < static_cast<int>(in_shape.size()) - 2; ++d) {
-        B *= static_cast<uint32_t>(in_shape[d]);
+    // Sum total rows = product of all dims except last.  Caller may pass
+    // either flat 2-D (B·N1·N2, N3) or N-D (..., N1·N2, N3) — we treat
+    // everything except the last dim as a contiguous row-stream of length
+    // B·N1·N2 and derive B from there.
+    uint32_t M_in = 1u;
+    for (int d = 0; d < static_cast<int>(in_shape.size()) - 1; ++d) {
+        M_in *= static_cast<uint32_t>(in_shape[d]);
     }
 
     const auto [N1, N2, N3] = pick_three_factorization(full_N);
-    TT_FATAL(P_in == N3 && M_in == N1 * N2,
-        "fft_three_pass: pre-shaped input mismatch — expected (..., M=N1·N2={}, "
-        "P=N3={}) for full_N={} (N1={}, N2={}, N3={}), got (..., {}, {}).",
-        N1 * N2, N3, full_N, N1, N2, N3, M_in, P_in);
+    TT_FATAL(P_in == N3,
+        "fft_three_pass: pre-shaped input last dim must be N3={} for full_N={} "
+        "(N1={}, N2={}, N3={}); got {}.",
+        N3, full_N, N1, N2, N3, P_in);
+    TT_FATAL(M_in % (N1 * N2) == 0u,
+        "fft_three_pass: total rows {} must be a multiple of N1·N2={} for "
+        "full_N={} (N1={}, N2={}, N3={}).",
+        M_in, N1 * N2, full_N, N1, N2, N3);
+    const uint32_t B = M_in / (N1 * N2);
 
     // ── Initial rearrangement (input n1 OUTER → n1 to LAST axis).
     //   Input (B·N1·N2, N3) is row-major with n = n1·N2·N3 + n2·N3 + n3.
