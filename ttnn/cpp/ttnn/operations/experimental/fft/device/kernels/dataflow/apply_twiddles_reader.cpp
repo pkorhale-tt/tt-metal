@@ -118,6 +118,13 @@ void kernel_main() {
 
             cb_push_back(CB_IN_R_BF16, 1);
             cb_push_back(CB_IN_I_BF16, 1);
+
+            // Pop the bf16 staging slots before the next iteration —
+            // these CBs are 1-deep and have no downstream consumer, so
+            // omitting the pop deadlocks the kernel on iteration 2 when
+            // rows_per_core > 1 (matches batch_fft_reader's pattern).
+            cb_pop_front(CB_IN_R_BF16, 1);
+            cb_pop_front(CB_IN_I_BF16, 1);
         } else {
             noc_async_read_tile(row, in_r_gen, get_write_ptr(CB_A_R));
             noc_async_read_tile(row, in_i_gen, get_write_ptr(CB_A_I));
