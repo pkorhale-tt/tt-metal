@@ -55,27 +55,35 @@ void kernel_main() {
     const DataFormat df = get_dataformat(CB_EVEN_R);
     const uint32_t   ts = get_tile_size(CB_EVEN_R);
 
-    // ── Input generators: pick fp32-tile or bf16-tile addressing ───────
+    // ── Input generators ───────────────────────────────────────────────
+    // CRITICAL: use InterleavedAddrGen<true> (NOT the *Fast variant) for
+    // the input/imag buffers.  InterleavedAddrGenFast computes the within-
+    // bank stride as bank_offset_index * tile_size(data_format) — it is
+    // hardcoded for tile-sized pages.  For ROW_MAJOR ttnn tensors the
+    // page_size is N*elem_size (which can be < tile_size), and once the
+    // tile index wraps past num_dram_banks the *Fast addressing reads from
+    // the wrong offset.  InterleavedAddrGen uses bank_offset_index *
+    // aligned_page_size(page_size, dram_alignment) — the correct stride.
+    //
     // For fp32: read straight into STATE (4096 B). For bf16: read into the
     // dedicated CB_IN_*_BF16 staging tile (2048 B), then expand to fp32.
-    // For ROW_MAJOR ttnn tensors the buffer page_size = N*elem_size, which
-    // can differ from a single tile (e.g. N<1024 fp32 → page<4096); honour
-    // the runtime override when set.
-    InterleavedAddrGenFast<true> in_r_gen, in_i_gen;
+    // The override is the ttnn buffer's page_size (set when caller passes
+    // !=0 in args 8/9); legacy callers pass 0 → fall back to ts / ts_bf16.
+    InterleavedAddrGen<true> in_r_gen, in_i_gen;
     if constexpr (INPUT_BF16) {
-        const DataFormat df_bf16 = get_dataformat(CB_IN_R_BF16);
         const uint32_t   ts_bf16 = get_tile_size(CB_IN_R_BF16);
         const uint32_t in_r_ps = in_page_size_override      ? in_page_size_override      : ts_bf16;
         const uint32_t in_i_ps = in_imag_page_size_override ? in_imag_page_size_override : ts_bf16;
-        in_r_gen = {.bank_base_address = in_r_addr, .page_size = in_r_ps, .data_format = df_bf16};
-        in_i_gen = {.bank_base_address = in_i_addr, .page_size = in_i_ps, .data_format = df_bf16};
+        in_r_gen = {.bank_base_address = in_r_addr, .page_size = in_r_ps};
+        in_i_gen = {.bank_base_address = in_i_addr, .page_size = in_i_ps};
     } else {
         const uint32_t in_r_ps = in_page_size_override      ? in_page_size_override      : ts;
         const uint32_t in_i_ps = in_imag_page_size_override ? in_imag_page_size_override : ts;
-        in_r_gen = {.bank_base_address = in_r_addr, .page_size = in_r_ps, .data_format = df};
-        in_i_gen = {.bank_base_address = in_i_addr, .page_size = in_i_ps, .data_format = df};
+        in_r_gen = {.bank_base_address = in_r_addr, .page_size = in_r_ps};
+        in_i_gen = {.bank_base_address = in_i_addr, .page_size = in_i_ps};
     }
 
+    // Twiddles are tile-sized buffers we allocate ourselves — *Fast is fine.
     InterleavedAddrGenFast<true> tw_r_gen = {
         .bank_base_address = tw_r_addr, .page_size = ts, .data_format = df};
     InterleavedAddrGenFast<true> tw_i_gen = {

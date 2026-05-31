@@ -24,23 +24,24 @@ void kernel_main() {
     // SUB_N (only needed for OUTPUT_BF16 conversion loop; harmless when 0).
     constexpr uint32_t SUB_N = get_compile_time_arg_val(1);
 
-    const DataFormat df = get_dataformat(CB_STATE_R);
     const uint32_t   ts = get_tile_size(CB_STATE_R);
 
-    // Output generators: pick fp32-tile or bf16-tile addressing. For
-    // ROW_MAJOR ttnn output the buffer page_size = N*elem_size — honour the
-    // runtime override if nonzero (otherwise default to CB tile size).
-    InterleavedAddrGenFast<true> out_r_gen, out_i_gen;
+    // Output generators.  See reader for full rationale: we MUST use
+    // InterleavedAddrGen<true> (NOT *Fast) so the per-bank stride is
+    // computed from page_size (aligned to dram_alignment) instead of the
+    // hardcoded tile size.  Otherwise ROW_MAJOR tensors with page_size <
+    // tile_size scribble at the wrong bank offset once tile_idx wraps
+    // past the number of DRAM banks (12 on WH, 8 on BH).
+    InterleavedAddrGen<true> out_r_gen, out_i_gen;
     if constexpr (OUTPUT_BF16) {
-        const DataFormat df_bf16 = get_dataformat(CB_OUT_R_BF16);
         const uint32_t   ts_bf16 = get_tile_size(CB_OUT_R_BF16);
         const uint32_t out_ps = out_page_size_override ? out_page_size_override : ts_bf16;
-        out_r_gen = {.bank_base_address = out_r_addr, .page_size = out_ps, .data_format = df_bf16};
-        out_i_gen = {.bank_base_address = out_i_addr, .page_size = out_ps, .data_format = df_bf16};
+        out_r_gen = {.bank_base_address = out_r_addr, .page_size = out_ps};
+        out_i_gen = {.bank_base_address = out_i_addr, .page_size = out_ps};
     } else {
         const uint32_t out_ps = out_page_size_override ? out_page_size_override : ts;
-        out_r_gen = {.bank_base_address = out_r_addr, .page_size = out_ps, .data_format = df};
-        out_i_gen = {.bank_base_address = out_i_addr, .page_size = out_ps, .data_format = df};
+        out_r_gen = {.bank_base_address = out_r_addr, .page_size = out_ps};
+        out_i_gen = {.bank_base_address = out_i_addr, .page_size = out_ps};
     }
 
     for (uint32_t k = 0; k < batch_per_core; ++k) {
