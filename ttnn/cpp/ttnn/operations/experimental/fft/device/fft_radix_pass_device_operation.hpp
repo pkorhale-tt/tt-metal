@@ -47,15 +47,16 @@ namespace ttnn::prim {
 
 // Public entry point used by the op-API layer (fft_radix_pass.cpp).
 //   P            : FFT length per row (= last dim of input, pow-2 in [2, 1024])
-//   twiddle_N2   : 0 → pure FFT.
-//                  >0 → after FFT, multiply each row by twiddle row
-//                       (row_idx % twiddle_N2) of T[n2, k] = exp(
-//                       -2πi · n2 · k / (P · twiddle_N2)).  Used by the
-//                       Pass-1 step of the two-pass / K-pass composite.
+//   twiddle_N2   : 0 → pure FFT.  >0 → fused post-twiddle indexed by
+//                       ((row / stride) % twiddle_N2).
+//   stride       : Row-index stride for the post-twiddle lookup.  Default
+//                  1 (= use row directly).  Used by fft_three_pass to skip
+//                  an extra transpose between pass-2 and pass-3.
 std::tuple<Tensor, Tensor> fft_radix_pass(
     const Tensor& input_real,
     const std::optional<Tensor>& input_imag,
     uint32_t P,
-    uint32_t twiddle_N2);
+    uint32_t twiddle_N2,
+    uint32_t stride = 1);
 
 }  // namespace ttnn::prim

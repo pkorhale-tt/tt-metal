@@ -16,6 +16,7 @@
 #include "ttnn-nanobind/bind_function.hpp"
 #include "ttnn/operations/experimental/fft/fft.hpp"
 #include "ttnn/operations/experimental/fft/apply_twiddles.hpp"
+#include "ttnn/operations/experimental/fft/apply_twiddles_xl.hpp"
 #include "ttnn/operations/experimental/fft/transpose_rm.hpp"
 #include "ttnn/operations/experimental/fft/fft_radix_pass.hpp"
 
@@ -65,6 +66,16 @@ TensorPair apply_twiddles_trampoline(
     return ttnn::operations::experimental::apply_twiddles(input_real, input_imag, N1, N2);
 }
 
+TensorPair apply_twiddles_xl_trampoline(
+    const ttnn::Tensor& input_real,
+    const ttnn::Tensor& input_imag,
+    uint32_t P,
+    uint32_t big_modulus,
+    uint32_t full_N) {
+    return ttnn::operations::experimental::apply_twiddles_xl(
+        input_real, input_imag, P, big_modulus, full_N);
+}
+
 ttnn::Tensor transpose_rm_trampoline(const ttnn::Tensor& input) {
     return ttnn::operations::experimental::transpose_rm(input);
 }
@@ -75,18 +86,20 @@ ttnn::Tensor transpose_rm_trampoline(const ttnn::Tensor& input) {
 TensorPair fft_radix_pass_real_trampoline(
     const ttnn::Tensor& input_real,
     uint32_t P,
-    uint32_t twiddle_N2) {
+    uint32_t twiddle_N2,
+    uint32_t stride) {
     return ttnn::operations::experimental::fft_radix_pass(
-        input_real, std::nullopt, P, twiddle_N2);
+        input_real, std::nullopt, P, twiddle_N2, stride);
 }
 
 TensorPair fft_radix_pass_complex_trampoline(
     const ttnn::Tensor& input_real,
     const ttnn::Tensor& input_imag,
     uint32_t P,
-    uint32_t twiddle_N2) {
+    uint32_t twiddle_N2,
+    uint32_t stride) {
     return ttnn::operations::experimental::fft_radix_pass(
-        input_real, input_imag, P, twiddle_N2);
+        input_real, input_imag, P, twiddle_N2, stride);
 }
 
 }  // namespace
@@ -222,6 +235,43 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             nb::arg("N1"),
             nb::arg("N2")));
 
+    const auto* apply_twiddles_xl_doc =
+        R"doc(
+            Large-modulus elementwise complex multiply:
+
+                row_phase_idx = (row % big_modulus)
+                out[r, k] = in[r, k] * exp(-2πi · row_phase_idx · k / full_N)
+
+            Used by the fft_three_pass composite (N > 1M) as the between-
+            pass-1-and-2 twiddle.  Unlike ``ttnn.experimental.apply_twiddles``
+            (which caps at twiddle_N2 ≤ 1024), this op builds each twiddle
+            row on-the-fly from a small per-(device, big_modulus, full_N)
+            delta lookup, letting ``big_modulus`` scale to ``2^20``.
+
+            Args:
+                * :attr:`input_real`, :attr:`input_imag`: Float32 or BFloat16
+                  ROW_MAJOR tensors of shape ``(..., P)``.  ``M`` = product
+                  of leading dims, must be a multiple of ``big_modulus``.
+                * :attr:`P`: row length, pow-2 in ``[2, 1024]``.
+                * :attr:`big_modulus`: twiddle row modulus, pow-2 in
+                  ``[1, 2^20]``.
+                * :attr:`full_N`: angle denominator, pow-2, ``>= big_modulus``.
+
+            Returns:
+                Tuple ``(real, imag)`` of Tensors, same shape as the input.
+        )doc";
+
+    ttnn::bind_function<"apply_twiddles_xl", ttnn::unique_string{"ttnn.experimental."}>(
+        mod,
+        apply_twiddles_xl_doc,
+        ttnn::overload_t(
+            &apply_twiddles_xl_trampoline,
+            nb::arg("input_real").noconvert(),
+            nb::arg("input_imag").noconvert(),
+            nb::arg("P"),
+            nb::arg("big_modulus"),
+            nb::arg("full_N")));
+
     const auto* transpose_rm_doc =
         R"doc(
             Precision-preserving inner-axis transpose for ROW_MAJOR
@@ -264,10 +314,13 @@ void bind_experimental_fft_operation(nb::module_& mod) {
 
             If ``twiddle_N2 != 0``, the output is then multiplied by
 
-                y[r, k] *= exp(-2πi · (r % twiddle_N2) · k / (P·twiddle_N2))
+                row_idx = (r / stride) % twiddle_N2       # stride defaults to 1
+                y[r, k] *= exp(-2πi · row_idx · k / (P·twiddle_N2))
 
             which is exactly the between-pass twiddle of a two-pass FFT
-            decomposition.  Passing ``twiddle_N2=0`` makes this a pure
+            decomposition (``stride=1``) or the Pass-2 twiddle of a three-
+            pass FFT (``stride=N3`` to pick the n1 twiddle without an
+            extra transpose).  Passing ``twiddle_N2=0`` makes this a pure
             batched FFT (equivalent to ``ttnn.experimental.fft`` on the
             same input).
 
@@ -277,7 +330,8 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             Constraints:
                 * P pow-2 in [2, 1024]
                 * M pow-2 and >= 1
-                * twiddle_N2 == 0 or pow-2 in [1, 1024] dividing M
+                * twiddle_N2 == 0 or pow-2 in [1, 1024]
+                * stride pow-2 in [1, M] dividing M, and (M/stride) % twiddle_N2 == 0
                 * fp32 or bf16; ROW_MAJOR layout
         )doc";
 
@@ -288,13 +342,15 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             &fft_radix_pass_real_trampoline,
             nb::arg("input_real").noconvert(),
             nb::arg("P"),
-            nb::arg("twiddle_N2") = 0u),
+            nb::arg("twiddle_N2") = 0u,
+            nb::arg("stride")     = 1u),
         ttnn::overload_t(
             &fft_radix_pass_complex_trampoline,
             nb::arg("input_real").noconvert(),
             nb::arg("input_imag").noconvert(),
             nb::arg("P"),
-            nb::arg("twiddle_N2") = 0u));
+            nb::arg("twiddle_N2") = 0u,
+            nb::arg("stride")     = 1u));
 }
 
 }  // namespace ttnn::operations::experimental::fft_binding::detail

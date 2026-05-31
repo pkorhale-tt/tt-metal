@@ -46,12 +46,15 @@ target_sources(
         device/batched_stockham_factory.cpp
         device/apply_twiddles_device_operation.cpp
         device/apply_twiddles_factory.cpp
+        device/apply_twiddles_xl_device_operation.cpp
+        device/apply_twiddles_xl_factory.cpp
         device/transpose_rm_device_operation.cpp
         device/transpose_rm_factory.cpp
         device/fft_radix_pass_device_operation.cpp
         device/fft_radix_pass_factory.cpp
         fft.cpp
         apply_twiddles.cpp
+        apply_twiddles_xl.cpp
         transpose_rm.cpp
         fft_radix_pass.cpp
 )

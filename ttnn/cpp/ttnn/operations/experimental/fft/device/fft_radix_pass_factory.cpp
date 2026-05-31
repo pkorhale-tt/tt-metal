@@ -140,13 +140,20 @@ tt::tt_metal::ProgramDescriptor FftRadixPassFactory::create_descriptor(
 
     const uint32_t log2N = log2u_rp(N);
     const bool apply_pt = operation_attributes.twiddle_N2 != 0u;
+    const uint32_t pt_stride = apply_pt ? operation_attributes.stride : 1u;
     if (apply_pt) {
         const uint32_t twN2 = operation_attributes.twiddle_N2;
         TT_FATAL(is_pow2_rp(twN2) && twN2 >= 1u && twN2 <= 1024u,
             "FftRadixPassFactory: twiddle_N2 must be pow-2 in [1, 1024] (got {}).", twN2);
-        TT_FATAL((B % twN2) == 0u,
-            "FftRadixPassFactory: total batch {} must be a multiple of "
-            "twiddle_N2 {}.", B, twN2);
+        TT_FATAL(is_pow2_rp(pt_stride) && pt_stride >= 1u && pt_stride <= B,
+            "FftRadixPassFactory: stride must be pow-2 in [1, B={}] (got {}).",
+            B, pt_stride);
+        TT_FATAL((B % pt_stride) == 0u,
+            "FftRadixPassFactory: total batch {} must be a multiple of stride {}.",
+            B, pt_stride);
+        TT_FATAL(((B / pt_stride) % twN2) == 0u,
+            "FftRadixPassFactory: (B={} / stride={}) must be a multiple of "
+            "twiddle_N2 {}.", B, pt_stride, twN2);
     }
 
     const auto dtype = in_real.dtype();
@@ -350,6 +357,7 @@ tt::tt_metal::ProgramDescriptor FftRadixPassFactory::create_descriptor(
                 /*pt_r_addr=*/pt_r_addr,
                 /*pt_i_addr=*/pt_i_addr,
                 /*pt_modulus=*/pt_modulus,
+                /*pt_stride=*/pt_stride,
             });
 
         writer.runtime_args.emplace_back(

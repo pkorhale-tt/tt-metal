@@ -1,0 +1,199 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""
+Tests for the three-pass Cooley–Tukey composite FFT path (commit 5a).
+
+For pow-2 N with 2^20 < N ≤ 2^28 (commit 5a ceiling; 5b extends to 2^30),
+ttnn.experimental.fft factors N = N1·N2·N3 (max-N3 then balance N1/N2,
+each pow-2 in [32, 1024]) and runs a 12-op device-side chain:
+
+    fft_radix_pass(P=N3, twiddle_N2=0)             # pass-1, pure FFT
+    apply_twiddles_xl(P=N3, big_mod=N1·N2)         # twiddle-1 (large mod)
+    transpose_rm                                   # ×2 r/i
+    fft_radix_pass(P=N2, twiddle_N2=N1, stride=N3) # pass-2 + twiddle-2
+    transpose_rm                                   # ×2 r/i
+    fft(P=N1)                                      # pass-3
+    transpose_rm + transpose_rm                    # ×2 each, k-axis reversal
+
+(plus zero-cost reshape views around each).  Activated by TT_FFT_NATIVE=1.
+
+Coverage:
+  - correctness vs torch.fft on the conservative band (N ≤ 2^22) for
+    fp32/bf16, B ∈ {1, 2};
+  - aggressive band (N ∈ {2^24, 2^26, 2^28}) gated behind --run-aggressive
+    or TT_FFT_AGGRESSIVE=1 — these are minutes-long, fp32-only, B=1;
+  - program-cache hit on repeat (small N);
+  - Metal-Trace is skipped (host-orchestrated composite, like fft_two_pass).
+"""
+
+import os
+import pytest
+import torch
+import ttnn
+
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("TT_FFT_NATIVE", "0") != "1",
+    reason="TT_FFT_NATIVE=1 not set; new ProgramDescriptor path is gated.",
+)
+
+
+# Cube-balanced 3-pass is dominated by the per-row recurrence in the XL
+# twiddle (≈ P · ε_fp32 per row) and the per-pass FFT error (≈ √N · ε).
+# Empirically that lands well inside 5e-4 for fp32 and 5e-2 for bf16.
+_DTYPES = [
+    (ttnn.float32,  torch.float32,  "fp32", 5e-4),
+    (ttnn.bfloat16, torch.bfloat16, "bf16", 5e-2),
+]
+
+
+def _rel_err(got: torch.Tensor, ref: torch.Tensor) -> float:
+    return float((got - ref).abs().norm() / ref.abs().norm().clamp_min(1e-30))
+
+
+def _expected_three_factorization(N: int) -> tuple[int, int, int]:
+    """Mirror C++ pick_three_factorization: max-N3 then balance N1/N2."""
+    log2N = N.bit_length() - 1
+    log2_N3 = 10 if (log2N - 10) >= 10 else max(5, log2N - 10)
+    log2_rest = log2N - log2_N3
+    log2_N1 = (log2_rest + 1) // 2
+    log2_N2 = log2_rest - log2_N1
+    return (1 << log2_N1, 1 << log2_N2, 1 << log2_N3)
+
+
+# ─── 1. Correctness — conservative band (N ≤ 2^22) ─────────────────────────
+# Three N points exercise three distinct factorizations and three sizes of
+# the XL twiddle modulus (N1·N2 = 2^11, 2^12, 2^13).
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("N", [1 << 21, 1 << 22])
+def test_three_pass_correctness(device, B, N, tt_dtype, torch_dtype, label, tol):
+    N1, N2, N3 = _expected_three_factorization(N)
+    assert N1 * N2 * N3 == N
+    for f in (N1, N2, N3):
+        assert 32 <= f <= 1024 and (f & (f - 1)) == 0
+
+    torch.manual_seed(7)
+    x_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x = x_fp32.to(torch_dtype)
+
+    tt_x = ttnn.from_torch(
+        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    re, im = ttnn.experimental.fft(tt_x)
+    got_r = ttnn.to_torch(re).reshape(B, N).to(torch.float32)
+    got_i = ttnn.to_torch(im).reshape(B, N).to(torch.float32)
+    got = torch.complex(got_r, got_i)
+
+    ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
+
+    for b in range(B):
+        rel = _rel_err(got[b], ref[b])
+        assert rel < tol, (
+            f"[{label}] B={B} N={N} (N1={N1},N2={N2},N3={N3}) row={b} "
+            f"rel err {rel:.2e} (tol {tol:.0e})"
+        )
+
+
+# ─── 2. Aggressive band — gated ─────────────────────────────────────────
+# These exercise the upper end of the supported range.  Default-skipped
+# because they each take minutes and need GB of host RAM for the torch
+# reference; opt in with TT_FFT_AGGRESSIVE=1.
+#
+# Ceiling notes (commit 5b):
+#   - fp32: 2^28 (256 MB input, ~4 GB working set incl. torch reference).
+#   - bf16: 2^28 (128 MB input, ~2 GB working set).
+#   - N = 2^30 (1G) IS algorithmically supported (cube-balanced gives
+#     N1=N2=N3=1024, big_modulus=2^20 = the apply_twiddles_xl cap), but
+#     even bf16 input is 2 GB and torch reference needs 8 GB fp64 — not
+#     practical for a default test box.  The router accepts it; users
+#     with sufficient DRAM can call it directly.
+_AGGRESSIVE_GATE = os.environ.get("TT_FFT_AGGRESSIVE", "0") == "1"
+
+
+@pytest.mark.skipif(
+    not _AGGRESSIVE_GATE,
+    reason="TT_FFT_AGGRESSIVE=1 not set; slow large-N three-pass tests are gated.",
+)
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", [
+    (ttnn.float32,  torch.float32,  "fp32", 1e-3),
+    (ttnn.bfloat16, torch.bfloat16, "bf16", 1e-1),
+], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("N", [1 << 24, 1 << 26, 1 << 28])
+def test_three_pass_correctness_large(
+    device, N, tt_dtype, torch_dtype, label, tol,
+):
+    """B=1 large-N coverage.  Tolerances are relaxed vs the small-N band
+    because the on-the-fly twiddle recurrence error scales linearly with
+    P and the per-pass FFT error scales as √N."""
+    N1, N2, N3 = _expected_three_factorization(N)
+    assert N1 * N2 * N3 == N
+
+    torch.manual_seed(101)
+    x = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
+
+    tt_x = ttnn.from_torch(
+        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    re, im = ttnn.experimental.fft(tt_x)
+    got_r = ttnn.to_torch(re).reshape(N).to(torch.float32)
+    got_i = ttnn.to_torch(im).reshape(N).to(torch.float32)
+    got = torch.complex(got_r, got_i)
+
+    ref = torch.fft.fft(x[0].to(torch.float32).to(torch.complex64), dim=-1)
+    rel = _rel_err(got, ref)
+    assert rel < tol, (
+        f"[{label}-large] N={N} (N1={N1},N2={N2},N3={N3}) rel err "
+        f"{rel:.2e} (tol {tol:.0e})"
+    )
+
+
+# ─── 3. Program cache hit ──────────────────────────────────────────────────
+# Three-pass dispatches:
+#   - 1 × fft_radix_pass(P=N3, twiddle=0)
+#   - 1 × apply_twiddles_xl
+#   - 2 × transpose_rm  (Step 5 r,i — same shape, so 1 cache entry)
+#   - 1 × fft_radix_pass(P=N2, twiddle=N1, stride=N3)
+#   - 2 × transpose_rm  (Step 9 r,i — different shape, so 1 more entry)
+#   - 1 × fft  (Pass-3)
+#   - 2 × transpose_rm  (Step 12 T1 r,i — 1 more entry)
+#   - 2 × transpose_rm  (Step 12 T2 r,i — 1 more entry)
+# Per-shape transpose cache entries; the second call with the same shape
+# must NOT grow the cache count.
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+def test_three_pass_program_cache_hit(device, tt_dtype, torch_dtype, label, tol):
+    B, N = 1, 1 << 21
+    torch.manual_seed(0)
+    x = torch.randn(B, N, dtype=torch.float32).to(torch_dtype)
+
+    tt_x = ttnn.from_torch(
+        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    ttnn.experimental.fft(tt_x)
+    n_after_warmup = device.num_program_cache_entries()
+
+    tt_x2 = ttnn.from_torch(
+        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    ttnn.experimental.fft(tt_x2)
+    n_after_repeat = device.num_program_cache_entries()
+
+    assert n_after_repeat == n_after_warmup, (
+        f"[{label}] three-pass program cache regression: "
+        f"{n_after_warmup} → {n_after_repeat}"
+    )
+
+
+# ─── 4. Metal Trace replay — SKIPPED ───────────────────────────────────────
+# Same caveat as fft_two_pass: the composite is host-orchestrated (each
+# intermediate tensor is freshly allocated between dispatches), so
+# capturing it into a single trace is not currently safe.  Each individual
+# component op (fft_radix_pass, apply_twiddles_xl, transpose_rm, fft) IS
+# trace-safe and is exercised by its own test file.  A future commit may
+# add a tensor-pool-based variant that wraps the chain into one trace-
+# capturable program.
+@pytest.mark.skip(reason="three-pass composite is host-orchestrated; trace deferred to commit 7")
+def test_three_pass_metal_trace_replay(device):
+    pass

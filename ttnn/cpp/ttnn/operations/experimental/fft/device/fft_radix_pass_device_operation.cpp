@@ -57,9 +57,15 @@ void FftRadixPassDeviceOperation::validate_on_program_cache_miss(
                  attrs.twiddle_N2 <= 1024u,
             "fft_radix_pass: twiddle_N2 must be pow-2 in [1, 1024] (got {}).",
             attrs.twiddle_N2);
-        TT_FATAL((M % attrs.twiddle_N2) == 0u,
-            "fft_radix_pass: total batch {} must be a multiple of "
-            "twiddle_N2 {}.", M, attrs.twiddle_N2);
+        TT_FATAL(is_pow2_op(attrs.stride) && attrs.stride >= 1u && attrs.stride <= M,
+            "fft_radix_pass: stride must be pow-2 in [1, M={}] (got {}).",
+            M, attrs.stride);
+        TT_FATAL((M % attrs.stride) == 0u,
+            "fft_radix_pass: total batch {} must be a multiple of stride {}.",
+            M, attrs.stride);
+        TT_FATAL(((M / attrs.stride) % attrs.twiddle_N2) == 0u,
+            "fft_radix_pass: (M={} / stride={}) must be a multiple of "
+            "twiddle_N2 {}.", M, attrs.stride, attrs.twiddle_N2);
     }
 
     if (args.input_imag.has_value()) {
@@ -100,6 +106,7 @@ tt::stl::hash::hash_t FftRadixPassDeviceOperation::compute_program_hash(
     return tt::tt_metal::operation::hash_operation<FftRadixPassDeviceOperation>(
         attrs.P,
         attrs.twiddle_N2,
+        attrs.stride,
         args.input_real.dtype(),
         args.input_real.memory_config(),
         args.input_real.padded_shape(),
@@ -114,13 +121,15 @@ std::tuple<Tensor, Tensor> fft_radix_pass(
     const Tensor& input_real,
     const std::optional<Tensor>& input_imag,
     uint32_t P,
-    uint32_t twiddle_N2)
+    uint32_t twiddle_N2,
+    uint32_t stride)
 {
     using OperationType = ttnn::experimental::prim::FftRadixPassDeviceOperation;
 
     OperationType::operation_attributes_t attrs{
         .P          = P,
         .twiddle_N2 = twiddle_N2,
+        .stride     = stride,
     };
     OperationType::tensor_args_t args{
         .input_real = input_real,

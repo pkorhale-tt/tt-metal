@@ -45,14 +45,20 @@ void kernel_main() {
     const uint32_t in_page_size_override      = get_arg_val<uint32_t>(8);
     const uint32_t in_imag_page_size_override = get_arg_val<uint32_t>(9);
     // Post-twiddle args.  When APPLY_POST_TWIDDLE=0, the factory passes
-    // zeros for 10..12 and they are never dereferenced.  When =1:
+    // zeros for 10..13 and they are never dereferenced.  When =1:
     //   pt_r_addr / pt_i_addr — tile-sized fp32 twiddle table, layout
     //     identical to apply_twiddles_host::build_twiddle_table(P, N2):
     //     N2 tiles total, tile n2 holds T[n2, 0..P-1] in slots [0, P).
     //   pt_modulus = N2 (twiddle modulus on row index).
+    //   pt_stride  = row-index stride before the modulus (default 1).
+    //                Three-pass Pass-2 uses pt_stride=N3 so that the row
+    //                enumeration (b, n1, k3) — laid out at stride N3 —
+    //                picks the right n1 twiddle without an extra
+    //                transpose.
     const uint32_t pt_r_addr       = get_arg_val<uint32_t>(10);
     const uint32_t pt_i_addr       = get_arg_val<uint32_t>(11);
     const uint32_t pt_modulus      = get_arg_val<uint32_t>(12);
+    const uint32_t pt_stride       = get_arg_val<uint32_t>(13);
 
     constexpr uint32_t SUB_N        = get_compile_time_arg_val(0);
     constexpr uint32_t LOG2_SUB_N   = get_compile_time_arg_val(1);
@@ -277,7 +283,7 @@ void kernel_main() {
         // do the scalar complex-multiply right before its
         // noc_async_write_tile (see header comment for the rationale).
         if constexpr (APPLY_POST_TWIDDLE) {
-            const uint32_t pt_tile_idx = tile_idx % pt_modulus;
+            const uint32_t pt_tile_idx = (tile_idx / pt_stride) % pt_modulus;
             cb_reserve_back(CB_PT_R, 1);
             cb_reserve_back(CB_PT_I, 1);
             noc_async_read_tile(pt_tile_idx, pt_r_gen, get_write_ptr(CB_PT_R));

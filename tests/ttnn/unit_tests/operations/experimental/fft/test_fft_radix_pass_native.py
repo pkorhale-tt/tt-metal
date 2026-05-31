@@ -46,13 +46,14 @@ def _rel_err(got: torch.Tensor, ref: torch.Tensor) -> float:
     return float((got - ref).abs().norm() / ref.abs().norm().clamp_min(1e-30))
 
 
-def _torch_post_twiddle(y: torch.Tensor, P: int, N2: int) -> torch.Tensor:
-    """Apply T[r % N2, k] = exp(-2πi · (r%N2) · k / (P*N2)) elementwise to
-    a complex tensor `y` of shape (M, P)."""
+def _torch_post_twiddle(
+    y: torch.Tensor, P: int, N2: int, stride: int = 1,
+) -> torch.Tensor:
+    """Apply T[(r/stride)%N2, k] = exp(-2πi · row_idx · k / (P*N2))
+    elementwise to a complex tensor `y` of shape (M, P)."""
     M = y.shape[-2]
-    rows = torch.arange(M, dtype=torch.float64) % N2
+    rows = (torch.arange(M, dtype=torch.float64) // stride) % N2
     cols = torch.arange(P, dtype=torch.float64)
-    # T[r, k] = exp(-2πi · (r%N2) · k / (P*N2))
     angle = -2.0 * math.pi * rows[:, None] * cols[None, :] / float(P * N2)
     tw = torch.complex(
         angle.cos().to(torch.float32),
@@ -63,21 +64,21 @@ def _torch_post_twiddle(y: torch.Tensor, P: int, N2: int) -> torch.Tensor:
 
 def _run_radix_pass(
     device, x_real: torch.Tensor, x_imag: torch.Tensor | None,
-    tt_dtype, P: int, twiddle_N2: int,
+    tt_dtype, P: int, twiddle_N2: int, stride: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tt_xr = ttnn.from_torch(
         x_real, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
     if x_imag is None:
         re, im = ttnn.experimental.fft_radix_pass(
-            tt_xr, P=P, twiddle_N2=twiddle_N2,
+            tt_xr, P=P, twiddle_N2=twiddle_N2, stride=stride,
         )
     else:
         tt_xi = ttnn.from_torch(
             x_imag, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
         )
         re, im = ttnn.experimental.fft_radix_pass(
-            tt_xr, tt_xi, P=P, twiddle_N2=twiddle_N2,
+            tt_xr, tt_xi, P=P, twiddle_N2=twiddle_N2, stride=stride,
         )
     return (
         ttnn.to_torch(re).to(torch.float32),
@@ -212,6 +213,56 @@ def test_radix_pass_fused_pass1_surrogate(
         assert rel < tol, (
             f"[{label}] pass1-surrogate B={B} N={N} (N1={N1},N2={N2}) "
             f"row={r} rel err {rel:.2e}"
+        )
+
+
+# ─── 3c. Strided post-twiddle — Pass-2 of fft_three_pass (commit 5) ──────
+# Three-pass enumerates rows as (b, n1, k3) at row index
+#     r = b·N1·N3 + n1·N3 + k3
+# i.e. n1 sits at row-stride N3.  fft_radix_pass with twiddle_N2=N1 and
+# stride=N3 picks twiddle row (r / N3) % N1 = n1 — exactly the n1 factor
+# of the Cooley–Tukey twiddle 2.  This test exercises that codepath
+# standalone so a three-pass regression points back here.
+_THREEPASS_PASS2 = [
+    # (P=N2, twiddle_N2=N1, stride=N3, M = N1 · N3) — modest sizes that
+    # cover one-batch-per-core, multi-batch-per-core, and a stride change.
+    (32, 32,  32,  32 * 32),
+    (32, 64,  32,  64 * 32),
+    (64, 64,  64,  64 * 64),
+    (32, 32, 128,  32 * 128),
+]
+
+
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("P,twiddle_N2,stride,M", _THREEPASS_PASS2,
+                         ids=[f"P{p}_N1{n}_S{s}" for (p, n, s, _) in _THREEPASS_PASS2])
+def test_radix_pass_strided_twiddle(
+    device, P, twiddle_N2, stride, M, tt_dtype, torch_dtype, label, tol,
+):
+    """fft_radix_pass(P, twiddle_N2, stride): post-twiddle picks row
+    (r/stride) % twiddle_N2.  Cross-check against torch FFT + manual
+    strided twiddle multiply on a complex (Pass-2-like) input."""
+    torch.manual_seed(23)
+    xr = torch.randn(M, P, dtype=torch.float32).to(torch_dtype)
+    xi = torch.randn(M, P, dtype=torch.float32).to(torch_dtype)
+
+    got_r, got_i = _run_radix_pass(
+        device, xr, xi, tt_dtype, P=P, twiddle_N2=twiddle_N2, stride=stride,
+    )
+    got = torch.complex(got_r.reshape(M, P), got_i.reshape(M, P))
+
+    x_complex = torch.complex(
+        xr.to(torch.float32), xi.to(torch.float32),
+    ).to(torch.complex64)
+    ref_fft = torch.fft.fft(x_complex, dim=-1)
+    ref = _torch_post_twiddle(ref_fft, P=P, N2=twiddle_N2, stride=stride)
+
+    for r in range(M):
+        rel = _rel_err(got[r], ref[r])
+        assert rel < tol, (
+            f"[{label}] strided P={P} N1={twiddle_N2} stride={stride} "
+            f"M={M} row={r} rel err {rel:.2e}"
         )
 
 

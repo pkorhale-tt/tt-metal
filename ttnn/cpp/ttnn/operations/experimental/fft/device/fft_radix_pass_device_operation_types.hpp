@@ -10,9 +10,15 @@
 //   For each row r ∈ [0, M):
 //     y[r, :] = FFT_P(in[r, :])
 //     if apply_post_twiddle:
-//       y[r, k] *= exp(-2πi * (r % twiddle_N2) * k / (P * twiddle_N2))
+//       row_idx = (r / stride) % twiddle_N2          (stride defaults to 1)
+//       y[r, k] *= exp(-2πi * row_idx * k / (P * twiddle_N2))
 //
 // twiddle_N1 is implicit and always equals P.
+//
+// `stride` lets the three-pass composite (commit 5) reuse fft_radix_pass
+// for its Pass-2 step without an extra transpose: with rows enumerating
+// (b, n1, k3) at stride N3, setting stride=N3, twiddle_N2=N1 picks the
+// correct twiddle row n1 = (b*N1 + n1) % N1.
 
 #pragma once
 
@@ -29,9 +35,13 @@ struct FftRadixPassParams {
     // 0 → no post-twiddle (pure batched FFT, same observable behaviour
     //     as a BatchedStockhamFactory call).
     // >0 → multiply each row's FFT output by twiddle row
-    //     (r % twiddle_N2).  Pow-2 in [1, 1024] and must divide the
-    //     product of leading dims of the input.
+    //     (r / stride) % twiddle_N2.  Pow-2 in [1, 1024] and must divide
+    //     the product of leading dims of the input (after applying stride).
     uint32_t twiddle_N2 = 0;
+    // Row-index stride for the post-twiddle lookup.  Must be a pow-2 in
+    //     [1, M] that divides M (i.e. (M / stride) % twiddle_N2 == 0).
+    //     Default 1 = "use r directly" (commit 4 / two-pass behaviour).
+    uint32_t stride = 1;
 };
 
 // input_imag is optional: for a Pass-1 (real input) radix pass we leave

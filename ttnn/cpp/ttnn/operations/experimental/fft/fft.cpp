@@ -11,6 +11,7 @@
 
 #include "device/fft_device_operation.hpp"
 #include "device/fft_radix_pass_device_operation.hpp"
+#include "device/apply_twiddles_xl_device_operation.hpp"
 #include "device/transpose_rm_device_operation.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/types.hpp"  // ttnn::Shape, ttnn::SmallVector
@@ -147,10 +148,189 @@ bool two_pass_eligible(const ttnn::Tensor& input_real) {
            is_pow2(B) && B >= 1u;
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Three-pass Cooley–Tukey composite (commit 5)
+//
+// For pow-2 N with 2^20 < N ≤ 2^30, factor N = N1 · N2 · N3 (each pow-2
+// in [32, 1024], picked "max-N3 then balance N1/N2" for best memory
+// coalescing on the innermost pass).  Decompose the length-N DFT as:
+//
+//   X[k1·N2·N3 + k2·N3 + k3]
+//     = Σ_n1 W_N1^(n1·k1) ·
+//           W_{N1N2}^(n1·k2) ·
+//             Σ_n2 W_N2^(n2·k2) ·
+//                W_N^((n1·N2+n2)·k3) ·
+//                  Σ_n3 x[n1,n2,n3] · W_N3^(n3·k3)
+//
+// where ω = exp(-2πi / ·).  Implementation chain (12 device dispatches):
+//
+//   1. reshape (B, N) → (B·N1·N2, N3)          [zero-cost]
+//   2. fft_radix_pass(P=N3, twiddle_N2=0)      [pass-1, no twiddle]
+//   3. apply_twiddles_xl(P=N3, big_mod=N1·N2)  [twiddle-1, large modulus]
+//   4. reshape (B·N1·N2, N3) → (B·N1, N2, N3)  [zero-cost]
+//   5. transpose_rm: (B·N1, N2, N3) → (B·N1, N3, N2)         [×2 r,i]
+//   6. reshape → (B·N1·N3, N2)                 [zero-cost]
+//   7. fft_radix_pass(P=N2, twiddle_N2=N1, stride=N3)  [pass-2 + twiddle-2]
+//   8. reshape → (B, N1, N3*N2) view of (B, N1, N3, N2)  [zero-cost]
+//   9. transpose_rm: (B, N1, N3·N2) → (B, N3·N2, N1)         [×2 r,i]
+//  10. reshape → (B·N3·N2, N1)                 [zero-cost]
+//  11. fft(P=N1)                               [pass-3, complex input]
+//  12. reshape + two transpose_rm pairs to undo k-axis reversal
+//      (B, N3, N2, N1) → (B, N1, N2, N3); final reshape → (B, N).
+//
+// Above 2^30, we'd need a 4-pass or Bluestein composite (commit 6).
+// ───────────────────────────────────────────────────────────────────────
+
+// Max-N3 then balanced N1/N2 split.  Both N1, N2, N3 ∈ [32, 1024], pow-2.
+//   N3 = min(1024, N / 32^2)   ← cap by tile-size on innermost
+//   then split remaining log2 between N1 and N2 (N1 gets ceil-half).
+std::tuple<uint32_t, uint32_t, uint32_t> pick_three_factorization(uint32_t N) {
+    uint32_t log2N = 0u;
+    while ((1u << log2N) < N) ++log2N;
+    TT_FATAL((1u << log2N) == N,
+        "fft_three_pass: N must be a power of two (got {}).", N);
+    TT_FATAL(log2N >= 15u && log2N <= 30u,
+        "fft_three_pass: N must be in [2^15, 2^30] (got 2^{}).", log2N);
+
+    // Cap log2(N3) at 10 (= 1024, the per-row FFT length limit); also
+    // leave ≥ 10 bits for N1+N2 split (= 32 · 32 minimum).
+    uint32_t log2_N3 = 10u;
+    if (log2N - log2_N3 < 10u) {
+        // Pathological tiny case (log2N < 20).  Shouldn't happen since
+        // routing kicks in at log2N > 20, but be safe.
+        log2_N3 = (log2N >= 10u) ? (log2N - 10u) : 5u;
+    }
+    const uint32_t log2_rest = log2N - log2_N3;
+    const uint32_t log2_N1 = (log2_rest + 1u) / 2u;   // ceil half → N1
+    const uint32_t log2_N2 = log2_rest - log2_N1;
+    TT_FATAL(log2_N1 >= 5u && log2_N1 <= 10u &&
+             log2_N2 >= 5u && log2_N2 <= 10u &&
+             log2_N3 >= 5u && log2_N3 <= 10u,
+        "fft_three_pass: N=2^{} factorization N1=2^{} N2=2^{} N3=2^{} "
+        "out of supported [32, 1024] range.",
+        log2N, log2_N1, log2_N2, log2_N3);
+    return {1u << log2_N1, 1u << log2_N2, 1u << log2_N3};
+}
+
+std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
+    const ttnn::Tensor& input_real, FFTPrecision precision) {
+    const auto& in_shape = input_real.padded_shape();
+    const uint32_t N = static_cast<uint32_t>(in_shape[-1]);
+    uint32_t B = 1u;
+    for (int d = 0; d < static_cast<int>(in_shape.size()) - 1; ++d) {
+        B *= static_cast<uint32_t>(in_shape[d]);
+    }
+
+    const auto [N1, N2, N3] = pick_three_factorization(N);
+
+    // ── Step 1: reshape input (B, N) → (B·N1·N2, N3)   [metadata-only]
+    auto x_p1 = ttnn::reshape(input_real, make_shape({B * N1 * N2, N3}));
+
+    // ── Step 2: Pass-1 batched length-N3 real FFT, NO twiddle.
+    //   fft_radix_pass treats input as (M=B·N1·N2 rows, N3 cols) and
+    //   emits FFT_N3 of each row.  twiddle_N2=0 → pure FFT path.
+    auto [r1, i1] = ttnn::prim::fft_radix_pass(
+        x_p1, /*input_imag=*/std::nullopt,
+        /*P=*/N3, /*twiddle_N2=*/0u);
+
+    // ── Step 3: between-pass-1-and-2 twiddle (LARGE modulus N1·N2).
+    //   Multiplies y[r=b·N1·N2 + n1·N2 + n2, k3] by
+    //       exp(-2πi · (r % (N1·N2)) · k3 / N)
+    //     = exp(-2πi · (n1·N2 + n2) · k3 / N)              (for B=1)
+    //   which is Cooley–Tukey twiddle 1 broadcast over B replicas.
+    auto [r2, i2] = ttnn::prim::apply_twiddles_xl(
+        r1, i1, /*P=*/N3, /*big_modulus=*/N1 * N2, /*full_N=*/N);
+
+    // ── Steps 4-6: bring n2 to last axis, ready for Pass-2.
+    //   (B·N1·N2, N3) → (B·N1, N2, N3) → transpose → (B·N1, N3, N2)
+    //   → (B·N1·N3, N2).
+    auto r2_3d = ttnn::reshape(r2, make_shape({B * N1, N2, N3}));
+    auto i2_3d = ttnn::reshape(i2, make_shape({B * N1, N2, N3}));
+    auto r2t   = ttnn::prim::transpose_rm(r2_3d);
+    auto i2t   = ttnn::prim::transpose_rm(i2_3d);
+    auto r2f   = ttnn::reshape(r2t, make_shape({B * N1 * N3, N2}));
+    auto i2f   = ttnn::reshape(i2t, make_shape({B * N1 * N3, N2}));
+
+    // ── Step 7: Pass-2 batched length-N2 complex FFT  +  small twiddle.
+    //   Rows enumerate (b, n1, k3) at stride N3 along the n1 axis, so
+    //   (r / stride=N3) % twiddle_N2=N1 picks the right n1 twiddle row
+    //   without needing an extra transpose.  Twiddle factor:
+    //       exp(-2πi · n1 · k2 / (N1·N2))   = Cooley–Tukey twiddle 2.
+    auto [r3, i3] = ttnn::prim::fft_radix_pass(
+        r2f, /*input_imag=*/i2f,
+        /*P=*/N2, /*twiddle_N2=*/N1, /*stride=*/N3);
+
+    // ── Steps 8-10: bring n1 to last axis, ready for Pass-3.
+    //   Layout after Step 7: (B·N1·N3, N2).  View as (B, N1, N3, N2),
+    //   collapse (N3, N2) → flat dim of length N3·N2, then transpose
+    //   (B, N1, N3·N2) → (B, N3·N2, N1), reshape → (B·N3·N2, N1).
+    auto r3_3d = ttnn::reshape(r3, make_shape({B, N1, N3 * N2}));
+    auto i3_3d = ttnn::reshape(i3, make_shape({B, N1, N3 * N2}));
+    auto r3t   = ttnn::prim::transpose_rm(r3_3d);   // (B, N3·N2, N1)
+    auto i3t   = ttnn::prim::transpose_rm(i3_3d);
+    auto r3f   = ttnn::reshape(r3t, make_shape({B * N3 * N2, N1}));
+    auto i3f   = ttnn::reshape(i3t, make_shape({B * N3 * N2, N1}));
+
+    // ── Step 11: Pass-3 batched length-N1 complex FFT, no twiddle.
+    auto [r4, i4] = ttnn::prim::fft(
+        r3f, /*inverse=*/false, /*input_imag=*/i3f, precision);
+
+    // ── Step 12: undo the k-axis reversal (k3, k2, k1) → (k1, k2, k3)
+    //   so the final flatten naturally gives the DIF-natural index
+    //   k = k1·N2·N3 + k2·N3 + k3.  Two transposes via the same
+    //   collapse-then-swap trick as Step 9.
+    //
+    //   T1: view (B, N3, N2, N1) as (B, N3·N2, N1) → transpose
+    //       → (B, N1, N3·N2) → reshape (B, N1, N3, N2).
+    auto r4_3d  = ttnn::reshape(r4, make_shape({B, N3 * N2, N1}));
+    auto i4_3d  = ttnn::reshape(i4, make_shape({B, N3 * N2, N1}));
+    auto r4t1   = ttnn::prim::transpose_rm(r4_3d);   // (B, N1, N3·N2)
+    auto i4t1   = ttnn::prim::transpose_rm(i4_3d);
+    //   T2: reshape (B, N1, N3·N2) → (B·N1, N3, N2) → transpose
+    //       → (B·N1, N2, N3) → reshape (B, N1, N2, N3).
+    auto r4t1f  = ttnn::reshape(r4t1, make_shape({B * N1, N3, N2}));
+    auto i4t1f  = ttnn::reshape(i4t1, make_shape({B * N1, N3, N2}));
+    auto r4t2   = ttnn::prim::transpose_rm(r4t1f);
+    auto i4t2   = ttnn::prim::transpose_rm(i4t1f);
+
+    // ── Final reshape back to (..., N).
+    auto out_r = ttnn::reshape(r4t2, in_shape);
+    auto out_i = ttnn::reshape(i4t2, in_shape);
+    return {std::move(out_r), std::move(out_i)};
+}
+
+bool three_pass_eligible(const ttnn::Tensor& input_real) {
+    if (!native_path_enabled()) return false;
+    const auto& shape = input_real.padded_shape();
+    if (shape.size() < 1) return false;
+    const uint32_t N = static_cast<uint32_t>(shape[-1]);
+    uint32_t B = 1u;
+    for (int d = 0; d < static_cast<int>(shape.size()) - 1; ++d) {
+        B *= static_cast<uint32_t>(shape[d]);
+    }
+    const auto dt = input_real.dtype();
+    const bool dtype_ok =
+        dt == tt::tt_metal::DataType::FLOAT32 ||
+        dt == tt::tt_metal::DataType::BFLOAT16;
+    const bool layout_ok =
+        input_real.layout() == tt::tt_metal::Layout::ROW_MAJOR;
+    return dtype_ok && layout_ok &&
+           is_pow2(N) && N > (1u << 20) && N <= (1u << 30) &&
+           is_pow2(B) && B >= 1u;
+}
+
 }  // namespace
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     const ttnn::Tensor& input_real, FFTPrecision precision) {
+    // Routing (TT_FFT_NATIVE=1):
+    //   N ≤ 1024            → SingleTileStockhamFactory  (via prim::fft)
+    //   1024 < N ≤ 2^20     → fft_two_pass               (commit 3/4)
+    //   2^20 < N ≤ 2^30     → fft_three_pass             (commit 5)
+    //   N > 2^30            → falls through to prim::fft (will TT_FATAL)
+    if (three_pass_eligible(input_real)) {
+        return fft_three_pass(input_real, precision);
+    }
     if (two_pass_eligible(input_real)) {
         return fft_two_pass(input_real, precision);
     }
