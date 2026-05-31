@@ -6,31 +6,35 @@
 // Builds a ProgramDescriptor that runs ONE radix-2 batched Stockham FFT
 // of length N (2 <= N <= 1024, pow-2, fp32) on a single Tensix core, with
 // input/output buffers taken directly from device tensors (no PCIe round
-// trip, no host scratch buffers, no WriteShard/ReadShard).
+// trip per call, no host scratch buffers, no WriteShard/ReadShard on the
+// hot path).
+//
+// Commit 1C: piggyback on fft_stockham::get_cached_batch_plan(N, 1) to
+// reuse its already-allocated twiddle MeshBuffers. Allocate a separate
+// persistent zero-imag scratch buffer (one tile of zeros, cached per
+// device) for the imag input. All host-side buffer setup is one-time
+// (Category B in the refactor inventory) — the per-call op path touches
+// zero tensor data on host.
 //
 // Wire-compatible with the existing batch_fft_{reader,writer,compute}.cpp
 // kernels (see stockham_host.hpp::make_batch_plan for the legacy build).
-//
-// This is the first commit of the host-to-device refactor. Subsequent
-// commits will:
-//   - Commit 2: add bf16 path
-//   - Commit 3: two-pass Stockham (chained kernels, no host glue between
-//               passes; covers 1024 < N <= ~32K)
-//   - Commit 4: standalone ttnn::prim::fft_radix_pass building block
-//   - Commit 5: composite fft_universal_xl (eliminates Steps 1/2/3 host
-//               loops, lifts ceiling 16M -> 1G)
-//   - Commit 6: composite Bluestein + composite IFFT
-//   - Commit 7: comprehensive program-cache + Metal-Trace tests
 
 #include "single_tile_stockham_factory.hpp"
 
 #include <cmath>
 #include <cstdint>
+#include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include <tt-metalium/circular_buffer_constants.h>
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/program_descriptors.hpp>
+#include <tt-metalium/distributed.hpp>
+#include <tt-metalium/mesh_buffer.hpp>
+#include <tt-metalium/mesh_command_queue.hpp>
+
+#include "stockham_host.hpp"   // fft_stockham::get_cached_batch_plan, buf_addr, etc.
 
 namespace ttnn::experimental::prim {
 
@@ -53,31 +57,41 @@ constexpr bool is_pow2_st(uint32_t n) {
     return n != 0u && (n & (n - 1u)) == 0u;
 }
 
-// Twiddle factors for length-N batched Stockham, packed for the
-// batch_fft_compute kernel. Mirrors stockham_host.hpp::batch_twiddles().
-// One tile worth of twiddles per stage; log2N stages total.
-std::pair<std::vector<float>, std::vector<float>> batch_twiddles_fp32(uint32_t log2N) {
-    // Layout: stage s (s in [0, log2N)) holds N/2 twiddles W_N^k = exp(-2πi k / 2^(s+1))
-    // packed into a single tile (kTileElems floats), zero-padded.
-    const size_t total = static_cast<size_t>(log2N) * kTileElems;
-    std::vector<float> tw_r(total, 0.0f);
-    std::vector<float> tw_i(total, 0.0f);
+// ── Zero-imag scratch buffer cache ─────────────────────────────────────
+// For forward FFT of REAL input, the kernel still expects an imag input
+// buffer. We allocate ONE tile of zeros per device and reuse it forever.
+// Category B work: one-time setup, no per-call host arithmetic.
+using MeshBufferPtr = std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>;
 
-    for (uint32_t s = 0; s < log2N; ++s) {
-        const uint32_t m       = 1u << (s + 1);          // butterfly span
-        const uint32_t half    = m >> 1;                  // # twiddles per stage
-        const double   ang_inc = -2.0 * M_PI / static_cast<double>(m);
+struct ZeroScratch {
+    MeshBufferPtr buf;
+};
 
-        float* dr = tw_r.data() + static_cast<size_t>(s) * kTileElems;
-        float* di = tw_i.data() + static_cast<size_t>(s) * kTileElems;
+inline std::unordered_map<uintptr_t, std::shared_ptr<ZeroScratch>>&
+zero_scratch_cache() {
+    static std::unordered_map<uintptr_t, std::shared_ptr<ZeroScratch>> c;
+    return c;
+}
 
-        for (uint32_t k = 0; k < half; ++k) {
-            const double ang = ang_inc * static_cast<double>(k);
-            dr[k] = static_cast<float>(std::cos(ang));
-            di[k] = static_cast<float>(std::sin(ang));
-        }
-    }
-    return { std::move(tw_r), std::move(tw_i) };
+std::shared_ptr<ZeroScratch> get_or_create_zero_scratch(
+    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> md)
+{
+    using namespace tt::tt_metal::distributed;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(md.get());
+    auto& cache = zero_scratch_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    auto z = std::make_shared<ZeroScratch>();
+    z->buf = fft_example::make_mesh_buf(md, kTileBytesFp32, kTileBytesFp32);
+
+    // One-time zero-fill via WriteShard (Category B: setup, cached forever).
+    std::vector<float> zeros(kTileElems, 0.0f);
+    MeshCommandQueue& cq = md->mesh_command_queue();
+    WriteShard(cq, z->buf, zeros, MeshCoordinate(0, 0), /*blocking=*/true);
+
+    cache.emplace(key, z);
+    return z;
 }
 
 }  // namespace
@@ -88,13 +102,13 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
     std::tuple<ttnn::Tensor, ttnn::Tensor>& tensor_return_value)
 {
     using namespace tt::tt_metal;
+    using namespace tt::tt_metal::distributed;
 
     // ── Resolve sizes from the input tensor ────────────────────────────
     const auto& in_real = tensor_args.input_real;
     const uint32_t N    = static_cast<uint32_t>(in_real.padded_shape()[-1]);
     const uint32_t log2N = log2u(N);
 
-    // Single-tile path: N must fit in one 32×32 tile.
     TT_FATAL(is_pow2_st(N) && N >= 2u && N <= kTileElems,
         "SingleTileStockhamFactory: requires pow-2 N in [2, 1024] (got N={}).", N);
     TT_FATAL(in_real.dtype() == DataType::FLOAT32,
@@ -112,12 +126,25 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
     TT_FATAL(in_r_buf != nullptr && out_r_buf != nullptr && out_i_buf != nullptr,
         "SingleTileStockhamFactory: input/output tensors must be on device.");
 
+    // ── Resolve MeshDevice (mirror fft_program_factory.cpp pattern) ────
+    auto* device_raw = in_real.device();
+    auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
+
+    // ── Reuse legacy plan's twiddle MeshBuffers (Category B, cached) ──
+    auto plan = fft_stockham::get_cached_batch_plan(md, /*sub_N=*/N, /*batch=*/1u);
+
+    // ── Zero-imag scratch buffer (Category B, one-time per device) ────
+    auto zscratch = get_or_create_zero_scratch(md);
+
     ProgramDescriptor desc;
 
     // ── Single Tensix core for now (batch=1, single sub-FFT) ───────────
     const CoreCoord core{0, 0};
     const CoreRange core_range(core, core);
     const CoreRangeSet crs({core_range});
+
+    // Get physical core coords (the reader kernel needs them for NoC).
+    const CoreCoord phys = md->worker_core_from_logical_core(core);
 
     // ── Circular Buffers ───────────────────────────────────────────────
     // CB layout mirrors batch_fft_compute.cpp / batch_fft_common.h:
@@ -148,37 +175,26 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
         });
     }
 
-    // ── Twiddle precompute on host (Category B: constant per-N, fine) ──
-    // TODO(commit-1c): wire twiddles as a const-data DRAM buffer + pass
-    // its address as a runtime arg to the reader. Currently the reader's
-    // tw_r/tw_i addrs are 0u — kernel will fault when it tries to load
-    // twiddles. Commit 1B (this commit): just get scaffolding compiling.
-    auto [tw_r_data, tw_i_data] = batch_twiddles_fp32(log2N);
-    (void)tw_r_data;
-    (void)tw_i_data;
-
     // ── Kernels ────────────────────────────────────────────────────────
-    // Reader (BRISC0): pulls input tiles from DRAM (in_real buffer),
-    // bit-reverses, fills CB_EVEN/CB_ODD per stage. Imag input is zero
-    // (forward FFT of real input).
+    // Reader (BRISC0): pulls input + twiddle tiles, bit-reverses, fills CBs.
     desc.kernels.push_back(KernelDescriptor{
         .kernel_source =
             "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/batch_fft_reader.cpp",
         .core_ranges = crs,
         .compile_time_args = {N, log2N},
         .runtime_args = {
-            // Per-core: {core, {in_r, in_i, tw_r, tw_i, base, batch_per_core, phys_x, phys_y}}
+            // {in_r, in_i, tw_r, tw_i, base, batch_per_core, phys_x, phys_y}
             std::pair<CoreCoord, std::vector<uint32_t>>{
                 core,
                 std::vector<uint32_t>{
-                    in_r_buf->address(),
-                    /*in_i_addr=*/0u,        // TODO(commit-1c)
-                    /*tw_r_addr=*/0u,        // TODO(commit-1c)
-                    /*tw_i_addr=*/0u,        // TODO(commit-1c)
+                    in_r_buf->address(),                           // input real (our tensor)
+                    fft_stockham::buf_addr(zscratch->buf),         // zero-imag scratch
+                    fft_stockham::buf_addr(plan->tw_r_buf),        // twiddles (legacy cache)
+                    fft_stockham::buf_addr(plan->tw_i_buf),        // twiddles (legacy cache)
                     /*base=*/0u,
                     /*batch_per_core=*/1u,
-                    /*phys_x=*/0u,
-                    /*phys_y=*/0u,
+                    static_cast<uint32_t>(phys.x),
+                    static_cast<uint32_t>(phys.y),
                 },
             },
         },
