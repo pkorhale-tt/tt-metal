@@ -13,9 +13,15 @@
 // This lets big_modulus scale to 2^20 without blowing up the host twiddle
 // table (which would otherwise be big_modulus·P × 8 bytes = up to 8 GB).
 //
-// Per-row DRAM cost: 2 × 4 bytes (one scalar fetch per delta_r/delta_i)
-// + one P-element row of the input.  Per-row compute cost on BRISC0:
-// ~P fp32 multiply-adds for the recurrence (≈ 1 µs/row at P=1024).
+// Per-row DRAM cost: two full delta-table tiles (4 KB each) + one
+// P-element row of the input.  We read the FULL tile per row because
+// scalar (< tile-sized) NoC reads have arch-specific alignment quirks
+// (16 B on WH, 32 B on some BH variants); reading a whole tile via the
+// InterleavedAddrGenFast `noc_async_read_tile` API sidesteps all of
+// that.  DRAM L2 caches the tile across rows, so the per-row cost is
+// dominated by the L1 fill, not the DRAM fetch.
+// Per-row compute cost on BRISC0: ~P fp32 multiply-adds for the
+// recurrence (≈ 1 µs/row at P=1024).
 //
 // Runtime args:
 //   0: in_r_addr               (input row DRAM base)
@@ -87,35 +93,26 @@ void kernel_main() {
         const uint32_t t_r_l1 = get_write_ptr(CB_T_R);
         const uint32_t t_i_l1 = get_write_ptr(CB_T_I);
 
-        // ── Step 1: delta lookup.  NoC DRAM reads require 16-byte
-        //    aligned src + dst + size on WH (and 64-byte on BH).  A
-        //    naive 4-byte scalar read at an unaligned offset silently
-        //    returns garbage — manifesting as a per-row correctness
-        //    drift for any row whose delta_byte isn't a multiple of 16.
-        //    Round the source offset DOWN to 16 bytes, read a 16-byte
-        //    chunk (= 4 consecutive fp32 entries) into the start of
-        //    CB_T_R/I (tile-aligned, so dst alignment is fine), then
-        //    pick the right entry from within the chunk.
-        constexpr uint32_t kAlign = 16u;
-
+        // ── Step 1: delta lookup.  Read the full delta_tile that
+        //    contains row_phase via `noc_async_read_tile` (which uses
+        //    InterleavedAddrGenFast and handles all DRAM-bank
+        //    alignment), then pick the right scalar slot from L1.
+        //    The tile lands in CB_T_R/I temporarily; we overwrite the
+        //    whole tile with the recurrence in Step 2.
         const uint32_t row_phase   = row % big_modulus;
         const uint32_t delta_tile  = row_phase / kTileElems;
-        const uint32_t delta_byte  = (row_phase % kTileElems) * sizeof(float);
-        const uint32_t aligned_byte    = delta_byte & ~(kAlign - 1u);
-        const uint32_t offset_in_chunk = (delta_byte & (kAlign - 1u)) / sizeof(float);
+        const uint32_t delta_slot  = row_phase % kTileElems;
 
-        const uint64_t noc_dr = dr_gen.get_noc_addr(delta_tile) + aligned_byte;
-        const uint64_t noc_di = di_gen.get_noc_addr(delta_tile) + aligned_byte;
-        noc_async_read(noc_dr, t_r_l1, kAlign);
-        noc_async_read(noc_di, t_i_l1, kAlign);
+        noc_async_read_tile(delta_tile, dr_gen, t_r_l1);
+        noc_async_read_tile(delta_tile, di_gen, t_i_l1);
         noc_async_read_barrier();
 
         volatile tt_l1_ptr float* const tw_r =
             reinterpret_cast<volatile tt_l1_ptr float*>(t_r_l1);
         volatile tt_l1_ptr float* const tw_i =
             reinterpret_cast<volatile tt_l1_ptr float*>(t_i_l1);
-        const float dr = tw_r[offset_in_chunk];
-        const float di = tw_i[offset_in_chunk];
+        const float dr = tw_r[delta_slot];
+        const float di = tw_i[delta_slot];
 
         // ── Step 2: build twiddle row by recurrence tw[k] = tw[k-1] · δ.
         //    Slots [0, P) hold the valid twiddle; slots [P, kTileElems)
