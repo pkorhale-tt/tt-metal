@@ -170,6 +170,51 @@ def test_radix_pass_complex_input(
         )
 
 
+# ─── 3b. Pass-1 surrogate — exact (P, twiddle_N2, M) tuples used by ──────
+#         fft_two_pass.  Catches twiddle_N2 ≥ 64 regressions that the
+#         baseline N2∈{1..32} sweep above doesn't reach.  N=2048..16K
+#         covers all balanced factorizations in the two-pass gated range.
+_TWOPASS_PASS1 = [
+    # (B, N, N1, N2) — N1 = twiddle_N2, N2 = P
+    (1,  2048,  64,  32),
+    (1,  4096,  64,  64),
+    (1,  8192, 128,  64),
+    (1, 16384, 128, 128),
+    (2,  2048,  64,  32),
+    (4,  2048,  64,  32),
+]
+
+
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("B,N,N1,N2", _TWOPASS_PASS1,
+                         ids=[f"B{b}N{n}" for (b, n, _, _) in _TWOPASS_PASS1])
+def test_radix_pass_fused_pass1_surrogate(
+    device, B, N, N1, N2, tt_dtype, torch_dtype, label, tol,
+):
+    """fft_radix_pass called with the exact (P=N2, twiddle_N2=N1, M=B*N1)
+    tuples that fft_two_pass produces for Pass-1.  Reference is the
+    explicit (length-N2 FFT) ∘ (post-twiddle) pipeline."""
+    M = B * N1
+    torch.manual_seed(11)
+    x = torch.randn(M, N2, dtype=torch.float32).to(torch_dtype)
+
+    got_r, got_i = _run_radix_pass(
+        device, x, None, tt_dtype, P=N2, twiddle_N2=N1,
+    )
+    got = torch.complex(got_r.reshape(M, N2), got_i.reshape(M, N2))
+
+    ref_fft = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
+    ref = _torch_post_twiddle(ref_fft, P=N2, N2=N1)
+
+    for r in range(M):
+        rel = _rel_err(got[r], ref[r])
+        assert rel < tol, (
+            f"[{label}] pass1-surrogate B={B} N={N} (N1={N1},N2={N2}) "
+            f"row={r} rel err {rel:.2e}"
+        )
+
+
 # ─── 4. Program cache hit ──────────────────────────────────────────────────
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
                          ids=[d[2] for d in _DTYPES])
