@@ -102,8 +102,10 @@ def test_cache_apply_twiddles_xl(device, dtype):
 @pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
                          ids=["fp32", "bf16"])
 def test_cache_transpose_rm(device, dtype):
+    """transpose_rm requires the second-to-last dim (`A`) to be a
+    multiple of 32 (tile size) and >= 32."""
     torch.manual_seed(2)
-    x = torch.randn(16, 128, dtype=torch.float32)
+    x = torch.randn(32, 128, dtype=torch.float32)
 
     def fn():
         ttnn.experimental.transpose_rm(_rm(x, device, dtype))
