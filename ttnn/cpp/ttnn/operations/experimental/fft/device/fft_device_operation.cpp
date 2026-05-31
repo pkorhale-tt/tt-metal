@@ -5,6 +5,8 @@
 #include "fft_device_operation.hpp"
 #include "ttnn/device_operation.hpp"
 
+#include <cstdlib>  // std::getenv
+
 namespace ttnn::experimental::prim {
 
 namespace {
@@ -12,6 +14,15 @@ namespace {
 // Compile-time check: is N a power of two?
 constexpr bool is_pow2(uint32_t n) {
     return n != 0u && (n & (n - 1u)) == 0u;
+}
+
+// Refactor rollout switch — when set to "1", N<=1024 fp32 real-input forward
+// FFTs route through the new SingleTileStockhamFactory (ProgramDescriptor
+// pattern). All other cases continue through the legacy FFTProgramFactory.
+// Default OFF so the existing test suite is untouched while we iterate.
+bool native_path_enabled() {
+    const char* v = std::getenv("TT_FFT_NATIVE");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
 // Pick the right backend for (dtype, N). Mirrors the dispatch table in
@@ -33,6 +44,25 @@ FFTBackend select_backend(tt::tt_metal::DataType dtype, uint32_t N) {
 }
 
 }  // namespace
+
+FFTDeviceOperation::program_factory_t FFTDeviceOperation::select_program_factory(
+    const operation_attributes_t& attrs, const tensor_args_t& args) {
+    const auto& input = args.input_real;
+    const uint32_t N  = static_cast<uint32_t>(input.padded_shape()[-1]);
+
+    // New ProgramDescriptor path: fp32 real-input forward FFT, N<=1024,
+    // pow-2. Gated by TT_FFT_NATIVE=1 during rollout.
+    if (native_path_enabled() &&
+        !attrs.inverse &&
+        !args.input_imag.has_value() &&
+        input.dtype() == tt::tt_metal::DataType::FLOAT32 &&
+        is_pow2(N) && N >= 2u && N <= 1024u) {
+        return SingleTileStockhamFactory{};
+    }
+
+    // Default: existing dispatcher (covers everything else).
+    return FFTProgramFactory{};
+}
 
 void FFTDeviceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& attrs, const tensor_args_t& args) {

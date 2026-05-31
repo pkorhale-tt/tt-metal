@@ -42,6 +42,7 @@ target_sources(
     PRIVATE
         device/fft_device_operation.cpp
         device/fft_program_factory.cpp
+        device/single_tile_stockham_factory.cpp
         fft.cpp
 )
 
