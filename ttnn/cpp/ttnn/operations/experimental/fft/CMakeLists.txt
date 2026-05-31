@@ -44,7 +44,10 @@ target_sources(
         device/fft_program_factory.cpp
         device/single_tile_stockham_factory.cpp
         device/batched_stockham_factory.cpp
+        device/apply_twiddles_device_operation.cpp
+        device/apply_twiddles_factory.cpp
         fft.cpp
+        apply_twiddles.cpp
 )
 
 target_include_directories(ttnn_op_experimental_fft PRIVATE ${FixmeOpIncDirs})

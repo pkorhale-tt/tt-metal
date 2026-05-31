@@ -15,6 +15,7 @@
 
 #include "ttnn-nanobind/bind_function.hpp"
 #include "ttnn/operations/experimental/fft/fft.hpp"
+#include "ttnn/operations/experimental/fft/apply_twiddles.hpp"
 
 namespace ttnn::operations::experimental::fft_binding::detail {
 
@@ -52,6 +53,14 @@ TensorPair fft_complex_trampoline(
 TensorPair ifft_trampoline(
     const ttnn::Tensor& spectrum_real, const ttnn::Tensor& spectrum_imag, std::string precision) {
     return ttnn::operations::experimental::ifft(spectrum_real, spectrum_imag, parse_precision(precision));
+}
+
+TensorPair apply_twiddles_trampoline(
+    const ttnn::Tensor& input_real,
+    const ttnn::Tensor& input_imag,
+    uint32_t N1,
+    uint32_t N2) {
+    return ttnn::operations::experimental::apply_twiddles(input_real, input_imag, N1, N2);
 }
 
 }  // namespace
@@ -146,6 +155,46 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             nb::arg("spectrum_real").noconvert(),
             nb::arg("spectrum_imag").noconvert(),
             nb::arg("precision") = std::string("precise")));
+
+    const auto* apply_twiddles_doc =
+        R"doc(
+            Cooley-Tukey two-pass FFT between-pass elementwise complex multiply.
+
+            Interprets the input ``(input_real, input_imag)`` as ``M`` rows of
+            length ``N1`` (where ``M`` is the product of all leading dims) and
+            multiplies each row by the corresponding row of the twiddle table
+
+                T[n2, k1] = exp(-2*pi*i * n2 * k1 / (N1 * N2)),  n2 in [0, N2)
+
+            broadcast over the leading-batch dimension as ``T[r % N2, :]``.
+
+            This is a building block of the upcoming two-pass FFT composite;
+            it is exposed for unit-testing the kernel in isolation and is not
+            intended as a general-purpose user op.  Both ``N1`` and ``N2``
+            must be powers of two with ``N1 in [2, 1024]`` and ``N2 in
+            [1, 1024]``; ``M`` must be a multiple of ``N2``.
+
+            Args:
+                * :attr:`input_real`: Float32 or BFloat16 ROW_MAJOR tensor of
+                  shape ``(..., N1)``.
+                * :attr:`input_imag`: same shape / dtype / layout as
+                  ``input_real``.
+                * :attr:`N1`, :attr:`N2`: outer / inner factorisation of the
+                  total FFT length ``N = N1 * N2``.
+
+            Returns:
+                Tuple ``(real, imag)`` of Tensors, same shape as the input.
+        )doc";
+
+    ttnn::bind_function<"apply_twiddles", ttnn::unique_string{"ttnn.experimental."}>(
+        mod,
+        apply_twiddles_doc,
+        ttnn::overload_t(
+            &apply_twiddles_trampoline,
+            nb::arg("input_real").noconvert(),
+            nb::arg("input_imag").noconvert(),
+            nb::arg("N1"),
+            nb::arg("N2")));
 }
 
 }  // namespace ttnn::operations::experimental::fft_binding::detail
