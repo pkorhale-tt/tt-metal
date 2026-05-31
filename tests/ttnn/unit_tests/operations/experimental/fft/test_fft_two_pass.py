@@ -1,19 +1,22 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent Inc.
 # SPDX-License-Identifier: Apache-2.0
 """
-Tests for the two-pass Cooley–Tukey composite FFT path (commit 3c).
+Tests for the two-pass Cooley–Tukey composite FFT path (commit 3c,
+updated in commit 4 to use fft_radix_pass for the fused Pass-1).
 
 For pow-2 N with 1024 < N ≤ 1M, ttnn.experimental.fft factors N = N1*N2
-(balanced, both pow-2 in [32, 1024]) and runs a 6-op device-side chain:
+(balanced, both pow-2 in [32, 1024]) and runs a 5-op device-side chain:
 
-    Pass-1 batched FFT  →  apply_twiddles  →  transpose_rm  →
-    Pass-2 batched complex FFT  →  transpose_rm
+    fft_radix_pass(P=N2, twiddle_N2=N1)   # fused: FFT + post-twiddle
+    transpose_rm                           # (B, N1, N2) → (B, N2, N1)
+    fft (Pass-2, complex batched)
+    transpose_rm                           # (B, N2, N1) → (B, N1, N2)
 
-Activated by TT_FFT_NATIVE=1.
+(plus zero-cost reshape views around each).  Activated by TT_FFT_NATIVE=1.
 
 Coverage:
   - correctness vs torch.fft, fp32 and bf16, various N and batch dims
-  - program-cache hit on repeat (six entries cache, then stay flat)
+  - program-cache hit on repeat
   - Metal-Trace replay on a single (B, N) shape (all work device-side)
 """
 
@@ -87,9 +90,10 @@ def test_two_pass_correctness(device, B, N, tt_dtype, torch_dtype, label, tol):
 
 
 # ─── 2. Program cache hit ──────────────────────────────────────────────────
-# Two-pass dispatches six ops (with two transpose_rm at different shapes,
-# so all six are distinct program cache entries).  After warmup the
-# entry count must not grow on a repeat call with the same shape/dtype.
+# Two-pass dispatches four distinct device ops per call: fft_radix_pass +
+# 2× transpose_rm (different shapes → 2 entries) + fft (Pass-2).  After
+# warmup the entry count must not grow on a repeat call with the same
+# shape/dtype.
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
                          ids=[d[2] for d in _DTYPES])
 def test_two_pass_program_cache_hit(device, tt_dtype, torch_dtype, label, tol):
@@ -122,27 +126,28 @@ def test_two_pass_program_cache_hit(device, tt_dtype, torch_dtype, label, tol):
 # operations (close_device's synchronize_device fails, downstream tests
 # in the same session become unreliable).
 #
-# Root cause: the composite is a chain of ~10 host-orchestrated ops
-# (reshape × 6 + fft × 2 + apply_twiddles × 1 + transpose_rm × 2) that
-# allocates fresh intermediate device tensors via create_device_tensor on
-# every call.  Metal Trace currently requires all dispatches inside the
-# captured region to use pre-bound buffer addresses and does NOT permit
-# mid-trace allocator activity — the reshape/allocate path triggers a
+# Root cause: even after commit-4 fused Pass-1 into fft_radix_pass, the
+# composite is still a chain of host-orchestrated dispatches
+# (reshape × 5 + fft_radix_pass + transpose_rm × 2 + fft) that allocates
+# fresh intermediate device tensors via create_device_tensor on every
+# call.  Metal Trace requires all dispatches inside the captured region
+# to use pre-bound buffer addresses and does NOT permit mid-trace
+# allocator activity — the reshape/allocate path triggers a
 # synchronous device-side metadata read, hence:
 #
 #   TT_FATAL: Reads are not supported during trace capture.
 #
-# This will become trace-safe once commit 4 (ttnn::prim::fft_radix_pass
-# standalone device op) folds the composite into a single dispatch with
-# pre-allocated workspace tensors.  Trace coverage for the underlying
-# ProgramDescriptor primitive is already provided by
-# test_fft_native.py::test_singletile_metal_trace_replay.
+# Trace coverage of the underlying primitives IS already in place via
+#   test_fft_radix_pass_native.py::test_radix_pass_metal_trace_replay
+#   test_fft_native.py::test_singletile_metal_trace_replay
+# Folding the whole 2-pass chain into a single trace-safe device op
+# would need either pre-allocated workspace tensors or a unified
+# ttnn::prim::fft_two_pass device op (TBD in commit 5+).
 @pytest.mark.skip(
     reason="two-pass composite is not trace-replayable today (host-side "
            "reshape + intermediate tensor allocation inside trace capture "
-           "fires TT_FATAL and corrupts device sync state). Will be "
-           "re-enabled once commit 4 (fft_radix_pass) folds the chain "
-           "into a single device op."
+           "fires TT_FATAL and corrupts device sync state). Per-primitive "
+           "trace coverage lives in test_fft_radix_pass_native.py."
 )
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
                          ids=[d[2] for d in _DTYPES])

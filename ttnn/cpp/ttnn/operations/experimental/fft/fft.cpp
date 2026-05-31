@@ -10,7 +10,7 @@
 #include <utility>
 
 #include "device/fft_device_operation.hpp"
-#include "device/apply_twiddles_device_operation.hpp"
+#include "device/fft_radix_pass_device_operation.hpp"
 #include "device/transpose_rm_device_operation.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/types.hpp"  // ttnn::Shape, ttnn::SmallVector
@@ -30,14 +30,18 @@ namespace {
 //
 // where ω = exp(-2πi / N).
 //
-// Implementation as a chain of six device ops:
-//   1. reshape (B, N) -> (B*N1, N2)      [metadata-only, free]
-//   2. Pass-1 batched length-N2 FFT       → (R1, I1) shape (B*N1, N2)
-//   3. apply_twiddles(N1=N2, N2=N1)       → (R2, I2) shape (B*N1, N2)
-//   4. reshape + transpose_rm + reshape   → (R3, I3) shape (B*N2, N1)
-//   5. Pass-2 batched length-N1 complex FFT
-//                                        → (R4, I4) shape (B*N2, N1)
-//   6. reshape + transpose_rm + reshape   → final (B, N) tensors
+// Implementation as a chain of FIVE device ops (commit 4 fused Pass-1
+// + between-pass twiddle into ONE dispatch via prim::fft_radix_pass):
+//   1. reshape (B, N) -> (B*N1, N2)               [metadata-only, free]
+//   2. fft_radix_pass(P=N2, twiddle_N2=N1)        → (R2, I2) shape (B*N1, N2)
+//                                                  fused [batched FFT
+//                                                  + post-twiddle cmul]
+//   3. reshape + transpose_rm + reshape           → (R3, I3) shape (B*N2, N1)
+//   4. Pass-2 batched length-N1 complex FFT       → (R4, I4) shape (B*N2, N1)
+//   5. reshape + transpose_rm + reshape           → final (B, N) tensors
+//
+// Reduces the per-call dispatch count from 6 to 5 in the host path
+// (Step 2 used to be prim::fft followed by prim::apply_twiddles).
 //
 // Gated by TT_FFT_NATIVE=1 like the rest of the new path.  Falls back to
 // the legacy CachedProgram path otherwise.
@@ -81,19 +85,25 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     // ── Step 1: reshape input  (B, N)  →  (B*N1, N2)  (metadata-only)
     auto x_p1 = ttnn::reshape(input_real, make_shape({B * N1, N2}));
 
-    // ── Step 2: Pass-1 batched length-N2 real FFT.
-    auto [r1, i1] = ttnn::prim::fft(
-        x_p1, /*inverse=*/false, /*input_imag=*/std::nullopt, precision);
+    // ── Step 2: Pass-1 batched length-N2 real FFT + between-pass
+    //   twiddle multiply, FUSED into a single device dispatch.
+    //
+    //   fft_radix_pass treats input as (M, P) and outputs
+    //       y[r, k] = FFT_P(x[r, :])[k]
+    //               * exp(-2πi · (r % twiddle_N2) · k / (P · twiddle_N2))
+    //
+    //   We want the row-index r to range over [0, B·N1) and the post-
+    //   twiddle modulus to be N1, so the twiddle T[n1, k2] =
+    //   exp(-2πi·n1·k2 / (N1·N2)) is broadcast correctly across
+    //   the B replicas.  Hence: P = N2, twiddle_N2 = N1.
+    //
+    //   Replaces the old (prim::fft → prim::apply_twiddles) pair —
+    //   1 dispatch instead of 2, no intermediate L1↔DRAM round-trip.
+    auto [r2, i2] = ttnn::prim::fft_radix_pass(
+        x_p1, /*input_imag=*/std::nullopt,
+        /*P=*/N2, /*twiddle_N2=*/N1);
 
-    // ── Step 3: between-pass twiddle multiply.
-    //   apply_twiddles sees data as (M, apply_N1) with M = M-rows
-    //   and applies T[r % apply_N2, k] for k ∈ [0, apply_N1).
-    //   We want T[n1, k2] = exp(-2πi·n1·k2 / (N1·N2)), so:
-    //       apply_N1 = N2 (= row length of r1/i1)
-    //       apply_N2 = N1 (= twiddle modulus on the row index)
-    auto [r2, i2] = ttnn::prim::apply_twiddles(r1, i1, /*N1=*/N2, /*N2=*/N1);
-
-    // ── Step 4: transpose (B*N1, N2) → (B*N2, N1) via (B, N1, N2) view.
+    // ── Step 3: transpose (B*N1, N2) → (B*N2, N1) via (B, N1, N2) view.
     auto r2_3d = ttnn::reshape(r2, make_shape({B, N1, N2}));
     auto i2_3d = ttnn::reshape(i2, make_shape({B, N1, N2}));
     auto r3_3d = ttnn::prim::transpose_rm(r2_3d);
@@ -101,11 +111,11 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     auto r3 = ttnn::reshape(r3_3d, make_shape({B * N2, N1}));
     auto i3 = ttnn::reshape(i3_3d, make_shape({B * N2, N1}));
 
-    // ── Step 5: Pass-2 batched length-N1 complex FFT.
+    // ── Step 4: Pass-2 batched length-N1 complex FFT.
     auto [r4, i4] = ttnn::prim::fft(
         r3, /*inverse=*/false, /*input_imag=*/i3, precision);
 
-    // ── Step 6: undo the row/col flip to restore natural ordering.
+    // ── Step 5: undo the row/col flip to restore natural ordering.
     auto r4_3d = ttnn::reshape(r4, make_shape({B, N2, N1}));
     auto i4_3d = ttnn::reshape(i4, make_shape({B, N2, N1}));
     auto r5_3d = ttnn::prim::transpose_rm(r4_3d);
