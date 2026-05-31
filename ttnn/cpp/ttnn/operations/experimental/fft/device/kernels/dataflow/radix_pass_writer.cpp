@@ -107,8 +107,10 @@ void kernel_main() {
         //   timing / L1-stack-layout regression on the unchanged FFT
         //   path.
         if constexpr (APPLY_SCALE) {
-            const uint32_t scale_bits = get_arg_val<uint32_t>(5);
-            const float output_scale = *reinterpret_cast<const float*>(&scale_bits);
+            // Bit-cast uint32_t → float via union (strict-aliasing safe).
+            union { uint32_t u; float f; } scale_u;
+            scale_u.u = get_arg_val<uint32_t>(5);
+            const float output_scale = scale_u.f;
             volatile tt_l1_ptr float* const sr =
                 reinterpret_cast<volatile tt_l1_ptr float*>(state_r_l1);
             volatile tt_l1_ptr float* const si =
