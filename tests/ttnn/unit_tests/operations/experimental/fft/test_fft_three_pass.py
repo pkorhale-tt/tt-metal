@@ -1,31 +1,35 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent Inc.
 # SPDX-License-Identifier: Apache-2.0
 """
-Tests for the three-pass Cooley–Tukey composite FFT path (commit 5).
+Tests for the three-pass Cooley–Tukey composite FFT path (commit 5, corrected 5c).
 
 For pow-2 N with 2^20 < N ≤ 2^30, ttnn.experimental.fft_three_pass
 factors N = N1·N2·N3 (max-N3 then balance N1/N2, each pow-2 in [32, 1024])
-and runs a 10-op device-side chain:
+and runs an 8-op device-side chain (standard mixed-radix DIT, FFT_N1 first):
 
-    fft_radix_pass(P=N3, twiddle_N2=0)             # pass-1, pure FFT
-    apply_twiddles_xl(P=N3, big_mod=N1·N2)         # twiddle-1 (large mod)
-    transpose_rm                                   # ×2 r/i
-    fft_radix_pass(P=N2, twiddle_N2=N1, stride=N3) # pass-2 + twiddle-2
-    transpose_rm                                   # ×2 r/i
-    fft(P=N1)                                      # pass-3
-    transpose_rm + transpose_rm                    # ×2 each, k-axis reversal
+    transpose_rm                                   # initial rearrangement
+    fft_radix_pass(P=N1, twiddle_N2=0)             # stage 1, pure FFT_N1
+    apply_twiddles_xl(P=N1, big_mod=N2·N3)         # twiddle-1 (large mod)
+    transpose_rm                                   # bring n2 to last
+    fft_radix_pass(P=N2, twiddle_N2=N3, stride=N1) # stage 2 + twiddle-2
+    transpose_rm                                   # bring n3 to last
+    fft_radix_pass(P=N3, twiddle_N2=0)             # stage 3, pure FFT_N3
+    transpose_rm + transpose_rm                    # final dim-reverse
 
-(plus zero-cost reshape views around each).  Activated by TT_FFT_NATIVE=1.
+(plus reshape views around each).  Activated by TT_FFT_NATIVE=1.
 
-⚠ API NOTE: fft_three_pass takes its input PRE-SHAPED as (B·N1·N2, N3).
-   The (B, N) → (B·N1·N2, N3) reshape would require streaming an
-   N-element row through one CB tile per core, which blows L1 for
-   N > ~256K.  Tests do the equivalent torch view on the host before
-   ttnn.from_torch, so the device buffer is allocated with small
-   page_size from the start.  Output is returned in the factored shape
-   (B·N1, N2, N3); tests reshape to (B, N) on host after to_torch().
-   Commit 7 will add a streaming rebank kernel so the public fft()
-   API can transparently route (B, N) → fft_three_pass.
+⚠ API NOTES:
+   (1) INPUT pre-shape: fft_three_pass takes its input PRE-SHAPED as
+       (B·N1·N2, N3).  The (B, N) → (B·N1·N2, N3) reshape would otherwise
+       require streaming an N-element row through one CB tile per core,
+       which blows L1 for N > ~256K.  Tests do the equivalent torch view
+       on the host before ttnn.from_torch.
+   (2) OUTPUT shape (B·N3, N2, N1): tests reshape to (B, N) on host after
+       to_torch(); the (N3, N2, N1) dim ordering encodes natural-order
+       K = k3·N1·N2 + k2·N1 + k1, so the flat reshape directly yields
+       X[k] in natural-K order (matching torch.fft.fft).
+       NOTE: in commit 5 the output shape was (B·N1, N2, N3); commit 5c
+       changed this together with the algorithm fix.
 
 Coverage:
   - correctness vs torch.fft on the conservative band (N ∈ {2^21, 2^22})
@@ -102,7 +106,9 @@ def test_three_pass_correctness(device, B, N, tt_dtype, torch_dtype, label, tol)
         x_preshaped, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
     )
     re, im = ttnn.experimental.fft_three_pass(tt_x, full_N=N)
-    # Output shape is (B·N1, N2, N3); flatten and reshape to (B, N) on host.
+    # Output shape is (B·N3, N2, N1); flat reshape to (B, N) on host gives
+    # natural-order X[k] (the (N3, N2, N1) dim ordering encodes
+    # K = k3·N1·N2 + k2·N1 + k1 which IS the natural flat K).
     got_r = ttnn.to_torch(re).reshape(B, N).to(torch.float32)
     got_i = ttnn.to_torch(im).reshape(B, N).to(torch.float32)
     got = torch.complex(got_r, got_i)
@@ -172,15 +178,16 @@ def test_three_pass_correctness_large(
 
 
 # ─── 3. Program cache hit ──────────────────────────────────────────────────
-# Three-pass dispatches:
+# Three-pass dispatches (after commit 5c restructuring):
+#   - 2 × transpose_rm  (initial rearrangement, r/i — 1 entry shape-wise)
+#   - 1 × fft_radix_pass(P=N1, twiddle=0)
+#   - 1 × apply_twiddles_xl(P=N1, big_mod=N2·N3)
+#   - 2 × transpose_rm  (n2-to-last r/i — different shape, 1 more entry)
+#   - 1 × fft_radix_pass(P=N2, twiddle=N3, stride=N1)
+#   - 2 × transpose_rm  (n3-to-last r/i — 1 more entry)
 #   - 1 × fft_radix_pass(P=N3, twiddle=0)
-#   - 1 × apply_twiddles_xl
-#   - 2 × transpose_rm  (Step 5 r,i — same shape, so 1 cache entry)
-#   - 1 × fft_radix_pass(P=N2, twiddle=N1, stride=N3)
-#   - 2 × transpose_rm  (Step 9 r,i — different shape, so 1 more entry)
-#   - 1 × fft  (Pass-3)
-#   - 2 × transpose_rm  (Step 12 T1 r,i — 1 more entry)
-#   - 2 × transpose_rm  (Step 12 T2 r,i — 1 more entry)
+#   - 2 × transpose_rm  (final dim-reverse T1 r/i — 1 more entry)
+#   - 2 × transpose_rm  (final dim-reverse T2 r/i — 1 more entry)
 # Per-shape transpose cache entries; the second call with the same shape
 # must NOT grow the cache count.
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,

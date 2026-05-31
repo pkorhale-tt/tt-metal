@@ -176,49 +176,95 @@ bool two_pass_eligible(const ttnn::Tensor& input_real) {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// Three-pass Cooley–Tukey composite (commit 5)
+// Three-pass Cooley–Tukey composite (commit 5, corrected commit 5c)
 //
-// ⚠ API NOTE: fft_three_pass takes its input ALREADY PRE-SHAPED as
-//   (B·N1·N2, N3) [i.e. with last dim = N3 ≤ 1024], NOT as (B, N).
-//   This is because the (B, N) → (B·N1·N2, N3) reshape requires
-//   moving an N-element row through a single CB tile per core, which
-//   blows L1 for N > ~256K.  The caller is expected to do the equivalent
-//   `torch.view(B·N1·N2, N3)` on the host (it's a metadata-only torch
-//   view) BEFORE `ttnn.from_torch`, so the device buffer is allocated
-//   with small page_size from the start.  Output is returned in the
-//   factored shape (B·N1, N2, N3) — caller can reshape on host to
-//   recover (B, N) since the data is in natural Cooley–Tukey order.
+// ⚠ API NOTES:
+//   (1) INPUT pre-shape: fft_three_pass takes its input ALREADY PRE-SHAPED
+//       as (B·N1·N2, N3) [last dim = N3 ≤ 1024], NOT as (B, N).  This is
+//       because the (B, N) → (B·N1·N2, N3) reshape requires moving an
+//       N-element row through a CB per core, blowing L1 for N > ~256K.
+//       Caller does `torch.view(B·N1·N2, N3)` on host (metadata-only)
+//       BEFORE `ttnn.from_torch` so the device buffer is allocated with
+//       small page_size from the start.
+//   (2) OUTPUT shape change (commit 5c): output is now (B·N3, N2, N1)
+//       instead of (B·N1, N2, N3).  Caller's `to_torch().reshape(B, N)`
+//       on host still gives natural-order X[k] because the (N3, N2, N1)
+//       dim layout encodes K = k3·N1·N2 + k2·N1 + k1 = natural flat K.
+//       The OLD shape was returning index-permuted (wrong-order) data
+//       due to the underlying algorithmic bug (see ALGORITHM section).
 //
 //   TODO (commit 7): write an L1-friendly DRAM→DRAM rebank kernel that
 //   handles the page-size change in chunks, so the public `fft()` API
 //   can transparently route (B, N) inputs into the three-pass composite.
 //
+// ── ALGORITHM ───────────────────────────────────────────────────────────
 // For pow-2 N with 2^20 < N ≤ 2^30, factor N = N1 · N2 · N3 (each pow-2
-// in [32, 1024], picked "max-N3 then balance N1/N2" for best memory
-// coalescing on the innermost pass).  Decompose the length-N DFT as:
+// in [32, 1024]).  We use the standard mixed-radix DIT decomposition.
 //
-//   X[k1·N2·N3 + k2·N3 + k3]
-//     = Σ_n1 W_N1^(n1·k1) ·
-//           W_{N1N2}^(n1·k2) ·
-//             Σ_n2 W_N2^(n2·k2) ·
-//                W_N^((n1·N2+n2)·k3) ·
-//                  Σ_n3 x[n1,n2,n3] · W_N3^(n3·k3)
+//   Input packing  : n = n1·N2·N3 + n2·N3 + n3   (n1 OUTER, n3 INNER)
+//   Output packing : K = k3·N1·N2 + k2·N1 + k1   (k1 INNER, k3 OUTER)
 //
-// where ω = exp(-2πi / ·).  Implementation chain (12 device dispatches):
+// Crucially, K is the REVERSED-digit packing (k_i factor positions
+// swapped relative to n_i).  Empirically (and provably) the natural-K
+// packing K = k1·N2·N3 + k2·N3 + k3 has a non-integer phase term
+// (n2·k2·N3/(N1·N2) is fractional when N3/(N1·N2) is not integer), so
+// it does NOT admit a clean Cooley-Tukey decomposition for asymmetric
+// (N1, N2, N3).  The reversed packing makes every cross-term integer-
+// vanishing or assignable to a clean FFT/twiddle factor:
 //
-//   1. reshape (B, N) → (B·N1·N2, N3)          [zero-cost]
-//   2. fft_radix_pass(P=N3, twiddle_N2=0)      [pass-1, no twiddle]
-//   3. apply_twiddles_xl(P=N3, big_mod=N1·N2)  [twiddle-1, large modulus]
-//   4. reshape (B·N1·N2, N3) → (B·N1, N2, N3)  [zero-cost]
-//   5. transpose_rm: (B·N1, N2, N3) → (B·N1, N3, N2)         [×2 r,i]
-//   6. reshape → (B·N1·N3, N2)                 [zero-cost]
-//   7. fft_radix_pass(P=N2, twiddle_N2=N1, stride=N3)  [pass-2 + twiddle-2]
-//   8. reshape → (B, N1, N3*N2) view of (B, N1, N3, N2)  [zero-cost]
-//   9. transpose_rm: (B, N1, N3·N2) → (B, N3·N2, N1)         [×2 r,i]
-//  10. reshape → (B·N3·N2, N1)                 [zero-cost]
-//  11. fft(P=N1)                               [pass-3, complex input]
-//  12. reshape + two transpose_rm pairs to undo k-axis reversal
-//      (B, N3, N2, N1) → (B, N1, N2, N3); final reshape → (B, N).
+//   n·K/N  ≡  n1·k1/N1
+//          + n2·k2/N2  +  n2·k1/(N1·N2)
+//          + n3·k3/N3  +  n3·k2/(N2·N3)  +  n3·k1/N        (mod 1)
+//
+// Three FFT stages with assignable twiddles:
+//
+//   Stage 1: FFT_N1 over n1 (→ k1).
+//   Twiddle-1 (post Stage 1): exp(-2πi · (n2·N3 + n3) · k1 / N)
+//     fuses the n2·k1/(N1·N2) and n3·k1/N cross-terms.
+//   Stage 2: FFT_N2 over n2 (→ k2).
+//   Twiddle-2 (post Stage 2, fused into Stage 2's post-twiddle):
+//     exp(-2πi · n3 · k2 / (N2·N3))
+//   Stage 3: FFT_N3 over n3 (→ k3).
+//
+// Output naturally lands at (B, k1, k2, k3) after Stage 3.  A final
+// transpose chain reverses the last 3 dims → (B, N3, N2, N1) so that
+// `.reshape(B, N)` on host yields X[K] at flat K.
+//
+// ── DISPATCH CHAIN (8 device ops) ──────────────────────────────────────
+//
+//   Initial rearrangement (input is (B·N1·N2, N3) with n1 OUTER):
+//     1. reshape (B·N1·N2, N3) → (B, N1, N2·N3)        [page: N3·elem
+//                                                        → N2·N3·elem]
+//     2. transpose_rm        → (B, N2·N3, N1)          [×2 r,i]
+//     3. reshape             → (B·N2·N3, N1)           [free]
+//
+//   Stage 1 + Twiddle-1:
+//     4. fft_radix_pass(P=N1, twiddle_N2=0)            [pure FFT_N1]
+//     5. apply_twiddles_xl(P=N1, big_mod=N2·N3,
+//                          full_N=N)                   [twiddle-1]
+//
+//   Bring n2 to inner (was at position 1 of (B, N2, N3, k1)):
+//     6. reshape → (B, N2, N3·N1)                      [free]
+//     7. transpose_rm → (B, N3·N1, N2)                 [×2 r,i]
+//     8. reshape → (B·N3·N1, N2)                       [free]
+//
+//   Stage 2 + Twiddle-2 (FUSED in fft_radix_pass post-twiddle):
+//     9. fft_radix_pass(P=N2, twiddle_N2=N3,
+//                       stride=N1)                     [FFT_N2 + tw-2]
+//
+//   Bring n3 to inner (was at position 1 of (B, N3, k1, k2)):
+//    10. reshape → (B, N3, N1·N2)                      [free]
+//    11. transpose_rm → (B, N1·N2, N3)                 [×2 r,i]
+//    12. reshape → (B·N1·N2, N3)                       [free]
+//
+//   Stage 3 (no twiddle):
+//    13. fft_radix_pass(P=N3, twiddle_N2=0)            [pure FFT_N3]
+//
+//   Final dim-reverse to natural-K order:
+//    14. reshape → (B, N1·N2, N3)                      [free]
+//    15. transpose_rm → (B, N3, N1·N2)                 [×2 r,i]
+//    16. reshape → (B, N3, N1, N2)                     [page change]
+//    17. transpose_rm → (B, N3, N2, N1)                [×2 r,i, small]
 //
 // Above 2^30, we'd need a 4-pass or Bluestein composite (commit 6).
 // ───────────────────────────────────────────────────────────────────────
@@ -261,20 +307,21 @@ std::tuple<uint32_t, uint32_t, uint32_t> pick_three_factorization(uint32_t N) {
 // shaped as (B·N1·N2, N3) [last dim = N3 ≤ 1024]; the (B, N) → factored
 // reshape would otherwise blow L1 (commit 7 will add a rebank kernel
 // to lift this restriction).  Output is returned in the factored shape
-// (B·N1, N2, N3) — caller can `to_torch().reshape(B, N)` to recover
-// natural-order (B, N) on host.
+// (B·N3, N2, N1) — caller does `to_torch().reshape(B, N)` on host to
+// recover natural-order X[k] (the (N3, N2, N1) dim order encodes
+// K = k3·N1·N2 + k2·N1 + k1, which IS the natural flat K).
 // ────────────────────────────────────────────────────────────────────
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     const ttnn::Tensor& input_real,
     uint32_t full_N,
     FFTPrecision precision) {
+    (void)precision;  // see fft_two_pass note.
     const auto& in_shape = input_real.padded_shape();
     TT_FATAL(in_shape.size() >= 2,
         "fft_three_pass: pre-shaped input must be ≥2-D, e.g. (M, N3). Got {}-D.",
         in_shape.size());
     const uint32_t P_in = static_cast<uint32_t>(in_shape[-1]);
     const uint32_t M_in = static_cast<uint32_t>(in_shape[-2]);
-    // Allow extra leading dims as implicit batch (rare; tests use 2-D inputs).
     uint32_t B = 1u;
     for (int d = 0; d < static_cast<int>(in_shape.size()) - 2; ++d) {
         B *= static_cast<uint32_t>(in_shape[d]);
@@ -286,81 +333,82 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
         "P=N3={}) for full_N={} (N1={}, N2={}, N3={}), got (..., {}, {}).",
         N1 * N2, N3, full_N, N1, N2, N3, M_in, P_in);
 
-    // ── Step 2: Pass-1 batched length-N3 real FFT, NO twiddle.
-    //   fft_radix_pass treats input as (M=B·N1·N2 rows, N3 cols) and
-    //   emits FFT_N3 of each row.  twiddle_N2=0 → pure FFT path.
-    //   (Input is already in this shape — no reshape needed.)
+    // ── Initial rearrangement (input n1 OUTER → n1 to LAST axis).
+    //   Input (B·N1·N2, N3) is row-major with n = n1·N2·N3 + n2·N3 + n3.
+    //   View as (B, N1, N2·N3) [merges (N2, N3) → page = N2·N3·elem,
+    //   page-changing reshape], then transpose_rm → (B, N2·N3, N1).
+    auto x_3d = ttnn::reshape(input_real, make_shape({B, N1, N2 * N3}));
+    auto x_t  = ttnn::prim::transpose_rm(x_3d);                       // (B, N2·N3, N1)
+    auto x_p1 = ttnn::reshape(x_t, make_shape({B * N2 * N3, N1}));
+
+    // ── Stage 1: pure FFT_N1 over the (now-inner) n1 axis.
     auto [r1, i1] = ttnn::prim::fft_radix_pass(
-        input_real, /*input_imag=*/std::nullopt,
+        x_p1, /*input_imag=*/std::nullopt,
+        /*P=*/N1, /*twiddle_N2=*/0u);
+
+    // ── Twiddle-1: exp(-2πi · (n2·N3 + n3) · k1 / N).
+    //   Row r = b·N2·N3 + n2·N3 + n3, so (r % (N2·N3)) = n2·N3 + n3.
+    //   apply_twiddles_xl with big_modulus=N2·N3 picks exactly that.
+    //   Combines the n2·k1/(N1·N2) and n3·k1/N cross-terms of the
+    //   Cooley-Tukey decomposition into a single dispatch.
+    auto [r1t, i1t] = ttnn::prim::apply_twiddles_xl(
+        r1, i1, /*P=*/N1, /*big_modulus=*/N2 * N3, /*full_N=*/full_N);
+
+    // ── Bring n2 to inner for Stage 2.
+    //   Logical (B, N2, N3, k1) → (B, N3, k1, N2).
+    //   View as (B, N2, N3·N1) [merge last two — page change], then
+    //   transpose_rm → (B, N3·N1, N2).
+    auto r2_3d = ttnn::reshape(r1t, make_shape({B, N2, N3 * N1}));
+    auto i2_3d = ttnn::reshape(i1t, make_shape({B, N2, N3 * N1}));
+    auto r2t   = ttnn::prim::transpose_rm(r2_3d);                     // (B, N3·N1, N2)
+    auto i2t   = ttnn::prim::transpose_rm(i2_3d);
+    auto r2p   = ttnn::reshape(r2t, make_shape({B * N3 * N1, N2}));
+    auto i2p   = ttnn::reshape(i2t, make_shape({B * N3 * N1, N2}));
+
+    // ── Stage 2 + Twiddle-2 fused: FFT_N2 + post-twiddle
+    //       exp(-2πi · n3 · k2 / (N2·N3)).
+    //   Row r' = b·N3·N1 + n3·N1 + k1.  (r' / stride=N1) % twiddle_N2=N3
+    //   = (b·N3 + n3) % N3 = n3.  P·twiddle_N2 = N2·N3.  ✓
+    auto [r2, i2] = ttnn::prim::fft_radix_pass(
+        r2p, /*input_imag=*/i2p,
+        /*P=*/N2, /*twiddle_N2=*/N3, /*stride=*/N1);
+
+    // ── Bring n3 to inner for Stage 3.
+    //   Logical (B, N3, k1, k2) → (B, k1, k2, N3).
+    //   View as (B, N3, N1·N2) [merge last two — page change], then
+    //   transpose_rm → (B, N1·N2, N3).
+    auto r3_3d = ttnn::reshape(r2, make_shape({B, N3, N1 * N2}));
+    auto i3_3d = ttnn::reshape(i2, make_shape({B, N3, N1 * N2}));
+    auto r3t   = ttnn::prim::transpose_rm(r3_3d);                     // (B, N1·N2, N3)
+    auto i3t   = ttnn::prim::transpose_rm(i3_3d);
+    auto r3p   = ttnn::reshape(r3t, make_shape({B * N1 * N2, N3}));
+    auto i3p   = ttnn::reshape(i3t, make_shape({B * N1 * N2, N3}));
+
+    // ── Stage 3: pure FFT_N3.
+    auto [r3, i3] = ttnn::prim::fft_radix_pass(
+        r3p, /*input_imag=*/i3p,
         /*P=*/N3, /*twiddle_N2=*/0u);
 
-    // ── Step 3: between-pass-1-and-2 twiddle (LARGE modulus N1·N2).
-    //   Multiplies y[r=b·N1·N2 + n1·N2 + n2, k3] by
-    //       exp(-2πi · (r % (N1·N2)) · k3 / full_N)
-    //     = exp(-2πi · (n1·N2 + n2) · k3 / full_N)              (for B=1)
-    //   which is Cooley–Tukey twiddle 1 broadcast over B replicas.
-    auto [r2, i2] = ttnn::prim::apply_twiddles_xl(
-        r1, i1, /*P=*/N3, /*big_modulus=*/N1 * N2, /*full_N=*/full_N);
-
-    // ── Steps 4-6: bring n2 to last axis, ready for Pass-2.
-    //   (B·N1·N2, N3) → (B·N1, N2, N3) → transpose → (B·N1, N3, N2)
-    //   → (B·N1·N3, N2).
-    auto r2_3d = ttnn::reshape(r2, make_shape({B * N1, N2, N3}));
-    auto i2_3d = ttnn::reshape(i2, make_shape({B * N1, N2, N3}));
-    auto r2t   = ttnn::prim::transpose_rm(r2_3d);
-    auto i2t   = ttnn::prim::transpose_rm(i2_3d);
-    auto r2f   = ttnn::reshape(r2t, make_shape({B * N1 * N3, N2}));
-    auto i2f   = ttnn::reshape(i2t, make_shape({B * N1 * N3, N2}));
-
-    // ── Step 7: Pass-2 batched length-N2 complex FFT  +  small twiddle.
-    //   Rows enumerate (b, n1, k3) at stride N3 along the n1 axis, so
-    //   (r / stride=N3) % twiddle_N2=N1 picks the right n1 twiddle row
-    //   without needing an extra transpose.  Twiddle factor:
-    //       exp(-2πi · n1 · k2 / (N1·N2))   = Cooley–Tukey twiddle 2.
-    auto [r3, i3] = ttnn::prim::fft_radix_pass(
-        r2f, /*input_imag=*/i2f,
-        /*P=*/N2, /*twiddle_N2=*/N1, /*stride=*/N3);
-
-    // ── Steps 8-10: bring n1 to last axis, ready for Pass-3.
-    //   Layout after Step 7: (B·N1·N3, N2).  View as (B, N1, N3, N2),
-    //   collapse (N3, N2) → flat dim of length N3·N2, then transpose
-    //   (B, N1, N3·N2) → (B, N3·N2, N1), reshape → (B·N3·N2, N1).
-    auto r3_3d = ttnn::reshape(r3, make_shape({B, N1, N3 * N2}));
-    auto i3_3d = ttnn::reshape(i3, make_shape({B, N1, N3 * N2}));
-    auto r3t   = ttnn::prim::transpose_rm(r3_3d);   // (B, N3·N2, N1)
-    auto i3t   = ttnn::prim::transpose_rm(i3_3d);
-    auto r3f   = ttnn::reshape(r3t, make_shape({B * N3 * N2, N1}));
-    auto i3f   = ttnn::reshape(i3t, make_shape({B * N3 * N2, N1}));
-
-    // ── Step 11: Pass-3 batched length-N1 complex FFT, no twiddle.
-    auto [r4, i4] = ttnn::prim::fft(
-        r3f, /*inverse=*/false, /*input_imag=*/i3f, precision);
-
-    // ── Step 12: undo the k-axis reversal (k3, k2, k1) → (k1, k2, k3)
-    //   so the final flatten naturally gives the DIF-natural index
-    //   k = k1·N2·N3 + k2·N3 + k3.  Two transposes via the same
-    //   collapse-then-swap trick as Step 9.
+    // ── FINAL rearrangement (k1, k2, k3) → (k3, k2, k1) so that
+    //   `.reshape(B, N)` on host gives natural-order X[K] at flat K.
     //
-    //   T1: view (B, N3, N2, N1) as (B, N3·N2, N1) → transpose
-    //       → (B, N1, N3·N2) → reshape (B, N1, N3, N2).
-    auto r4_3d  = ttnn::reshape(r4, make_shape({B, N3 * N2, N1}));
-    auto i4_3d  = ttnn::reshape(i4, make_shape({B, N3 * N2, N1}));
-    auto r4t1   = ttnn::prim::transpose_rm(r4_3d);   // (B, N1, N3·N2)
-    auto i4t1   = ttnn::prim::transpose_rm(i4_3d);
-    //   T2: reshape (B, N1, N3·N2) → (B·N1, N3, N2) → transpose
-    //       → (B·N1, N2, N3) → reshape (B, N1, N2, N3).
-    auto r4t1f  = ttnn::reshape(r4t1, make_shape({B * N1, N3, N2}));
-    auto i4t1f  = ttnn::reshape(i4t1, make_shape({B * N1, N3, N2}));
-    auto r4t2   = ttnn::prim::transpose_rm(r4t1f);
-    auto i4t2   = ttnn::prim::transpose_rm(i4t1f);
+    //   After Stage 3 we have (B·N1·N2, N3) ≡ (B, k1, k2, k3).
+    //   Target: (B, N3, N2, N1) ≡ (B, k3, k2, k1).
+    //
+    //   (a) view → (B, N1·N2, N3)         [free, last dim unchanged]
+    //   (b) transpose_rm → (B, N3, N1·N2) [page_out = N1·N2·elem]
+    //   (c) view → (B, N3, N1, N2)        [page change: N1·N2 → N2]
+    //   (d) transpose_rm → (B, N3, N2, N1)[page_out = N1·elem, tiny]
+    auto r4_3d = ttnn::reshape(r3, make_shape({B, N1 * N2, N3}));
+    auto i4_3d = ttnn::reshape(i3, make_shape({B, N1 * N2, N3}));
+    auto r4t1  = ttnn::prim::transpose_rm(r4_3d);                     // (B, N3, N1·N2)
+    auto i4t1  = ttnn::prim::transpose_rm(i4_3d);
+    auto r4s   = ttnn::reshape(r4t1, make_shape({B, N3, N1, N2}));
+    auto i4s   = ttnn::reshape(i4t1, make_shape({B, N3, N1, N2}));
+    auto r_out = ttnn::prim::transpose_rm(r4s);                       // (B, N3, N2, N1)
+    auto i_out = ttnn::prim::transpose_rm(i4s);
 
-    // NOTE: NO final reshape back to (B, N).  That would require
-    // an L1-busting page_size change (N3·elem → full_N·elem).  Output
-    // shape is the factored (B·N1, N2, N3) — caller is expected to do
-    // `to_torch().reshape(B, full_N)` on host to recover natural-order
-    // (B, full_N).  This is cheap (just a torch view) since the FFT
-    // chain already arranges k = k1·N2·N3 + k2·N3 + k3 naturally.
-    return {std::move(r4t2), std::move(i4t2)};
+    return {std::move(r_out), std::move(i_out)};
 }
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
