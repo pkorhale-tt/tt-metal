@@ -52,11 +52,14 @@ target_sources(
         device/transpose_rm_factory.cpp
         device/fft_radix_pass_device_operation.cpp
         device/fft_radix_pass_factory.cpp
+        device/complex_mul_device_operation.cpp
+        device/complex_mul_factory.cpp
         fft.cpp
         apply_twiddles.cpp
         apply_twiddles_xl.cpp
         transpose_rm.cpp
         fft_radix_pass.cpp
+        complex_mul.cpp
 )
 
 target_include_directories(ttnn_op_experimental_fft PRIVATE ${FixmeOpIncDirs})

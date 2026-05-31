@@ -19,6 +19,7 @@
 #include "ttnn/operations/experimental/fft/apply_twiddles_xl.hpp"
 #include "ttnn/operations/experimental/fft/transpose_rm.hpp"
 #include "ttnn/operations/experimental/fft/fft_radix_pass.hpp"
+#include "ttnn/operations/experimental/fft/complex_mul.hpp"
 
 namespace ttnn::operations::experimental::fft_binding::detail {
 
@@ -100,6 +101,14 @@ TensorPair fft_radix_pass_complex_trampoline(
     uint32_t stride) {
     return ttnn::operations::experimental::fft_radix_pass(
         input_real, input_imag, P, twiddle_N2, stride);
+}
+
+TensorPair complex_mul_trampoline(
+    const ttnn::Tensor& a_real,
+    const ttnn::Tensor& a_imag,
+    const ttnn::Tensor& b_real,
+    const ttnn::Tensor& b_imag) {
+    return ttnn::operations::experimental::complex_mul(a_real, a_imag, b_real, b_imag);
 }
 
 TensorPair fft_three_pass_real_trampoline(
@@ -368,6 +377,51 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             nb::arg("P"),
             nb::arg("twiddle_N2") = 0u,
             nb::arg("stride")     = 1u));
+
+    const auto* complex_mul_doc =
+        R"doc(
+            Fused ROW_MAJOR elementwise complex multiply of two same-shape
+            complex tensors.
+
+            Computes, for ``A = (a_real, a_imag)`` and ``B = (b_real, b_imag)``::
+
+                out_real = a_real * b_real - a_imag * b_imag
+                out_imag = a_real * b_imag + a_imag * b_real
+
+            Single device dispatch (4 dense NoC reads + SFPU complex
+            multiply + 2 NoC writes per row).  Compute is fp32 internally;
+            bf16 inputs/outputs are expanded/truncated at the kernel
+            boundary.
+
+            Used by:
+                - Bluestein composite (commit 6d): chirp pre/post
+                  multiply, and the spectral-domain H multiply.
+                - IFFT inverse path (commit 6c): conjugate-and-scale via
+                  a length-1 broadcast tensor of ``(1/N, -1/N)``.
+
+            Args:
+                * :attr:`a_real`, :attr:`a_imag`, :attr:`b_real`,
+                  :attr:`b_imag`: Float32 or BFloat16 ROW_MAJOR tensors,
+                  all sharing the same shape, dtype, and layout.
+
+            Constraints:
+                * All four tensors same shape / dtype / layout.
+                * Last-dim row length P in ``[1, 1024]``.
+
+            Returns:
+                Tuple ``(out_real, out_imag)`` of Tensors, same spec as
+                the inputs.
+        )doc";
+
+    ttnn::bind_function<"complex_mul", ttnn::unique_string{"ttnn.experimental."}>(
+        mod,
+        complex_mul_doc,
+        ttnn::overload_t(
+            &complex_mul_trampoline,
+            nb::arg("a_real").noconvert(),
+            nb::arg("a_imag").noconvert(),
+            nb::arg("b_real").noconvert(),
+            nb::arg("b_imag").noconvert()));
 
     const auto* fft_three_pass_doc =
         R"doc(
