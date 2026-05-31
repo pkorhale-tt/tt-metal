@@ -100,6 +100,57 @@ def test_singletile_program_cache_hit(device, tt_dtype, torch_dtype, label, tol)
 
 
 # ─── 3. Metal Trace replay ─────────────────────────────────────────────────
+# ─── 4. Batched correctness (commit 3a) ────────────────────────────────────
+# Shape (B, N) → B independent length-N FFTs in parallel across cores.
+# Routes through BatchedStockhamFactory in select_program_factory.
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("B", [2, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("N", [128, 256, 512, 1024])
+def test_batched_correctness(device, B, N, tt_dtype, torch_dtype, label, tol):
+    torch.manual_seed(7)
+    x_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x = x_fp32.to(torch_dtype)
+
+    tt_x = ttnn.from_torch(
+        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device
+    )
+    re, im = ttnn.experimental.fft(tt_x)
+    got_r = ttnn.to_torch(re).reshape(B, N).to(torch.float32)
+    got_i = ttnn.to_torch(im).reshape(B, N).to(torch.float32)
+    got = torch.complex(got_r, got_i)
+
+    ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
+
+    # Per-row rel-err — every row must individually satisfy the bound.
+    for b in range(B):
+        rel = _rel_err(got[b], ref[b])
+        assert rel < tol, f"[{label}] B={B} N={N} row={b} rel err {rel:.2e}"
+
+
+# ─── 5. Batched program cache hit (commit 3a) ──────────────────────────────
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+def test_batched_program_cache_hit(device, tt_dtype, torch_dtype, label, tol):
+    B, N = 32, 1024
+    torch.manual_seed(0)
+    x = torch.randn(B, N, dtype=torch.float32).to(torch_dtype)
+
+    tt_x = ttnn.from_torch(x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    ttnn.experimental.fft(tt_x)
+    n_after_warmup = device.num_program_cache_entries()
+
+    tt_x2 = ttnn.from_torch(x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    ttnn.experimental.fft(tt_x2)
+    n_after_repeat = device.num_program_cache_entries()
+
+    assert n_after_repeat == n_after_warmup, (
+        f"[{label}] batched program cache regression: "
+        f"{n_after_warmup} → {n_after_repeat}"
+    )
+
+
+# ─── 6. Single-tile Metal Trace replay ─────────────────────────────────────
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
                          ids=[d[2] for d in _DTYPES])
 def test_singletile_metal_trace_replay(device, tt_dtype, torch_dtype, label, tol):

@@ -48,11 +48,20 @@ FFTBackend select_backend(tt::tt_metal::DataType dtype, uint32_t N) {
 FFTDeviceOperation::program_factory_t FFTDeviceOperation::select_program_factory(
     const operation_attributes_t& attrs, const tensor_args_t& args) {
     const auto& input = args.input_real;
-    const uint32_t N  = static_cast<uint32_t>(input.padded_shape()[-1]);
+    const auto& shape = input.padded_shape();
+    const uint32_t N  = static_cast<uint32_t>(shape[-1]);
 
-    // New ProgramDescriptor path: fp32 OR bf16 real-input forward FFT,
+    // Compute product of leading dims (batch size). Pow-2 check happens
+    // inside the factory; here we just sniff for "batched" vs "single".
+    uint32_t B = 1u;
+    for (int d = 0; d < static_cast<int>(shape.size()) - 1; ++d) {
+        B *= static_cast<uint32_t>(shape[d]);
+    }
+
+    // New ProgramDescriptor paths: fp32 OR bf16, real-input forward FFT,
     // N<=1024, pow-2. Gated by TT_FFT_NATIVE=1 during rollout.
-    // (commit 2 of refactor: bf16 added on top of commit 1's fp32 path.)
+    //   B == 1 → SingleTileStockhamFactory (commits 1, 2)
+    //   B  > 1 → BatchedStockhamFactory    (commit 3a, foundation for two-pass)
     const auto dt = input.dtype();
     const bool dtype_ok =
         dt == tt::tt_metal::DataType::FLOAT32 ||
@@ -61,8 +70,10 @@ FFTDeviceOperation::program_factory_t FFTDeviceOperation::select_program_factory
         !attrs.inverse &&
         !args.input_imag.has_value() &&
         dtype_ok &&
-        is_pow2(N) && N >= 2u && N <= 1024u) {
-        return SingleTileStockhamFactory{};
+        is_pow2(N) && N >= 2u && N <= 1024u &&
+        is_pow2(B) && B >= 1u) {
+        if (B == 1u) return SingleTileStockhamFactory{};
+        return BatchedStockhamFactory{};
     }
 
     // Default: existing dispatcher (covers everything else).
