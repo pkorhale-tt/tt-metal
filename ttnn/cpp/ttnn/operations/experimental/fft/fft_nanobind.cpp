@@ -20,6 +20,7 @@
 #include "ttnn/operations/experimental/fft/transpose_rm.hpp"
 #include "ttnn/operations/experimental/fft/fft_radix_pass.hpp"
 #include "ttnn/operations/experimental/fft/complex_mul.hpp"
+#include "ttnn/operations/experimental/fft/bluestein.hpp"
 
 namespace ttnn::operations::experimental::fft_binding::detail {
 
@@ -129,6 +130,24 @@ TensorPair fft_three_pass_complex_trampoline(
     bool inverse) {
     return ttnn::operations::experimental::fft_three_pass(
         input_real, input_imag, full_N, parse_precision(precision), inverse);
+}
+
+// Bluestein (commit 6d) — arbitrary-N (not just pow-2) DFT.
+TensorPair bluestein_fft_real_trampoline(
+    const ttnn::Tensor& input_real,
+    uint32_t N,
+    std::string precision) {
+    return ttnn::operations::experimental::bluestein_fft(
+        input_real, /*input_imag=*/std::nullopt, N, parse_precision(precision));
+}
+
+TensorPair bluestein_fft_complex_trampoline(
+    const ttnn::Tensor& input_real,
+    const ttnn::Tensor& input_imag,
+    uint32_t N,
+    std::string precision) {
+    return ttnn::operations::experimental::bluestein_fft(
+        input_real, input_imag, N, parse_precision(precision));
 }
 
 }  // namespace
@@ -512,6 +531,68 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             nb::arg("full_N"),
             nb::arg("precision") = std::string("precise"),
             nb::arg("inverse")   = false));
+
+    const auto* bluestein_fft_doc =
+        R"doc(
+            Arbitrary-length 1-D forward DFT via Bluestein's chirp-Z
+            transform (commit 6d).  Handles **non-pow-2 N** by reducing
+            the length-N DFT to a length-M cyclic convolution where
+            ``M = next_pow2(2*N - 1)``.  The inner length-M FFT and IFFT
+            are dispatched through the existing pow-2 chain
+            (SingleTileStockham for M ≤ 1024, fft_two_pass otherwise).
+
+            Per-call device dispatch chain (B = 1, length N → length N)::
+
+                complex_mul(x, chirp_n)   # pre-twiddle
+                pad to length M           # zero-pad
+                fft (forward, length M)
+                complex_mul(A, B)         # B = FFT(b_cyc) precomputed
+                ifft (length M)
+                slice [:N]                # truncate
+                complex_mul(c, chirp_k)   # post-twiddle
+
+            ``chirp_n``, ``chirp_k``, and ``B`` are pre-computed and
+            cached **per (device, N, dtype)** on first call.
+
+            Args:
+                * :attr:`input_real`: Float32 or BFloat16 ROW_MAJOR tensor
+                  of shape ``(1, N)``.  Batched input (B > 1) is not yet
+                  supported by this overload (commit 6d limitation).
+                * :attr:`input_imag` (optional): same shape / dtype /
+                  layout as ``input_real``.  Implicit zero if omitted.
+                * :attr:`N`: logical FFT length (arbitrary integer ≥ 2).
+                  Constrained to ``N ≤ 524_288`` for now (so
+                  ``M = next_pow2(2*N - 1) ≤ 2^20``).
+                * :attr:`precision` (default ``"precise"``): same as
+                  :func:`ttnn.experimental.fft`.
+
+            Returns:
+                Tuple ``(real, imag)`` of Tensors, shape ``(1, N)``.
+
+            Example::
+
+                N = 257   # prime — Bluestein required
+                x = torch.randn(1, N).to(torch.float32)
+                tt_x = ttnn.from_torch(x, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+                re, im = ttnn.experimental.bluestein_fft(tt_x, N=N)
+                X = torch.complex(ttnn.to_torch(re), ttnn.to_torch(im))
+                # X ≈ torch.fft.fft(x.to(torch.complex64), dim=-1)
+        )doc";
+
+    ttnn::bind_function<"bluestein_fft", ttnn::unique_string{"ttnn.experimental."}>(
+        mod,
+        bluestein_fft_doc,
+        ttnn::overload_t(
+            &bluestein_fft_real_trampoline,
+            nb::arg("input_real").noconvert(),
+            nb::arg("N"),
+            nb::arg("precision") = std::string("precise")),
+        ttnn::overload_t(
+            &bluestein_fft_complex_trampoline,
+            nb::arg("input_real").noconvert(),
+            nb::arg("input_imag").noconvert(),
+            nb::arg("N"),
+            nb::arg("precision") = std::string("precise")));
 }
 
 }  // namespace ttnn::operations::experimental::fft_binding::detail

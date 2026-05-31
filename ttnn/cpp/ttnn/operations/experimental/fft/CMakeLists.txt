@@ -60,6 +60,7 @@ target_sources(
         transpose_rm.cpp
         fft_radix_pass.cpp
         complex_mul.cpp
+        bluestein.cpp
 )
 
 target_include_directories(ttnn_op_experimental_fft PRIVATE ${FixmeOpIncDirs})
