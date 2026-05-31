@@ -12,9 +12,11 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_radix_pass(
     const std::optional<ttnn::Tensor>& input_imag,
     uint32_t P,
     uint32_t twiddle_N2,
-    uint32_t stride)
+    uint32_t stride,
+    float    output_scale)
 {
-    return ttnn::prim::fft_radix_pass(input_real, input_imag, P, twiddle_N2, stride);
+    return ttnn::prim::fft_radix_pass(
+        input_real, input_imag, P, twiddle_N2, stride, output_scale);
 }
 
 }  // namespace ttnn::operations::experimental

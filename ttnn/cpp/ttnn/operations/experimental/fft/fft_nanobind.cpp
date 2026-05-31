@@ -88,9 +88,10 @@ TensorPair fft_radix_pass_real_trampoline(
     const ttnn::Tensor& input_real,
     uint32_t P,
     uint32_t twiddle_N2,
-    uint32_t stride) {
+    uint32_t stride,
+    float    output_scale) {
     return ttnn::operations::experimental::fft_radix_pass(
-        input_real, std::nullopt, P, twiddle_N2, stride);
+        input_real, std::nullopt, P, twiddle_N2, stride, output_scale);
 }
 
 TensorPair fft_radix_pass_complex_trampoline(
@@ -98,9 +99,10 @@ TensorPair fft_radix_pass_complex_trampoline(
     const ttnn::Tensor& input_imag,
     uint32_t P,
     uint32_t twiddle_N2,
-    uint32_t stride) {
+    uint32_t stride,
+    float    output_scale) {
     return ttnn::operations::experimental::fft_radix_pass(
-        input_real, input_imag, P, twiddle_N2, stride);
+        input_real, input_imag, P, twiddle_N2, stride, output_scale);
 }
 
 TensorPair complex_mul_trampoline(
@@ -123,9 +125,10 @@ TensorPair fft_three_pass_complex_trampoline(
     const ttnn::Tensor& input_real,
     const ttnn::Tensor& input_imag,
     uint32_t full_N,
-    std::string precision) {
+    std::string precision,
+    bool inverse) {
     return ttnn::operations::experimental::fft_three_pass(
-        input_real, input_imag, full_N, parse_precision(precision));
+        input_real, input_imag, full_N, parse_precision(precision), inverse);
 }
 
 }  // namespace
@@ -353,6 +356,12 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             The two-arg form passes only the real input (imag implicitly
             zero); the three-arg form takes a complex (real+imag) input.
 
+            ``output_scale`` (commit 6c, default 1.0) multiplies every
+            output element by the given scalar AFTER the (optional)
+            post-twiddle and BEFORE any bf16 truncation.  Used by the
+            IFFT composite to fold the ``1/N`` scale into the LAST
+            radix_pass call with zero extra dispatch.
+
             Constraints:
                 * P pow-2 in [2, 1024]
                 * M pow-2 and >= 1
@@ -368,15 +377,17 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             &fft_radix_pass_real_trampoline,
             nb::arg("input_real").noconvert(),
             nb::arg("P"),
-            nb::arg("twiddle_N2") = 0u,
-            nb::arg("stride")     = 1u),
+            nb::arg("twiddle_N2")   = 0u,
+            nb::arg("stride")       = 1u,
+            nb::arg("output_scale") = 1.0f),
         ttnn::overload_t(
             &fft_radix_pass_complex_trampoline,
             nb::arg("input_real").noconvert(),
             nb::arg("input_imag").noconvert(),
             nb::arg("P"),
-            nb::arg("twiddle_N2") = 0u,
-            nb::arg("stride")     = 1u));
+            nb::arg("twiddle_N2")   = 0u,
+            nb::arg("stride")       = 1u,
+            nb::arg("output_scale") = 1.0f));
 
     const auto* complex_mul_doc =
         R"doc(
@@ -465,6 +476,12 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                   factor pow-2 in ``[32, 1024]``.
                 * :attr:`precision` (default ``"precise"``): same as
                   :func:`ttnn.experimental.fft`.
+                * :attr:`inverse` (default ``False``, complex form only):
+                  request an inverse FFT (IFFT).  Uses the swap-trick:
+                  forward FFT on ``(input_imag, input_real)`` with the
+                  ``1/full_N`` scale folded into the LAST radix_pass
+                  writer via ``output_scale``, then a free relabel swap
+                  on return.  Zero extra dispatch vs forward FFT.
 
             Returns:
                 Tuple ``(real, imag)`` of Tensors, shape ``(B·N1, N2, N3)``.
@@ -493,7 +510,8 @@ void bind_experimental_fft_operation(nb::module_& mod) {
             nb::arg("input_real").noconvert(),
             nb::arg("input_imag").noconvert(),
             nb::arg("full_N"),
-            nb::arg("precision") = std::string("precise")));
+            nb::arg("precision") = std::string("precise"),
+            nb::arg("inverse")   = false));
 }
 
 }  // namespace ttnn::operations::experimental::fft_binding::detail

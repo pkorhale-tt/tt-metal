@@ -19,6 +19,13 @@
 //   0: OUTPUT_BF16           — 0 fp32 fast path, 1 = bf16 trunc on output
 //   1: SUB_N                 — number of valid floats per row (= P)
 //   2: APPLY_POST_TWIDDLE    — 0 = pure FFT writer, 1 = fused cmul
+//   3: APPLY_SCALE           — 0 = no output scale, 1 = multiply each
+//                              STATE element by runtime arg 5 (used by
+//                              the IFFT path to fold the 1/N scale).
+//
+// Runtime args:
+//   5: output_scale_bits     — uint32_t bit-pattern of float, only read
+//                              when APPLY_SCALE=1.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -34,6 +41,18 @@ void kernel_main() {
     constexpr uint32_t OUTPUT_BF16        = get_compile_time_arg_val(0);
     constexpr uint32_t SUB_N              = get_compile_time_arg_val(1);
     constexpr uint32_t APPLY_POST_TWIDDLE = get_compile_time_arg_val(2);
+    constexpr uint32_t APPLY_SCALE        = get_compile_time_arg_val(3);
+
+    // Only read the runtime scale when APPLY_SCALE=1; the host
+    // omits arg 5 entirely for the no-scale path (default 1.0f path
+    // shares its program-cache entry with all existing commit-5 calls).
+    // Union bit-cast — kernel build env has no <cstring>.
+    union { uint32_t u; float f; } scale_u;
+    scale_u.f = 1.0f;
+    if constexpr (APPLY_SCALE) {
+        scale_u.u = get_arg_val<uint32_t>(5);
+    }
+    const float output_scale = scale_u.f;
 
     const uint32_t ts = get_tile_size(CB_STATE_R);
 
@@ -83,6 +102,24 @@ void kernel_main() {
 
             cb_pop_front(CB_PT_R, 1);
             cb_pop_front(CB_PT_I, 1);
+        }
+
+        // ── Optional output scale (IFFT 1/N fold, commit 6c) ────────────
+        //   Applied AFTER any post-twiddle (so it commutes with the cmul
+        //   above — scaling a complex number doesn't change the order of
+        //   operations) and BEFORE the bf16 truncation (so we don't lose
+        //   precision in the scale itself).  Runs in fp32 on BRISC1 just
+        //   like the post-twiddle loop above; total cost ≈ SUB_N extra
+        //   fp32 muls per row.
+        if constexpr (APPLY_SCALE) {
+            volatile tt_l1_ptr float* const sr =
+                reinterpret_cast<volatile tt_l1_ptr float*>(state_r_l1);
+            volatile tt_l1_ptr float* const si =
+                reinterpret_cast<volatile tt_l1_ptr float*>(state_i_l1);
+            for (uint32_t i = 0; i < SUB_N; ++i) {
+                sr[i] = sr[i] * output_scale;
+                si[i] = si[i] * output_scale;
+            }
         }
 
         if constexpr (OUTPUT_BF16) {

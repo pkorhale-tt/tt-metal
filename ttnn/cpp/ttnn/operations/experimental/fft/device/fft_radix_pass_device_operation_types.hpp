@@ -42,6 +42,18 @@ struct FftRadixPassParams {
     //     [1, M] that divides M (i.e. (M / stride) % twiddle_N2 == 0).
     //     Default 1 = "use r directly" (commit 4 / two-pass behaviour).
     uint32_t stride = 1;
+    // Output scalar (added commit 6c, for IFFT).  When != 1.0f, the
+    // writer multiplies each STATE element by this value after the
+    // (optional) post-twiddle, before the bf16 truncation / DRAM write.
+    // The composite's `inverse` flag sets this to 1/N on the LAST
+    // radix_pass call to fold the IFFT 1/N scale into the FFT chain
+    // with zero extra dispatch.
+    //
+    // Program-cache identity: the runtime float value does NOT affect
+    // the kernel binary, but the BOOLEAN "is_scale_enabled" does (it
+    // controls whether the writer compiles in the per-element multiply
+    // loop).  We hash on the boolean only.
+    float output_scale = 1.0f;
 };
 
 // input_imag is optional: for a Pass-1 (real input) radix pass we leave

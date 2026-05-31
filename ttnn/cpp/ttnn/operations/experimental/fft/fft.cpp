@@ -100,7 +100,8 @@ ttnn::Shape make_shape(std::initializer_list<uint32_t> dims) {
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     const ttnn::Tensor& input_real,
     std::optional<ttnn::Tensor> input_imag,
-    FFTPrecision precision) {
+    FFTPrecision precision,
+    bool inverse) {
     // precision is currently unused — both passes route through
     // prim::fft_radix_pass which keeps its compute precision implicit
     // (fp32 input → fp32 compute, bf16 input → packed bf16).  Kept in
@@ -115,19 +116,49 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     }
 
     const auto [N1, N2] = pick_factorization(N);
-    // When input_imag is supplied (complex-input forward FFT — added in
-    // commit 6a for Bluestein) we transpose it alongside the real tensor
-    // and feed both to Pass-1.  This adds 1 extra transpose_rm dispatch
-    // (5 → 6 device ops total) but is the only correct way to keep
-    // Cooley-Tukey Method A invariants intact for complex input.
-    const bool has_imag = input_imag.has_value();
+
+    // ── INVERSE PATH (commit 6c): zero-extra-dispatch IFFT via the
+    //   "swap-trick".  Standard conjugate trick is
+    //
+    //       IFFT(X) = (1/N) · conj( FFT( conj(X) ) ).
+    //
+    //   Both conjugations are NEGATE-IMAG, which is an antilinear op
+    //   and CANNOT be folded into a complex multiply (complex_mul has
+    //   no representable element that maps z ↦ z̄).  Materialising a
+    //   (-1 on imag) constant tensor would cost 8 GB at N=1G in
+    //   three-pass — unacceptable.
+    //
+    //   The swap-trick rewrites IFFT using only LINEAR operations:
+    //
+    //       Let X̃ = X_im + i·X_re = i · conj(X), so
+    //       FFT(X̃) = i · FFT(conj(X))
+    //              ⇒ FFT(conj(X)) = -i · FFT(X̃)
+    //              ⇒ IFFT(X) = (1/N) · conj(-i · FFT(X̃))
+    //                        = (1/N) · ( W_im,  W_re )      where W = FFT(X̃)
+    //
+    //   So we (1) swap input halves → pass (X_im, X_re) to forward FFT,
+    //   (2) fold the 1/N scale into the LAST radix_pass writer via
+    //   output_scale (zero extra dispatch — see commit 6c kernel patch),
+    //   and (3) swap output halves before returning.  Both swaps are
+    //   pure C++ relabels, FREE.
+    TT_FATAL(!inverse || input_imag.has_value(),
+        "fft_two_pass: inverse=true requires both input_real and input_imag.");
+
+    // ── INPUT swap (free, just relabel which tensor is real / imag).
+    const ttnn::Tensor& src_real = inverse ? *input_imag : input_real;
+    const std::optional<ttnn::Tensor> src_imag =
+        inverse ? std::make_optional(input_real) : input_imag;
+
+    const bool has_imag = src_imag.has_value();
+    const float final_scale =
+        inverse ? (1.0f / static_cast<float>(N)) : 1.0f;
 
     // ── Step 1: reshape input (B, N) → (B, N1, N2).  View, free.
     //   x_3d[b, n1, n2] = x_orig[b, n1·N2 + n2].
-    auto x_3d_r = ttnn::reshape(input_real, make_shape({B, N1, N2}));
+    auto x_3d_r = ttnn::reshape(src_real, make_shape({B, N1, N2}));
     std::optional<ttnn::Tensor> x_3d_i;
     if (has_imag) {
-        x_3d_i = ttnn::reshape(*input_imag, make_shape({B, N1, N2}));
+        x_3d_i = ttnn::reshape(*src_imag, make_shape({B, N1, N2}));
     }
 
     // ── Step 2: initial transpose (B, N1, N2) → (B, N2, N1).
@@ -161,9 +192,13 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
 
     // ── Step 5: Pass-2 batched length-N2 complex FFT, NO twiddle
     //   (all Cooley–Tukey twiddles were absorbed into Pass-1 above).
+    //   For IFFT: the 1/N scale is folded INTO this writer via
+    //   output_scale (single compile-time kernel branch, runtime float
+    //   arg).  Zero extra dispatch vs forward FFT.
     auto [r3, i3] = ttnn::prim::fft_radix_pass(
         r2, /*input_imag=*/i2,
-        /*P=*/N2, /*twiddle_N2=*/0u);
+        /*P=*/N2, /*twiddle_N2=*/0u, /*stride=*/1u,
+        /*output_scale=*/final_scale);
 
     // ── Step 6: final transpose (B, N1, N2) → (B, N2, N1) to put
     //   the output in natural-K order under flat reshape.
@@ -178,6 +213,13 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
 
     auto out_r = ttnn::reshape(r4t, in_shape);
     auto out_i = ttnn::reshape(i4t, in_shape);
+
+    // ── OUTPUT swap (free) — completes the swap-trick.  After the
+    //   forward FFT chain with scale=1/N we have (W_re/N, W_im/N);
+    //   the IFFT result is (W_im/N, W_re/N), i.e. swap halves.
+    if (inverse) {
+        return {std::move(out_i), std::move(out_r)};
+    }
     return {std::move(out_r), std::move(out_i)};
 }
 
@@ -341,9 +383,21 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     const ttnn::Tensor& input_real,
     std::optional<ttnn::Tensor> input_imag,
     uint32_t full_N,
-    FFTPrecision precision) {
+    FFTPrecision precision,
+    bool inverse) {
     (void)precision;  // see fft_two_pass note.
-    const auto& in_shape = input_real.padded_shape();
+    // Same swap-trick as fft_two_pass.  See its long comment for
+    // derivation.  The 1/N scale is folded into the Stage-3 (last)
+    // fft_radix_pass writer via output_scale.
+    TT_FATAL(!inverse || input_imag.has_value(),
+        "fft_three_pass: inverse=true requires both input_real and input_imag.");
+    const ttnn::Tensor& src_real = inverse ? *input_imag : input_real;
+    const std::optional<ttnn::Tensor> src_imag =
+        inverse ? std::make_optional(input_real) : input_imag;
+    const float final_scale =
+        inverse ? (1.0f / static_cast<float>(full_N)) : 1.0f;
+
+    const auto& in_shape = src_real.padded_shape();
     TT_FATAL(in_shape.size() >= 2,
         "fft_three_pass: pre-shaped input must be ≥2-D, e.g. (M, N3). Got {}-D.",
         in_shape.size());
@@ -374,9 +428,13 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     // on the input.  Pass-1 then sees a true complex input.  The rest
     // of the pipeline already handles complex (Pass-2 and Pass-3 both
     // do) so no further changes are required.
-    const bool has_imag = input_imag.has_value();
+    //
+    // commit 6c: for inverse=true, src_real/src_imag are the post-swap
+    // labels (X_im, X_re) — has_imag is therefore always true and the
+    // imag path is unconditionally taken.
+    const bool has_imag = src_imag.has_value();
     if (has_imag) {
-        const auto& im_shape = input_imag->padded_shape();
+        const auto& im_shape = src_imag->padded_shape();
         TT_FATAL(im_shape == in_shape,
             "fft_three_pass: input_imag shape must match input_real shape.");
     }
@@ -385,12 +443,12 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     //   Input (B·N1·N2, N3) is row-major with n = n1·N2·N3 + n2·N3 + n3.
     //   View as (B, N1, N2·N3) [merges (N2, N3) → page = N2·N3·elem,
     //   page-changing reshape], then transpose_rm → (B, N2·N3, N1).
-    auto x_3d_r = ttnn::reshape(input_real, make_shape({B, N1, N2 * N3}));
+    auto x_3d_r = ttnn::reshape(src_real, make_shape({B, N1, N2 * N3}));
     auto x_t_r  = ttnn::prim::transpose_rm(x_3d_r);                   // (B, N2·N3, N1)
     auto x_p1_r = ttnn::reshape(x_t_r, make_shape({B * N2 * N3, N1}));
     std::optional<ttnn::Tensor> x_p1_i;
     if (has_imag) {
-        auto x_3d_i = ttnn::reshape(*input_imag, make_shape({B, N1, N2 * N3}));
+        auto x_3d_i = ttnn::reshape(*src_imag, make_shape({B, N1, N2 * N3}));
         auto x_t_i  = ttnn::prim::transpose_rm(x_3d_i);               // (B, N2·N3, N1)
         x_p1_i = ttnn::reshape(x_t_i, make_shape({B * N2 * N3, N1}));
     }
@@ -439,9 +497,13 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     auto i3p   = ttnn::reshape(i3t, make_shape({B * N1 * N2, N3}));
 
     // ── Stage 3: pure FFT_N3.
+    //   For IFFT (commit 6c): fold the 1/full_N scale into THIS writer
+    //   via output_scale.  Zero extra dispatch — the writer's element
+    //   loop multiplies every STATE element by 1/full_N in-place.
     auto [r3, i3] = ttnn::prim::fft_radix_pass(
         r3p, /*input_imag=*/i3p,
-        /*P=*/N3, /*twiddle_N2=*/0u);
+        /*P=*/N3, /*twiddle_N2=*/0u, /*stride=*/1u,
+        /*output_scale=*/final_scale);
 
     // ── FINAL rearrangement (k1, k2, k3) → (k3, k2, k1) so that
     //   `.reshape(B, N)` on host gives natural-order X[K] at flat K.
@@ -462,18 +524,23 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     auto r_out = ttnn::prim::transpose_rm(r4s);                       // (B, N3, N2, N1)
     auto i_out = ttnn::prim::transpose_rm(i4s);
 
+    // ── OUTPUT swap (free) — completes the swap-trick for IFFT.
+    if (inverse) {
+        return {std::move(i_out), std::move(r_out)};
+    }
     return {std::move(r_out), std::move(i_out)};
 }
 
 // Public real-input wrapper (preserves the original commit-5 signature).
-// The complex-input form is the lower-level 3-arg overload above and is
-// what Bluestein (commit 6d) drives.
+// The complex-input form is the lower-level overload above and is
+// what Bluestein (commit 6d) drives.  Inverse mode requires complex
+// input (swap-trick), so we don't expose it here.
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     const ttnn::Tensor& input_real,
     uint32_t full_N,
     FFTPrecision precision) {
     return fft_three_pass(input_real, /*input_imag=*/std::nullopt,
-                          full_N, precision);
+                          full_N, precision, /*inverse=*/false);
 }
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
@@ -486,7 +553,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     //                         (until commit 7 adds rebank kernel)
     //   N > 2^30            → falls through to prim::fft (will TT_FATAL)
     if (two_pass_eligible(input_real)) {
-        return fft_two_pass(input_real, /*input_imag=*/std::nullopt, precision);
+        return fft_two_pass(input_real, /*input_imag=*/std::nullopt, precision,
+                            /*inverse=*/false);
     }
     return ttnn::prim::fft(input_real, /*inverse=*/false,
                            /*input_imag=*/std::nullopt, precision);
@@ -502,7 +570,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     // intermediate complex pipeline).  Small-N still goes through
     // prim::fft which has had complex-input support since commit 0.
     if (two_pass_eligible(input_real)) {
-        return fft_two_pass(input_real, input_imag, precision);
+        return fft_two_pass(input_real, input_imag, precision,
+                            /*inverse=*/false);
     }
     return ttnn::prim::fft(input_real, /*inverse=*/false, input_imag, precision);
 }
@@ -511,6 +580,21 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ifft(
     const ttnn::Tensor& spectrum_real,
     const ttnn::Tensor& spectrum_imag,
     FFTPrecision precision) {
+    // Routing (TT_FFT_NATIVE=1):
+    //   N ≤ 1024            → SingleTileStockhamFactory (prim::fft inverse=true)
+    //   1024 < N ≤ 2^20     → fft_two_pass  with inverse=true (commit 6c)
+    //   N > 2^20            → caller MUST invoke fft_three_pass(inverse=true)
+    //                         explicitly with pre-shaped input
+    //                         (until commit 7 adds rebank kernel)
+    //
+    // For the two_pass / three_pass paths, the IFFT uses the swap-trick
+    // (see fft_two_pass): forward FFT on swapped (X_im, X_re) with
+    // output_scale=1/N folded into the LAST radix_pass writer, then a
+    // free relabel swap on return.  Zero extra dispatch vs forward FFT.
+    if (two_pass_eligible(spectrum_real)) {
+        return fft_two_pass(spectrum_real, spectrum_imag, precision,
+                            /*inverse=*/true);
+    }
     return ttnn::prim::fft(spectrum_real, /*inverse=*/true,
                            spectrum_imag, precision);
 }

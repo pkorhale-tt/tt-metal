@@ -65,6 +65,7 @@ def _torch_post_twiddle(
 def _run_radix_pass(
     device, x_real: torch.Tensor, x_imag: torch.Tensor | None,
     tt_dtype, P: int, twiddle_N2: int, stride: int = 1,
+    output_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tt_xr = ttnn.from_torch(
         x_real, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
@@ -72,6 +73,7 @@ def _run_radix_pass(
     if x_imag is None:
         re, im = ttnn.experimental.fft_radix_pass(
             tt_xr, P=P, twiddle_N2=twiddle_N2, stride=stride,
+            output_scale=output_scale,
         )
     else:
         tt_xi = ttnn.from_torch(
@@ -79,6 +81,7 @@ def _run_radix_pass(
         )
         re, im = ttnn.experimental.fft_radix_pass(
             tt_xr, tt_xi, P=P, twiddle_N2=twiddle_N2, stride=stride,
+            output_scale=output_scale,
         )
     return (
         ttnn.to_torch(re).to(torch.float32),
@@ -263,6 +266,49 @@ def test_radix_pass_strided_twiddle(
         assert rel < tol, (
             f"[{label}] strided P={P} N1={twiddle_N2} stride={stride} "
             f"M={M} row={r} rel err {rel:.2e}"
+        )
+
+
+# ─── 3b. Output scale (commit 6c, for IFFT) ────────────────────────────────
+# fft_radix_pass gained an `output_scale` param: every output element is
+# multiplied by this scalar AFTER any post-twiddle (and before any bf16
+# truncation).  Used by the IFFT composite to fold the 1/N scale into the
+# LAST radix_pass writer with zero extra dispatch.
+#
+# We cross-check by running the SAME input twice — once with scale=1.0
+# and once with scale=alpha — and verifying the scale-alpha output is
+# exactly alpha × the scale-1.0 output to within fp32 noise.  We also
+# pair scale with twiddle_N2>0 to make sure the scale multiplies AFTER
+# the post-twiddle (commute-with-cmul property).
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("twiddle_N2", [0, 4])
+@pytest.mark.parametrize("alpha", [0.5, 1.0 / 128.0, -2.0])
+def test_radix_pass_output_scale(
+    device, alpha, twiddle_N2, tt_dtype, torch_dtype, label, tol,
+):
+    """output_scale α scales every output element by α.  Cross-check
+    against torch reference (FFT + optional post-twiddle, then × α)."""
+    M, P = 8, 128
+    torch.manual_seed(53)
+    x = torch.randn(M, P, dtype=torch.float32).to(torch_dtype)
+
+    got_r, got_i = _run_radix_pass(
+        device, x, None, tt_dtype,
+        P=P, twiddle_N2=twiddle_N2, output_scale=alpha,
+    )
+    got = torch.complex(got_r.reshape(M, P), got_i.reshape(M, P))
+
+    ref_fft = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
+    if twiddle_N2 > 0:
+        ref_fft = _torch_post_twiddle(ref_fft, P=P, N2=twiddle_N2)
+    ref = ref_fft * alpha
+
+    for r in range(M):
+        rel = _rel_err(got[r], ref[r])
+        assert rel < tol, (
+            f"[{label}] scale α={alpha} tw_N2={twiddle_N2} row={r} "
+            f"rel err {rel:.2e} (tol {tol:.0e})"
         )
 
 

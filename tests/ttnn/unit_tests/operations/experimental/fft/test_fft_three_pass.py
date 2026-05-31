@@ -176,6 +176,118 @@ def test_three_pass_complex_correctness(
         )
 
 
+# ─── 1c. IFFT correctness — THREE-PASS PATH (commit 6c) ────────────────────
+# fft_three_pass(inverse=true) uses the swap-trick:
+#
+#     IFFT(X) = (1/full_N) · (W_im, W_re)  where W = FFT(X_im, X_re).
+#
+# Both swap steps are pure C++ relabels (free) and the 1/full_N scale is
+# folded into the Stage-3 (last) fft_radix_pass writer via output_scale,
+# so the IFFT chain has the SAME 8-op dispatch count as forward complex
+# FFT (no extra dispatch for the scale).
+#
+# IFFT REQUIRES complex input (both halves of the spectrum) — the swap-
+# trick depends on having both X_re and X_im.  We don't expose an
+# inverse=true overload for the real-only wrapper.
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("N", [1 << 21])
+def test_three_pass_ifft_correctness(
+    device, B, N, tt_dtype, torch_dtype, label, tol,
+):
+    N1, N2, N3 = _expected_three_factorization(N)
+    assert N1 * N2 * N3 == N
+
+    torch.manual_seed(37)
+    x_re_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x_im_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x_re = x_re_fp32.to(torch_dtype)
+    x_im = x_im_fp32.to(torch_dtype)
+
+    x_re_pre = x_re.reshape(B * N1 * N2, N3).contiguous()
+    x_im_pre = x_im.reshape(B * N1 * N2, N3).contiguous()
+
+    tt_re = ttnn.from_torch(
+        x_re_pre, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    tt_im = ttnn.from_torch(
+        x_im_pre, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    out_re, out_im = ttnn.experimental.fft_three_pass(
+        tt_re, tt_im, full_N=N, inverse=True,
+    )
+    got_r = ttnn.to_torch(out_re).reshape(B, N).to(torch.float32)
+    got_i = ttnn.to_torch(out_im).reshape(B, N).to(torch.float32)
+    got = torch.complex(got_r, got_i)
+
+    ref = torch.fft.ifft(
+        torch.complex(x_re_fp32, x_im_fp32).to(torch.complex64), dim=-1,
+    )
+
+    for b in range(B):
+        rel = _rel_err(got[b], ref[b])
+        assert rel < tol, (
+            f"[{label}-ifft] B={B} N={N} (N1={N1},N2={N2},N3={N3}) "
+            f"row={b} rel err {rel:.2e} (tol {tol:.0e})"
+        )
+
+
+# Round-trip sanity check: ifft(fft(x)) ≈ x.  Uses real input (passed as
+# input_imag=zero) through the COMPLEX three-pass forward, then IFFT on
+# the resulting complex spectrum.  Recovers x to within fp32/bf16 noise.
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("N", [1 << 21])
+def test_three_pass_fft_ifft_roundtrip(
+    device, N, tt_dtype, torch_dtype, label, tol,
+):
+    B = 1
+    N1, N2, N3 = _expected_three_factorization(N)
+    torch.manual_seed(41)
+    x_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x = x_fp32.to(torch_dtype)
+    x_pre = x.reshape(B * N1 * N2, N3).contiguous()
+    z_pre = torch.zeros_like(x_pre)
+
+    tt_x = ttnn.from_torch(
+        x_pre, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    tt_z = ttnn.from_torch(
+        z_pre, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    # Forward (complex form with zero imag) → spectrum.
+    fft_re, fft_im = ttnn.experimental.fft_three_pass(tt_x, tt_z, full_N=N)
+
+    # The forward output shape is (B·N3, N2, N1).  IFFT expects the same
+    # PRE-shape that the forward took, i.e. (B·N1·N2, N3).  We could do a
+    # to_torch+from_torch round-trip here, but the simpler thing is to use
+    # the fact that the (B, N) view is consistent: reshape via host.
+    fft_re_flat = ttnn.to_torch(fft_re).reshape(B * N1 * N2, N3).contiguous()
+    fft_im_flat = ttnn.to_torch(fft_im).reshape(B * N1 * N2, N3).contiguous()
+    tt_fft_re = ttnn.from_torch(
+        fft_re_flat, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    tt_fft_im = ttnn.from_torch(
+        fft_im_flat, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    rec_re, rec_im = ttnn.experimental.fft_three_pass(
+        tt_fft_re, tt_fft_im, full_N=N, inverse=True,
+    )
+
+    rec_r = ttnn.to_torch(rec_re).reshape(B, N).to(torch.float32)
+    rec_i = ttnn.to_torch(rec_im).reshape(B, N).to(torch.float32)
+
+    rel_r = _rel_err(rec_r, x_fp32)
+    rel_i = float(rec_i.abs().norm() / x_fp32.abs().norm().clamp_min(1e-30))
+    assert rel_r < tol, (
+        f"[{label}-roundtrip] N={N} real-part rel err {rel_r:.2e} (tol {tol:.0e})"
+    )
+    assert rel_i < tol, (
+        f"[{label}-roundtrip] N={N} imag-part residual {rel_i:.2e} (tol {tol:.0e})"
+    )
+
+
 # ─── 2. Aggressive band — gated ─────────────────────────────────────────
 # These exercise the upper end of the supported range.  Default-skipped
 # because they each take minutes and need GB of host RAM for the torch

@@ -135,6 +135,84 @@ def test_two_pass_complex_correctness(device, B, N, tt_dtype, torch_dtype, label
         )
 
 
+# ─── 1c. IFFT correctness — TWO-PASS PATH (commit 6c) ──────────────────────
+# Routed through fft_two_pass with inverse=true via the swap-trick:
+#
+#     IFFT(X) = (1/N) * (W_im, W_re)   where W = FFT(X_im, X_re).
+#
+# Implementation folds the 1/N scale into the LAST radix_pass writer
+# (zero extra dispatch vs forward FFT — same 6-op chain).
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("N", [2048, 4096])
+def test_two_pass_ifft_correctness(device, B, N, tt_dtype, torch_dtype, label, tol):
+    N1, N2 = _expected_factorization(N)
+    assert N1 * N2 == N
+
+    torch.manual_seed(23)
+    x_re_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x_im_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x_re = x_re_fp32.to(torch_dtype)
+    x_im = x_im_fp32.to(torch_dtype)
+
+    tt_re = ttnn.from_torch(
+        x_re, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    tt_im = ttnn.from_torch(
+        x_im, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    out_re, out_im = ttnn.experimental.ifft(tt_re, tt_im)
+    got_r = ttnn.to_torch(out_re).reshape(B, N).to(torch.float32)
+    got_i = ttnn.to_torch(out_im).reshape(B, N).to(torch.float32)
+    got = torch.complex(got_r, got_i)
+
+    ref = torch.fft.ifft(
+        torch.complex(x_re_fp32, x_im_fp32).to(torch.complex64), dim=-1,
+    )
+
+    for b in range(B):
+        rel = _rel_err(got[b], ref[b])
+        assert rel < tol, (
+            f"[{label}-ifft] B={B} N={N} (N1={N1},N2={N2}) row={b} "
+            f"rel err {rel:.2e} (tol {tol:.0e})"
+        )
+
+
+# Round-trip sanity check: ifft(fft(x)) ≈ x.  Uses real input on the
+# outer FFT (input_imag implicitly zero), then IFFT on the resulting
+# complex spectrum — should recover x to within fp32/bf16 noise.
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
+                         ids=[d[2] for d in _DTYPES])
+@pytest.mark.parametrize("N", [2048, 4096])
+def test_two_pass_fft_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
+    B = 1
+    torch.manual_seed(29)
+    x_fp32 = torch.randn(B, N, dtype=torch.float32)
+    x = x_fp32.to(torch_dtype)
+
+    tt_x = ttnn.from_torch(
+        x, dtype=tt_dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+    )
+    fft_re, fft_im = ttnn.experimental.fft(tt_x)
+    rec_re, rec_im = ttnn.experimental.ifft(fft_re, fft_im)
+
+    rec_r = ttnn.to_torch(rec_re).reshape(B, N).to(torch.float32)
+    rec_i = ttnn.to_torch(rec_im).reshape(B, N).to(torch.float32)
+
+    rel_r = _rel_err(rec_r, x_fp32)
+    # Imag part of round-trip must be essentially zero (real input).
+    # Use abs scale relative to the input magnitude so the tolerance
+    # is dimensionally consistent.
+    rel_i = float(rec_i.abs().norm() / x_fp32.abs().norm().clamp_min(1e-30))
+    assert rel_r < tol, (
+        f"[{label}-roundtrip] N={N} real-part rel err {rel_r:.2e} (tol {tol:.0e})"
+    )
+    assert rel_i < tol, (
+        f"[{label}-roundtrip] N={N} imag-part residual {rel_i:.2e} (tol {tol:.0e})"
+    )
+
+
 # ─── 2. Program cache hit ──────────────────────────────────────────────────
 # Two-pass dispatches four distinct device ops per call: fft_radix_pass +
 # 2× transpose_rm (different shapes → 2 entries) + fft (Pass-2).  After

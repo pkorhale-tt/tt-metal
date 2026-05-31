@@ -66,10 +66,17 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
 // `input_real`.  Adds one extra transpose_rm dispatch on the imag
 // tensor at the head of the pipeline; the rest of the three-pass
 // chain already handles complex data natively.
+//
+// `inverse=true` (commit 6c) requests an inverse FFT (IFFT).  Uses
+// the swap-trick: requires BOTH halves of the spectrum (input_imag
+// must be supplied), and folds the 1/full_N scale into the LAST
+// fft_radix_pass writer via output_scale.  Zero extra dispatch vs
+// forward FFT — the only "work" is two C++-level relabel swaps.
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     const ttnn::Tensor& input_real,
     std::optional<ttnn::Tensor> input_imag,
     uint32_t full_N,
-    FFTPrecision precision = FFTPrecision::Precise);
+    FFTPrecision precision = FFTPrecision::Precise,
+    bool inverse = false);
 
 }  // namespace ttnn::operations::experimental

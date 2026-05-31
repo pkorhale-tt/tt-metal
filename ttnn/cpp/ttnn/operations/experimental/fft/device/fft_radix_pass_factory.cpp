@@ -17,6 +17,7 @@
 #include "fft_radix_pass_factory.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -289,6 +290,18 @@ tt::tt_metal::ProgramDescriptor FftRadixPassFactory::create_descriptor(
     const uint32_t input_bf16_flag  = is_bf16 ? 1u : 0u;
     const uint32_t output_bf16_flag = is_bf16 ? 1u : 0u;
     const uint32_t apply_pt_flag    = apply_pt ? 1u : 0u;
+    // commit 6c: IFFT folds 1/N into the LAST radix_pass writer.
+    // We compile the per-element scale loop into the kernel binary only
+    // when the host actually asks for a non-unity scale (so the legacy
+    // commit-5 path keeps its bit-identical writer kernel and program
+    // cache entry).
+    const bool     apply_scale      = (operation_attributes.output_scale != 1.0f);
+    const uint32_t apply_scale_flag = apply_scale ? 1u : 0u;
+    uint32_t output_scale_bits = 0u;
+    {
+        const float scale_value = operation_attributes.output_scale;
+        std::memcpy(&output_scale_bits, &scale_value, sizeof(float));
+    }
 
     KernelDescriptor reader{
         .kernel_source =
@@ -304,8 +317,8 @@ tt::tt_metal::ProgramDescriptor FftRadixPassFactory::create_descriptor(
         .kernel_source =
             "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/radix_pass_writer.cpp",
         .core_ranges = crs,
-        // {OUTPUT_BF16, SUB_N, APPLY_POST_TWIDDLE}
-        .compile_time_args = {output_bf16_flag, N, apply_pt_flag},
+        // {OUTPUT_BF16, SUB_N, APPLY_POST_TWIDDLE, APPLY_SCALE}
+        .compile_time_args = {output_bf16_flag, N, apply_pt_flag, apply_scale_flag},
         .runtime_args = {},
         .config = WriterConfigDescriptor{},
     };
@@ -360,15 +373,31 @@ tt::tt_metal::ProgramDescriptor FftRadixPassFactory::create_descriptor(
                 /*pt_stride=*/pt_stride,
             });
 
-        writer.runtime_args.emplace_back(
-            logical,
-            KernelDescriptor::CoreRuntimeArgs{
-                out_r_buf->address(),
-                out_i_buf->address(),
-                base,
-                batch_per_core,
-                /*out_page_size_override=*/out_page_size_bytes,
-            });
+        // commit 6c: arg 5 (output_scale_bits) is ONLY appended when
+        // APPLY_SCALE=1.  When 0, the kernel never reads it and the
+        // runtime arg vector stays at 5 entries (same as commit 5).
+        if (apply_scale) {
+            writer.runtime_args.emplace_back(
+                logical,
+                KernelDescriptor::CoreRuntimeArgs{
+                    out_r_buf->address(),
+                    out_i_buf->address(),
+                    base,
+                    batch_per_core,
+                    /*out_page_size_override=*/out_page_size_bytes,
+                    /*output_scale_bits=*/output_scale_bits,
+                });
+        } else {
+            writer.runtime_args.emplace_back(
+                logical,
+                KernelDescriptor::CoreRuntimeArgs{
+                    out_r_buf->address(),
+                    out_i_buf->address(),
+                    base,
+                    batch_per_core,
+                    /*out_page_size_override=*/out_page_size_bytes,
+                });
+        }
 
         compute.runtime_args.emplace_back(
             logical,

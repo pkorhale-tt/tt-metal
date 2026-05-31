@@ -103,6 +103,11 @@ tt::stl::hash::hash_t FftRadixPassDeviceOperation::compute_program_hash(
     // doesn't alias program cache entries (the kernel ABI is identical
     // but the imag-buffer wire path differs — caller buffer page-size
     // vs cached zero-scratch tile size).
+    //
+    // For output_scale we hash only the BOOLEAN "is scale enabled" — the
+    // actual float scale value flows through a runtime arg so all
+    // non-unity scales share one kernel binary / program cache entry.
+    const bool apply_scale = (attrs.output_scale != 1.0f);
     return tt::tt_metal::operation::hash_operation<FftRadixPassDeviceOperation>(
         attrs.P,
         attrs.twiddle_N2,
@@ -110,7 +115,8 @@ tt::stl::hash::hash_t FftRadixPassDeviceOperation::compute_program_hash(
         args.input_real.dtype(),
         args.input_real.memory_config(),
         args.input_real.padded_shape(),
-        args.input_imag.has_value());
+        args.input_imag.has_value(),
+        apply_scale);
 }
 
 }  // namespace ttnn::experimental::prim
@@ -122,14 +128,16 @@ std::tuple<Tensor, Tensor> fft_radix_pass(
     const std::optional<Tensor>& input_imag,
     uint32_t P,
     uint32_t twiddle_N2,
-    uint32_t stride)
+    uint32_t stride,
+    float output_scale)
 {
     using OperationType = ttnn::experimental::prim::FftRadixPassDeviceOperation;
 
     OperationType::operation_attributes_t attrs{
-        .P          = P,
-        .twiddle_N2 = twiddle_N2,
-        .stride     = stride,
+        .P            = P,
+        .twiddle_N2   = twiddle_N2,
+        .stride       = stride,
+        .output_scale = output_scale,
     };
     OperationType::tensor_args_t args{
         .input_real = input_real,

@@ -52,11 +52,18 @@ namespace ttnn::prim {
 //   stride       : Row-index stride for the post-twiddle lookup.  Default
 //                  1 (= use row directly).  Used by fft_three_pass to skip
 //                  an extra transpose between pass-2 and pass-3.
+//   output_scale : Fused scalar multiplier applied to every output element
+//                  (after the optional post-twiddle).  Default 1.0f =
+//                  no-op (same kernel binary as commit 5).  Used by the
+//                  IFFT path (commit 6c) to fold the 1/N scale into the
+//                  LAST radix_pass writer of the composite, zero extra
+//                  dispatch.
 std::tuple<Tensor, Tensor> fft_radix_pass(
     const Tensor& input_real,
     const std::optional<Tensor>& input_imag,
     uint32_t P,
     uint32_t twiddle_N2,
-    uint32_t stride = 1);
+    uint32_t stride       = 1,
+    float    output_scale = 1.0f);
 
 }  // namespace ttnn::prim
