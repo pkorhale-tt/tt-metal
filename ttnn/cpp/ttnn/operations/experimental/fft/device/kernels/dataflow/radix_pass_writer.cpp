@@ -43,17 +43,6 @@ void kernel_main() {
     constexpr uint32_t APPLY_POST_TWIDDLE = get_compile_time_arg_val(2);
     constexpr uint32_t APPLY_SCALE        = get_compile_time_arg_val(3);
 
-    // Only read the runtime scale when APPLY_SCALE=1; the host
-    // omits arg 5 entirely for the no-scale path (default 1.0f path
-    // shares its program-cache entry with all existing commit-5 calls).
-    // Union bit-cast — kernel build env has no <cstring>.
-    union { uint32_t u; float f; } scale_u;
-    scale_u.f = 1.0f;
-    if constexpr (APPLY_SCALE) {
-        scale_u.u = get_arg_val<uint32_t>(5);
-    }
-    const float output_scale = scale_u.f;
-
     const uint32_t ts = get_tile_size(CB_STATE_R);
 
     uint32_t fallback_ts;
@@ -111,7 +100,15 @@ void kernel_main() {
         //   precision in the scale itself).  Runs in fp32 on BRISC1 just
         //   like the post-twiddle loop above; total cost ≈ SUB_N extra
         //   fp32 muls per row.
+        //
+        //   The runtime arg fetch + bit-cast LIVE INSIDE this constexpr
+        //   block so that the no-scale path's BRISC1 instruction stream
+        //   is bit-identical to commit 5 — protects against any subtle
+        //   timing / L1-stack-layout regression on the unchanged FFT
+        //   path.
         if constexpr (APPLY_SCALE) {
+            const uint32_t scale_bits = get_arg_val<uint32_t>(5);
+            const float output_scale = *reinterpret_cast<const float*>(&scale_bits);
             volatile tt_l1_ptr float* const sr =
                 reinterpret_cast<volatile tt_l1_ptr float*>(state_r_l1);
             volatile tt_l1_ptr float* const si =
