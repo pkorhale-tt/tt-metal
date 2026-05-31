@@ -181,7 +181,9 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
         .kernel_source =
             "ttnn/cpp/ttnn/operations/experimental/fft/device/kernels/dataflow/batch_fft_reader.cpp",
         .core_ranges = crs,
-        .compile_time_args = {N, log2N},
+        // 3rd compile arg = BIT_REVERSE_ON_LOAD = 1: we pass the input tensor
+        // in NATURAL order; kernel will bit-reverse on load.
+        .compile_time_args = {N, log2N, 1u},
         .runtime_args = {
             // {in_r, in_i, tw_r, tw_i, base, batch_per_core, phys_x, phys_y}
             std::pair<CoreCoord, std::vector<uint32_t>>{

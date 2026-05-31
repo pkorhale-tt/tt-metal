@@ -253,7 +253,9 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
         DataMovementConfig{
             .processor    = DataMovementProcessor::RISCV_0,
             .noc          = NOC::RISCV_0_default,
-            .compile_args = {sub_N, bp->log2_sub_N}});
+            // 3rd arg = BIT_REVERSE_ON_LOAD = 0: legacy path bit-reverses on
+            // host before WriteShard, so kernel sees pre-bit-reversed input.
+            .compile_args = {sub_N, bp->log2_sub_N, 0u}});
 
     auto wk = CreateKernel(
         prog,

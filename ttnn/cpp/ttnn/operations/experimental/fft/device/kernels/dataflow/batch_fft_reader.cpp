@@ -31,6 +31,12 @@ void kernel_main() {
     constexpr uint32_t SUB_N        = get_compile_time_arg_val(0);
     constexpr uint32_t LOG2_SUB_N   = get_compile_time_arg_val(1);
     constexpr uint32_t LOCAL_PAIRS  = SUB_N / 2;
+    // BIT_REVERSE_ON_LOAD: when set, the input tile is in NATURAL order and
+    // this kernel will bit-reverse it in L1 after load. Default 0 preserves
+    // legacy behavior (legacy stockham_host bit-reverses on host before
+    // WriteShard). The new SingleTileStockhamFactory path sets this to 1
+    // so the input tensor can be passed straight through with no host work.
+    constexpr uint32_t BIT_REVERSE_ON_LOAD = get_compile_time_arg_val(2);
 
     const DataFormat df = get_dataformat(CB_EVEN_R);
     const uint32_t   ts = get_tile_size(CB_EVEN_R);
@@ -62,6 +68,24 @@ void kernel_main() {
             reinterpret_cast<volatile tt_l1_ptr float*>(state_r_l1);
         volatile tt_l1_ptr float* const state_i =
             reinterpret_cast<volatile tt_l1_ptr float*>(state_i_l1);
+
+        // ── Optional in-L1 bit-reversal (NEW path, flag-gated) ──────────
+        // Legacy path: input arrives pre-bit-reversed (host does this).
+        // New SingleTileStockhamFactory path: input arrives in natural
+        // order; we bit-reverse it here so subsequent stages match the
+        // legacy assumption. In-place swap of pairs (k, br(k)).
+        if constexpr (BIT_REVERSE_ON_LOAD) {
+            for (uint32_t k = 0; k < SUB_N; ++k) {
+                uint32_t br = 0;
+                for (uint32_t b = 0; b < LOG2_SUB_N; ++b) {
+                    br = (br << 1) | ((k >> b) & 1u);
+                }
+                if (k < br) {
+                    float tr = state_r[k]; state_r[k] = state_r[br]; state_r[br] = tr;
+                    float ti = state_i[k]; state_i[k] = state_i[br]; state_i[br] = ti;
+                }
+            }
+        }
 
         // ── LOCAL stages 0 .. LOG2_SUB_N-1 ──────────────────────────────
         for (uint32_t s = 0; s < LOG2_SUB_N; ++s) {
