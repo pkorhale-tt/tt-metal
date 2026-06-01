@@ -15,6 +15,12 @@ TT_FFT_AGGRESSIVE=1 — they take minutes per call.
 """
 
 import os
+import sys
+
+# Make the sibling helper `bluestein_xl.py` importable regardless of how
+# pytest is invoked (rootdir, importlib mode, etc.). The helper lives in
+# the same directory as this test file.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pytest
 import torch
