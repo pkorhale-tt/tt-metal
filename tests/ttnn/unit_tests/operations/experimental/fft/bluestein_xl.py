@@ -203,7 +203,9 @@ def bluestein_fft_xl(
         precision,
         inverse=False,
     )
-    A = torch.complex(A_re.to(torch.complex128), A_im.to(torch.complex128))
+    # torch.complex(real, imag) wants real-valued inputs (float/double),
+    # not complex ones — promote to fp64 and combine.
+    A = torch.complex(A_re.to(torch.float64), A_im.to(torch.float64))
 
     # ── Step 4: convolution multiply by precomputed B (host) ────────────
     C = A * B_fft.to(torch.complex128).unsqueeze(0)
@@ -220,7 +222,7 @@ def bluestein_fft_xl(
         precision,
         inverse=True,
     )
-    c = torch.complex(c_re.to(torch.complex128), c_im.to(torch.complex128))
+    c = torch.complex(c_re.to(torch.float64), c_im.to(torch.float64))
 
     # ── Steps 6+7: slice [:N] + post-mul by w (host) ─────────────────────
     X = c[:, :N] * w.to(torch.complex128).unsqueeze(0)
