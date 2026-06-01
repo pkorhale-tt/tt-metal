@@ -80,11 +80,16 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
 
     const uint32_t M = bluestein_M(N);
     TT_FATAL(M <= (1u << 20),
-        "bluestein_fft: padded length M = {} exceeds current cap of 2^20 = "
-        "1M.  N must satisfy 2*N - 1 ≤ 2^20, i.e. N ≤ 524_288. (got N = {}).  "
-        "Lifting this cap is the 6e-2 work item (route inner FFT through "
-        "fft_three_pass).",
-        M, N);
+        "bluestein_fft: padded length M = {} exceeds the fully-device-resident "
+        "cap of 2^20 = 1M (i.e. N ≤ 524_288).  Got N = {}.\n"
+        "  For larger N use the host-glue extended-range wrapper:\n"
+        "    from bluestein_xl import bluestein_fft_xl\n"
+        "    re, im = bluestein_fft_xl(device, x, N={})\n"
+        "  See tests/ttnn/unit_tests/operations/experimental/fft/bluestein_xl.py.\n"
+        "  The wrapper executes the chirp pre/post multiplies + B-multiply on "
+        "the host (torch) and dispatches the two length-M FFTs through "
+        "fft_three_pass on device, supporting M up to 2^30.",
+        M, N, N);
 
     if (input_imag.has_value()) {
         TT_FATAL(input_imag->padded_shape() == in_shape &&

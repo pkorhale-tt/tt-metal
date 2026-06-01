@@ -562,9 +562,13 @@ void bind_experimental_fft_operation(nb::module_& mod) {
                 * :attr:`input_imag` (optional): same shape / dtype /
                   layout as ``input_real``.  Implicit zero if omitted.
                 * :attr:`N`: logical FFT length (arbitrary integer ≥ 2).
-                  Constrained to ``N ≤ 524_288`` for now (so
-                  ``M = next_pow2(2*N - 1) ≤ 2^20``); larger N coming in
-                  6e-2 via fft_three_pass routing.
+                  Constrained to ``N ≤ 524_288`` for the fully-device-
+                  resident path (so ``M = next_pow2(2*N - 1) ≤ 2^20``).
+                  For larger N use the ``bluestein_fft_xl`` Python
+                  wrapper which keeps the chirp / B multiplies on the
+                  host (torch) and dispatches the inner length-M FFTs
+                  through ``fft_three_pass`` on device — see
+                  ``tests/ttnn/unit_tests/operations/experimental/fft/bluestein_xl.py``.
                 * :attr:`precision` (default ``"precise"``): same as
                   :func:`ttnn.experimental.fft`.
 
