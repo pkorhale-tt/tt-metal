@@ -13,6 +13,11 @@ add_executable(metal_example_fft_universal_test
 add_executable(metal_example_fft_universal_benchmark
     ${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_benchmark.cpp)
 
+# HPEC 2026 sweep driver — runs many N in one device session and
+# emits CSV consumed by plot_universal.py.
+add_executable(metal_example_fft_universal_sweep
+    ${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_sweep.cpp)
+
 # Minimal "how to call it" example.
 add_executable(metal_example_fft_universal_demo
     ${CMAKE_CURRENT_SOURCE_DIR}/fft_universal_demo.cpp)
@@ -29,6 +34,7 @@ add_executable(metal_example_fft_universal_run
 foreach(tgt
     metal_example_fft_universal_test
     metal_example_fft_universal_benchmark
+    metal_example_fft_universal_sweep
     metal_example_fft_universal_demo
     metal_example_fft_universal_vs_torch
     metal_example_fft_universal_run)

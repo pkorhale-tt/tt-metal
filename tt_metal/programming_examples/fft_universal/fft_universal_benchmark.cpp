@@ -126,13 +126,21 @@ int main(int argc, char** argv) {
     auto signal = make_random(N);
 
     std::vector<double> dt(iter, 0.0);
+    std::vector<double> host_pct(iter, 0.0);
+    std::vector<double> dev_pct(iter, 0.0);
 
     for (uint32_t i = 0; i < iter; ++i) {
+        fft_universal::profile::current().reset();
         const auto t0 = std::chrono::high_resolution_clock::now();
         auto X = fft_universal::fft(md, signal);
-        const double ms = std::chrono::duration<double, std::milli>(
+        const auto wall_ns = std::chrono::duration<double, std::nano>(
             std::chrono::high_resolution_clock::now() - t0).count();
+        const double ms = wall_ns * 1e-6;
         dt[i] = ms;
+        const double dev_ns = std::chrono::duration<double, std::nano>(
+            fft_universal::profile::current().device_ns).count();
+        dev_pct[i]  = (wall_ns > 0.0) ? 100.0 * dev_ns / wall_ns : 0.0;
+        host_pct[i] = std::max(0.0, 100.0 - dev_pct[i]);
 
         if (i == 0) {
             std::printf("  iter %3u  %8.3f ms   <- includes plan build + JIT\n",
@@ -157,6 +165,15 @@ int main(int argc, char** argv) {
     const double total =
         std::accumulate(dt.begin(), dt.end(), 0.0);
 
+    // Host/device split, averaged over the cached iterations.
+    double host_avg = 0.0, dev_avg = 0.0;
+    for (uint32_t i = 1; i < iter; ++i) {
+        host_avg += host_pct[i];
+        dev_avg  += dev_pct[i];
+    }
+    host_avg /= static_cast<double>(iter - 1);
+    dev_avg  /= static_cast<double>(iter - 1);
+
     std::printf("\n--- Wormhole summary ---\n");
     std::printf("  First call (build):       %8.3f ms\n", cold);
     std::printf("  Cached avg (iters 1..%u): %8.3f ms\n", iter - 1, cached_avg);
@@ -166,6 +183,8 @@ int main(int argc, char** argv) {
                 cold / cached_avg);
     std::printf("  Total wall: %.3f ms  (without cache would be ~%.0f ms)\n",
                 total, cold * static_cast<double>(iter));
+    std::printf("  Host / device split (cached avg): %.1f%% / %.1f%%\n",
+                host_avg, dev_avg);
 
     // ─────────────────────────────────────────────────────────────────────
     // IFFT timing pass. Conjugate-trick IFFT internally calls fft(), so
@@ -295,6 +314,8 @@ int main(int argc, char** argv) {
     std::printf("    | %-44s | %5s | %13.3f |\n",
                 "Wormhole fft_universal (cached, many Tensix)",
                 "many", cached_avg);
+    std::printf("\n    Wormhole cached call breakdown: %.1f%% host glue, %.1f%% device.\n",
+                host_avg, dev_avg);
     if (cpu_ran) {
         const double ratio = cached_avg / cpu_cached_avg;
         std::printf("\n    => CPU is %.2fx %s than Wormhole end-to-end.\n",

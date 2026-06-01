@@ -76,6 +76,29 @@ namespace fft_universal {
 using Complex = std::complex<float>;
 using tt::tt_metal::distributed::MeshDevice;
 
+// ─── Host/device timing profile (HPEC 2026 paper) ────────────────────────────
+// Always-on, ~ns overhead. The benchmark/sweep binaries reset() before each
+// call and read the accumulator after. Anything inside a `ScopeDevice` is
+// charged to the device bucket (write-shard → enqueue-workload → blocking
+// read-shard); the remainder of the call is, by construction, host work
+// (planner, twiddle lookup, packing, unpacking, glue).
+namespace profile {
+struct Budget {
+    using clk = std::chrono::steady_clock;
+    clk::duration host_ns{};
+    clk::duration device_ns{};
+    uint64_t      n_dispatches = 0;
+    void reset() { host_ns = device_ns = clk::duration{}; n_dispatches = 0; }
+};
+inline Budget& current() { static thread_local Budget b; return b; }
+
+struct ScopeDevice {
+    Budget::clk::time_point t0;
+    ScopeDevice() : t0(Budget::clk::now()) { ++current().n_dispatches; }
+    ~ScopeDevice() { current().device_ns += Budget::clk::now() - t0; }
+};
+}  // namespace profile
+
 // ─── Tunables ────────────────────────────────────────────────────────────────
 // Largest power-of-two that fft_stockham::fft currently accepts. Bluestein
 // requires M = next_pow2(2N - 1) <= this ceiling, i.e. prime N <= 524,288.
@@ -576,13 +599,16 @@ inline void packed_direct_dft_batched(
     in_i_til = tilize_nfaces(in_i_rm, total_rows, 32u);
 
     MeshCommandQueue& cq = plan->md->mesh_command_queue();
-    WriteShard(cq, plan->in_r_buf, in_r_til, MeshCoordinate(0, 0), false);
-    WriteShard(cq, plan->in_i_buf, in_i_til, MeshCoordinate(0, 0), false);
+    {
+        profile::ScopeDevice _dev;
+        WriteShard(cq, plan->in_r_buf, in_r_til, MeshCoordinate(0, 0), false);
+        WriteShard(cq, plan->in_i_buf, in_i_til, MeshCoordinate(0, 0), false);
 
-    EnqueueMeshWorkload(cq, plan->workload, false);
+        EnqueueMeshWorkload(cq, plan->workload, false);
 
-    ReadShard(cq, out_r_til, plan->out_r_buf, MeshCoordinate(0, 0), true);
-    ReadShard(cq, out_i_til, plan->out_i_buf, MeshCoordinate(0, 0), true);
+        ReadShard(cq, out_r_til, plan->out_r_buf, MeshCoordinate(0, 0), true);
+        ReadShard(cq, out_i_til, plan->out_i_buf, MeshCoordinate(0, 0), true);
+    }
 
     std::vector<float>& out_r_rm = plan->out_r_rm;
     std::vector<float>& out_i_rm = plan->out_i_rm;
@@ -678,6 +704,7 @@ inline void batched_siblings_fft(
     if (is_pow2(len) && len <= kBatchMaxSubN) {
         const uint32_t padded = next_pow2(count);
         if (padded == count) {
+            profile::ScopeDevice _dev;
             fft_stockham::batch_fft(md, len, count, in, out);
             return;
         }
@@ -685,7 +712,10 @@ inline void batched_siblings_fft(
                                        Complex{0.0f, 0.0f});
         std::copy(in.begin(), in.end(), in_padded.begin());
         std::vector<Complex> out_padded;
-        fft_stockham::batch_fft(md, len, padded, in_padded, out_padded);
+        {
+            profile::ScopeDevice _dev;
+            fft_stockham::batch_fft(md, len, padded, in_padded, out_padded);
+        }
         out.assign(out_padded.begin(),
                    out_padded.begin() + static_cast<size_t>(count) * len);
         return;
@@ -699,7 +729,11 @@ inline void batched_siblings_fft(
         for (uint32_t r = 0; r < count; ++r) {
             const size_t base = static_cast<size_t>(r) * len;
             std::copy(in.begin() + base, in.begin() + base + len, row.begin());
-            const std::vector<Complex> Yr = fft_stockham::fft(md, row);
+            std::vector<Complex> Yr;
+            {
+                profile::ScopeDevice _dev;
+                Yr = fft_stockham::fft(md, row);
+            }
             std::copy(Yr.begin(), Yr.end(), out.begin() + base);
         }
         return;
@@ -878,7 +912,10 @@ inline std::vector<Complex> fft(
     // multi-pass path (up to N = 1M). Everything else — including small pow2
     // — funnels through the batched engine with count=1, which still uses
     // batch_fft internally for tile-sized pow2s.
-    if (is_pow2(N)) return fft_stockham::fft(md, signal);
+    if (is_pow2(N)) {
+        profile::ScopeDevice _dev;
+        return fft_stockham::fft(md, signal);
+    }
 
     if (is_prime(N)) {
         const uint32_t M = next_pow2(2u * N - 1u);
