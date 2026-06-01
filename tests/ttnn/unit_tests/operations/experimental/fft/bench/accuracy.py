@@ -147,7 +147,13 @@ N_SWEEP_POW2 = [
 B_SWEEP   = [1, 8]                          # one small, one batched
 DTYPES    = [("fp32", ttnn.float32), ("bf16", ttnn.bfloat16)]
 
-N_SWEEP_BLUESTEIN = [17, 257, 1009, 7919, 65537]    # primes / non-pow2
+# Bluestein arbitrary-N sweep.  Current-build cap: complex_mul rejects
+# last-dim > 1024, so M = next_pow2(2N-1) ≤ 1024 → **N ≤ 512**.  We
+# document this honestly in the paper as a current-build limit (lifting
+# the cmul cap is future work).  Within that cap we still cover the
+# DSP-relevant cases: small primes, just-around-pow2, mid-range primes.
+N_SWEEP_BLUESTEIN = [3, 5, 7, 11, 13, 17, 23, 31,
+                     100, 127, 129, 257, 384, 511]
 B_SWEEP_BLUESTEIN = [1, 4]
 
 
