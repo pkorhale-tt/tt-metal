@@ -73,6 +73,7 @@ inline XLPlan plan(uint32_t N) {
         prod *= f;
     }
     assert(prod == static_cast<uint64_t>(N));
+    (void)prod;  // silence -Wunused-but-set-variable in NDEBUG builds
 
     return p;
 }
