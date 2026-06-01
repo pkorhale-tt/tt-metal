@@ -139,7 +139,8 @@ static Row measure_one(
     std::shared_ptr<MeshDevice> md,
     uint32_t                    N,
     uint32_t                    iters,
-    bool                        do_round_trip)
+    bool                        do_round_trip,
+    uint32_t                    batch)
 {
     auto signal = make_random(N);
 
@@ -150,16 +151,24 @@ static Row measure_one(
     for (uint32_t i = 0; i < iters; ++i) {
         fft_universal::profile::current().reset();
         const auto t0 = std::chrono::high_resolution_clock::now();
-        auto X = fft_universal::fft(md, signal);
+        // Sequential B-batched throughput: B calls share the cached plan
+        // + JIT'd kernels, so this measures steady-state per-call latency
+        // under back-to-back load (the metric most applications care about
+        // for "frames per second" style workloads).
+        for (uint32_t b = 0; b < batch; ++b) {
+            auto X = fft_universal::fft(md, signal);
+            (void)X;
+        }
         const auto wall_ns = std::chrono::duration<double, std::nano>(
             std::chrono::high_resolution_clock::now() - t0).count();
-        dt[i] = wall_ns * 1e-6;
+        // Report per-call latency (divide by batch).
+        dt[i] = (wall_ns / static_cast<double>(batch)) * 1e-6;
 
         const auto& p = fft_universal::profile::current();
         const double dev_ns = std::chrono::duration<double, std::nano>(p.device_ns).count();
         dev_pct[i]  = (wall_ns > 0.0) ? 100.0 * dev_ns / wall_ns : 0.0;
         host_pct[i] = std::max(0.0, 100.0 - dev_pct[i]);
-        ndisp[i]    = static_cast<double>(p.n_dispatches);
+        ndisp[i]    = static_cast<double>(p.n_dispatches) / static_cast<double>(batch);
     }
 
     const double cold = dt[0];
@@ -226,6 +235,8 @@ int main(int argc, char** argv) {
     uint32_t    iters        = 50u;
     bool        do_round_trip = false;
     bool        include_cold = false;
+    bool        disable_packed_dft = false;
+    uint32_t    batch        = 1u;
     std::vector<uint32_t> Ns = kDefaultNs;
 
     for (int i = 1; i < argc; ++i) {
@@ -245,10 +256,24 @@ int main(int argc, char** argv) {
         } else if (a == "--include-cold") {
             include_cold = true;
             (void)include_cold;  // reserved for future use
+        } else if (a == "--disable-packed-dft") {
+            disable_packed_dft = true;
+        } else if (a == "--batch" && i + 1 < argc) {
+            batch = static_cast<uint32_t>(std::atoi(argv[++i]));
+            if (batch < 1u) batch = 1u;
         } else if (a == "--help" || a == "-h") {
             std::printf(
                 "Usage: %s [--csv path] [--iters N] [--N-list \"n1,n2,...\"]\n"
-                "         [--round-trip] [--include-cold]\n", argv[0]);
+                "          [--batch B] [--round-trip]\n"
+                "          [--disable-packed-dft]\n"
+                "\n"
+                "Flags:\n"
+                "  --batch B               run B back-to-back fft() calls per iter,\n"
+                "                          report per-call latency (steady-state\n"
+                "                          throughput metric)\n"
+                "  --disable-packed-dft    bypass the packed direct-DFT kernel for\n"
+                "                          N<=32 leaves (ablation: forces the legacy\n"
+                "                          zero-padded pow-2 path)\n", argv[0]);
             return 0;
         } else {
             std::fprintf(stderr, "Unknown arg: %s (use --help)\n", argv[0]);
@@ -258,12 +283,19 @@ int main(int argc, char** argv) {
     if (iters < 2u) iters = 2u;
 
     std::printf("=== fft_universal_sweep ===\n");
-    std::printf("  N values     : %zu\n", Ns.size());
-    std::printf("  iters per N  : %u\n", iters);
-    std::printf("  round trip   : %s\n", do_round_trip ? "yes" : "no");
-    std::printf("  CSV output   : %s\n",
+    std::printf("  N values        : %zu\n", Ns.size());
+    std::printf("  iters per N     : %u\n", iters);
+    std::printf("  batch per call  : %u  %s\n", batch,
+                batch > 1 ? "(sequential, kernels cached)" : "");
+    std::printf("  round trip      : %s\n", do_round_trip ? "yes" : "no");
+    std::printf("  packed DFT      : %s\n",
+                disable_packed_dft ? "DISABLED (ablation)" : "ENABLED");
+    std::printf("  CSV output      : %s\n",
                 csv_path.empty() ? "(stdout only)" : csv_path.c_str());
     std::printf("\n");
+
+    // Apply ablation flag globally before we ever call into the engine.
+    fft_universal::ablation::disable_packed_dft() = disable_packed_dft;
 
     auto md = MeshDevice::create_unit_mesh(0);
 
@@ -277,7 +309,7 @@ int main(int argc, char** argv) {
 
     for (uint32_t N : Ns) {
         try {
-            Row r = measure_one(md, N, iters, do_round_trip);
+            Row r = measure_one(md, N, iters, do_round_trip, batch);
             rows.push_back(r);
 
             std::printf("  %8u  %-15s  %10.3f  %10.3f  %10.3f  %10.3f  %7.2f  %7.1f  %6.1f\n",

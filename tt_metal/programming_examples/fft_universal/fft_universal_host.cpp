@@ -99,6 +99,18 @@ struct ScopeDevice {
 };
 }  // namespace profile
 
+// ─── Ablation hooks (HPEC 2026 paper §5.7) ───────────────────────────────────
+// When set true, the planner bypasses the new packed direct-DFT kernel for
+// len <= 32 and routes those leaves through the legacy zero-padded pow-2
+// path (Path A with sub_N = next_pow2(len), tile occupancy ~3%). This is
+// the "without packed DFT" point in the ablation plot.
+namespace ablation {
+inline bool& disable_packed_dft() {
+    static bool flag = false;
+    return flag;
+}
+}  // namespace ablation
+
 // ─── Tunables ────────────────────────────────────────────────────────────────
 // Largest power-of-two that fft_stockham::fft currently accepts. Bluestein
 // requires M = next_pow2(2N - 1) <= this ceiling, i.e. prime N <= 524,288.
@@ -695,7 +707,7 @@ inline void batched_siblings_fft(
     // tile, compute as a complex 32x32 matmul → one dispatch, (len/32)
     // tile efficiency. Covers every small prime/composite leaf the CT
     // recursion would otherwise bounce into Bluestein or serial batch_fft.
-    if (len >= 2u && len <= kPackedMaxN) {
+    if (len >= 2u && len <= kPackedMaxN && !ablation::disable_packed_dft()) {
         packed_direct_dft_batched(md, len, count, in, out);
         return;
     }
