@@ -11,6 +11,7 @@
 #include "tt-metalium/tilize_utils.hpp"
 
 #include "stockham_host.hpp"
+#include "complex_mul_host.hpp"   // optional device path for Bluestein chirp mul
 
 #include <algorithm>
 #include <cassert>
@@ -26,6 +27,7 @@ namespace fft_universal {
 
 using Complex = std::complex<float>;
 using tt::tt_metal::distributed::MeshDevice;
+using tt::tt_metal::distributed::MeshBuffer;
 
 // ─── Tunables ────────────────────────────────────────────────────────────────
 // Largest power-of-two that fft_stockham::fft currently accepts. Bluestein
@@ -81,6 +83,13 @@ struct BluesteinPlan {
     uint32_t             M = 0u;
     std::vector<Complex> chirp_fwd;   // w[n] = exp(-i π n² / N), length N
     std::vector<Complex> B_fft;       // FFT_M(b_ext), length M
+
+    // Optional cached device chirp buffers (length M, zero-padded after
+    // index N). Populated lazily by get_bluestein_plan() the first time
+    // the TT_FFT_DEVICE_CHIRP_MUL toggle is observed to be on for this N.
+    // Reused by batched_bluestein{,_precise} via complex_mul_host.hpp.
+    std::shared_ptr<MeshBuffer> chirp_dev_r;
+    std::shared_ptr<MeshBuffer> chirp_dev_i;
 };
 
 inline std::unordered_map<uint32_t, std::shared_ptr<BluesteinPlan>>&
@@ -124,8 +133,103 @@ inline std::shared_ptr<BluesteinPlan> get_bluestein_plan(
     // M is a power of two by construction, so Stockham handles it directly.
     plan->B_fft = fft_stockham::fft(md, b_ext);
 
+    // ── Optional device-resident chirp upload ────────────────────────────
+    // Only spend the DRAM on this when the toggle is observed at plan-build
+    // time. Subsequent calls reuse the cached buffers as long as N stays the
+    // same. Geometric requirement: M must be a multiple of one tile.
+    if (fft_complex_mul::device_chirp_mul_enabled() &&
+        M >= fft_complex_mul::kTileElems &&
+        (M % fft_complex_mul::kTileElems) == 0u)
+    {
+        auto bufs = fft_complex_mul::upload_chirp_padded(
+            md, plan->chirp_fwd.data(), N, M);
+        plan->chirp_dev_r = bufs.first;
+        plan->chirp_dev_i = bufs.second;
+    }
+
     cache[N] = plan;
     return plan;
+}
+
+// ─── Device-side chirp pre/post mul helpers ─────────────────────────────────
+//
+// `pre_premul_in`  : caller-supplied `in` of length `count * N` (the
+//                    pre-padding signal).
+// `out_padded_M`   : caller-supplied output of length `count * M` (will be
+//                    written with `in[r,n] * w[n]` for n in [0,N) and
+//                    zero everywhere else).
+//
+// Both functions assume the BluesteinPlan already has chirp_dev_r/i populated
+// (caller must check before calling). The chirp buffer is M-long with zeros
+// at indices [N, M), so multiplying by zero past index N gives zero output
+// naturally and we don't need a separate "active prefix" length runtime arg.
+inline void device_chirp_premul(
+    std::shared_ptr<MeshDevice>       md,
+    const std::shared_ptr<BluesteinPlan>& plan,
+    uint32_t                          count,
+    const std::vector<Complex>&       in,
+    std::vector<Complex>&             out_padded_M)
+{
+    using namespace fft_complex_mul;
+    const uint32_t N = plan->N;
+    const uint32_t M = plan->M;
+    assert(in.size() == static_cast<size_t>(count) * N);
+    assert(out_padded_M.size() == static_cast<size_t>(count) * M);
+    assert(plan->chirp_dev_r && plan->chirp_dev_i);
+
+    const uint32_t num_b_tiles = M / kTileElems;
+    const uint32_t num_a_tiles = (count * M) / kTileElems;
+
+    // Stage the padded A buffer on host: copy `in` into the first N
+    // elements of each row, leaving [N, M) zero. This is the same
+    // zero-padded layout the original host loop produced into `A`.
+    std::vector<Complex> A_padded(static_cast<size_t>(count) * M,
+                                  Complex{0.0f, 0.0f});
+    for (uint32_t r = 0; r < count; ++r) {
+        const Complex* src = in.data() + static_cast<size_t>(r) * N;
+        Complex*       dst = A_padded.data() + static_cast<size_t>(r) * M;
+        std::copy(src, src + N, dst);
+    }
+
+    auto cm = get_cached_complex_mul_plan(
+        md, num_a_tiles, num_b_tiles,
+        plan->chirp_dev_r, plan->chirp_dev_i);
+    run_complex_mul(cm, A_padded.data(), out_padded_M.data());
+}
+
+// Post-mul: input is `count * M`, output is `count * N` (sliced to the
+// first N samples per row).
+inline void device_chirp_postmul(
+    std::shared_ptr<MeshDevice>       md,
+    const std::shared_ptr<BluesteinPlan>& plan,
+    uint32_t                          count,
+    const std::vector<Complex>&       in_M,
+    std::vector<Complex>&             out_N)
+{
+    using namespace fft_complex_mul;
+    const uint32_t N = plan->N;
+    const uint32_t M = plan->M;
+    assert(in_M.size() == static_cast<size_t>(count) * M);
+    assert(plan->chirp_dev_r && plan->chirp_dev_i);
+
+    const uint32_t num_b_tiles = M / kTileElems;
+    const uint32_t num_a_tiles = (count * M) / kTileElems;
+
+    std::vector<Complex> out_padded_M(static_cast<size_t>(count) * M);
+
+    auto cm = get_cached_complex_mul_plan(
+        md, num_a_tiles, num_b_tiles,
+        plan->chirp_dev_r, plan->chirp_dev_i);
+
+    run_complex_mul(cm, in_M.data(), out_padded_M.data());
+
+    // Slice first N of each row into out_N.
+    out_N.resize(static_cast<size_t>(count) * N);
+    for (uint32_t r = 0; r < count; ++r) {
+        const Complex* src = out_padded_M.data() + static_cast<size_t>(r) * M;
+        Complex*       dst = out_N.data()       + static_cast<size_t>(r) * N;
+        std::copy(src, src + N, dst);
+    }
 }
 
 struct CooleyTukeyPlan {
@@ -548,13 +652,26 @@ inline void batched_bluestein(
     const auto&    w    = plan->chirp_fwd;   // chirp, length N
     const auto&    B    = plan->B_fft;       // FFT of mirrored conj(w), length M
 
+    // Per-call decision: use the device chirp-mul path when (a) the toggle
+    // is on, (b) chirp buffers were uploaded at plan time, and (c) the
+    // (count, M) tile geometry is well-formed for the kernel. Otherwise
+    // fall back to the original host loops bit-for-bit unchanged.
+    const bool use_device_chirp =
+        plan->chirp_dev_r && plan->chirp_dev_i &&
+        fft_complex_mul::device_chirp_mul_enabled() &&
+        fft_complex_mul::eligible(count, M);
+
     // Step 1: pre-multiply each sibling by w, zero-pad to length M.
     std::vector<Complex> A(static_cast<size_t>(count) * M, Complex{0.0f, 0.0f});
-    for (uint32_t r = 0; r < count; ++r) {
-        const size_t in_base  = static_cast<size_t>(r) * N;
-        const size_t out_base = static_cast<size_t>(r) * M;
-        for (uint32_t n = 0; n < N; ++n) {
-            A[out_base + n] = in[in_base + n] * w[n];
+    if (use_device_chirp) {
+        device_chirp_premul(md, plan, count, in, A);
+    } else {
+        for (uint32_t r = 0; r < count; ++r) {
+            const size_t in_base  = static_cast<size_t>(r) * N;
+            const size_t out_base = static_cast<size_t>(r) * M;
+            for (uint32_t n = 0; n < N; ++n) {
+                A[out_base + n] = in[in_base + n] * w[n];
+            }
         }
     }
 
@@ -563,6 +680,7 @@ inline void batched_bluestein(
     batched_siblings_fft(md, count, M, A, A_fft);
 
     // Step 3: elementwise A_fft[r, k] *= B[k] (same B for every sibling).
+    // NOTE: still on host; out of scope for this change.
     for (uint32_t r = 0; r < count; ++r) {
         const size_t base = static_cast<size_t>(r) * M;
         for (uint32_t k = 0; k < M; ++k) A_fft[base + k] *= B[k];
@@ -577,12 +695,16 @@ inline void batched_bluestein(
     for (auto& z : c) z = std::conj(z) * inv_M;
 
     // Step 5: post-multiply first N samples of each row by w, drop padding.
-    out.resize(static_cast<size_t>(count) * N);
-    for (uint32_t r = 0; r < count; ++r) {
-        const size_t in_base  = static_cast<size_t>(r) * M;
-        const size_t out_base = static_cast<size_t>(r) * N;
-        for (uint32_t k = 0; k < N; ++k) {
-            out[out_base + k] = c[in_base + k] * w[k];
+    if (use_device_chirp) {
+        device_chirp_postmul(md, plan, count, c, out);
+    } else {
+        out.resize(static_cast<size_t>(count) * N);
+        for (uint32_t r = 0; r < count; ++r) {
+            const size_t in_base  = static_cast<size_t>(r) * M;
+            const size_t out_base = static_cast<size_t>(r) * N;
+            for (uint32_t k = 0; k < N; ++k) {
+                out[out_base + k] = c[in_base + k] * w[k];
+            }
         }
     }
 }
@@ -808,12 +930,21 @@ inline void batched_bluestein_precise(
     const auto&    w    = plan->chirp_fwd;
     const auto&    B    = plan->B_fft;
 
+    const bool use_device_chirp =
+        plan->chirp_dev_r && plan->chirp_dev_i &&
+        fft_complex_mul::device_chirp_mul_enabled() &&
+        fft_complex_mul::eligible(count, M);
+
     std::vector<Complex> A(static_cast<size_t>(count) * M, Complex{0.0f, 0.0f});
-    for (uint32_t r = 0; r < count; ++r) {
-        const size_t in_base  = static_cast<size_t>(r) * N;
-        const size_t out_base = static_cast<size_t>(r) * M;
-        for (uint32_t n = 0; n < N; ++n) {
-            A[out_base + n] = in[in_base + n] * w[n];
+    if (use_device_chirp) {
+        device_chirp_premul(md, plan, count, in, A);
+    } else {
+        for (uint32_t r = 0; r < count; ++r) {
+            const size_t in_base  = static_cast<size_t>(r) * N;
+            const size_t out_base = static_cast<size_t>(r) * M;
+            for (uint32_t n = 0; n < N; ++n) {
+                A[out_base + n] = in[in_base + n] * w[n];
+            }
         }
     }
 
@@ -831,12 +962,16 @@ inline void batched_bluestein_precise(
     const float inv_M = 1.0f / static_cast<float>(M);
     for (auto& z : c) z = std::conj(z) * inv_M;
 
-    out.resize(static_cast<size_t>(count) * N);
-    for (uint32_t r = 0; r < count; ++r) {
-        const size_t in_base  = static_cast<size_t>(r) * M;
-        const size_t out_base = static_cast<size_t>(r) * N;
-        for (uint32_t k = 0; k < N; ++k) {
-            out[out_base + k] = c[in_base + k] * w[k];
+    if (use_device_chirp) {
+        device_chirp_postmul(md, plan, count, c, out);
+    } else {
+        out.resize(static_cast<size_t>(count) * N);
+        for (uint32_t r = 0; r < count; ++r) {
+            const size_t in_base  = static_cast<size_t>(r) * M;
+            const size_t out_base = static_cast<size_t>(r) * N;
+            for (uint32_t k = 0; k < N; ++k) {
+                out[out_base + k] = c[in_base + k] * w[k];
+            }
         }
     }
 }
