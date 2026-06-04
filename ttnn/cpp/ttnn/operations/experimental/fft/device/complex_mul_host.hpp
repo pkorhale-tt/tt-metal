@@ -200,8 +200,6 @@ inline std::shared_ptr<ComplexMulPlan> make_complex_mul_plan(
     std::tie(pp->grid_cols, pp->grid_rows) =
         fft_stockham::pick_batch_grid(pp->num_cores, dev_grid.x);
 
-    MeshCommandQueue& cq = md->mesh_command_queue();
-
     // ── A + OUT device buffers ────────────────────────────────────────────
     const uint32_t a_bytes = num_a_tiles * kTileSizeFp32;
     pp->a_r_buf   = make_mesh_buf(md, a_bytes, kTileSizeFp32);
