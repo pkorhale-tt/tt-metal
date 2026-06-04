@@ -9,11 +9,8 @@
 //     OUT_I = A_R * B_I + A_I * B_R
 // using the SFPU binary-op path (full IEEE fp32, "precise" mode).
 //
-// Structurally identical to pass2_compute.cpp; the CB layout matches
-// `complex_mul_common.h`. We keep this as a separate kernel rather than
-// reusing pass2 because the pass2 host plan is hard-coded to Stockham's
-// (N1, N2) geometry, which is the wrong shape for arbitrary-length
-// Bluestein chirp tables.
+// One tile_regs_acquire/commit cycle per tile: all four input tiles are
+// loaded into DST[0..3], products and sums stay in DST (no TMP CB traffic).
 
 #include <cstdint>
 #include "api/compute/common.h"
@@ -29,31 +26,47 @@ constexpr auto CB_B_R   = tt::CBIndex::c_2;
 constexpr auto CB_B_I   = tt::CBIndex::c_3;
 constexpr auto CB_OUT_R = tt::CBIndex::c_4;
 constexpr auto CB_OUT_I = tt::CBIndex::c_5;
-constexpr auto CB_TMP_R = tt::CBIndex::c_6;
-constexpr auto CB_TMP_I = tt::CBIndex::c_7;
 
-enum : uint32_t { OP_ADD = 0, OP_SUB = 1, OP_MUL = 2 };
+constexpr uint32_t DST_AR    = 0;
+constexpr uint32_t DST_AI    = 1;
+constexpr uint32_t DST_BR    = 2;
+constexpr uint32_t DST_BI    = 3;
+constexpr uint32_t DST_OUT_R = 0;
+constexpr uint32_t DST_OUT_I = 2;
 
-template <uint32_t OP>
-FORCE_INLINE void sfpu_binop_push(uint32_t a, uint32_t b, uint32_t out) {
-    tile_regs_acquire();
+FORCE_INLINE void load_operand_tiles() {
+    copy_tile_to_dst_init_short(CB_A_R);
+    copy_tile(CB_A_R, 0, DST_AR);
+    copy_tile_to_dst_init_short_with_dt(CB_A_R, CB_A_I);
+    copy_tile(CB_A_I, 0, DST_AI);
+    copy_tile_to_dst_init_short_with_dt(CB_A_I, CB_B_R);
+    copy_tile(CB_B_R, 0, DST_BR);
+    copy_tile_to_dst_init_short_with_dt(CB_B_R, CB_B_I);
+    copy_tile(CB_B_I, 0, DST_BI);
+}
 
-    copy_tile_to_dst_init_short(a);
-    copy_tile(a, 0, 0);
-    copy_tile_to_dst_init_short_with_dt(a, b);
-    copy_tile(b, 0, 1);
+// OUT_I = A_R*B_I + A_I*B_R, result in DST_OUT_I (DST_BR/DST_BI slots reused).
+FORCE_INLINE void compute_out_imag() {
+    mul_binary_tile_init();
+    mul_binary_tile(DST_AI, DST_BR, DST_BI);   // AI*BR -> DST_BI
+    copy_tile_to_dst_init_short_with_dt(CB_B_R, CB_B_I);
+    copy_tile(CB_B_I, 0, DST_BR);            // reload B_I for A_R*B_I
+    mul_binary_tile(DST_AR, DST_BR, DST_BR);  // A_R*B_I -> DST_BR
+    add_binary_tile_init();
+    add_binary_tile(DST_BR, DST_BI, DST_OUT_I);
+}
 
-    if      constexpr (OP == OP_ADD) { add_binary_tile_init(); add_binary_tile(0, 1, 0); }
-    else if constexpr (OP == OP_SUB) { sub_binary_tile_init(); sub_binary_tile(0, 1, 0); }
-    else if constexpr (OP == OP_MUL) { mul_binary_tile_init(); mul_binary_tile(0, 1, 0); }
-
-    tile_regs_commit();
-
-    cb_reserve_back(out, 1);
-    tile_regs_wait();
-    pack_tile(0, out);
-    tile_regs_release();
-    cb_push_back(out, 1);
+// OUT_R = A_R*B_R - A_I*B_I, result in DST_OUT_R.
+FORCE_INLINE void compute_out_real() {
+    copy_tile_to_dst_init_short_with_dt(CB_A_I, CB_B_R);
+    copy_tile(CB_B_R, 0, DST_BI);
+    mul_binary_tile_init();
+    mul_binary_tile(DST_AR, DST_BI, DST_OUT_R);  // A_R*B_R -> DST_AR
+    copy_tile_to_dst_init_short_with_dt(CB_B_R, CB_B_I);
+    copy_tile(CB_B_I, 0, DST_BI);
+    mul_binary_tile(DST_AI, DST_BI, DST_AI);     // A_I*B_I -> DST_AI
+    sub_binary_tile_init();
+    sub_binary_tile(DST_OUT_R, DST_AI, DST_OUT_R);
 }
 
 void kernel_main() {
@@ -68,23 +81,20 @@ void kernel_main() {
         cb_wait_front(CB_B_R, 1);
         cb_wait_front(CB_B_I, 1);
 
-        // OUT_R = A_R * B_R - A_I * B_I
-        sfpu_binop_push<OP_MUL>(CB_A_R, CB_B_R, CB_TMP_R);
-        sfpu_binop_push<OP_MUL>(CB_A_I, CB_B_I, CB_TMP_I);
-        cb_wait_front(CB_TMP_R, 1);
-        cb_wait_front(CB_TMP_I, 1);
-        sfpu_binop_push<OP_SUB>(CB_TMP_R, CB_TMP_I, CB_OUT_R);
-        cb_pop_front(CB_TMP_R, 1);
-        cb_pop_front(CB_TMP_I, 1);
+        tile_regs_acquire();
+        load_operand_tiles();
+        compute_out_imag();
+        compute_out_real();
+        tile_regs_commit();
 
-        // OUT_I = A_R * B_I + A_I * B_R
-        sfpu_binop_push<OP_MUL>(CB_A_R, CB_B_I, CB_TMP_R);
-        sfpu_binop_push<OP_MUL>(CB_A_I, CB_B_R, CB_TMP_I);
-        cb_wait_front(CB_TMP_R, 1);
-        cb_wait_front(CB_TMP_I, 1);
-        sfpu_binop_push<OP_ADD>(CB_TMP_R, CB_TMP_I, CB_OUT_I);
-        cb_pop_front(CB_TMP_R, 1);
-        cb_pop_front(CB_TMP_I, 1);
+        cb_reserve_back(CB_OUT_R, 1);
+        cb_reserve_back(CB_OUT_I, 1);
+        tile_regs_wait();
+        pack_tile(DST_OUT_R, CB_OUT_R);
+        pack_tile(DST_OUT_I, CB_OUT_I);
+        tile_regs_release();
+        cb_push_back(CB_OUT_R, 1);
+        cb_push_back(CB_OUT_I, 1);
 
         cb_pop_front(CB_A_R, 1);
         cb_pop_front(CB_A_I, 1);

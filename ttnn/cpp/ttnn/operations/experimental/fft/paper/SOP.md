@@ -16,7 +16,9 @@ For where each computation runs see `HOST_VS_DEVICE.md`.
    ```bash
    cd $TT_METAL_HOME
    ./build_metal.sh -b Release
-   pip install -e ttnn
+   # First time only — re-installing after a rebuild is unnecessary, the
+   # rebuilt _ttnn.so is picked up automatically.
+   pip install -e .
    ```
 
    Confirm:
@@ -238,7 +240,7 @@ git clone …/tt-metal
 cd tt-metal
 git checkout pkorhale/experimental-fft        # or whichever commit your paper cites
 ./build_metal.sh -b Release
-pip install -e ttnn
+pip install -e .
 bash ttnn/cpp/ttnn/operations/experimental/fft/paper/scripts/run_all.sh
 ```
 

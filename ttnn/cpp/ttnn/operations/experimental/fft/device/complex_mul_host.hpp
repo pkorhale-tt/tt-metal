@@ -117,6 +117,11 @@ struct ComplexMulPlan {
     std::vector<float> a_r_host, a_i_host;
     std::vector<float> out_r_host, out_i_host;
 
+    // Interleaved complex staging for Bluestein chirp pre/post mul (length
+    // num_a_tiles * kTileElems). Allocated once per cached plan — not per call.
+    std::vector<Complex> a_padded;
+    std::vector<Complex> out_padded_M;
+
     bool initialized = false;
 };
 
@@ -213,6 +218,10 @@ inline std::shared_ptr<ComplexMulPlan> make_complex_mul_plan(
     pp->a_i_host.assign(scratch_floats, 0.0f);
     pp->out_r_host.assign(scratch_floats, 0.0f);
     pp->out_i_host.assign(scratch_floats, 0.0f);
+
+    const size_t scratch_complex = scratch_floats;
+    pp->a_padded.assign(scratch_complex, Complex{0.0f, 0.0f});
+    pp->out_padded_M.assign(scratch_complex, Complex{0.0f, 0.0f});
 
     // ── Build the program ─────────────────────────────────────────────────
     Program prog = CreateProgram();
@@ -423,6 +432,61 @@ inline bool eligible(uint32_t count, uint32_t M) {
         && M    >= kTileElems
         && (M % kTileElems) == 0u
         && (static_cast<uint64_t>(count) * M) >= kTileElems;
+}
+
+// ───────────────────────── Bluestein chirp pre/post mul ────────────────────
+//
+// Device-side replacements for the host loops in universal_host.hpp.
+// Requires BluesteinPlan::chirp_dev_r/i and a cached ComplexMulPlan whose
+// num_a_tiles matches (count * M) / kTileElems.
+
+inline void device_chirp_premul(
+    std::shared_ptr<MeshDevice>           md,
+    const std::shared_ptr<ComplexMulPlan>& cm,
+    uint32_t                              count,
+    uint32_t                              N,
+    uint32_t                              M,
+    const std::vector<Complex>&           in,
+    std::vector<Complex>&                 out_padded_M)
+{
+    (void)md;
+    assert(cm && cm->initialized);
+    assert(in.size() == static_cast<size_t>(count) * N);
+    assert(out_padded_M.size() == static_cast<size_t>(count) * M);
+    assert(cm->a_padded.size() == static_cast<size_t>(count) * M);
+
+    for (uint32_t r = 0; r < count; ++r) {
+        const Complex* src = in.data() + static_cast<size_t>(r) * N;
+        Complex*       dst = cm->a_padded.data() + static_cast<size_t>(r) * M;
+        std::copy(src, src + N, dst);
+        // [N, M) stays zero from plan-build memset / prior calls.
+    }
+
+    run_complex_mul(cm, cm->a_padded.data(), out_padded_M.data());
+}
+
+inline void device_chirp_postmul(
+    std::shared_ptr<MeshDevice>           md,
+    const std::shared_ptr<ComplexMulPlan>& cm,
+    uint32_t                              count,
+    uint32_t                              N,
+    uint32_t                              M,
+    const std::vector<Complex>&           in_M,
+    std::vector<Complex>&                 out_N)
+{
+    (void)md;
+    assert(cm && cm->initialized);
+    assert(in_M.size() == static_cast<size_t>(count) * M);
+    assert(cm->out_padded_M.size() == static_cast<size_t>(count) * M);
+
+    run_complex_mul(cm, in_M.data(), cm->out_padded_M.data());
+
+    out_N.resize(static_cast<size_t>(count) * N);
+    for (uint32_t r = 0; r < count; ++r) {
+        const Complex* src = cm->out_padded_M.data() + static_cast<size_t>(r) * M;
+        Complex*       dst = out_N.data() + static_cast<size_t>(r) * N;
+        std::copy(src, src + N, dst);
+    }
 }
 
 }  // namespace fft_complex_mul
