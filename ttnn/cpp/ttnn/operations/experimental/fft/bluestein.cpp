@@ -52,9 +52,15 @@ namespace {
 // Matches kRebankThresholdBytes in fft.cpp (kept separate to avoid Unity collision).
 constexpr uint32_t kBluesteinRebankThreshold = 64u * 1024u;
 
-// Page-shrinking reshape helper: (rows_in, cols_in) → (rows_out, cols_out).
-// Uses rebank_rm (DRAM-to-DRAM, tiny CB ≤ 4 KB) when the source page
-// exceeds the L1-safe threshold, otherwise falls through to ttnn::reshape.
+// Page-shrinking reshape: (B, src_cols) → (B × src_cols/new_cols, new_cols).
+//
+// For large source pages (> 64 KB), ttnn::reshape overflows L1, so we use
+// rebank_rm (CB = 8 KB).  rebank_rm requires the input last-dim to be a
+// power of 2.  When src_cols is NOT a power of 2, we:
+//   1. Column-concat a zero block to reach the next pow-2 (CB = 2×pow2×ebytes).
+//   2. Call rebank_rm on the pow-2-aligned tensor (CB = 8 KB).
+//   3. Row-slice off the extra rows introduced by the zero-padding (CB = 256 KB).
+// For small source pages the standard ttnn::reshape is used (metadata or small CB).
 static ttnn::Tensor shrink_reshape(
     const ttnn::Tensor& t, uint32_t new_cols)
 {
@@ -62,15 +68,58 @@ static ttnn::Tensor shrink_reshape(
     const uint32_t src_cols = static_cast<uint32_t>(s[-1]);
     const uint32_t elem_bytes =
         (t.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
-    if (src_cols * elem_bytes > kBluesteinRebankThreshold) {
+
+    if (src_cols * elem_bytes <= kBluesteinRebankThreshold) {
+        // Small source page: standard reshape (metadata-only or small-CB kernel).
+        uint32_t total = 1u;
+        for (int d = 0; d < static_cast<int>(s.size()); ++d)
+            total *= static_cast<uint32_t>(s[d]);
+        const uint32_t new_rows = total / new_cols;
+        return ttnn::reshape(t,
+            ttnn::Shape{ttnn::SmallVector<uint32_t>{new_rows, new_cols}});
+    }
+
+    // Large source page: use rebank_rm (DRAM-to-DRAM, CB = 8 KB).
+    if (rebank_is_pow2(src_cols)) {
+        // Already pow-2: direct rebank.
         return ttnn::prim::rebank_rm(t, new_cols);
     }
-    uint32_t total = 1u;
-    for (int d = 0; d < static_cast<int>(s.size()); ++d)
-        total *= static_cast<uint32_t>(s[d]);
-    const uint32_t new_rows = total / new_cols;
-    return ttnn::reshape(t,
-        ttnn::Shape{ttnn::SmallVector<uint32_t>{new_rows, new_cols}});
+
+    // src_cols is NOT a power of 2.  Zero-pad the last dim to the next pow-2
+    // so that rebank_rm's pow-2 constraint is satisfied.
+    uint32_t src_pow2 = 1u;
+    while (src_pow2 < src_cols) src_pow2 <<= 1u;
+
+    // Compute B (product of all leading dims).
+    uint32_t B_total = 1u;
+    for (int d = 0; d < static_cast<int>(s.size()) - 1; ++d)
+        B_total *= static_cast<uint32_t>(s[d]);
+
+    auto* dev = t.device();
+    TT_FATAL(dev != nullptr, "shrink_reshape: tensor has no device.");
+    const auto mc = t.memory_config();
+
+    // Append (B_total, src_pow2 - src_cols) zeros via concat along dim=1.
+    // CB = 2 × src_pow2 × elem_bytes ≤ 1 MB (for src_pow2 ≤ 131072 fp32).
+    auto zeros_tail = ttnn::zeros(
+        ttnn::Shape{ttnn::SmallVector<uint32_t>{B_total, src_pow2 - src_cols}},
+        t.dtype(), t.layout(), std::ref(*dev), mc);
+    auto t_pow2 = ttnn::concat({t, zeros_tail}, /*dim=*/1);
+
+    // rebank_rm: (B_total, src_pow2) → (B_total × src_pow2/new_cols, new_cols).
+    // src_pow2 IS a power of 2.  CB = 8 KB.
+    auto rebankd = ttnn::prim::rebank_rm(t_pow2, new_cols);
+
+    // Trim the extra rows added by the zero-padding.
+    const uint32_t n_want = B_total * (src_cols / new_cols);
+    const uint32_t n_have = B_total * (src_pow2 / new_cols);
+    if (n_have > n_want) {
+        const ttnn::SmallVector<uint32_t> beg = {0u, 0u};
+        const ttnn::SmallVector<uint32_t> end = {n_want, new_cols};
+        const ttnn::SmallVector<uint32_t> stp = {1u, 1u};
+        rebankd = ttnn::slice(rebankd, beg, end, stp, mc);
+    }
+    return rebankd;
 }
 
 // complex_mul_safe: element-wise complex multiply for any last-dim size.
