@@ -40,19 +40,20 @@ namespace {
 
 // complex_mul_safe: element-wise complex multiply for any last-dim size.
 //
-// The complex_mul kernel has a hard cap of P ≤ 1024 (one tile row).  For
-// Bluestein's step-4 convolution multiply the input shape is (B, M) where
-// M = next_pow2(2N-1); for N=997 this is 2048, for N=524289 it can be
-// millions.  Since complex_mul is purely element-wise we reshape:
+// The complex_mul kernel has a hard cap of P ≤ 1024 (one tile row).
+// For P > 1024 we split into 1024-element chunks:
 //
-//   (B, M) → (B·M/1024, 1024) → complex_mul → reshape back to (B, M)
+//   Case A — P divisible by 1024 (always true for Bluestein M, a pow-2):
+//     Reshape (B, P) → (B·P/1024, 1024), multiply, reshape back.
+//     Zero extra dispatches beyond the multiply itself.
 //
-// This only works when M is divisible by 1024, which is guaranteed for all
-// Bluestein M values ≥ 2048 because M is always a power of 2.
-// Steps 1 and 7 use P=N (user's FFT length); for N ≤ 1024 the direct path
-// is taken.  For N > 1024 the reshape path is used if N is divisible by 1024
-// (which holds for pow-2 N in the bluestein_eligible range), otherwise a
-// TT_THROW is raised — extend if you need large non-pow-2 chirp muls.
+//   Case B — P NOT divisible by 1024 (e.g. steps 1 & 7 with N=1997):
+//     Pad each input from (B, P) to (B, P_pad) where P_pad is the next
+//     multiple of 1024, apply Case A, then slice the result back to (B, P).
+//     The padded elements are 0 * anything = 0, so the slice recovers the
+//     exact element-wise product for positions 0..P-1.
+//     Cost: 4 extra pad dispatches + 1 slice dispatch — acceptable for the
+//     rare non-pow-2 large-N Bluestein case.
 static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
     const ttnn::Tensor& ar, const ttnn::Tensor& ai,
     const ttnn::Tensor& br, const ttnn::Tensor& bi)
@@ -62,21 +63,49 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
     if (P <= 1024u)
         return complex_mul(ar, ai, br, bi);
 
-    TT_FATAL(P % 1024u == 0u,
-        "complex_mul_safe: P={} is not divisible by 1024; "
-        "only pow-2 P ≥ 2048 is currently supported.", P);
-
     uint32_t B = 1u;
     for (int d = 0; d < static_cast<int>(sh.size()) - 1; ++d)
         B *= static_cast<uint32_t>(sh[d]);
 
-    const auto flat = ttnn::Shape{ttnn::SmallVector<uint32_t>{B * (P / 1024u), 1024u}};
-    const auto orig = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P}};
+    if (P % 1024u == 0u) {
+        // Case A: P already a multiple of 1024 — pure reshape, no extra dispatches.
+        const auto flat = ttnn::Shape{ttnn::SmallVector<uint32_t>{B * (P / 1024u), 1024u}};
+        const auto orig = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P}};
+        auto [cr, ci] = complex_mul(
+            ttnn::reshape(ar, flat), ttnn::reshape(ai, flat),
+            ttnn::reshape(br, flat), ttnn::reshape(bi, flat));
+        return {ttnn::reshape(cr, orig), ttnn::reshape(ci, orig)};
+    }
 
-    auto [cr, ci] = complex_mul(
-        ttnn::reshape(ar, flat), ttnn::reshape(ai, flat),
-        ttnn::reshape(br, flat), ttnn::reshape(bi, flat));
-    return {ttnn::reshape(cr, orig), ttnn::reshape(ci, orig)};
+    // Case B: P is not a multiple of 1024 (e.g. N=1997 chirp mul).
+    // Round up to the next multiple of 1024 via zero-padding, multiply, slice.
+    const uint32_t P_pad = (P + 1023u) & ~1023u;   // next multiple of 1024
+    const uint32_t pad_len = P_pad - P;
+
+    const ttnn::SmallVector<std::array<uint32_t, 2>> padding = {
+        {{0u, 0u}},          // batch dim: no padding
+        {{0u, pad_len}},     // last dim: append zeros
+    };
+    const auto mc = ar.memory_config();
+    auto ar_p = ttnn::pad(ar, padding, 0.0f, /*use_multicore=*/true, mc);
+    auto ai_p = ttnn::pad(ai, padding, 0.0f, /*use_multicore=*/true, mc);
+    auto br_p = ttnn::pad(br, padding, 0.0f, /*use_multicore=*/true, mc);
+    auto bi_p = ttnn::pad(bi, padding, 0.0f, /*use_multicore=*/true, mc);
+
+    const auto flat   = ttnn::Shape{ttnn::SmallVector<uint32_t>{B * (P_pad / 1024u), 1024u}};
+    const auto padded = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P_pad}};
+
+    auto [cr_p, ci_p] = complex_mul(
+        ttnn::reshape(ar_p, flat), ttnn::reshape(ai_p, flat),
+        ttnn::reshape(br_p, flat), ttnn::reshape(bi_p, flat));
+
+    // Slice result back to (B, P) — padded positions are 0 * x = 0.
+    const ttnn::SmallVector<uint32_t> begins = {0u, 0u};
+    const ttnn::SmallVector<uint32_t> ends   = {B,  P};
+    const ttnn::SmallVector<uint32_t> step   = {1u, 1u};
+    auto cr = ttnn::slice(ttnn::reshape(cr_p, padded), begins, ends, step, mc);
+    auto ci = ttnn::slice(ttnn::reshape(ci_p, padded), begins, ends, step, mc);
+    return {std::move(cr), std::move(ci)};
 }
 
 // Build a (1, N) zeros tensor matching `like` for the implicit zero-imag
