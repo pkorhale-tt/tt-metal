@@ -25,6 +25,7 @@
 #include "ttnn/operations/experimental/fft/device/bluestein_host.hpp"
 
 #include "ttnn/operations/data_movement/pad/pad.hpp"
+#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/creation/creation.hpp"  // ttnn::zeros for the imag input fallback
 
@@ -36,6 +37,47 @@
 namespace ttnn::operations::experimental {
 
 namespace {
+
+// complex_mul_safe: element-wise complex multiply for any last-dim size.
+//
+// The complex_mul kernel has a hard cap of P ≤ 1024 (one tile row).  For
+// Bluestein's step-4 convolution multiply the input shape is (B, M) where
+// M = next_pow2(2N-1); for N=997 this is 2048, for N=524289 it can be
+// millions.  Since complex_mul is purely element-wise we reshape:
+//
+//   (B, M) → (B·M/1024, 1024) → complex_mul → reshape back to (B, M)
+//
+// This only works when M is divisible by 1024, which is guaranteed for all
+// Bluestein M values ≥ 2048 because M is always a power of 2.
+// Steps 1 and 7 use P=N (user's FFT length); for N ≤ 1024 the direct path
+// is taken.  For N > 1024 the reshape path is used if N is divisible by 1024
+// (which holds for pow-2 N in the bluestein_eligible range), otherwise a
+// TT_THROW is raised — extend if you need large non-pow-2 chirp muls.
+static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
+    const ttnn::Tensor& ar, const ttnn::Tensor& ai,
+    const ttnn::Tensor& br, const ttnn::Tensor& bi)
+{
+    const auto& sh = ar.padded_shape();
+    const uint32_t P = static_cast<uint32_t>(sh[-1]);
+    if (P <= 1024u)
+        return complex_mul(ar, ai, br, bi);
+
+    TT_FATAL(P % 1024u == 0u,
+        "complex_mul_safe: P={} is not divisible by 1024; "
+        "only pow-2 P ≥ 2048 is currently supported.", P);
+
+    uint32_t B = 1u;
+    for (int d = 0; d < static_cast<int>(sh.size()) - 1; ++d)
+        B *= static_cast<uint32_t>(sh[d]);
+
+    const auto flat = ttnn::Shape{ttnn::SmallVector<uint32_t>{B * (P / 1024u), 1024u}};
+    const auto orig = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P}};
+
+    auto [cr, ci] = complex_mul(
+        ttnn::reshape(ar, flat), ttnn::reshape(ai, flat),
+        ttnn::reshape(br, flat), ttnn::reshape(bi, flat));
+    return {ttnn::reshape(cr, orig), ttnn::reshape(ci, orig)};
+}
 
 // Build a (1, N) zeros tensor matching `like` for the implicit zero-imag
 // case (Bluestein needs an explicit imag input because the pipeline does
@@ -113,7 +155,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
         : make_zeros_like(input_real);
 
     // ── Step 1: pre-multiply by chirp_n  (1, N) × (1, N) → (1, N).
-    auto [a_re, a_im] = complex_mul(
+    auto [a_re, a_im] = complex_mul_safe(
         input_real, x_imag, plan->chirp_n_re, plan->chirp_n_im);
 
     // ── Step 2: zero-pad last dim from N to M  (1, N) → (1, M).
@@ -132,8 +174,10 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     //   (1024 < M ≤ 1M).
     auto [A_re, A_im] = fft(a_pad_re, a_pad_im, precision);
 
-    // ── Step 4: convolution multiply  A ⊙ B   (1, M) × (1, M).
-    auto [C_re, C_im] = complex_mul(A_re, A_im, plan->B_re, plan->B_im);
+    // ── Step 4: convolution multiply  A ⊙ B   (B, M) × (B, M).
+    //   Uses complex_mul_safe because M may exceed the 1024-element kernel cap
+    //   (e.g. N=997 → M=2048).
+    auto [C_re, C_im] = complex_mul_safe(A_re, A_im, plan->B_re, plan->B_im);
 
     // ── Step 5: inverse FFT_M  ─────────────────────────────────────────
     auto [c_re, c_im] = ifft(C_re, C_im, precision);
@@ -148,7 +192,7 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     auto c_im_n = ttnn::slice(c_im, begins, ends, step, c_im.memory_config());
 
     // ── Step 7: post-multiply by chirp_k → final DFT output X[k].
-    auto [X_re, X_im] = complex_mul(
+    auto [X_re, X_im] = complex_mul_safe(
         c_re_n, c_im_n, plan->chirp_k_re, plan->chirp_k_im);
 
     return {std::move(X_re), std::move(X_im)};
