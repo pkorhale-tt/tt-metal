@@ -128,6 +128,7 @@ static ttnn::Tensor reshape_or_rebank(
     uint32_t rows,
     uint32_t chunk)
 {
+    (void)rows;  // only chunk matters; rows = N/chunk is implied by rebank_rm output shape.
     // Always use the DRAM-to-DRAM rebank kernel.
     //
     // Rationale: ttnn::reshape for a 2D page-shrinking operation (fewer but
