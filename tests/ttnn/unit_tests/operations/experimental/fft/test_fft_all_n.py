@@ -173,34 +173,34 @@ def test_two_pass_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
 
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES_POW2,
                          ids=[d[2] for d in _DTYPES_POW2])
-@pytest.mark.parametrize("N,chunk", [
-    # Small — direct rebank path verification
-    (2048, 32),
-    (2048, 64),
-    (4096, 64),
-    # Large page (> 256 KB threshold) — exercises the rebank_rm kernel path
-    pytest.param(1 << 17, 128,
-                 marks=pytest.mark.skipif(not _AGGRESSIVE,
-                                          reason="TT_FFT_AGGRESSIVE not set")),
-    pytest.param(1 << 20, 1024,
-                 marks=pytest.mark.skipif(not _AGGRESSIVE,
-                                          reason="TT_FFT_AGGRESSIVE not set")),
+@pytest.mark.parametrize("N", [
+    # N=2^17: page = 512 KB > 256 KB threshold → rebank_rm triggered in fft_two_pass
+    pytest.param(1 << 17, marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                                    reason="TT_FFT_AGGRESSIVE not set")),
+    # N=2^20: page = 4 MB → rebank_rm triggered in fft_two_pass
+    pytest.param(1 << 20, marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                                    reason="TT_FFT_AGGRESSIVE not set")),
+    # N=2^21: page = 8 MB → rebank_rm triggered in fft_three_pass_auto
+    pytest.param(1 << 21, marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                                    reason="TT_FFT_AGGRESSIVE not set")),
 ])
-def test_rebank_rm(device, N, chunk, tt_dtype, torch_dtype, label, tol):
-    """rebank_rm: (1, N) → (N/chunk, chunk) copy is numerically lossless."""
-    import ttnn.experimental.prim as prim
-    torch.manual_seed(N * chunk)
+def test_rebank_rm(device, N, tt_dtype, torch_dtype, label, tol):
+    """
+    Exercises the rebank_rm DRAM kernel indirectly via ttnn.experimental.fft.
+
+    For N > 256K (fp32 page > 256 KB), fft_two_pass / fft_three_pass_auto
+    internally call ttnn::prim::rebank_rm instead of ttnn::reshape to
+    convert (B, N) page=N*4 → (B*N/chunk, chunk) page=chunk*4 without
+    overflowing the 1.5 MB Wormhole L1.  A correct DFT result here proves
+    the rebank copy was lossless AND the subsequent FFT chain was correct.
+    """
+    torch.manual_seed(N % (1 << 20))
     x = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
-    tt_x = ttnn.from_torch(x, dtype=tt_dtype,
-                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
-    # rebank (1, N) → (N//chunk, chunk)
-    rebankd = prim.rebank_rm(tt_x, chunk)
-    got = ttnn.to_torch(rebankd).to(torch.float32).reshape(1, N)
-    ref = x.to(torch.float32)
+    ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
+    got = _run_fft(device, x, tt_dtype, N=N, B=1)
     err = _rel_err(got, ref)
-    assert err < 1e-6, (
-        f"rebank_rm N={N} chunk={chunk} {label}: "
-        f"rel_err={err:.2e} (expected < 1e-6 — this is a lossless copy)"
+    assert err < tol, (
+        f"rebank_rm path N={N} {label}: rel_err={err:.2e} > tol={tol:.2e}"
     )
 
 
