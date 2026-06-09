@@ -313,3 +313,171 @@ def test_unified_api_dispatch(device, N, dtype):
     got = _run_fft(device, x, dtype, N=N, B=1)
     assert _rel_err(got, ref) < tol, \
         f"Unified API N={N} dtype={dtype}: rel_err={_rel_err(got, ref):.2e} > tol={tol:.2e}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8.  Routing boundary values
+#     Tests the exact N values that sit at or adjacent to routing thresholds
+#     to verify the router hands off correctly.
+#
+#   Stockham  : N ≤ 1024 (pow-2)
+#   Two-pass  : 1024 < N ≤ 2²⁰  (pow-2)
+#   Three-pass: 2²⁰  < N ≤ 2³⁰  (pow-2, AGGRESSIVE)
+#   Bluestein : non-pow-2, M = next_pow2(2N-1)
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("N,expected_bucket", [
+    # ── Stockham ──
+    (2,    "stockham"),     # minimum valid N
+    (1024, "stockham"),     # maximum Stockham N
+    # ── Two-pass ──
+    (2048,        "two_pass"),   # minimum two-pass N (1024*2)
+    (1 << 20,     "two_pass"),   # maximum two-pass N (= 2^20)
+    # ── Three-pass (AGGRESSIVE) ──
+    pytest.param(1 << 21, "three_pass",
+                 marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                          reason="TT_FFT_AGGRESSIVE not set")),
+    pytest.param(1 << 27, "three_pass",
+                 marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                          reason="TT_FFT_AGGRESSIVE not set")),
+    # ── Bluestein: M just at Stockham cap (M=1024) ──
+    (383,  "bluestein"),    # M = next_pow2(765) = 1024
+    # ── Bluestein: M enters two-pass inner (M=2048) ──
+    (997,  "bluestein"),    # M = next_pow2(1993) = 2048
+    # ── Bluestein: M enters two-pass inner (M=4096) ──
+    (1997, "bluestein"),    # M = next_pow2(3993) = 4096
+    # ── Bluestein: M just above 2^20 → three-pass inner (AGGRESSIVE) ──
+    pytest.param(524_289, "bluestein_xl",
+                 marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                          reason="TT_FFT_AGGRESSIVE not set")),
+], ids=lambda x: f"N={x}" if isinstance(x, int) else x)
+def test_routing_boundaries(device, N, expected_bucket):
+    """Each routing boundary N produces a correct DFT via ttnn.experimental.fft."""
+    tol = 5e-4 if N & (N - 1) == 0 else 1e-3  # tighter for pow-2, relaxed for Bluestein
+    torch.manual_seed(N % (1 << 20))
+    x = torch.randn(1, N, dtype=torch.float32)
+    ref = torch.fft.fft(x.to(torch.complex64), dim=-1)
+    got = _run_fft(device, x, ttnn.float32, N=N, B=1)
+    err = _rel_err(got, ref)
+    assert err < tol, (
+        f"Boundary N={N} ({expected_bucket}): rel_err={err:.2e} > tol={tol:.2e}"
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 9.  Complex-input FFT (re + im path)
+#     Verifies fft(re, im) → correct DFT for all routing buckets.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _run_fft_complex(device, x_re, x_im, tt_dtype, *, N, B=1):
+    """Upload (B,N) real+imag tensors, call ttnn.experimental.fft(re, im)."""
+    tt_r = ttnn.from_torch(x_re.reshape(B, N), dtype=tt_dtype,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    tt_i = ttnn.from_torch(x_im.reshape(B, N), dtype=tt_dtype,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    re, im = ttnn.experimental.fft(tt_r, tt_i)
+    got_r = ttnn.to_torch(re).reshape(B, N).to(torch.float32)
+    got_i = ttnn.to_torch(im).reshape(B, N).to(torch.float32)
+    return torch.complex(got_r, got_i)
+
+
+@pytest.mark.parametrize("N,label", [
+    (256,   "stockham"),
+    (4096,  "two_pass"),
+    (97,    "bluestein"),
+    (997,   "bluestein_m2048"),   # exercises complex_mul_safe
+])
+@pytest.mark.parametrize("tt_dtype,torch_dtype,dtype_label,tol", _DTYPES_POW2,
+                         ids=[d[2] for d in _DTYPES_POW2])
+def test_complex_input_fft(device, N, label, tt_dtype, torch_dtype, dtype_label, tol):
+    """fft(re, im) for a complex input (re + i*im) via the unified API."""
+    torch.manual_seed(N)
+    x = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
+    y = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
+    ref = torch.fft.fft(
+        torch.complex(x.to(torch.float32), y.to(torch.float32)), dim=-1)
+    got = _run_fft_complex(device, x, y, tt_dtype, N=N, B=1)
+    err = _rel_err(got, ref)
+    # Bluestein complex input has slightly higher rounding; widen tolerance.
+    effective_tol = tol * 4 if label.startswith("bluestein") else tol
+    assert err < effective_tol, (
+        f"Complex FFT N={N} ({label}) {dtype_label}: rel_err={err:.2e} > tol={effective_tol:.2e}"
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 10. Batched Bluestein (B > 1)
+#     Ensures the B-replication in bluestein_host and the batch dimension
+#     handling in bluestein_dispatch are correct.
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("N,B", [
+    (7,   2),
+    (97,  4),
+    (383, 2),
+    (997, 2),   # M=2048, exercises complex_mul_safe with B=2 → rows=4
+])
+def test_bluestein_batched(device, N, B):
+    """Batched Bluestein: (B, N) input produces per-row correct DFT."""
+    torch.manual_seed(N * B)
+    x = torch.randn(B, N, dtype=torch.float32)
+    ref = torch.fft.fft(x.to(torch.complex64), dim=-1)  # (B, N) batch FFT
+    got = _run_fft(device, x, ttnn.float32, N=N, B=B)
+    err = _rel_err(got, ref)
+    assert err < 1e-3, f"Batched Bluestein N={N} B={B}: rel_err={err:.2e} > 1e-3"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 11. Three-pass IFFT roundtrip (AGGRESSIVE)
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.skipif(not _AGGRESSIVE, reason="TT_FFT_AGGRESSIVE not set")
+@pytest.mark.parametrize("N", [1 << 21, 1 << 24])
+def test_three_pass_ifft_roundtrip(device, N):
+    """Forward → Inverse roundtrip for the three-pass composite."""
+    torch.manual_seed(N % (1 << 20))
+    x = torch.randn(1, N, dtype=torch.float32)
+    tt_x = ttnn.from_torch(x, dtype=ttnn.float32,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    re_fft, im_fft = ttnn.experimental.fft(tt_x)
+    got = _run_ifft(device,
+                    ttnn.to_torch(re_fft).to(torch.float32),
+                    ttnn.to_torch(im_fft).to(torch.float32),
+                    ttnn.float32, N=N)
+    err = _rel_err(got.real, x)
+    assert err < 5e-4, f"ThreePass IFFT roundtrip N={N}: rel_err={err:.2e} > 5e-4"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 12. Metal Trace compatibility
+#     Verifies that capturing and replaying a Metal Trace does not alter
+#     FFT numerical results.  Exercises the ProgramDescriptor-based paths
+#     (SingleTileStockham, fft_radix_pass) which must be trace-safe.
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("N", [256, 4096])
+def test_metal_trace(device, N):
+    """FFT result is identical when executed inside a Metal Trace replay."""
+    torch.manual_seed(N)
+    x = torch.randn(1, N, dtype=torch.float32)
+    tt_x = ttnn.from_torch(x, dtype=ttnn.float32,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+    # Baseline: un-traced execution
+    re_ref, im_ref = ttnn.experimental.fft(tt_x)
+    ref = torch.complex(ttnn.to_torch(re_ref).to(torch.float32),
+                        ttnn.to_torch(im_ref).to(torch.float32))
+
+    # Capture trace
+    tid = ttnn.begin_trace_capture(device, cq_id=0)
+    re_t, im_t = ttnn.experimental.fft(tt_x)
+    ttnn.end_trace_capture(device, tid, cq_id=0)
+
+    # Replay trace
+    ttnn.execute_trace(device, tid, cq_id=0, blocking=True)
+    got = torch.complex(ttnn.to_torch(re_t).to(torch.float32),
+                        ttnn.to_torch(im_t).to(torch.float32))
+    ttnn.release_trace(device, tid)
+
+    err = _rel_err(got, ref)
+    assert err < 1e-6, f"Metal Trace N={N}: result differs from baseline: rel_err={err:.2e}"
