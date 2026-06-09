@@ -50,6 +50,8 @@ target_sources(
         device/apply_twiddles_xl_factory.cpp
         device/transpose_rm_device_operation.cpp
         device/transpose_rm_factory.cpp
+        device/rebank_rm_device_operation.cpp
+        device/rebank_rm_factory.cpp
         device/fft_radix_pass_device_operation.cpp
         device/fft_radix_pass_factory.cpp
         device/complex_mul_device_operation.cpp

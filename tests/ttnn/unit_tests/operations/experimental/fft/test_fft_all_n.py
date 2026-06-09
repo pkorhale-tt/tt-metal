@@ -133,10 +133,11 @@ def test_stockham_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
                          ids=[d[2] for d in _DTYPES_POW2])
 @pytest.mark.parametrize("B", [1, 2])
 @pytest.mark.parametrize("N", [2048, 4096, 8192, 65536,
+                                # N=2^20: page=4 MB → rebank_rm triggered in fft_two_pass
                                 pytest.param(1 << 20, marks=pytest.mark.skipif(
                                     not _AGGRESSIVE, reason="TT_FFT_AGGRESSIVE not set"))])
 def test_two_pass_fft(device, N, B, tt_dtype, torch_dtype, label, tol):
-    """Two-pass composite pow-2 N in (1024, 1M]."""
+    """Two-pass composite pow-2 N in (1024, 1M]; uses rebank_rm for N=2^20."""
     torch.manual_seed(N + B)
     x = torch.randn(B, N, dtype=torch.float32).to(torch_dtype)
     ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
@@ -162,6 +163,45 @@ def test_two_pass_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
                     tt_dtype, N=N)
     assert _rel_err(got.real, ref) < tol * 4, \
         f"TwoPass IFFT roundtrip N={N} {label}: rel_err={_rel_err(got.real, ref):.2e}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2b. rebank_rm — page-size-converting DRAM copy (commit 7)
+#     Directly exercises the new ttnn.experimental.prim.rebank_rm kernel
+#     that fft_two_pass and fft_three_pass_auto call when source page > 256 KB.
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES_POW2,
+                         ids=[d[2] for d in _DTYPES_POW2])
+@pytest.mark.parametrize("N,chunk", [
+    # Small — direct rebank path verification
+    (2048, 32),
+    (2048, 64),
+    (4096, 64),
+    # Large page (> 256 KB threshold) — exercises the rebank_rm kernel path
+    pytest.param(1 << 17, 128,
+                 marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                          reason="TT_FFT_AGGRESSIVE not set")),
+    pytest.param(1 << 20, 1024,
+                 marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                          reason="TT_FFT_AGGRESSIVE not set")),
+])
+def test_rebank_rm(device, N, chunk, tt_dtype, torch_dtype, label, tol):
+    """rebank_rm: (1, N) → (N/chunk, chunk) copy is numerically lossless."""
+    import ttnn.experimental.prim as prim
+    torch.manual_seed(N * chunk)
+    x = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
+    tt_x = ttnn.from_torch(x, dtype=tt_dtype,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    # rebank (1, N) → (N//chunk, chunk)
+    rebankd = prim.rebank_rm(tt_x, chunk)
+    got = ttnn.to_torch(rebankd).to(torch.float32).reshape(1, N)
+    ref = x.to(torch.float32)
+    err = _rel_err(got, ref)
+    assert err < 1e-6, (
+        f"rebank_rm N={N} chunk={chunk} {label}: "
+        f"rel_err={err:.2e} (expected < 1e-6 — this is a lossless copy)"
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════

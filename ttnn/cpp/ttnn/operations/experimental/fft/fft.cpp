@@ -13,6 +13,7 @@
 #include "device/fft_radix_pass_device_operation.hpp"
 #include "device/apply_twiddles_xl_device_operation.hpp"
 #include "device/transpose_rm_device_operation.hpp"
+#include "device/rebank_rm_device_operation.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/types.hpp"  // ttnn::Shape, ttnn::SmallVector
 
@@ -101,6 +102,35 @@ ttnn::Shape make_shape(std::initializer_list<uint32_t> dims) {
     return ttnn::Shape{v};
 }
 
+// ── Large-page reshape guard ──────────────────────────────────────────────
+// On-device reshape that reduces the last dimension is a page-size-changing
+// copy.  The Metal copy kernel buffers the OLD page in an L1 CB.
+// Wormhole L1 = ~1.5 MB, so any source page > kRebankThresholdBytes triggers
+// an explicit DRAM-to-DRAM rebank_rm dispatch (CB = chunk × 4 bytes ≤ 4 KB,
+// never overflows L1).
+constexpr uint32_t kRebankThresholdBytes = 256u * 1024u;  // 256 KB
+
+// Reshape or rebank a (B_total, N) tensor to (B_total * N/chunk, chunk).
+// Uses rebank_rm when the source page exceeds the L1 safe limit.
+static ttnn::Tensor reshape_or_rebank(
+    const ttnn::Tensor& t,
+    uint32_t rows,
+    uint32_t chunk)
+{
+    const auto& s = t.padded_shape();
+    const uint32_t N = static_cast<uint32_t>(s[-1]);
+    const uint32_t elem_bytes =
+        (t.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    const uint32_t src_page_bytes = N * elem_bytes;
+
+    if (src_page_bytes > kRebankThresholdBytes) {
+        // Use the DRAM-to-DRAM rebank kernel to avoid L1 overflow.
+        // Output is (B_total * N/chunk, chunk) — matches (rows, chunk).
+        return ttnn::prim::rebank_rm(t, chunk);
+    }
+    return ttnn::reshape(t, make_shape({rows, chunk}));
+}
+
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     const ttnn::Tensor& input_real,
     std::optional<ttnn::Tensor> input_imag,
@@ -157,12 +187,28 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     const float final_scale =
         inverse ? (1.0f / static_cast<float>(N)) : 1.0f;
 
-    // ── Step 1: reshape input (B, N) → (B, N1, N2).  View, free.
-    //   x_3d[b, n1, n2] = x_orig[b, n1·N2 + n2].
-    auto x_3d_r = ttnn::reshape(src_real, make_shape({B, N1, N2}));
+    // ── Step 1: reshape input (B, N) → (B*N1, N2) then view as (B, N1, N2).
+    //   When the source page is large (N > ~64 K for fp32) the reshape is a
+    //   page-size-splitting copy that overflows L1.  reshape_or_rebank
+    //   transparently substitutes a DRAM-to-DRAM rebank_rm in that case.
+    //   Output of rebank_rm is already (B*N1, N2); we view it as (B, N1, N2).
+    const uint32_t elem_bytes_tp =
+        (src_real.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    const uint32_t src_page_tp = N * elem_bytes_tp;
+
     std::optional<ttnn::Tensor> x_3d_i;
-    if (has_imag) {
-        x_3d_i = ttnn::reshape(*src_imag, make_shape({B, N1, N2}));
+    ttnn::Tensor x_3d_r;
+    if (src_page_tp > kRebankThresholdBytes) {
+        // rebank_rm produces (B*N1, N2); view as (B, N1, N2) is free.
+        x_3d_r = ttnn::reshape(reshape_or_rebank(src_real, B * N1, N2),
+                               make_shape({B, N1, N2}));
+        if (has_imag)
+            x_3d_i = ttnn::reshape(reshape_or_rebank(*src_imag, B * N1, N2),
+                                   make_shape({B, N1, N2}));
+    } else {
+        x_3d_r = ttnn::reshape(src_real, make_shape({B, N1, N2}));
+        if (has_imag)
+            x_3d_i = ttnn::reshape(*src_imag, make_shape({B, N1, N2}));
     }
 
     // ── Step 2: initial transpose (B, N1, N2) → (B, N2, N1).
@@ -491,12 +537,16 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass_auto(
 
     const auto [N1, N2, N3] = pick_three_factorization(N);
 
-    // Pre-shape: (B, N) → (B·N1·N2, N3)  [free view]
+    // Pre-shape: (B, N) → (B·N1·N2, N3).
+    // When the source page (N × elem_bytes) exceeds the L1 safe limit, the
+    // on-device reshape copies through an L1 CB that overflows.  Use
+    // reshape_or_rebank which transparently substitutes a DRAM-to-DRAM
+    // rebank_rm (CB = N3 × elem_bytes ≤ 4 KB, never overflows L1).
     const uint32_t rows = B * N1 * N2;
-    auto re_pre = ttnn::reshape(input_real, make_shape({rows, N3}));
+    auto re_pre = reshape_or_rebank(input_real, rows, N3);
     std::optional<ttnn::Tensor> im_pre;
     if (input_imag.has_value())
-        im_pre = ttnn::reshape(*input_imag, make_shape({rows, N3}));
+        im_pre = reshape_or_rebank(*input_imag, rows, N3);
 
     auto [out_re, out_im] = fft_three_pass(re_pre, im_pre, N, precision, inverse);
 
