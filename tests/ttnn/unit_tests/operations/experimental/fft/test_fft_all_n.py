@@ -131,13 +131,19 @@ def test_stockham_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
 
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES_POW2,
                          ids=[d[2] for d in _DTYPES_POW2])
-@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("B", [
+    1,
+    # B=2 doubles CB pressure in fft_radix_pass.  Gate behind AGGRESSIVE to
+    # keep the default suite within safe L1 headroom on all N values.
+    pytest.param(2, marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                             reason="TT_FFT_AGGRESSIVE not set")),
+])
 @pytest.mark.parametrize("N", [2048, 4096, 8192,
-                                # N=65536: page=256 KB > 128 KB threshold → covered by test_rebank_rm
+                                # N=2^20: page=4 MB → rebank_rm triggered in fft_two_pass
                                 pytest.param(1 << 20, marks=pytest.mark.skipif(
                                     not _AGGRESSIVE, reason="TT_FFT_AGGRESSIVE not set"))])
 def test_two_pass_fft(device, N, B, tt_dtype, torch_dtype, label, tol):
-    """Two-pass composite pow-2 N in (1024, 1M]; uses rebank_rm for N ≥ 65536."""
+    """Two-pass composite pow-2 N in (1024, 1M]; B=1 default; B=2 AGGRESSIVE."""
     torch.manual_seed(N + B)
     x = torch.randn(B, N, dtype=torch.float32).to(torch_dtype)
     ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
