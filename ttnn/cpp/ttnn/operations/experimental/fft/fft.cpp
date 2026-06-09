@@ -292,6 +292,58 @@ bool bluestein_eligible(const ttnn::Tensor& t) {
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// Small-N IFFT (pow-2 N ≤ 1024, complex input): swap trick via fft_radix_pass.
+//
+// The SingleTileStockhamFactory / BatchedStockhamFactory kernels implement
+// only the forward DFT.  For IFFT at small N we apply the same swap trick
+// that the two-pass / three-pass composites use, but delegate to
+// fft_radix_pass (which supports output_scale to fold in the 1/N factor):
+//
+//   IFFT(X)[n] = (1/N) · (W_im[n] + i · W_re[n])
+//   where W = FFT(X̃)  and  X̃ = X_im + i · X_re.
+//
+// Steps:
+//   (1) Swap inputs: pass (X_im, X_re) as (real, imag) to fft_radix_pass.
+//   (2) fft_radix_pass computes FFT_N × (1/N) via output_scale — zero
+//       extra dispatch vs a forward FFT call.
+//   (3) Swap outputs: return (W_im, W_re).  No negation required.
+//
+// Precondition: spectrum_imag must be provided (complex spectrum).
+static std::tuple<ttnn::Tensor, ttnn::Tensor> small_pow2_ifft(
+    const ttnn::Tensor&  spectrum_real,
+    const ttnn::Tensor&  spectrum_imag,
+    uint32_t             N,
+    FFTPrecision         /*precision*/)
+{
+    const auto& sh  = spectrum_real.padded_shape();
+    uint32_t    B   = 1u;
+    for (int d = 0; d < static_cast<int>(sh.size()) - 1; ++d)
+        B *= static_cast<uint32_t>(sh[d]);
+
+    const float inv_n = 1.0f / static_cast<float>(N);
+
+    // Flatten to (B, N) for fft_radix_pass.
+    auto re_2d = (sh.size() == 2u)
+        ? spectrum_real
+        : ttnn::reshape(spectrum_real,  make_shape({B, N}));
+    auto im_2d = (sh.size() == 2u)
+        ? spectrum_imag
+        : ttnn::reshape(spectrum_imag,  make_shape({B, N}));
+
+    // Swap inputs: X̃ = X_im + i·X_re → W = FFT(X̃) × (1/N)
+    auto [W_re, W_im] = ttnn::prim::fft_radix_pass(
+        im_2d,                            // real part  = X_im
+        std::make_optional(re_2d),        // imag part  = X_re
+        /*P=*/N, /*twiddle_N2=*/0u, /*stride=*/1u,
+        /*output_scale=*/inv_n);
+
+    // Swap outputs: IFFT(X) = (W_im, W_re); 1/N already applied above.
+    auto out_re = (sh.size() == 2u) ? std::move(W_im) : ttnn::reshape(W_im, sh);
+    auto out_im = (sh.size() == 2u) ? std::move(W_re) : ttnn::reshape(W_re, sh);
+    return {std::move(out_re), std::move(out_im)};
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Three-pass Cooley–Tukey composite (commit 5, corrected commit 5c)
 //
 // ⚠ API NOTES:
@@ -717,8 +769,19 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ifft(
         return fft_three_pass_auto(spectrum_real, spectrum_imag, precision, true);
     if (bluestein_eligible(spectrum_real))
         return bluestein_dispatch(spectrum_real, spectrum_imag, precision, true);
+    // Small pow-2 N ≤ 1024: SingleTile/BatchedStockhamFactory only implement
+    // the forward DFT, so prim::fft(inverse=true) would fall through to the
+    // legacy FFTProgramFactory → TT_THROW.  Use the same swap trick as the
+    // two-pass IFFT but via fft_radix_pass (which has output_scale for 1/N).
+    {
+        const uint32_t N = static_cast<uint32_t>(spectrum_real.padded_shape()[-1]);
+        if (native_path_enabled() && is_pow2(N) && N >= 2u && N <= 1024u)
+            return small_pow2_ifft(spectrum_real, spectrum_imag, N, precision);
+    }
+    // Unreachable with TT_FFT_NATIVE ON for any supported N.  Kept as a
+    // safety valve for the TT_FFT_NATIVE=0 debug mode.
     return ttnn::prim::fft(spectrum_real, /*inverse=*/true,
-                           spectrum_imag, precision);
+                           std::make_optional(spectrum_imag), precision);
 }
 
 }  // namespace ttnn::operations::experimental
