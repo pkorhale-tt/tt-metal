@@ -132,12 +132,12 @@ def test_stockham_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES_POW2,
                          ids=[d[2] for d in _DTYPES_POW2])
 @pytest.mark.parametrize("B", [1, 2])
-@pytest.mark.parametrize("N", [2048, 4096, 8192, 65536,
-                                # N=2^20: page=4 MB → rebank_rm triggered in fft_two_pass
+@pytest.mark.parametrize("N", [2048, 4096, 8192,
+                                # N=65536: page=256 KB > 128 KB threshold → covered by test_rebank_rm
                                 pytest.param(1 << 20, marks=pytest.mark.skipif(
                                     not _AGGRESSIVE, reason="TT_FFT_AGGRESSIVE not set"))])
 def test_two_pass_fft(device, N, B, tt_dtype, torch_dtype, label, tol):
-    """Two-pass composite pow-2 N in (1024, 1M]; uses rebank_rm for N=2^20."""
+    """Two-pass composite pow-2 N in (1024, 1M]; uses rebank_rm for N ≥ 65536."""
     torch.manual_seed(N + B)
     x = torch.randn(B, N, dtype=torch.float32).to(torch_dtype)
     ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
@@ -167,20 +167,30 @@ def test_two_pass_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2b. rebank_rm — page-size-converting DRAM copy (commit 7)
-#     Directly exercises the new ttnn.experimental.prim.rebank_rm kernel
-#     that fft_two_pass and fft_three_pass_auto call when source page > 256 KB.
+#     Exercises the rebank_rm kernel that fft_two_pass and fft_three_pass_auto
+#     call when source page > 128 KB (kRebankThresholdBytes in fft.cpp).
+#
+#     Threshold rationale: fft_two_pass needs simultaneous CBs for reshape,
+#     transpose_rm, and radix_pass tiles.  Empirically, source page ≥ 64 KB
+#     pushes combined static L1 allocation past the 1.5 MB Wormhole limit
+#     for both fp32 and bf16 (bf16 N=65536 page = 128 KB > 64 KB).
+#     → N=65536, fp32/bf16: page > 64 KB → rebank_rm (non-AGGRESSIVE)
+#     → N=2^17+:            large pages  → rebank_rm (AGGRESSIVE)
 # ════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES_POW2,
                          ids=[d[2] for d in _DTYPES_POW2])
 @pytest.mark.parametrize("N", [
-    # N=2^17: page = 512 KB > 256 KB threshold → rebank_rm triggered in fft_two_pass
+    # N=65536: fp32 page=256 KB / bf16 page=128 KB — both > 64 KB threshold
+    #   → rebank_rm triggered in fft_two_pass; no AGGRESSIVE needed
+    1 << 16,
+    # N=2^17: page=512 KB → rebank_rm triggered in fft_two_pass
     pytest.param(1 << 17, marks=pytest.mark.skipif(not _AGGRESSIVE,
                                                     reason="TT_FFT_AGGRESSIVE not set")),
-    # N=2^20: page = 4 MB → rebank_rm triggered in fft_two_pass
+    # N=2^20: page=4 MB → rebank_rm triggered in fft_two_pass
     pytest.param(1 << 20, marks=pytest.mark.skipif(not _AGGRESSIVE,
                                                     reason="TT_FFT_AGGRESSIVE not set")),
-    # N=2^21: page = 8 MB → rebank_rm triggered in fft_three_pass_auto
+    # N=2^21: page=8 MB → rebank_rm triggered in fft_three_pass_auto
     pytest.param(1 << 21, marks=pytest.mark.skipif(not _AGGRESSIVE,
                                                     reason="TT_FFT_AGGRESSIVE not set")),
 ])
@@ -188,10 +198,10 @@ def test_rebank_rm(device, N, tt_dtype, torch_dtype, label, tol):
     """
     Exercises the rebank_rm DRAM kernel indirectly via ttnn.experimental.fft.
 
-    For N > 256K (fp32 page > 256 KB), fft_two_pass / fft_three_pass_auto
-    internally call ttnn::prim::rebank_rm instead of ttnn::reshape to
-    convert (B, N) page=N*4 → (B*N/chunk, chunk) page=chunk*4 without
-    overflowing the 1.5 MB Wormhole L1.  A correct DFT result here proves
+    For source page > 64 KB (kRebankThresholdBytes in fft.cpp), fft_two_pass /
+    fft_three_pass_auto call ttnn::prim::rebank_rm instead of ttnn::reshape to
+    convert (B, N) page=N*elem → (B*N/chunk, chunk) page=chunk*elem bytes
+    without filling the 1.5 MB Wormhole L1.  A correct DFT result proves
     the rebank copy was lossless AND the subsequent FFT chain was correct.
     """
     torch.manual_seed(N % (1 << 20))

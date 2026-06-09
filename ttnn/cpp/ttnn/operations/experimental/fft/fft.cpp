@@ -104,11 +104,22 @@ ttnn::Shape make_shape(std::initializer_list<uint32_t> dims) {
 
 // ── Large-page reshape guard ──────────────────────────────────────────────
 // On-device reshape that reduces the last dimension is a page-size-changing
-// copy.  The Metal copy kernel buffers the OLD page in an L1 CB.
-// Wormhole L1 = ~1.5 MB, so any source page > kRebankThresholdBytes triggers
-// an explicit DRAM-to-DRAM rebank_rm dispatch (CB = chunk × 4 bytes ≤ 4 KB,
-// never overflows L1).
-constexpr uint32_t kRebankThresholdBytes = 256u * 1024u;  // 256 KB
+// copy.  The Metal copy kernel buffers the OLD page in an L1 CB alongside
+// other static allocations (transpose_rm tiles, radix-pass tiles).
+// Wormhole L1 = ~1.5 MB total, but fft_two_pass/three_pass already use
+// several hundred KB for their own CBs.  Empirically, a source page ≥ 128 KB
+// pushes the combined static allocation over the L1 limit.  Anything above
+// this threshold routes through rebank_rm (pure DRAM-to-DRAM, CB ≤ 4 KB).
+//
+// Threshold derivation (applies to BOTH fp32 and bf16):
+//   N=32768, fp32 → page = 128 KB > 64 KB → rebanked
+//   N=32768, bf16 → page =  64 KB = 64 KB → NOT rebanked (at limit)
+//   N=65536, fp32 → page = 256 KB > 64 KB → rebanked  ← cascade fix
+//   N=65536, bf16 → page = 128 KB > 64 KB → rebanked  ← cascade fix
+//   N=2^20,  fp32 → page =   4 MB > 64 KB → rebanked (would overflow L1)
+// Keeping the threshold at 64 KB ensures both fp32 and bf16 large-N cases
+// avoid the multi-hundred-KB reshape CB that destabilises subsequent tests.
+constexpr uint32_t kRebankThresholdBytes = 64u * 1024u;  // 64 KB
 
 // Reshape or rebank a (B_total, N) tensor to (B_total * N/chunk, chunk).
 // Uses rebank_rm when the source page exceeds the L1 safe limit.
