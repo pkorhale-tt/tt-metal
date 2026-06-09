@@ -23,6 +23,7 @@
 #include "ttnn/operations/experimental/fft/complex_mul.hpp"
 #include "ttnn/operations/experimental/fft/fft.hpp"
 #include "ttnn/operations/experimental/fft/device/bluestein_host.hpp"
+#include "ttnn/operations/experimental/fft/device/rebank_rm_device_operation.hpp"
 
 #include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
@@ -38,20 +39,45 @@ namespace ttnn::operations::experimental {
 
 namespace {
 
+// Source-page threshold above which ttnn::reshape allocates a CB equal to the
+// full source row (e.g. (1,131072)→(128,1024) uses 4×1 MB CB → L1 overflow).
+// Matches kRebankThresholdBytes in fft.cpp.
+constexpr uint32_t kRebankThresholdBytes = 64u * 1024u;
+
+// Page-shrinking reshape helper: (rows_in, cols_in) → (rows_out, cols_out).
+// Uses rebank_rm (DRAM-to-DRAM, tiny CB ≤ 4 KB) when the source page
+// exceeds the L1-safe threshold, otherwise falls through to ttnn::reshape.
+static ttnn::Tensor shrink_reshape(
+    const ttnn::Tensor& t, uint32_t new_cols)
+{
+    const auto& s = t.padded_shape();
+    const uint32_t src_cols = static_cast<uint32_t>(s[-1]);
+    const uint32_t elem_bytes =
+        (t.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    if (src_cols * elem_bytes > kRebankThresholdBytes) {
+        return ttnn::prim::rebank_rm(t, new_cols);
+    }
+    uint32_t total = 1u;
+    for (int d = 0; d < static_cast<int>(s.size()); ++d)
+        total *= static_cast<uint32_t>(s[d]);
+    const uint32_t new_rows = total / new_cols;
+    return ttnn::reshape(t,
+        ttnn::Shape{ttnn::SmallVector<uint32_t>{new_rows, new_cols}});
+}
+
 // complex_mul_safe: element-wise complex multiply for any last-dim size.
 //
 // The complex_mul kernel has a hard cap of P ≤ 1024 (one tile row).
 // For P > 1024 we split into 1024-element chunks:
 //
 //   Case A — P divisible by 1024 (always true for Bluestein M, a pow-2):
-//     Reshape (B, P) → (B·P/1024, 1024), multiply, reshape back.
-//     Zero extra dispatches beyond the multiply itself.
+//     Rebank  (B, P) → (B·P/1024, 1024) via rebank_rm when P is large
+//     (avoids the 4 MB CB that ttnn::reshape would require for M=131072).
+//     Multiply, then reshape back (page-growing, CB ≤ 1 MB, always safe).
 //
 //   Case B — P NOT divisible by 1024 (e.g. steps 1 & 7 with N=1997):
 //     Pad each input from (B, P) to (B, P_pad) where P_pad is the next
-//     multiple of 1024, apply Case A, then slice the result back to (B, P).
-//     The padded elements are 0 * anything = 0, so the slice recovers the
-//     exact element-wise product for positions 0..P-1.
+//     multiple of 1024, apply Case A logic, then slice back to (B, P).
 //     Cost: 4 extra pad dispatches + 1 slice dispatch — acceptable for the
 //     rare non-pow-2 large-N Bluestein case.
 static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
@@ -68,12 +94,14 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
         B *= static_cast<uint32_t>(sh[d]);
 
     if (P % 1024u == 0u) {
-        // Case A: P already a multiple of 1024 — pure reshape, no extra dispatches.
-        const auto flat = ttnn::Shape{ttnn::SmallVector<uint32_t>{B * (P / 1024u), 1024u}};
+        // Case A: P a multiple of 1024.
+        // shrink_reshape uses rebank_rm when source page (P × elem_bytes) > 64 KB,
+        // so (1,131072)→(128,1024) goes DRAM-to-DRAM without a large L1 CB.
         const auto orig = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P}};
         auto [cr, ci] = complex_mul(
-            ttnn::reshape(ar, flat), ttnn::reshape(ai, flat),
-            ttnn::reshape(br, flat), ttnn::reshape(bi, flat));
+            shrink_reshape(ar, 1024u), shrink_reshape(ai, 1024u),
+            shrink_reshape(br, 1024u), shrink_reshape(bi, 1024u));
+        // Reshape back: page grows from 1024 to P — CB ≤ 1 MB, always within L1.
         return {ttnn::reshape(cr, orig), ttnn::reshape(ci, orig)};
     }
 
@@ -92,12 +120,11 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
     auto br_p = ttnn::pad(br, padding, 0.0f, /*use_multicore=*/true, mc);
     auto bi_p = ttnn::pad(bi, padding, 0.0f, /*use_multicore=*/true, mc);
 
-    const auto flat   = ttnn::Shape{ttnn::SmallVector<uint32_t>{B * (P_pad / 1024u), 1024u}};
     const auto padded = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P_pad}};
 
     auto [cr_p, ci_p] = complex_mul(
-        ttnn::reshape(ar_p, flat), ttnn::reshape(ai_p, flat),
-        ttnn::reshape(br_p, flat), ttnn::reshape(bi_p, flat));
+        shrink_reshape(ar_p, 1024u), shrink_reshape(ai_p, 1024u),
+        shrink_reshape(br_p, 1024u), shrink_reshape(bi_p, 1024u));
 
     // Slice result back to (B, P) — padded positions are 0 * x = 0.
     const ttnn::SmallVector<uint32_t> begins = {0u, 0u};
