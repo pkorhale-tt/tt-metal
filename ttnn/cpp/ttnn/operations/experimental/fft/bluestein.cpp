@@ -196,42 +196,33 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
 
 // zero_pad_to_m: zero-pad (B, N) → (B, M) without using ttnn::pad.
 //
-// ttnn::pad allocates CB = 16 × output_stick_size, which overflows L1 for
-// M > ~22 K elements (fp32).  This helper avoids the problem by rebanding to
-// (B·N/1024, 1024), appending a (B·(M-N)/1024, 1024) zeros block, and
-// reshaping back — the maximum CB per step is ~1 MB.
+// ttnn::pad allocates CB = 16 × output_stick_size (+ 1 staging), giving
+// CB ≈ 17 × M × elem_bytes, which overflows 1.5 MB L1 for M ≥ 131072 (fp32).
 //
-// PRECONDITION: N % 1024 == 0, M % 1024 == 0, M > N.
+// This helper instead creates a (B, M-N) zeros tensor and column-concatenates.
+// concat_program_factory uses CB = 2 × single_page_size, where
+//   single_page_size = align(M × elem_bytes, 32),
+// so CB ≤ 2 × 524,288 = 1 MB for M ≤ 131,072 (fp32) or M ≤ 262,144 (bf16).
+//
+// NOTE: N does NOT need to be a power of 2 (unlike rebank_rm).
 static ttnn::Tensor zero_pad_to_m(
     const ttnn::Tensor& t, uint32_t M)
 {
-    const auto& s       = t.padded_shape();
-    const uint32_t B    = static_cast<uint32_t>(s[0]);
-    const uint32_t N    = static_cast<uint32_t>(s[-1]);
+    const auto& s    = t.padded_shape();
+    const uint32_t B = static_cast<uint32_t>(s[0]);
+    const uint32_t N = static_cast<uint32_t>(s[-1]);
+    if (N == M) return t;
 
-    const uint32_t n_chunks   = N / 1024u;
-    const uint32_t pad_chunks = M / 1024u - n_chunks;
-
-    auto*      dev = t.device();
+    auto* dev = t.device();
     TT_FATAL(dev != nullptr, "zero_pad_to_m: tensor has no device.");
     const auto mc = t.memory_config();
 
-    // (B, N) → (B·n_chunks, 1024).  CB = 8 KB via rebank_rm.
-    auto flat_n = ttnn::prim::rebank_rm(t, 1024u);
-
-    // (B·pad_chunks, 1024) zeros.
-    auto zeros_pad = ttnn::zeros(
-        ttnn::Shape{ttnn::SmallVector<uint32_t>{B * pad_chunks, 1024u}},
+    // (B, M-N) zeros, column-concatenated to reach (B, M).
+    // CB = 2 × M × elem_bytes.
+    auto zeros_tail = ttnn::zeros(
+        ttnn::Shape{ttnn::SmallVector<uint32_t>{B, M - N}},
         t.dtype(), t.layout(), std::ref(*dev), mc);
-
-    // Row-concat: (B·M/1024, 1024).  CB = 2 × 4 KB = 8 KB.
-    auto stacked = ttnn::concat({flat_n, zeros_pad}, /*dim=*/0);
-
-    // Reshape back: (B·M/1024, 1024) → (B, M).
-    // Page grows to M × elem_bytes; CB = 2 × M × elem_bytes ≤ 2 × 524 KB = 1 MB.
-    return ttnn::reshape(
-        stacked,
-        ttnn::Shape{ttnn::SmallVector<uint32_t>{B, M}});
+    return ttnn::concat({t, zeros_tail}, /*dim=*/1);
 }
 
 // trim_to_n: extract first N elements from (B, M) without ttnn::slice.
@@ -241,7 +232,8 @@ static ttnn::Tensor zero_pad_to_m(
 // (B·M/1024, 1024), takes the first B·N/1024 rows via a row-slice (page =
 // 4 KB), and reshapes back — the maximum CB per step is ~1 MB.
 //
-// PRECONDITION: N % 1024 == 0, M % 1024 == 0, M >= N.
+// PRECONDITION: N % 1024 == 0, M must be a power of 2 (Bluestein always
+// satisfies this: M = next_pow2(2N-1) ≥ 2048), M >= N.
 static ttnn::Tensor trim_to_n(
     const ttnn::Tensor& t, uint32_t N)
 {
@@ -350,13 +342,12 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
         input_real, x_imag, plan->chirp_n_re, plan->chirp_n_im);
 
     // ── Step 2: zero-pad last dim from N to M  (B, N) → (B, M).
-    //   For large M (output stick > 64 KB) and N%1024==0, ttnn::pad's 16×
-    //   async CB would overflow L1 (~17 × M × elem_bytes > 1.5 MB for
-    //   M ≥ 131072 fp32).  Use the rebank_rm-based helper instead.
+    //   ttnn::pad's 16× async CB overflows L1 for M ≥ 131072 fp32 (CB = 17×
+    //   M × elem_bytes ≈ 17 × 524 KB = 8.9 MB).  Use zero_pad_to_m (concat)
+    //   which needs CB = 2 × M × elem_bytes ≤ 1 MB.  No N%1024 constraint.
     const uint32_t elem_bytes =
         (a_re.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
-    const bool large_m_pad = ((uint64_t)M * elem_bytes > kBluesteinRebankThreshold)
-                             && (N % 1024u == 0u);
+    const bool large_m_pad = ((uint64_t)M * elem_bytes > kBluesteinRebankThreshold);
 
     ttnn::Tensor a_pad_re, a_pad_im;
     if (large_m_pad) {
