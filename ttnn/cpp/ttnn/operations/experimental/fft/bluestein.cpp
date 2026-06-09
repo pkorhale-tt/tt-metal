@@ -25,6 +25,7 @@
 #include "ttnn/operations/experimental/fft/device/bluestein_host.hpp"
 #include "ttnn/operations/experimental/fft/device/rebank_rm_device_operation.hpp"
 
+#include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
@@ -67,19 +68,82 @@ static ttnn::Tensor shrink_reshape(
 
 // complex_mul_safe: element-wise complex multiply for any last-dim size.
 //
-// The complex_mul kernel has a hard cap of P ≤ 1024 (one tile row).
-// For P > 1024 we split into 1024-element chunks:
+// The complex_mul kernel has a hard cap of P ≤ 1024 (one tile row), and its
+// CB scales as 4 inputs × 2 (dbl-buf) × B_eff × 1024 × elem_bytes.  For
+// large B_eff (= B × P/1024) that exceeds the 1.5 MB L1 limit.
 //
-//   Case A — P divisible by 1024 (always true for Bluestein M, a pow-2):
-//     Rebank  (B, P) → (B·P/1024, 1024) via rebank_rm when P is large
-//     (avoids the 4 MB CB that ttnn::reshape would require for M=131072).
-//     Multiply, then reshape back (page-growing, CB ≤ 1 MB, always safe).
+// Strategy for P > 1024:
+//   1. Rebank (B, P) → (B·P/1024, 1024) via rebank_rm when the source page
+//      is large (avoids the multi-MB reshape CB).
+//   2. If B_eff = B·P/1024 is within the safe limit (b_safe), one complex_mul
+//      call suffices.  Otherwise, slice the rebankd tensor into b_safe-row
+//      blocks, call complex_mul once per block, and concat the results.
+//   3. Reshape the (B·P/1024, 1024) result back to (B, P) — page-growing
+//      reshape, CB ≤ 1 MB, always within L1.
 //
-//   Case B — P NOT divisible by 1024 (e.g. steps 1 & 7 with N=1997):
-//     Pad each input from (B, P) to (B, P_pad) where P_pad is the next
-//     multiple of 1024, apply Case A logic, then slice back to (B, P).
-//     Cost: 4 extra pad dispatches + 1 slice dispatch — acceptable for the
-//     rare non-pow-2 large-N Bluestein case.
+// b_safe derivation (CB ≤ 1 MB):
+//   fp32: b_safe = 1 MB / (4 × 2 × 1024 × 4 B) = 32 rows
+//   bf16: b_safe = 1 MB / (4 × 2 × 1024 × 2 B) = 64 rows
+//
+// Case B (P not divisible by 1024): pad to next multiple of 1024 first,
+// apply the above, then slice back to (B, P).
+static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_chunked(
+    const ttnn::Tensor& ar, const ttnn::Tensor& ai,
+    const ttnn::Tensor& br, const ttnn::Tensor& bi,
+    uint32_t B, uint32_t P_col)
+{
+    // P_col must be a multiple of 1024 on entry.
+    const uint32_t nchunks   = P_col / 1024u;
+    const uint32_t total_rows = B * nchunks;
+
+    const uint32_t elem_bytes =
+        (ar.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    // Max rows per complex_mul to keep CB ≤ 1 MB.
+    const uint32_t b_safe = (1u << 20u) / (8u * 1024u * elem_bytes); // 32/64
+
+    // Rebank (B, P_col) → (total_rows, 1024) with tiny CB.
+    auto ar_f = shrink_reshape(ar, 1024u);
+    auto ai_f = shrink_reshape(ai, 1024u);
+    auto br_f = shrink_reshape(br, 1024u);
+    auto bi_f = shrink_reshape(bi, 1024u);
+
+    const auto mc = ar.memory_config();
+
+    if (total_rows <= b_safe) {
+        // Small enough: one complex_mul call.
+        auto [cr, ci] = complex_mul(ar_f, ai_f, br_f, bi_f);
+        const auto orig = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P_col}};
+        return {ttnn::reshape(cr, orig), ttnn::reshape(ci, orig)};
+    }
+
+    // Large: loop in b_safe-row blocks, collect results, concat.
+    std::vector<ttnn::Tensor> cr_vec, ci_vec;
+    cr_vec.reserve((total_rows + b_safe - 1u) / b_safe);
+    ci_vec.reserve(cr_vec.capacity());
+
+    for (uint32_t start = 0u; start < total_rows; start += b_safe) {
+        const uint32_t end_r = std::min(start + b_safe, total_rows);
+        const ttnn::SmallVector<uint32_t> beg_idx  = {start, 0u};
+        const ttnn::SmallVector<uint32_t> end_idx  = {end_r, 1024u};
+        const ttnn::SmallVector<uint32_t> step_idx = {1u, 1u};
+        auto arc = ttnn::slice(ar_f, beg_idx, end_idx, step_idx, mc);
+        auto aic = ttnn::slice(ai_f, beg_idx, end_idx, step_idx, mc);
+        auto brc = ttnn::slice(br_f, beg_idx, end_idx, step_idx, mc);
+        auto bic = ttnn::slice(bi_f, beg_idx, end_idx, step_idx, mc);
+        auto [crc, cic] = complex_mul(arc, aic, brc, bic);
+        cr_vec.push_back(std::move(crc));
+        ci_vec.push_back(std::move(cic));
+    }
+
+    // Concat along dim 0: (k × b_safe, 1024) → (total_rows, 1024).
+    auto cr_f = ttnn::concat(cr_vec, /*dim=*/0);
+    auto ci_f = ttnn::concat(ci_vec, /*dim=*/0);
+
+    // Reshape back (page-growing, CB ≤ 1 MB).
+    const auto orig = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P_col}};
+    return {ttnn::reshape(cr_f, orig), ttnn::reshape(ci_f, orig)};
+}
+
 static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
     const ttnn::Tensor& ar, const ttnn::Tensor& ai,
     const ttnn::Tensor& br, const ttnn::Tensor& bi)
@@ -93,45 +157,33 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
     for (int d = 0; d < static_cast<int>(sh.size()) - 1; ++d)
         B *= static_cast<uint32_t>(sh[d]);
 
+    const auto mc = ar.memory_config();
+
     if (P % 1024u == 0u) {
-        // Case A: P a multiple of 1024.
-        // shrink_reshape uses rebank_rm when source page (P × elem_bytes) > 64 KB,
-        // so (1,131072)→(128,1024) goes DRAM-to-DRAM without a large L1 CB.
-        const auto orig = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P}};
-        auto [cr, ci] = complex_mul(
-            shrink_reshape(ar, 1024u), shrink_reshape(ai, 1024u),
-            shrink_reshape(br, 1024u), shrink_reshape(bi, 1024u));
-        // Reshape back: page grows from 1024 to P — CB ≤ 1 MB, always within L1.
-        return {ttnn::reshape(cr, orig), ttnn::reshape(ci, orig)};
+        return complex_mul_chunked(ar, ai, br, bi, B, P);
     }
 
-    // Case B: P is not a multiple of 1024 (e.g. N=1997 chirp mul).
-    // Round up to the next multiple of 1024 via zero-padding, multiply, slice.
-    const uint32_t P_pad = (P + 1023u) & ~1023u;   // next multiple of 1024
+    // Case B: P not divisible by 1024 — pad to P_pad, multiply, slice back.
+    const uint32_t P_pad = (P + 1023u) & ~1023u;
     const uint32_t pad_len = P_pad - P;
 
     const ttnn::SmallVector<std::array<uint32_t, 2>> padding = {
-        {{0u, 0u}},          // batch dim: no padding
-        {{0u, pad_len}},     // last dim: append zeros
+        {{0u, 0u}},
+        {{0u, pad_len}},
     };
-    const auto mc = ar.memory_config();
     auto ar_p = ttnn::pad(ar, padding, 0.0f, /*use_multicore=*/true, mc);
     auto ai_p = ttnn::pad(ai, padding, 0.0f, /*use_multicore=*/true, mc);
     auto br_p = ttnn::pad(br, padding, 0.0f, /*use_multicore=*/true, mc);
     auto bi_p = ttnn::pad(bi, padding, 0.0f, /*use_multicore=*/true, mc);
 
-    const auto padded = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P_pad}};
+    auto [cr_p, ci_p] = complex_mul_chunked(ar_p, ai_p, br_p, bi_p, B, P_pad);
 
-    auto [cr_p, ci_p] = complex_mul(
-        shrink_reshape(ar_p, 1024u), shrink_reshape(ai_p, 1024u),
-        shrink_reshape(br_p, 1024u), shrink_reshape(bi_p, 1024u));
-
-    // Slice result back to (B, P) — padded positions are 0 * x = 0.
+    // Slice result back to (B, P) — zero-padded positions are 0 × anything = 0.
     const ttnn::SmallVector<uint32_t> begins = {0u, 0u};
     const ttnn::SmallVector<uint32_t> ends   = {B,  P};
     const ttnn::SmallVector<uint32_t> step   = {1u, 1u};
-    auto cr = ttnn::slice(ttnn::reshape(cr_p, padded), begins, ends, step, mc);
-    auto ci = ttnn::slice(ttnn::reshape(ci_p, padded), begins, ends, step, mc);
+    auto cr = ttnn::slice(cr_p, begins, ends, step, mc);
+    auto ci = ttnn::slice(ci_p, begins, ends, step, mc);
     return {std::move(cr), std::move(ci)};
 }
 
