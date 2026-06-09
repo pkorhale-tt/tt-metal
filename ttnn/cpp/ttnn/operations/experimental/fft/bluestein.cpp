@@ -251,8 +251,6 @@ static ttnn::Tensor trim_to_n(
     if (M == N) return t;
 
     const uint32_t n_chunks = N / 1024u;
-    const uint32_t m_chunks = M / 1024u;
-    (void)m_chunks;  // used implicitly via rebank_rm
     const auto mc = t.memory_config();
 
     // (B, M) → (B·m_chunks, 1024).  CB = 8 KB via rebank_rm.

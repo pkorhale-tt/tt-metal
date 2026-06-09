@@ -204,6 +204,7 @@ if bluestein_last_pass[ttnn.bfloat16]:
           f"twiddle = {M*4/(1<<20):.2f} MB")
 
 print()
+print("  Note: Bluestein requires N % 1024 == 0 for large N (rebank_rm path).")
 print("  Gap (no pow-2 path): fp32 N ∈ [2^18, 2^20], bf16 N ∈ [2^19, 2^20]")
 print("  (apply_twiddles_xl uses L1 table for 'medium' N; streaming only for N > 2^20)")
 print("="*70)
