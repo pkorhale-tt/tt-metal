@@ -5,13 +5,18 @@
 //
 // Per-call device dispatch chain (B = 1, length N → length N):
 //
-//   1.  complex_mul(x, chirp_n)              — pre-twiddle, shape (1, N)
-//   2.  pad to (1, M),  trailing zeros       — ttnn::pad
+//   1.  complex_mul(x, chirp_n)              — pre-twiddle, shape (B, N)
+//   2.  pad to (B, M),  trailing zeros       — zero_pad_to_m (rebank) or ttnn::pad
 //   3.  fft (forward, length M)              — ttnn::experimental::fft
-//   4.  complex_mul(A, B)                    — convolution multiply, (1, M)
+//   4.  complex_mul(A, B)                    — convolution multiply, (B, M)
 //   5.  ifft (length M)                      — ttnn::experimental::ifft
-//   6.  slice [:, :N]                        — ttnn::slice
-//   7.  complex_mul(c, chirp_k)              — post-twiddle, shape (1, N)
+//   6.  extract first N elements             — trim_to_n (rebank) or ttnn::slice
+//   7.  complex_mul(c, chirp_k)              — post-twiddle, shape (B, N)
+//
+// Steps 2 and 6 switch to rebank_rm-based helpers (zero_pad_to_m / trim_to_n)
+// when the output row exceeds 64 KB and N%1024==0.  This avoids ttnn::pad's
+// 16× async CB and ttnn::slice's 32× CB, both of which overflow the 1.5 MB
+// L1 for M ≥ 131072 (fp32).
 //
 // Step 3 / 5 each lower to either the SingleTileStockham factory
 // (M ≤ 1024) or fft_two_pass (1024 < M ≤ 1M).  Chirp_n, chirp_k, and
@@ -189,6 +194,84 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
     return {std::move(cr), std::move(ci)};
 }
 
+// zero_pad_to_m: zero-pad (B, N) → (B, M) without using ttnn::pad.
+//
+// ttnn::pad allocates CB = 16 × output_stick_size, which overflows L1 for
+// M > ~22 K elements (fp32).  This helper avoids the problem by rebanding to
+// (B·N/1024, 1024), appending a (B·(M-N)/1024, 1024) zeros block, and
+// reshaping back — the maximum CB per step is ~1 MB.
+//
+// PRECONDITION: N % 1024 == 0, M % 1024 == 0, M > N.
+static ttnn::Tensor zero_pad_to_m(
+    const ttnn::Tensor& t, uint32_t M)
+{
+    const auto& s       = t.padded_shape();
+    const uint32_t B    = static_cast<uint32_t>(s[0]);
+    const uint32_t N    = static_cast<uint32_t>(s[-1]);
+
+    const uint32_t n_chunks   = N / 1024u;
+    const uint32_t pad_chunks = M / 1024u - n_chunks;
+
+    auto*      dev = t.device();
+    TT_FATAL(dev != nullptr, "zero_pad_to_m: tensor has no device.");
+    const auto mc = t.memory_config();
+
+    // (B, N) → (B·n_chunks, 1024).  CB = 8 KB via rebank_rm.
+    auto flat_n = ttnn::prim::rebank_rm(t, 1024u);
+
+    // (B·pad_chunks, 1024) zeros.
+    auto zeros_pad = ttnn::zeros(
+        ttnn::Shape{ttnn::SmallVector<uint32_t>{B * pad_chunks, 1024u}},
+        t.dtype(), t.layout(), std::ref(*dev), mc);
+
+    // Row-concat: (B·M/1024, 1024).  CB = 2 × 4 KB = 8 KB.
+    auto stacked = ttnn::concat({flat_n, zeros_pad}, /*dim=*/0);
+
+    // Reshape back: (B·M/1024, 1024) → (B, M).
+    // Page grows to M × elem_bytes; CB = 2 × M × elem_bytes ≤ 2 × 524 KB = 1 MB.
+    return ttnn::reshape(
+        stacked,
+        ttnn::Shape{ttnn::SmallVector<uint32_t>{B, M}});
+}
+
+// trim_to_n: extract first N elements from (B, M) without ttnn::slice.
+//
+// ttnn::slice on a 2-D RM tensor allocates CB = 32 × 2 × output_row_bytes,
+// which overflows L1 for N > ~22 K elements (fp32).  This helper rebands to
+// (B·M/1024, 1024), takes the first B·N/1024 rows via a row-slice (page =
+// 4 KB), and reshapes back — the maximum CB per step is ~1 MB.
+//
+// PRECONDITION: N % 1024 == 0, M % 1024 == 0, M >= N.
+static ttnn::Tensor trim_to_n(
+    const ttnn::Tensor& t, uint32_t N)
+{
+    const auto& s    = t.padded_shape();
+    const uint32_t B = static_cast<uint32_t>(s[0]);
+    const uint32_t M = static_cast<uint32_t>(s[-1]);
+    if (M == N) return t;
+
+    const uint32_t n_chunks = N / 1024u;
+    const uint32_t m_chunks = M / 1024u;
+    (void)m_chunks;  // used implicitly via rebank_rm
+    const auto mc = t.memory_config();
+
+    // (B, M) → (B·m_chunks, 1024).  CB = 8 KB via rebank_rm.
+    auto flat_m = ttnn::prim::rebank_rm(t, 1024u);
+
+    // Row-slice: keep first B·n_chunks rows.
+    // page = 4 KB → CB = 32 × 2 × 4 KB = 256 KB.
+    const ttnn::SmallVector<uint32_t> beg = {0u, 0u};
+    const ttnn::SmallVector<uint32_t> end = {B * n_chunks, 1024u};
+    const ttnn::SmallVector<uint32_t> stp = {1u, 1u};
+    auto flat_n = ttnn::slice(flat_m, beg, end, stp, mc);
+
+    // Reshape (B·n_chunks, 1024) → (B, N).
+    // Page grows to N × elem_bytes; CB = 2 × N × elem_bytes ≤ ~1 MB.
+    return ttnn::reshape(
+        flat_n,
+        ttnn::Shape{ttnn::SmallVector<uint32_t>{B, N}});
+}
+
 // Build a (1, N) zeros tensor matching `like` for the implicit zero-imag
 // case (Bluestein needs an explicit imag input because the pipeline does
 // a complex_mul as its very first step).
@@ -268,16 +351,29 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     auto [a_re, a_im] = complex_mul_safe(
         input_real, x_imag, plan->chirp_n_re, plan->chirp_n_im);
 
-    // ── Step 2: zero-pad last dim from N to M  (1, N) → (1, M).
-    //   ttnn::pad takes {before, after} per dim; we only append zeros.
-    ttnn::SmallVector<std::array<uint32_t, 2>> padding = {
-        {{0u, 0u}},
-        {{0u, M - N}},
-    };
-    auto a_pad_re = ttnn::pad(a_re, padding, /*value=*/0.0f,
-                              /*use_multicore=*/true, a_re.memory_config());
-    auto a_pad_im = ttnn::pad(a_im, padding, /*value=*/0.0f,
-                              /*use_multicore=*/true, a_im.memory_config());
+    // ── Step 2: zero-pad last dim from N to M  (B, N) → (B, M).
+    //   For large M (output stick > 64 KB) and N%1024==0, ttnn::pad's 16×
+    //   async CB would overflow L1 (~17 × M × elem_bytes > 1.5 MB for
+    //   M ≥ 131072 fp32).  Use the rebank_rm-based helper instead.
+    const uint32_t elem_bytes =
+        (a_re.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    const bool large_m_pad = ((uint64_t)M * elem_bytes > kBluesteinRebankThreshold)
+                             && (N % 1024u == 0u);
+
+    ttnn::Tensor a_pad_re, a_pad_im;
+    if (large_m_pad) {
+        a_pad_re = zero_pad_to_m(a_re, M);
+        a_pad_im = zero_pad_to_m(a_im, M);
+    } else {
+        ttnn::SmallVector<std::array<uint32_t, 2>> padding = {
+            {{0u, 0u}},
+            {{0u, M - N}},
+        };
+        a_pad_re = ttnn::pad(a_re, padding, /*value=*/0.0f,
+                             /*use_multicore=*/true, a_re.memory_config());
+        a_pad_im = ttnn::pad(a_im, padding, /*value=*/0.0f,
+                             /*use_multicore=*/true, a_im.memory_config());
+    }
 
     // ── Step 3: forward FFT_M  ─────────────────────────────────────────
     //   Routes through SingleTileStockham (M ≤ 1024) or fft_two_pass
@@ -292,14 +388,24 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     // ── Step 5: inverse FFT_M  ─────────────────────────────────────────
     auto [c_re, c_im] = ifft(C_re, C_im, precision);
 
-    // ── Step 6: slice first N elements (linear-conv result lives in
-    //   the first N indices — the trailing M-N indices are cyclic-
-    //   wrap-around garbage).
-    ttnn::SmallVector<uint32_t> begins = {0u, 0u};
-    ttnn::SmallVector<uint32_t> ends   = {B,  N};
-    ttnn::SmallVector<uint32_t> step   = {1u, 1u};
-    auto c_re_n = ttnn::slice(c_re, begins, ends, step, c_re.memory_config());
-    auto c_im_n = ttnn::slice(c_im, begins, ends, step, c_im.memory_config());
+    // ── Step 6: extract first N elements from (B, M).
+    //   ttnn::slice on a 2-D RM tensor allocates CB = 32 × 2 × output_row_bytes,
+    //   which overflows L1 for N > ~22 K (fp32).  Use the rebank_rm-based
+    //   helper when N is large and a multiple of 1024.
+    const bool large_n_slice = ((uint64_t)N * elem_bytes > kBluesteinRebankThreshold)
+                               && (N % 1024u == 0u);
+
+    ttnn::Tensor c_re_n, c_im_n;
+    if (large_n_slice) {
+        c_re_n = trim_to_n(c_re, N);
+        c_im_n = trim_to_n(c_im, N);
+    } else {
+        ttnn::SmallVector<uint32_t> begins = {0u, 0u};
+        ttnn::SmallVector<uint32_t> ends   = {B,  N};
+        ttnn::SmallVector<uint32_t> step   = {1u, 1u};
+        c_re_n = ttnn::slice(c_re, begins, ends, step, c_re.memory_config());
+        c_im_n = ttnn::slice(c_im, begins, ends, step, c_im.memory_config());
+    }
 
     // ── Step 7: post-multiply by chirp_k → final DFT output X[k].
     auto [X_re, X_im] = complex_mul_safe(

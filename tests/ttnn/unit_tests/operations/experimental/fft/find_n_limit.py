@@ -132,21 +132,20 @@ print("-"*70)
 
 # Bluestein limit is determined by the inner FFT length M = next_pow2(2N-1).
 # Same L1 twiddle constraint applies: M × 8 ≤ 1.5 MB (fp32) → M ≤ 2^17 = 131,072.
-# Candidate non-pow-2 values spanning the boundary:
-#   fp32 limit: M ≤ 2^17  →  N ≤ 65,535  (last non-pow2 before 2^16+1)
-#   bf16 limit: M ≤ 2^18  →  N ≤ 131,071
+#
+# The large-N rebank_rm path (zero_pad_to_m / trim_to_n) requires N % 1024 == 0,
+# so candidates are chosen as the largest N divisible by 1024 for each M bucket:
+#
+#   fp32 limit: M = 2^17 = 131,072  →  N = 64,512  (63 × 1024, non-pow-2)
+#   bf16 limit: M = 2^18 = 262,144  →  N = 130,048 (127 × 1024, non-pow-2)
+#   both fail : M = 2^19 = 524,288  →  N = 261,120 (expected OOM)
 bluestein_candidates = [
-    # Well below fp32 limit (M = 2^17)
-    60_013,    # M = 131,072  (just fits)
-    65_521,    # M = 131,072  (largest prime < 65536 where M still = 2^17)
-    65_535,    # M = 131,072  (2^17: fp32 boundary)
-    # Just above fp32 limit → M jumps to 2^18 = 262,144
-    65_537,    # M = 262,144  fp32: FAIL, bf16: PASS
-    100_003,   # M = 262,144  fp32: FAIL, bf16: PASS
-    131_063,   # M = 262,144  largest non-pow2 where M = 2^18
-    131_071,   # M = 262,144  bf16 boundary
-    # Just above bf16 limit → M jumps to 2^19 = 524,288
-    131_073,   # M = 524,288  both FAIL
+    # M = 2^17 = 131,072  (fp32 twiddle fits: 131072 × 8 = 1.00 MB ≤ 1.5 MB)
+    64_512,    # 63 × 1024 = 64,512  →  M = 131,072  fp32: PASS, bf16: PASS
+    # M = 2^18 = 262,144  (fp32 twiddle exceeds: 262144 × 8 = 2.0 MB > 1.5 MB)
+    130_048,   # 127 × 1024 = 130,048  →  M = 262,144  fp32: FAIL, bf16: PASS
+    # M = 2^19 = 524,288  (both dtypes fail)
+    261_120,   # 255 × 1024 = 261,120  →  M = 524,288  both FAIL
 ]
 
 bluestein_last_pass = {ttnn.float32: None, ttnn.bfloat16: None}
