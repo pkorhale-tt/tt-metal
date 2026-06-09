@@ -34,7 +34,9 @@
 #include "ttnn/distributed/types.hpp"             // MeshDevice
 #include "ttnn/types.hpp"
 
+#include <algorithm>
 #include <array>
+#include <vector>
 
 namespace ttnn::operations::experimental {
 
