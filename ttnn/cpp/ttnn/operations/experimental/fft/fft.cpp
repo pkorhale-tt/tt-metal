@@ -128,26 +128,46 @@ static ttnn::Tensor reshape_or_rebank(
     uint32_t rows,
     uint32_t chunk)
 {
-    (void)rows;  // only chunk matters; rows = N/chunk is implied by rebank_rm output shape.
-    // Always use the DRAM-to-DRAM rebank kernel.
+    const auto& s = t.padded_shape();
+    const uint32_t N = static_cast<uint32_t>(s[-1]);
+    const uint32_t elem_bytes =
+        (t.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    const uint32_t src_page_bytes = N * elem_bytes;
+
+    // Compute B_total = product of all dims except the last.
+    uint32_t B_total = 1u;
+    for (int d = 0; d < static_cast<int>(s.size()) - 1; ++d)
+        B_total *= static_cast<uint32_t>(s[d]);
+
+    // Large-page path: always use rebank_rm to avoid L1 overflow in the
+    // Metal copy CB (CB ≥ src_page_bytes; 64+ KB overflows the twiddle/tile
+    // allocations already present in fft_two_pass).
+    if (src_page_bytes > kRebankThresholdBytes) {
+        return ttnn::prim::rebank_rm(t, chunk);
+    }
+
+    // Small-page, single-row (B_total == 1): use rebank_rm.
     //
-    // Rationale: ttnn::reshape for a 2D page-shrinking operation (fewer but
-    // larger logical rows → more but smaller logical rows) may be treated as
-    // metadata-only when the source tensor was created by ttnn::from_torch or
-    // other allocation paths that produce a single large DRAM page.  In that
-    // case the physical page layout does not change, and subsequent kernels
-    // (e.g. transpose_rm) that rely on page-aligned row boundaries read
-    // garbage — producing zeros in the FFT output.
+    // A 2D→3D metadata reshape of a single-DRAM-page tensor leaves the
+    // physical page_size unchanged.  transpose_rm then reads incorrect row
+    // boundaries (it uses page_size/elem_bytes as row width) → zeros / garbage.
+    // rebank_rm is a true DRAM-to-DRAM copy that sets page_size = chunk*elem_bytes.
     //
-    // rebank_rm always performs a true DRAM-to-DRAM copy that physically
-    // reorganises the data into (rows, chunk)-sized pages.  It requires the
-    // input last-dim to be a power of 2, which is guaranteed here because
-    // fft_two_pass is only invoked by two_pass_eligible() which asserts
-    // is_pow2(N).  CB cost is ≤ 4 KB regardless of N (no L1 overflow risk).
+    // Precondition satisfied: fft_two_pass is only called by two_pass_eligible(),
+    // which asserts is_pow2(N), so rebank_rm's pow-2 last-dim requirement holds.
+    if (B_total == 1u) {
+        return ttnn::prim::rebank_rm(t, chunk);
+    }
+
+    // Small-page, multi-row (B_total > 1): ttnn::reshape is safe.
     //
-    // Output is (rows, chunk) — i.e. (B_total * N1, N2) — with page_size =
-    // chunk * elem_bytes.  The caller then adds a metadata-only batch dim.
-    return ttnn::prim::rebank_rm(t, chunk);
+    // Each batch row is a separate DRAM page (page_size = N*elem_bytes).
+    // The 2D→2D page-shrinking reshape physically splits each row's page
+    // into N/chunk smaller pages of chunk elements — a proper copy that
+    // sets page_size correctly for all B_total rows.
+    // rebank_rm does NOT correctly handle B_total > 1 (it assumes a
+    // single contiguous DRAM page of N elements).
+    return ttnn::reshape(t, make_shape({rows, chunk}));
 }
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
