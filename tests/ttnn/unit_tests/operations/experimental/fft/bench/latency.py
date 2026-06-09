@@ -223,7 +223,7 @@ def main():
 
     args.out.mkdir(parents=True, exist_ok=True)
 
-    if os.environ.get("TT_FFT_NATIVE", "0") != "1":
+    if os.environ.get("TT_FFT_NATIVE", "1") == "0":
         os.environ["TT_FFT_NATIVE"] = "1"
         print("[bench] forcing TT_FFT_NATIVE=1")
 

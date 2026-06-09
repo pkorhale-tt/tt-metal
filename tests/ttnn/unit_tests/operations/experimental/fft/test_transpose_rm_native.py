@@ -13,7 +13,7 @@ import ttnn
 
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("TT_FFT_NATIVE", "0") != "1",
+    os.environ.get("TT_FFT_NATIVE", "1") == "0",
     reason="TT_FFT_NATIVE=1 not set; new ProgramDescriptor path is gated.",
 )
 

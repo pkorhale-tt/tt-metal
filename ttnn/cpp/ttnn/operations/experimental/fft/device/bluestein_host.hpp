@@ -111,13 +111,14 @@ build_chirp(uint32_t N, int sign) {
     return {std::move(r), std::move(im)};
 }
 
-// Build the cyclic b-kernel of length M:
-//   b_cyc[m]      =  exp(+π·i · m² / N)   for m = 0..N-1
-//   b_cyc[M - m]  =  exp(+π·i · m² / N)   for m = 1..N-1   (b is even)
-//   b_cyc[m]      =  0                    for m = N..M-N
+// Build the cyclic b-kernel of length M.
+//   sign = +1 (forward): b_cyc[m] = exp(+π·i · m² / N)
+//   sign = -1 (inverse): b_cyc[m] = exp(-π·i · m² / N)
+//   b_cyc[M - m] = b_cyc[m]  for m = 1..N-1   (b is even)
+//   b_cyc[m] = 0              for m = N..M-N
 inline std::pair<std::vector<float>, std::vector<float>>
-build_b_cyc(uint32_t N, uint32_t M) {
-    auto [b_r, b_i] = build_chirp(N, /*sign=*/+1);
+build_b_cyc(uint32_t N, uint32_t M, int sign = +1) {
+    auto [b_r, b_i] = build_chirp(N, sign);
     std::vector<float> r(M, 0.0f), im(M, 0.0f);
     for (uint32_t m = 0; m < N; ++m) {
         r[m]  = b_r[m];
@@ -183,21 +184,20 @@ inline std::unordered_map<uint64_t, std::shared_ptr<BluesteinPlan>>& cache() {
     return c;
 }
 
-// Hash key: (device-ptr, N, dtype, B).  We include B because chirp / B
-// tensors are stored at the caller's batch shape — complex_mul is
-// shape-strict, so a (1, N) chirp can't be multiplied against a (4, N)
-// activation.  Different B values get their own cache entries; in
-// practice most workloads use a single fixed B so this is fine.
+// Hash key: (device-ptr, N, dtype, B, inverse).  We include B because chirp
+// tensors are shape-strict, and `inverse` because the chirp signs differ.
 inline uint64_t make_key(
     tt::tt_metal::distributed::MeshDevice* md,
     uint32_t N,
     tt::tt_metal::DataType dtype,
-    uint32_t B)
+    uint32_t B,
+    bool inverse = false)
 {
     return reinterpret_cast<uint64_t>(md)
-         ^ (static_cast<uint64_t>(N)              * 0x9E3779B97F4A7C15ull)
-         ^ (static_cast<uint64_t>(dtype)          * 0xBF58476D1CE4E5B9ull)
-         ^ (static_cast<uint64_t>(B)              * 0x94D049BB133111EBull);
+         ^ (static_cast<uint64_t>(N)                       * 0x9E3779B97F4A7C15ull)
+         ^ (static_cast<uint64_t>(dtype)                   * 0xBF58476D1CE4E5B9ull)
+         ^ (static_cast<uint64_t>(B)                       * 0x94D049BB133111EBull)
+         ^ (static_cast<uint64_t>(inverse ? 1u : 0u)       * 0x6C62272E07BB0142ull);
 }
 
 // Get or build the per-(N, dtype, B) Bluestein plan for `device`.
@@ -212,19 +212,25 @@ inline uint64_t make_key(
 //      of the output are identical — that's intentional, they'll be
 //      used to multiply the per-call (B, M) activations row-wise.
 //      Precision matches by construction (same on-device FFT chain).
+// Build a Bluestein plan for `N`, `dtype`, batch `B`, and direction.
+//
+// Forward (inverse=false): chirp[n] = exp(-πi·n²/N), b = exp(+πi·m²/N).
+// Inverse (inverse=true) : chirp[n] = exp(+πi·n²/N), b = exp(-πi·m²/N),
+//   chirp_k pre-scaled by 1/N so the algorithm output is already normalised.
 inline std::shared_ptr<BluesteinPlan> get_or_create(
     tt::tt_metal::distributed::MeshDevice* md,
     uint32_t N,
     tt::tt_metal::DataType dtype,
     uint32_t B = 1u,
     ttnn::operations::experimental::FFTPrecision precision =
-        ttnn::operations::experimental::FFTPrecision::Precise)
+        ttnn::operations::experimental::FFTPrecision::Precise,
+    bool inverse = false)
 {
     TT_FATAL(N >= 2u, "bluestein_host: N must be ≥ 2 (got {}).", N);
     TT_FATAL(B >= 1u, "bluestein_host: B must be ≥ 1 (got {}).", B);
 
     const uint32_t M = bluestein_M(N);
-    const uint64_t key = make_key(md, N, dtype, B);
+    const uint64_t key = make_key(md, N, dtype, B, inverse);
     auto& c = cache();
     auto it = c.find(key);
     if (it != c.end()) return it->second;
@@ -234,35 +240,46 @@ inline std::shared_ptr<BluesteinPlan> get_or_create(
     plan->M = M;
     plan->B = B;
 
-    // ── (1) chirp_n  (sign = -1).  Build host arrays ONCE; chirp_k uses
-    //   the same math so we reuse those vectors.
-    auto [chirp_r, chirp_i] = build_chirp(N, /*sign=*/-1);
+    // Chirp sign convention:
+    //   forward : chirp[n] = exp(-πi·n²/N)  → sign = -1
+    //   inverse : chirp[n] = exp(+πi·n²/N)  → sign = +1
+    const int chirp_sign = inverse ? +1 : -1;
+    const int b_sign     = inverse ? -1 : +1;
 
+    // ── (1) chirp_n
+    auto [chirp_r, chirp_i] = build_chirp(N, chirp_sign);
     plan->chirp_n_re = upload_replicated_rows(chirp_r, B, N, dtype, md);
     plan->chirp_n_im = upload_replicated_rows(chirp_i, B, N, dtype, md);
 
-    // ── (2) chirp_k = chirp_n (same expression).
-    plan->chirp_k_re = upload_replicated_rows(chirp_r, B, N, dtype, md);
-    plan->chirp_k_im = upload_replicated_rows(chirp_i, B, N, dtype, md);
-
-    // ── (3) b_cyc → upload (replicated to B rows) → FFT_M  ⇒  B_fft.
-    ttnn::Tensor b_cyc_re;
-    ttnn::Tensor b_cyc_im;
-    {
-        auto [r, i] = build_b_cyc(N, M);
-        b_cyc_re = upload_replicated_rows(r, B, M, dtype, md);
-        b_cyc_im = upload_replicated_rows(i, B, M, dtype, md);
+    // ── (2) chirp_k.  For inverse, fold the 1/N normalisation into chirp_k
+    //   so the per-call device chain needs no separate scale pass.
+    if (inverse) {
+        const float inv_N = 1.0f / static_cast<float>(N);
+        std::vector<float> ck_r(N), ck_i(N);
+        for (uint32_t n = 0u; n < N; ++n) {
+            ck_r[n] = chirp_r[n] * inv_N;
+            ck_i[n] = chirp_i[n] * inv_N;
+        }
+        plan->chirp_k_re = upload_replicated_rows(ck_r, B, N, dtype, md);
+        plan->chirp_k_im = upload_replicated_rows(ck_i, B, N, dtype, md);
+    } else {
+        plan->chirp_k_re = upload_replicated_rows(chirp_r, B, N, dtype, md);
+        plan->chirp_k_im = upload_replicated_rows(chirp_i, B, N, dtype, md);
     }
 
-    // Run the same device FFT chain we'll use per-call so the B we
-    // multiply against has exactly matching numerics.  For M ≤ 1024
-    // this is the SingleTileStockham path; for 1024 < M ≤ 1M it's
-    // fft_two_pass.  M > 1M not yet supported here (Bluestein for
-    // N > ~500K → M > 1M is the 6e-2 extension via fft_three_pass).
-    auto [B_re, B_im] =
-        ttnn::operations::experimental::fft(b_cyc_re, b_cyc_im, precision);
-    plan->B_re = std::move(B_re);
-    plan->B_im = std::move(B_im);
+    // ── (3) b_cyc → upload → FFT_M  ⇒  B_fft.
+    {
+        auto [r, i] = build_b_cyc(N, M, b_sign);
+        auto b_cyc_re = upload_replicated_rows(r, B, M, dtype, md);
+        auto b_cyc_im = upload_replicated_rows(i, B, M, dtype, md);
+        // fft() routes through SingleTileStockham / fft_two_pass / fft_three_pass_auto
+        // depending on M.  The inverse flag does NOT apply here — we always
+        // need the forward FFT of the b_cyc kernel regardless of direction.
+        auto [B_re, B_im] =
+            ttnn::operations::experimental::fft(b_cyc_re, b_cyc_im, precision);
+        plan->B_re = std::move(B_re);
+        plan->B_im = std::move(B_im);
+    }
 
     c.emplace(key, plan);
     return plan;

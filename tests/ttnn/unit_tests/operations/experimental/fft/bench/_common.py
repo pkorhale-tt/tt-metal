@@ -176,7 +176,7 @@ def gflops(N: int, B: int, latency_us: float) -> float:
 
 # ─── device setup ──────────────────────────────────────────────────────
 def open_device(device_id: int = 0, trace_region: int = 2 * 1024 * 1024):
-    if os.environ.get("TT_FFT_NATIVE", "0") != "1":
+    if os.environ.get("TT_FFT_NATIVE", "1") == "0":
         os.environ["TT_FFT_NATIVE"] = "1"
         print("[bench] forcing TT_FFT_NATIVE=1")
     return ttnn.open_device(device_id=device_id, trace_region_size=trace_region)

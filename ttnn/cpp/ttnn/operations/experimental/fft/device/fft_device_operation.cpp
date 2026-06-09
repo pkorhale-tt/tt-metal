@@ -16,13 +16,13 @@ constexpr bool is_pow2(uint32_t n) {
     return n != 0u && (n & (n - 1u)) == 0u;
 }
 
-// Refactor rollout switch — when set to "1", N<=1024 fp32 real-input forward
-// FFTs route through the new SingleTileStockhamFactory (ProgramDescriptor
-// pattern). All other cases continue through the legacy FFTProgramFactory.
-// Default OFF so the existing test suite is untouched while we iterate.
+// New-path rollout switch.  The ProgramDescriptor factories (SingleTile,
+// Batched, RadixPass, …) are now the default.  Set TT_FFT_NATIVE=0 to
+// revert to the legacy FFTProgramFactory for debugging only.
 bool native_path_enabled() {
     const char* v = std::getenv("TT_FFT_NATIVE");
-    return v != nullptr && v[0] == '1' && v[1] == '\0';
+    if (v == nullptr) return true;               // default ON
+    return !(v[0] == '0' && v[1] == '\0');       // OFF only if explicitly "0"
 }
 
 // Pick the right backend for (dtype, N). Mirrors the dispatch table in

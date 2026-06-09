@@ -16,6 +16,9 @@
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/types.hpp"  // ttnn::Shape, ttnn::SmallVector
 
+// Bluestein: included after fft.hpp to avoid circular dependency
+#include "ttnn/operations/experimental/fft/bluestein.hpp"
+
 namespace ttnn::operations::experimental {
 
 namespace {
@@ -75,7 +78,8 @@ namespace {
 
 bool native_path_enabled() {
     const char* v = std::getenv("TT_FFT_NATIVE");
-    return v != nullptr && v[0] == '1' && v[1] == '\0';
+    if (v == nullptr) return true;               // default ON
+    return !(v[0] == '0' && v[1] == '\0');       // OFF only if explicitly "0"
 }
 
 constexpr bool is_pow2(uint32_t n) { return n != 0u && (n & (n - 1u)) == 0u; }
@@ -223,6 +227,20 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     return {std::move(out_r), std::move(out_i)};
 }
 
+// Compute next power-of-2 ≥ v without including bluestein_host.hpp
+// (which would create a circular dependency through fft.hpp).
+constexpr uint32_t next_pow2_local(uint32_t v) {
+    if (v <= 1u) return 1u;
+    --v;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    return ++v;
+}
+
+// Bluestein padded length M = next_pow2(2N - 1).
+constexpr uint32_t bluestein_M_local(uint32_t N) {
+    return next_pow2_local(2u * N - 1u);
+}
+
 bool two_pass_eligible(const ttnn::Tensor& input_real) {
     if (!native_path_enabled()) return false;
     const auto& shape = input_real.padded_shape();
@@ -241,6 +259,36 @@ bool two_pass_eligible(const ttnn::Tensor& input_real) {
     return dtype_ok && layout_ok &&
            is_pow2(N) && N > 1024u && N <= (1u << 20) &&
            is_pow2(B) && B >= 1u;
+}
+
+// Three-pass eligible: pow-2 N in (1M, 1G], any B.
+bool three_pass_eligible(const ttnn::Tensor& t) {
+    if (!native_path_enabled()) return false;
+    const auto& shape = t.padded_shape();
+    if (shape.size() < 1) return false;
+    const uint32_t N = static_cast<uint32_t>(shape[-1]);
+    const auto dt = t.dtype();
+    return (dt == tt::tt_metal::DataType::FLOAT32 ||
+            dt == tt::tt_metal::DataType::BFLOAT16) &&
+           t.layout() == tt::tt_metal::Layout::ROW_MAJOR &&
+           is_pow2(N) && N > (1u << 20) && N <= (1u << 30);
+}
+
+// Bluestein eligible: non-pow-2 N where M = next_pow2(2N-1) ≤ 2^30.
+// Covers N up to ~715M for the XL range once three-pass inner FFTs are
+// available.
+bool bluestein_eligible(const ttnn::Tensor& t) {
+    if (!native_path_enabled()) return false;
+    const auto& shape = t.padded_shape();
+    if (shape.size() < 1) return false;
+    const uint32_t N = static_cast<uint32_t>(shape[-1]);
+    if (is_pow2(N)) return false;      // pow-2 handled by stockham / pass paths
+    const uint32_t M = bluestein_M_local(N);
+    const auto dt = t.dtype();
+    return (dt == tt::tt_metal::DataType::FLOAT32 ||
+            dt == tt::tt_metal::DataType::BFLOAT16) &&
+           t.layout() == tt::tt_metal::Layout::ROW_MAJOR &&
+           M <= (1u << 30);
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -369,6 +417,81 @@ std::tuple<uint32_t, uint32_t, uint32_t> pick_three_factorization(uint32_t N) {
 }
 
 }  // namespace
+
+// ── Three-pass auto-reshape wrapper (P2) ─────────────────────────────────
+// Makes large pow-2 FFTs transparent: caller passes (B, N) and gets (B, N)
+// back, matching the cuFFT API contract.  Internally we pre-shape the input
+// to (B·N1·N2, N3) (a free ROW_MAJOR view) before calling fft_three_pass,
+// then flatten the (B·N3, N2, N1) factored output back to (B, N).
+//
+// Both reshapes are zero-copy for ROW_MAJOR contiguous tensors.
+static std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass_auto(
+    const ttnn::Tensor& input_real,
+    std::optional<ttnn::Tensor> input_imag,
+    FFTPrecision precision,
+    bool inverse)
+{
+    const auto& shape = input_real.padded_shape();
+    const uint32_t N  = static_cast<uint32_t>(shape[-1]);
+    uint32_t B = 1u;
+    for (int d = 0; d < static_cast<int>(shape.size()) - 1; ++d)
+        B *= static_cast<uint32_t>(shape[d]);
+
+    const auto [N1, N2, N3] = pick_three_factorization(N);
+
+    // Pre-shape: (B, N) → (B·N1·N2, N3)  [free view]
+    const uint32_t rows = B * N1 * N2;
+    auto re_pre = ttnn::reshape(input_real, make_shape({rows, N3}));
+    std::optional<ttnn::Tensor> im_pre;
+    if (input_imag.has_value())
+        im_pre = ttnn::reshape(*input_imag, make_shape({rows, N3}));
+
+    auto [out_re, out_im] = fft_three_pass(re_pre, im_pre, N, precision, inverse);
+
+    // fft_three_pass output is (B·N3, N2, N1) — flatten to (B, N)
+    auto out_re_flat = ttnn::reshape(out_re, make_shape({B, N}));
+    auto out_im_flat = ttnn::reshape(out_im, make_shape({B, N}));
+    return {std::move(out_re_flat), std::move(out_im_flat)};
+}
+
+// ── Bluestein batch-dim flatten helper ───────────────────────────────────
+// bluestein_fft expects 2-D (B, N).  Flatten multi-dim inputs before call.
+static std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_dispatch(
+    const ttnn::Tensor& input_real,
+    std::optional<ttnn::Tensor> input_imag,
+    FFTPrecision precision,
+    bool inverse)
+{
+    const auto& shape = input_real.padded_shape();
+    const uint32_t N  = static_cast<uint32_t>(shape[-1]);
+    uint32_t B = 1u;
+    for (int d = 0; d < static_cast<int>(shape.size()) - 1; ++d)
+        B *= static_cast<uint32_t>(shape[d]);
+
+    // Flatten to (B, N) if needed
+    auto re_2d = (shape.size() == 2u)
+        ? input_real
+        : ttnn::reshape(input_real, make_shape({B, N}));
+    std::optional<ttnn::Tensor> im_2d;
+    if (input_imag.has_value())
+        im_2d = (shape.size() == 2u)
+            ? *input_imag
+            : ttnn::reshape(*input_imag, make_shape({B, N}));
+
+    auto [out_re, out_im] = bluestein_fft(re_2d, im_2d, N, precision, inverse);
+
+    // Restore original leading dims if they were multi-dim
+    if (shape.size() != 2u) {
+        ttnn::SmallVector<uint32_t> orig_dims;
+        for (int d = 0; d < static_cast<int>(shape.size()) - 1; ++d)
+            orig_dims.push_back(static_cast<uint32_t>(shape[d]));
+        orig_dims.push_back(N);
+        ttnn::Shape orig_shape{orig_dims};
+        out_re = ttnn::reshape(out_re, orig_shape);
+        out_im = ttnn::reshape(out_im, orig_shape);
+    }
+    return {std::move(out_re), std::move(out_im)};
+}
 
 // ────────────────────────────────────────────────────────────────────
 // Public entrypoint — caller-visible.  Input is REQUIRED to be pre-
@@ -545,17 +668,19 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     const ttnn::Tensor& input_real, FFTPrecision precision) {
-    // Routing (TT_FFT_NATIVE=1):
-    //   N ≤ 1024            → SingleTileStockhamFactory  (via prim::fft)
-    //   1024 < N ≤ 2^20     → fft_two_pass               (commit 3/4)
-    //   N > 2^20            → caller MUST invoke fft_three_pass
-    //                         explicitly with pre-shaped input
-    //                         (until commit 7 adds rebank kernel)
-    //   N > 2^30            → falls through to prim::fft (will TT_FATAL)
-    if (two_pass_eligible(input_real)) {
-        return fft_two_pass(input_real, /*input_imag=*/std::nullopt, precision,
-                            /*inverse=*/false);
-    }
+    // Unified cuFFT-style router — any N, any dtype, no env var needed.
+    //
+    //   N ≤ 1024,  pow-2           → prim::fft  → SingleTile/BatchedStockham
+    //   1024 < N ≤ 2^20, pow-2     → fft_two_pass   (3 transposes + 2 passes)
+    //   2^20 < N ≤ 2^30, pow-2     → fft_three_pass_auto (auto-reshape)
+    //   non-pow-2, M ≤ 2^30        → bluestein_dispatch (7-op device chain)
+    if (two_pass_eligible(input_real))
+        return fft_two_pass(input_real, /*input_imag=*/std::nullopt, precision, false);
+    if (three_pass_eligible(input_real))
+        return fft_three_pass_auto(input_real, /*input_imag=*/std::nullopt, precision, false);
+    if (bluestein_eligible(input_real))
+        return bluestein_dispatch(input_real, /*input_imag=*/std::nullopt, precision, false);
+    // N ≤ 1024 pow-2 (or unsupported N > 2^30): delegate to prim::fft.
     return ttnn::prim::fft(input_real, /*inverse=*/false,
                            /*input_imag=*/std::nullopt, precision);
 }
@@ -564,15 +689,13 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     const ttnn::Tensor& input_real,
     const ttnn::Tensor& input_imag,
     FFTPrecision precision) {
-    // Same routing as the real-input overload, but the complex-input
-    // path is now plumbed through the two-pass composite when N falls
-    // in its range (added commit 6a — required for Bluestein's
-    // intermediate complex pipeline).  Small-N still goes through
-    // prim::fft which has had complex-input support since commit 0.
-    if (two_pass_eligible(input_real)) {
-        return fft_two_pass(input_real, input_imag, precision,
-                            /*inverse=*/false);
-    }
+    // Complex-input variant — same routing table as the real-input overload.
+    if (two_pass_eligible(input_real))
+        return fft_two_pass(input_real, input_imag, precision, false);
+    if (three_pass_eligible(input_real))
+        return fft_three_pass_auto(input_real, input_imag, precision, false);
+    if (bluestein_eligible(input_real))
+        return bluestein_dispatch(input_real, input_imag, precision, false);
     return ttnn::prim::fft(input_real, /*inverse=*/false, input_imag, precision);
 }
 
@@ -580,21 +703,20 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ifft(
     const ttnn::Tensor& spectrum_real,
     const ttnn::Tensor& spectrum_imag,
     FFTPrecision precision) {
-    // Routing (TT_FFT_NATIVE=1):
-    //   N ≤ 1024            → SingleTileStockhamFactory (prim::fft inverse=true)
-    //   1024 < N ≤ 2^20     → fft_two_pass  with inverse=true (commit 6c)
-    //   N > 2^20            → caller MUST invoke fft_three_pass(inverse=true)
-    //                         explicitly with pre-shaped input
-    //                         (until commit 7 adds rebank kernel)
+    // Inverse routing mirrors fft() with the inverse flag set.
     //
-    // For the two_pass / three_pass paths, the IFFT uses the swap-trick
-    // (see fft_two_pass): forward FFT on swapped (X_im, X_re) with
-    // output_scale=1/N folded into the LAST radix_pass writer, then a
-    // free relabel swap on return.  Zero extra dispatch vs forward FFT.
-    if (two_pass_eligible(spectrum_real)) {
-        return fft_two_pass(spectrum_real, spectrum_imag, precision,
-                            /*inverse=*/true);
-    }
+    // Two-pass / three-pass IFFT: swap-trick (see fft_two_pass comment)
+    //   — forward FFT on conjugated spectrum with 1/N folded into the
+    //   last radix_pass writer.  Zero extra dispatch vs forward FFT.
+    //
+    // Bluestein IFFT: sign-flipped chirps + 1/N folded into chirp_k;
+    //   see bluestein_host.hpp get_or_create(inverse=true).
+    if (two_pass_eligible(spectrum_real))
+        return fft_two_pass(spectrum_real, spectrum_imag, precision, true);
+    if (three_pass_eligible(spectrum_real))
+        return fft_three_pass_auto(spectrum_real, spectrum_imag, precision, true);
+    if (bluestein_eligible(spectrum_real))
+        return bluestein_dispatch(spectrum_real, spectrum_imag, precision, true);
     return ttnn::prim::fft(spectrum_real, /*inverse=*/true,
                            spectrum_imag, precision);
 }

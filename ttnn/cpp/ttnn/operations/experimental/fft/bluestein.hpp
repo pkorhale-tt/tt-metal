@@ -26,16 +26,21 @@
 
 namespace ttnn::operations::experimental {
 
-// Forward Bluestein FFT.  `input_real` is shape (B, N); `input_imag`, if
-// supplied, must match.  Returns (out_real, out_imag) of shape (B, N).
+// Bluestein FFT (forward or inverse).  `input_real` is shape (B, N);
+// `input_imag`, if supplied, must match.  Returns (out_real, out_imag)
+// of shape (B, N).
 //
-// `B` can be any positive integer.  Chirp / B_fft tensors are replicated
-// to (B, ·) on cache miss; subsequent calls with the same (N, dtype, B)
-// hit the cache.
+// `inverse=false` → DFT(x)[k]  = Σ x[n] · exp(-2πi·kn/N)
+// `inverse=true`  → IDFT(X)[n] = (1/N) · Σ X[k] · exp(+2πi·kn/N)
+//
+// Supported N: any N ≥ 2 where M = next_pow2(2N-1) ≤ 2^30.
+//   M ≤ 2^20 : inner FFTs use fft_two_pass  (all on-device).
+//   M ≤ 2^30 : inner FFTs use fft_three_pass (all on-device).
 std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     const ttnn::Tensor& input_real,
     std::optional<ttnn::Tensor> input_imag,
     uint32_t N,
-    FFTPrecision precision = FFTPrecision::Precise);
+    FFTPrecision precision = FFTPrecision::Precise,
+    bool inverse = false);
 
 }  // namespace ttnn::operations::experimental

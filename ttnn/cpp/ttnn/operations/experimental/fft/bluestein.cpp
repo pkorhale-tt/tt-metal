@@ -57,7 +57,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
     const ttnn::Tensor& input_real,
     std::optional<ttnn::Tensor> input_imag,
     uint32_t N,
-    FFTPrecision precision)
+    FFTPrecision precision,
+    bool inverse)
 {
     using namespace ttnn::experimental::prim::bluestein_host;
 
@@ -79,17 +80,12 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
         "bluestein_fft: only Float32 / BFloat16 supported.");
 
     const uint32_t M = bluestein_M(N);
-    TT_FATAL(M <= (1u << 20),
-        "bluestein_fft: padded length M = {} exceeds the fully-device-resident "
-        "cap of 2^20 = 1M (i.e. N ≤ 524_288).  Got N = {}.\n"
-        "  For larger N use the host-glue extended-range wrapper:\n"
-        "    from bluestein_xl import bluestein_fft_xl\n"
-        "    re, im = bluestein_fft_xl(device, x, N={})\n"
-        "  See tests/ttnn/unit_tests/operations/experimental/fft/bluestein_xl.py.\n"
-        "  The wrapper executes the chirp pre/post multiplies + B-multiply on "
-        "the host (torch) and dispatches the two length-M FFTs through "
-        "fft_three_pass on device, supporting M up to 2^30.",
-        M, N, N);
+    // M is capped by fft_three_pass limit (2^30).  Inner fft() / ifft() calls
+    // route automatically through fft_two_pass (M ≤ 2^20) or fft_three_pass
+    // (2^20 < M ≤ 2^30) via the unified router in fft.cpp.
+    TT_FATAL(M <= (1u << 30),
+        "bluestein_fft: padded M = {} > 2^30 is not yet supported (N = {}).",
+        M, N);
 
     if (input_imag.has_value()) {
         TT_FATAL(input_imag->padded_shape() == in_shape &&
@@ -99,13 +95,14 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> bluestein_fft(
             "shape/dtype/layout.");
     }
 
-    // ── Get plan (chirp_n, chirp_k, B_fft) — cached per (device, N, dtype, B).
+    // ── Get plan (chirp_n, chirp_k, B_fft) — cached per (device, N, dtype, B, inverse).
     auto plan = get_or_create(
         input_real.device(),
         N,
         input_real.dtype(),
         B,
-        precision);
+        precision,
+        inverse);
 
     // ── Materialise an explicit zero imag input when omitted ───────────
     //   The first step (complex_mul with chirp_n) requires both halves;
