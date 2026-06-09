@@ -16,7 +16,14 @@ Coverage:
   │ pow-2, 2^20 < N ≤ 2^30          │ fft_three_pass_auto composite      │
   │ non-pow-2, M ≤ 2^20             │ bluestein_dispatch (two-pass inner)│
   │ non-pow-2, 2^20 < M ≤ 2^30      │ bluestein_dispatch (3-pass inner)  │
+  │ non-pow-2 large (N%1024==0)      │ bluestein + rebank_rm helpers      │
   └──────────────────────────────────┴────────────────────────────────────┘
+
+Verified hardware limits on Wormhole B0 (L1 = 1,499,136 B):
+  Pow-2    fp32:  N ≤ 131,072  (2^17)  twiddle = 1.00 MB
+  Pow-2    bf16:  N ≤ 262,144  (2^18)  twiddle = 1.00 MB
+  Bluestein fp32: N ≤  64,512  (63×1024, M=2^17)
+  Bluestein bf16: N ≤ 130,048 (127×1024, M=2^18)
 
 Aggressive (large N) cases are gated behind TT_FFT_AGGRESSIVE=1 to keep
 the default CI run fast.  Run:
@@ -27,6 +34,7 @@ Tolerances:
   fp32 : 5e-4 (two-stage Bluestein can accumulate ≈1e-5 per op)
   bf16 : 5e-2 (two quantisation steps dominate)
   bf16 Bluestein : 1.5e-1 (three cmul + two FFT stages add rounding)
+  large Bluestein fp32: 1e-3, bf16: 1e-1
 """
 
 import os
@@ -285,6 +293,86 @@ def test_bluestein_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 4b. Large Bluestein — verified hardware limits on Wormhole B0
+#
+#  For N%1024==0, bluestein_fft uses:
+#    • shrink_reshape: concat-to-pow2 + rebank_rm + row-trim (CB ≤ 512 KB)
+#    • zero_pad_to_m : ttnn::concat + zeros              (CB ≤ 1 MB)
+#    • trim_to_n     : rebank_rm (M IS pow-2) + row-slice + reshape
+#
+#  Limit is the same L1 twiddle constraint as pow-2:
+#    M × 2 × sizeof(dtype) ≤ 1,499,136 B
+#      fp32: M ≤ 131,072 (2^17) → max N = 64,512 = 63×1024
+#      bf16: M ≤ 262,144 (2^18) → max N = 130,048 = 127×1024
+# ════════════════════════════════════════════════════════════════════════════
+
+# Bluestein N values that are multiples of 1024 (required for the large-N
+# rebank_rm path) and within the hardware twiddle-table limit.
+_BLUESTEIN_LARGE_FP32_BF16 = [
+    # M = 2^17 = 131,072:  fp32 twiddle = 1.00 MB ✓,  bf16 twiddle = 0.50 MB ✓
+    pytest.param(
+        64_512,   # 63 × 1024 — largest non-pow-2 1024-multiple with M=2^17
+        marks=pytest.mark.skipif(not _AGGRESSIVE, reason="TT_FFT_AGGRESSIVE not set"),
+    ),
+]
+_BLUESTEIN_LARGE_BF16_ONLY = [
+    # M = 2^18 = 262,144:  fp32 twiddle = 2.00 MB ✗,  bf16 twiddle = 1.00 MB ✓
+    pytest.param(
+        130_048,  # 127 × 1024 — largest non-pow-2 1024-multiple with M=2^18
+        marks=pytest.mark.skipif(not _AGGRESSIVE, reason="TT_FFT_AGGRESSIVE not set"),
+    ),
+]
+
+
+@pytest.mark.parametrize("N", _BLUESTEIN_LARGE_FP32_BF16)
+@pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", [
+    (ttnn.float32,  torch.float32,  "fp32", 1e-3),
+    (ttnn.bfloat16, torch.bfloat16, "bf16", 1e-1),
+], ids=["fp32", "bf16"])
+def test_bluestein_large_m17(device, N, tt_dtype, torch_dtype, label, tol):
+    """Large Bluestein N=64,512 (M=2^17): fp32 and bf16 both within L1 limit."""
+    torch.manual_seed(N % (1 << 20))
+    x = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
+    ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
+    got = _run_fft(device, x, tt_dtype, N=N, B=1)
+    err = _rel_err(got, ref)
+    assert err < tol, (
+        f"Large Bluestein N={N} {label}: rel_err={err:.2e} > tol={tol:.2e}"
+    )
+
+
+@pytest.mark.parametrize("N", _BLUESTEIN_LARGE_BF16_ONLY)
+def test_bluestein_large_m18_bf16(device, N):
+    """Large Bluestein N=130,048 (M=2^18): bf16-only (fp32 twiddle exceeds L1)."""
+    torch.manual_seed(N % (1 << 20))
+    x = torch.randn(1, N, dtype=torch.float32).to(torch.bfloat16)
+    ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
+    got = _run_fft(device, x, ttnn.bfloat16, N=N, B=1)
+    err = _rel_err(got, ref)
+    assert err < 1e-1, (
+        f"Large Bluestein bf16 N={N}: rel_err={err:.2e} > tol=1e-1"
+    )
+
+
+@pytest.mark.parametrize("N", _BLUESTEIN_LARGE_FP32_BF16)
+def test_bluestein_large_ifft_roundtrip(device, N):
+    """Large Bluestein forward→inverse roundtrip at the fp32 hardware limit."""
+    torch.manual_seed(N % (1 << 20))
+    x = torch.randn(1, N, dtype=torch.float32)
+    tt_x = ttnn.from_torch(x, dtype=ttnn.float32,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    re_fft, im_fft = ttnn.experimental.fft(tt_x)
+    got = _run_ifft(device,
+                    ttnn.to_torch(re_fft).to(torch.float32),
+                    ttnn.to_torch(im_fft).to(torch.float32),
+                    ttnn.float32, N=N)
+    err = _rel_err(got.real, x)
+    assert err < 2e-3, (
+        f"Large Bluestein IFFT roundtrip N={N}: rel_err={err:.2e} > 2e-3"
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 5.  XL Bluestein — non-pow-2, M > 2^20 (three-pass inner FFTs)
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -405,6 +493,10 @@ def test_unified_api_dispatch(device, N, dtype):
     (997,  "bluestein"),    # M = next_pow2(1993) = 2048
     # ── Bluestein: M enters two-pass inner (M=4096) ──
     (1997, "bluestein"),    # M = next_pow2(3993) = 4096
+    # ── Large Bluestein: fp32 hardware limit N=64,512 (M=2^17) (AGGRESSIVE) ──
+    pytest.param(64_512, "bluestein_large_m17",
+                 marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                          reason="TT_FFT_AGGRESSIVE not set")),
     # ── Bluestein: M just above 2^20 → three-pass inner (AGGRESSIVE) ──
     pytest.param(524_289, "bluestein_xl",
                  marks=pytest.mark.skipif(not _AGGRESSIVE,
@@ -412,7 +504,12 @@ def test_unified_api_dispatch(device, N, dtype):
 ], ids=lambda x: f"N={x}" if isinstance(x, int) else x)
 def test_routing_boundaries(device, N, expected_bucket):
     """Each routing boundary N produces a correct DFT via ttnn.experimental.fft."""
-    tol = 5e-4 if N & (N - 1) == 0 else 1e-3  # tighter for pow-2, relaxed for Bluestein
+    if expected_bucket == "bluestein_large_m17":
+        tol = 1e-3   # large Bluestein fp32 limit
+    elif N & (N - 1) == 0:
+        tol = 5e-4   # pow-2 paths
+    else:
+        tol = 1e-3   # standard Bluestein
     torch.manual_seed(N % (1 << 20))
     x = torch.randn(1, N, dtype=torch.float32)
     ref = torch.fft.fft(x.to(torch.complex64), dim=-1)
