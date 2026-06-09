@@ -211,11 +211,13 @@ FFTProgramFactory::cached_program_t FFTProgramFactory::create(
 
 void FFTProgramFactory::override_runtime_arguments(
     cached_program_t&           /*cached_program*/,
-    const FFTParams&            operation_attributes,
-    const FFTTensorArgs&        tensor_args,
-    std::tuple<Tensor, Tensor>& tensor_return_value) {
+    const FFTParams&            /*operation_attributes*/,
+    const FFTTensorArgs&        /*tensor_args*/,
+    std::tuple<Tensor, Tensor>& /*tensor_return_value*/) {
     // This should never be reached — see create() above.
-    create(operation_attributes, tensor_args, tensor_return_value);
+    TT_THROW(
+        "FFTProgramFactory::override_runtime_arguments reached — "
+        "this is a bug (see create() for details).");
 }
 
 }  // namespace ttnn::experimental::prim
