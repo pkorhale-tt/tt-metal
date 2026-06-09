@@ -280,45 +280,15 @@ inline std::shared_ptr<BluesteinPlan> get_or_create(
     // ── (3) b_cyc → upload → FFT_M  ⇒  B_fft.
     {
         auto [r, i] = build_b_cyc(N, M, b_sign);
-
-        // For bf16 with M ≤ 4096: compute B_fft on the host in double
-        // precision instead of using the device bf16 FFT.
-        //
-        // Rationale: in bf16, the butterfly multiplications inside prim::fft
-        // accumulate enough rounding error on the chirp data to fully corrupt
-        // B_fft for certain N values (e.g. N=11 → rel_err ≈ 2.5,
-        // N=97 → rel_err ≈ 3.77e+07 in bf16).  A host-side O(M²) DFT is
-        // fast for M ≤ 4096 (≤ 16M double-precision ops, < 10 ms) and is
-        // computed only once per (N, dtype) plan.
-        if (dtype == tt::tt_metal::DataType::BFLOAT16 && M <= 4096u) {
-            std::vector<float> B_r(M, 0.0f), B_i(M, 0.0f);
-            const double tw = -2.0 * M_PI / static_cast<double>(M);
-            for (uint32_t k = 0u; k < M; ++k) {
-                std::complex<double> s = 0;
-                for (uint32_t n = 0u; n < M; ++n) {
-                    const double angle = tw
-                        * static_cast<double>(k)
-                        * static_cast<double>(n);
-                    s += std::complex<double>(r[n], i[n])
-                       * std::complex<double>(std::cos(angle), std::sin(angle));
-                }
-                B_r[k] = static_cast<float>(s.real());
-                B_i[k] = static_cast<float>(s.imag());
-            }
-            plan->B_re = upload_replicated_rows(B_r, B, M, dtype, md);
-            plan->B_im = upload_replicated_rows(B_i, B, M, dtype, md);
-        } else {
-            // fp32 or large M: use the device FFT chain.
-            // Routes through SingleTileStockham / fft_two_pass / fft_three_pass_auto
-            // depending on M.  The inverse flag does NOT apply here — we always
-            // need the forward FFT of the b_cyc kernel regardless of direction.
-            auto b_cyc_re = upload_replicated_rows(r, B, M, dtype, md);
-            auto b_cyc_im = upload_replicated_rows(i, B, M, dtype, md);
-            auto [B_re, B_im] =
-                ttnn::operations::experimental::fft(b_cyc_re, b_cyc_im, precision);
-            plan->B_re = std::move(B_re);
-            plan->B_im = std::move(B_im);
-        }
+        auto b_cyc_re = upload_replicated_rows(r, B, M, dtype, md);
+        auto b_cyc_im = upload_replicated_rows(i, B, M, dtype, md);
+        // fft() routes through SingleTileStockham / fft_two_pass / fft_three_pass_auto
+        // depending on M.  The inverse flag does NOT apply here — we always
+        // need the forward FFT of the b_cyc kernel regardless of direction.
+        auto [B_re, B_im] =
+            ttnn::operations::experimental::fft(b_cyc_re, b_cyc_im, precision);
+        plan->B_re = std::move(B_re);
+        plan->B_im = std::move(B_im);
     }
 
     c.emplace(key, plan);

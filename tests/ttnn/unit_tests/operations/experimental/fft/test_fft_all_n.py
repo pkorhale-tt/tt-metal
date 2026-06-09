@@ -37,9 +37,9 @@ Tolerances:
   large Bluestein fp32: 1e-3, bf16: 1e-1
 
 Known Bluestein limitations (xfail):
-  bf16, N=11/97: B_fft is now accurate (host double-precision DFT), but the
-    per-call device Stockham FFT (steps 3/5) still accumulates too much error
-    for small M (M=32 / M=256) in bf16 precision.
+  bf16, N=11/97: correlated bf16 rounding errors in the on-device FFTs of
+    b_cyc, a_pad, and c produce catastrophically wrong output for these two
+    specific prime N values.  N=13/31 (same M) are unaffected.
   fp32, N=509: FIXED — bluestein_M now guarantees ≥8 zero-pad elements,
     routing N=509 to M=2048 (fft_two_pass) instead of the problematic M=1024.
 """
@@ -268,19 +268,16 @@ _BLUESTEIN_SMALL = [
 
 # Bluestein accuracy limitations (bf16 only)
 # ─────────────────────────────────────────────
-# For bf16 with small M (M ≤ 256), the device Stockham FFT stages in steps
-# 3 and 5 of the Bluestein algorithm accumulate enough rounding error to
-# make the overall result unusable.  The B_fft plan is now computed on the
-# host in double precision (bluestein_host.hpp), which removes that error
-# source, but the per-call forward FFT (step 3) and inverse FFT (step 5)
-# still run on-device in bf16 for M=32 / M=256:
+# For certain small-N primes in bf16, correlated rounding errors between the
+# on-device bf16 FFTs of b_cyc (plan step) and a_pad / c (per-call steps)
+# accumulate to produce catastrophically wrong output.  These are N-specific,
+# not simply M-size dependent: N=13 (same M=32) and N=31 (same M=64) pass.
 #
-#   N=11 → M=32:  device bf16 FFT of 32-point a_pad accumulates ~0.96
-#                 relative error through 5 butterfly stages.
-#   N=97 → M=256: similarly, 8 butterfly stages in bf16 leave rel_err > 0.15.
+#   N=11 → M=32:  rel_err ≈ 2.5  (bf16 chirp accumulation)
+#   N=97 → M=256: rel_err ≈ 3.77e+07 (phase k²π/97 overflows bf16 precision)
 #
-# fp32 N=509 is now FIXED: bluestein_M forces M=2048 (fft_two_pass),
-# avoiding the problematic M=1024 Stockham kernel.
+# fp32 N=509 is FIXED: bluestein_M now guarantees ≥8 zero-pad elements,
+# forcing N=509 to use M=2048 (fft_two_pass) instead of M=1024 (Stockham).
 _BF16_BLUESTEIN_CHIRP_UNSTABLE = frozenset({11, 97})
 _FP32_BLUESTEIN_UNSTABLE       = frozenset()
 
