@@ -9,13 +9,6 @@
 
 namespace ttnn::experimental::prim {
 
-namespace {
-
-constexpr bool is_pow2_rb(uint32_t n) {
-    return n != 0u && (n & (n - 1u)) == 0u;
-}
-
-}  // namespace
 
 RebankRmDeviceOperation::program_factory_t
 RebankRmDeviceOperation::select_program_factory(
@@ -41,11 +34,11 @@ void RebankRmDeviceOperation::validate_on_program_cache_miss(
         "rebank_rm: input must have >= 2 dims (got {}).", shape.size());
 
     const uint32_t N = static_cast<uint32_t>(shape[-1]);
-    TT_FATAL(is_pow2_rb(chunk) && chunk >= 1u && chunk <= N,
+    TT_FATAL(rebank_is_pow2(chunk) && chunk >= 1u && chunk <= N,
         "rebank_rm: chunk_size must be pow-2 in [1, N={}] (got {}).", N, chunk);
     TT_FATAL(N % chunk == 0u,
         "rebank_rm: N={} must be divisible by chunk_size={}.", N, chunk);
-    TT_FATAL(is_pow2_rb(N),
+    TT_FATAL(rebank_is_pow2(N),
         "rebank_rm: N must be a power of 2 (got {}).", N);
 }
 

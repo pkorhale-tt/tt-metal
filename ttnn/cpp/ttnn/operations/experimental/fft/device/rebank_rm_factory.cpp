@@ -38,10 +38,6 @@ constexpr uint32_t log2u_rb(uint32_t n) {
     return r;
 }
 
-constexpr bool is_pow2_rb(uint32_t n) {
-    return n != 0u && (n & (n - 1u)) == 0u;
-}
-
 }  // namespace
 
 tt::tt_metal::ProgramDescriptor RebankRmFactory::create_descriptor(
@@ -64,7 +60,7 @@ tt::tt_metal::ProgramDescriptor RebankRmFactory::create_descriptor(
     for (int d = 0; d < static_cast<int>(s_x.size()) - 1; ++d)
         B_total *= static_cast<uint32_t>(s_x[d]);
 
-    TT_FATAL(is_pow2_rb(chunk) && chunk >= 1u && chunk <= N,
+    TT_FATAL(rebank_is_pow2(chunk) && chunk >= 1u && chunk <= N,
         "rebank_rm: chunk_size must be pow-2 in [1, N={}] (got {}).", N, chunk);
     TT_FATAL(N % chunk == 0u,
         "rebank_rm: N={} must be divisible by chunk_size={}", N, chunk);
