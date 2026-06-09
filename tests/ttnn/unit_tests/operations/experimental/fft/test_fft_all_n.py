@@ -332,7 +332,10 @@ def test_unified_api_dispatch(device, N, dtype):
     (1024, "stockham"),     # maximum Stockham N
     # ── Two-pass ──
     (2048,        "two_pass"),   # minimum two-pass N (1024*2)
-    (1 << 20,     "two_pass"),   # maximum two-pass N (= 2^20)
+    (65536,       "two_pass"),   # mid-range two-pass
+    pytest.param(1 << 20, "two_pass",
+                 marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                          reason="TT_FFT_AGGRESSIVE not set")),
     # ── Three-pass (AGGRESSIVE) ──
     pytest.param(1 << 21, "three_pass",
                  marks=pytest.mark.skipif(not _AGGRESSIVE,
