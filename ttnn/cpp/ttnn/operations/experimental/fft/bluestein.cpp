@@ -41,8 +41,8 @@ namespace {
 
 // Source-page threshold above which ttnn::reshape allocates a CB equal to the
 // full source row (e.g. (1,131072)→(128,1024) uses 4×1 MB CB → L1 overflow).
-// Matches kRebankThresholdBytes in fft.cpp.
-constexpr uint32_t kRebankThresholdBytes = 64u * 1024u;
+// Matches kRebankThresholdBytes in fft.cpp (kept separate to avoid Unity collision).
+constexpr uint32_t kBluesteinRebankThreshold = 64u * 1024u;
 
 // Page-shrinking reshape helper: (rows_in, cols_in) → (rows_out, cols_out).
 // Uses rebank_rm (DRAM-to-DRAM, tiny CB ≤ 4 KB) when the source page
@@ -54,7 +54,7 @@ static ttnn::Tensor shrink_reshape(
     const uint32_t src_cols = static_cast<uint32_t>(s[-1]);
     const uint32_t elem_bytes =
         (t.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
-    if (src_cols * elem_bytes > kRebankThresholdBytes) {
+    if (src_cols * elem_bytes > kBluesteinRebankThreshold) {
         return ttnn::prim::rebank_rm(t, new_cols);
     }
     uint32_t total = 1u;
