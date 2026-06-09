@@ -80,7 +80,7 @@ static ttnn::Tensor shrink_reshape(
     }
 
     // Large source page: use rebank_rm (DRAM-to-DRAM, CB = 8 KB).
-    if (rebank_is_pow2(src_cols)) {
+    if (ttnn::experimental::prim::rebank_is_pow2(src_cols)) {
         // Already pow-2: direct rebank.
         return ttnn::prim::rebank_rm(t, new_cols);
     }
