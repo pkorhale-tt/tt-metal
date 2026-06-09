@@ -298,6 +298,16 @@ constexpr uint32_t bluestein_M_local(uint32_t N) {
     return next_pow2_local(2u * N - 1u);
 }
 
+// ── L1 twiddle-table limit ───────────────────────────────────────────────────
+// fft_radix_pass (Pass-1 of two-pass) stores the full N1×N2 complex twiddle
+// table in L1: size = N1·N2·2·sizeof(dtype) = N · 2·sizeof(dtype) bytes.
+// Wormhole L1 per core = 1,499,136 B (~1.46 MB).
+//   fp32: N ≤ 1,499,136/8 = 187,392  →  max pow-2 = 2^17 = 131,072
+//   bf16: N ≤ 1,499,136/4 = 374,784  →  max pow-2 = 2^18 = 262,144
+// Measured with find_n_limit.py on WH B0: N=2^17 fp32 PASS, N=2^18 fp32 FAIL.
+constexpr uint32_t kTwoPassMaxFP32 = 1u << 17;  //  131,072
+constexpr uint32_t kTwoPassMaxBF16 = 1u << 18;  //  262,144
+
 bool two_pass_eligible(const ttnn::Tensor& input_real) {
     if (!native_path_enabled()) return false;
     const auto& shape = input_real.padded_shape();
@@ -313,22 +323,32 @@ bool two_pass_eligible(const ttnn::Tensor& input_real) {
         dt == tt::tt_metal::DataType::BFLOAT16;
     const bool layout_ok =
         input_real.layout() == tt::tt_metal::Layout::ROW_MAJOR;
+    // Use dtype-specific L1 limit so the twiddle table always fits.
+    const uint32_t max_n = (dt == tt::tt_metal::DataType::FLOAT32)
+                               ? kTwoPassMaxFP32 : kTwoPassMaxBF16;
     return dtype_ok && layout_ok &&
-           is_pow2(N) && N > 1024u && N <= (1u << 20) &&
+           is_pow2(N) && N > 1024u && N <= max_n &&
            is_pow2(B) && B >= 1u;
 }
 
-// Three-pass eligible: pow-2 N in (1M, 1G], any B.
+// Three-pass eligible: pow-2 N beyond the two-pass L1 limit, up to 1G.
+// Lower bound is dtype-aware to match two_pass_eligible's upper bound:
+//   fp32: N > 2^17  (two-pass L1 overflows at 2^18)
+//   bf16: N > 2^18  (two-pass L1 overflows at 2^19)
 bool three_pass_eligible(const ttnn::Tensor& t) {
     if (!native_path_enabled()) return false;
     const auto& shape = t.padded_shape();
     if (shape.size() < 1) return false;
     const uint32_t N = static_cast<uint32_t>(shape[-1]);
     const auto dt = t.dtype();
-    return (dt == tt::tt_metal::DataType::FLOAT32 ||
-            dt == tt::tt_metal::DataType::BFLOAT16) &&
+    const bool dtype_ok =
+        dt == tt::tt_metal::DataType::FLOAT32 ||
+        dt == tt::tt_metal::DataType::BFLOAT16;
+    const uint32_t min_n = (dt == tt::tt_metal::DataType::FLOAT32)
+                               ? kTwoPassMaxFP32 : kTwoPassMaxBF16;
+    return dtype_ok &&
            t.layout() == tt::tt_metal::Layout::ROW_MAJOR &&
-           is_pow2(N) && N > (1u << 20) && N <= (1u << 30);
+           is_pow2(N) && N > min_n && N <= (1u << 30);
 }
 
 // Bluestein eligible: non-pow-2 N where M = next_pow2(2N-1) ≤ 2^30.
