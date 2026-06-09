@@ -179,7 +179,7 @@ void run_backend_fft(
 }  // namespace
 
 FFTProgramFactory::cached_program_t FFTProgramFactory::create(
-    const FFTParams&            operation_attributes,
+    const FFTParams&            /*operation_attributes*/,
     const FFTTensorArgs&        tensor_args,
     std::tuple<Tensor, Tensor>& /*tensor_return_value*/) {
 
