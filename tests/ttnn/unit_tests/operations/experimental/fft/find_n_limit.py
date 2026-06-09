@@ -5,9 +5,18 @@
 find_n_limit.py — Determines the maximum supported FFT length on this WH device.
 
 Measures:
-  1. Maximum pow-2 N (fp32 and bf16) via three-pass auto-route
-  2. Maximum non-pow-2 N (Bluestein XL) via bluestein_dispatch
+  1. Maximum pow-2 N (fp32 and bf16) via fft_two_pass / fft_three_pass_auto
+  2. Maximum non-pow-2 N (Bluestein, fp32 and bf16) via bluestein_dispatch
   3. Peak verified DRAM usage at the limit
+
+WH B0 L1 twiddle-table constraint (measured):
+  fft_radix_pass / apply_twiddles_xl store N × 2 × sizeof(dtype) bytes in L1.
+  Wormhole L1 per core = 1,499,136 B (~1.46 MB).
+    fp32 : N × 8 ≤ 1,499,136  →  max pow-2 = 2^17 = 131,072
+    bf16 : N × 4 ≤ 1,499,136  →  max pow-2 = 2^18 = 262,144
+  For Bluestein: inner FFT has length M = next_pow2(2N-1), same limit applies.
+    fp32 : M ≤ 2^17  →  N ≤ 65,535   (2N-1 ≤ 131,071)
+    bf16 : M ≤ 2^18  →  N ≤ 131,071  (2N-1 ≤ 262,143)
 
 Run from the tt-metal root:
     python tests/ttnn/unit_tests/operations/experimental/fft/find_n_limit.py
@@ -96,90 +105,108 @@ for N in pow2_candidates:
 
     fp32_str = f"{fp32_err:.2e}" if math.isfinite(fp32_err) else "  OOM/ERR"
     bf16_str = f"{bf16_err:.2e}" if math.isfinite(bf16_err) else "  OOM/ERR"
-    status = "PASS" if (fp32_ok and bf16_ok) else ("fp32-only" if fp32_ok else "FAIL/OOM")
+    if fp32_ok and bf16_ok:
+        status = "PASS"
+    elif bf16_ok:
+        status = "bf16-only"   # fp32 twiddle overflows but bf16 fits
+    elif fp32_ok:
+        status = "fp32-only"
+    else:
+        status = "FAIL/OOM"
 
     print(f"{N:>15,}  {log2N:>6}  {input_mb:>10.1f}M  {fp32_str:>10}  {bf16_str:>10}  {status}")
     sys.stdout.flush()
 
-    # Stop after both fail (OOM reached)
+    # Stop after both fail (OOM reached for both dtypes)
     if not fp32_ok and not bf16_ok:
         print("  → OOM boundary reached, stopping.")
         break
 
-# ── Section 2: non-pow-2 Bluestein limit ─────────────────────────────────────
+# ── Section 2: non-pow-2 Bluestein limit (fp32 and bf16) ─────────────────────
 
 print("\n" + "="*70)
-print("  NON-POW-2 N LIMIT  (Bluestein, fp32 only)")
+print("  NON-POW-2 N LIMIT  (Bluestein, fp32 and bf16)")
 print("="*70)
-print(f"{'N':>15}  {'M=nxp2(2N-1)':>14}  {'log2M':>6}  {'DRAM input':>12}  {'fp32 err':>10}  {'status'}")
+print(f"{'N':>15}  {'M=nxp2(2N-1)':>14}  {'log2M':>6}  {'fp32 err':>10}  {'bf16 err':>10}  {'status'}")
 print("-"*70)
 
-# Candidate non-pow-2 values: primes / composites near each doubling boundary
+# Bluestein limit is determined by the inner FFT length M = next_pow2(2N-1).
+# Same L1 twiddle constraint applies: M × 8 ≤ 1.5 MB (fp32) → M ≤ 2^17 = 131,072.
+# Candidate non-pow-2 values spanning the boundary:
+#   fp32 limit: M ≤ 2^17  →  N ≤ 65,535  (last non-pow2 before 2^16+1)
+#   bf16 limit: M ≤ 2^18  →  N ≤ 131,071
 bluestein_candidates = [
-    # M in range (2^17, 2^18)  → two-pass inner
-    100_003,
-    # M in range (2^18, 2^19)
-    200_003,
-    # M up to 2^20 inner FFT boundary
-    500_009,
-    # XL Bluestein: M just above 2^20
-    524_289,
-    600_000,
-    1_000_003,
-    # M in (2^21, 2^22)
-    2_000_003,
-    # M in (2^22, 2^23)
-    4_000_037,
-    # M in (2^23, 2^24)
-    8_000_011,
-    # M in (2^24, 2^25)
-    16_000_057,
-    # M in (2^25, 2^26)
-    32_000_011,
-    # M in (2^26, 2^27)
-    64_000_037,
+    # Well below fp32 limit (M = 2^17)
+    60_013,    # M = 131,072  (just fits)
+    65_521,    # M = 131,072  (largest prime < 65536 where M still = 2^17)
+    65_535,    # M = 131,072  (2^17: fp32 boundary)
+    # Just above fp32 limit → M jumps to 2^18 = 262,144
+    65_537,    # M = 262,144  fp32: FAIL, bf16: PASS
+    100_003,   # M = 262,144  fp32: FAIL, bf16: PASS
+    131_063,   # M = 262,144  largest non-pow2 where M = 2^18
+    131_071,   # M = 262,144  bf16 boundary
+    # Just above bf16 limit → M jumps to 2^19 = 524,288
+    131_073,   # M = 524,288  both FAIL
 ]
 
-bluestein_last_pass = None
-TOL_BLUESTEIN = 1e-3  # fp32, multi-stage accumulation
+bluestein_last_pass = {ttnn.float32: None, ttnn.bfloat16: None}
+TOL_BLUESTEIN_FP32 = 1e-3
+TOL_BLUESTEIN_BF16 = 5e-2
 
 for N in bluestein_candidates:
     M = _bluestein_M(N)
     log2M = math.log2(M)
-    input_mb = N * 4 / (1 << 20)
-    err = _run_fft(N, ttnn.float32, torch.float32)
-    ok = math.isfinite(err) and err < TOL_BLUESTEIN
-    if ok:
-        bluestein_last_pass = N
-    err_str = f"{err:.2e}" if math.isfinite(err) else "  OOM/ERR"
-    status = "PASS" if ok else "FAIL/OOM"
-    print(f"{N:>15,}  {M:>14,}  {log2M:>6.1f}  {input_mb:>10.1f}M  {err_str:>10}  {status}")
+    errs = {}
+    for tt_dtype, tol in [(ttnn.float32, TOL_BLUESTEIN_FP32),
+                          (ttnn.bfloat16, TOL_BLUESTEIN_BF16)]:
+        err = _run_fft(N, tt_dtype, torch_dtypes[tt_dtype])
+        errs[tt_dtype] = err
+        if math.isfinite(err) and err < tol:
+            bluestein_last_pass[tt_dtype] = N
+
+    fp32_err, bf16_err = errs[ttnn.float32], errs[ttnn.bfloat16]
+    fp32_ok = math.isfinite(fp32_err) and fp32_err < TOL_BLUESTEIN_FP32
+    bf16_ok  = math.isfinite(bf16_err) and bf16_err < TOL_BLUESTEIN_BF16
+    fp32_str = f"{fp32_err:.2e}" if math.isfinite(fp32_err) else "  OOM/ERR"
+    bf16_str  = f"{bf16_err:.2e}"  if math.isfinite(bf16_err)  else "  OOM/ERR"
+    status = "PASS" if (fp32_ok and bf16_ok) else (
+             "bf16-only" if bf16_ok else "FAIL/OOM")
+    print(f"{N:>15,}  {M:>14,}  {log2M:>6.1f}  {fp32_str:>10}  {bf16_str:>10}  {status}")
     sys.stdout.flush()
-    if not ok:
-        print("  → limit reached, stopping.")
-        break
 
 # ── Summary for paper ─────────────────────────────────────────────────────────
 
 print("\n" + "="*70)
-print("  SUMMARY — Verified N limits on this WH device")
+print("  SUMMARY — Verified N limits on this WH B0 device")
 print("="*70)
+print("  Constraint: L1 twiddle table = N × 2 × sizeof(dtype) ≤ 1,499,136 B")
+print()
 
 if pow2_last_pass[ttnn.float32]:
     N = pow2_last_pass[ttnn.float32]
     dram = N * 4 / (1 << 20)
-    print(f"  Pow-2  fp32 :  N = {N:,}  (2^{int(math.log2(N))})   input = {dram:.0f} MB")
+    print(f"  Pow-2  fp32 :  N = {N:>9,}  (2^{int(math.log2(N)):2d})  "
+          f"twiddle = {N*8/(1<<20):.2f} MB   input = {dram:.2f} MB")
 if pow2_last_pass[ttnn.bfloat16]:
     N = pow2_last_pass[ttnn.bfloat16]
     dram = N * 2 / (1 << 20)
-    print(f"  Pow-2  bf16 :  N = {N:,}  (2^{int(math.log2(N))})   input = {dram:.0f} MB")
-if bluestein_last_pass:
-    N = bluestein_last_pass
+    print(f"  Pow-2  bf16 :  N = {N:>9,}  (2^{int(math.log2(N)):2d})  "
+          f"twiddle = {N*4/(1<<20):.2f} MB   input = {dram:.2f} MB")
+print()
+if bluestein_last_pass[ttnn.float32]:
+    N = bluestein_last_pass[ttnn.float32]
     M = _bluestein_M(N)
-    dram_in = N * 4 / (1 << 20)
-    dram_m  = M * 4 / (1 << 20)
-    print(f"  Non-pow-2 fp32 :  N = {N:,}   M = {M:,}  (2^{math.log2(M):.1f})   input = {dram_in:.0f} MB  padded = {dram_m:.0f} MB")
+    print(f"  Bluestein fp32 :  N = {N:>9,}   M = {M:,}  (2^{math.log2(M):.0f})  "
+          f"twiddle = {M*8/(1<<20):.2f} MB")
+if bluestein_last_pass[ttnn.bfloat16]:
+    N = bluestein_last_pass[ttnn.bfloat16]
+    M = _bluestein_M(N)
+    print(f"  Bluestein bf16 :  N = {N:>9,}   M = {M:,}  (2^{math.log2(M):.0f})  "
+          f"twiddle = {M*4/(1<<20):.2f} MB")
 
+print()
+print("  Gap (no pow-2 path): fp32 N ∈ [2^18, 2^20], bf16 N ∈ [2^19, 2^20]")
+print("  (apply_twiddles_xl uses L1 table for 'medium' N; streaming only for N > 2^20)")
 print("="*70)
 
 ttnn.close_device(device)
