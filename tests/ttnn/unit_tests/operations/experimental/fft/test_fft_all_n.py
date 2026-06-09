@@ -670,3 +670,56 @@ def test_metal_trace(device, N):
 
     err = _rel_err(got, ref)
     assert err < 1e-6, f"Metal Trace N={N}: result differs from baseline: rel_err={err:.2e}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 13. bf16 prime sweep — characterise all primes in the Stockham range
+#
+# For non-pow-2 N in bf16, Bluestein's algorithm runs the inner FFTs on the
+# Stockham kernel (M ≤ 1024).  Certain primes (e.g. N=11, N=97) suffer
+# catastrophic rounding error due to worst-case chirp-phase cancellation.
+#
+# This sweep tests every prime 3 ≤ N ≤ 503  (bluestein_M(N) ≤ 1024)
+# to identify the complete set of unstable primes on this hardware.
+#
+# Run:
+#   TT_FFT_PRIME_SWEEP=1 pytest test_fft_all_n.py \
+#       -k test_bluestein_bf16_prime_sweep -v --tb=no -q
+#
+# Primes that FAIL will show up as FAILED (not xfailed) unless they are
+# already in _BF16_BLUESTEIN_CHIRP_UNSTABLE.  Add any newly found primes
+# to that frozenset.
+# ════════════════════════════════════════════════════════════════════════════
+
+_PRIME_SWEEP_ENABLED = os.environ.get("TT_FFT_PRIME_SWEEP", "0") == "1"
+
+
+def _sieve(limit: int):
+    """Return all primes ≤ limit via Sieve of Eratosthenes."""
+    is_p = [True] * (limit + 1)
+    is_p[0] = is_p[1] = False
+    for i in range(2, int(limit**0.5) + 1):
+        if is_p[i]:
+            for j in range(i * i, limit + 1, i):
+                is_p[j] = False
+    return [i for i in range(2, limit + 1) if is_p[i]]
+
+
+# All primes 3..503 whose bluestein_M(N) ≤ 1024 (SingleTileStockham range).
+# N=509 is excluded: bluestein_M(509)=2048 after the zero-pad fix.
+_PRIMES_BF16_SWEEP = [p for p in _sieve(503) if p >= 3]
+
+
+@pytest.mark.skipif(not _PRIME_SWEEP_ENABLED, reason="TT_FFT_PRIME_SWEEP not set")
+@pytest.mark.parametrize("N", _PRIMES_BF16_SWEEP)
+def test_bluestein_bf16_prime_sweep(device, N):
+    """bf16 Bluestein accuracy for every prime 3 ≤ N ≤ 503 (M ≤ 1024)."""
+    if N in _BF16_BLUESTEIN_CHIRP_UNSTABLE:
+        pytest.xfail(f"bf16 Bluestein N={N}: known chirp-phase bf16 instability.")
+    torch.manual_seed(N)
+    x = torch.randn(1, N, dtype=torch.float32).to(torch.bfloat16)
+    ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
+    got = _run_fft(device, x, ttnn.bfloat16, N=N, B=1)
+    tol = 1.5e-1  # same as _DTYPES_BLUESTEIN bf16 Bluestein tolerance
+    assert _rel_err(got, ref) < tol, \
+        f"Prime sweep N={N} bf16: rel_err={_rel_err(got, ref):.2e} > tol={tol:.2e}"
