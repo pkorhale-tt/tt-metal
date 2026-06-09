@@ -199,28 +199,30 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
         inverse ? (1.0f / static_cast<float>(N)) : 1.0f;
 
     // ── Step 1: reshape input (B, N) → (B*N1, N2) then view as (B, N1, N2).
-    //   When the source page is large (N > ~64 K for fp32) the reshape is a
-    //   page-size-splitting copy that overflows L1.  reshape_or_rebank
-    //   transparently substitutes a DRAM-to-DRAM rebank_rm in that case.
-    //   Output of rebank_rm is already (B*N1, N2); we view it as (B, N1, N2).
-    const uint32_t elem_bytes_tp =
-        (src_real.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
-    const uint32_t src_page_tp = N * elem_bytes_tp;
-
+    //
+    //   ALWAYS go through reshape_or_rebank (not a direct 2D→3D reshape).
+    //
+    //   Rationale: ttnn::reshape((B, N) → (B, N1, N2)) is a 2D→3D
+    //   page-shrinking operation.  For small N this may be treated as a
+    //   metadata-only view, leaving the DRAM buffer with the original
+    //   large page_size.  transpose_rm then reads the wrong row boundaries
+    //   (it uses page_size / elem_bytes as the row width), producing
+    //   garbage output and ultimately zeros after the FFT.
+    //
+    //   reshape_or_rebank always produces a proper 2D (B*N1, N2) tensor
+    //   with the physically-correct page_size = N2 * elem_bytes (either
+    //   via rebank_rm for large pages or via a 2D ttnn::reshape for small
+    //   pages — a 2D→2D reshape is well-tested and always copies correctly).
+    //   The subsequent 2D→3D ttnn::reshape((B*N1, N2) → (B, N1, N2)) is
+    //   then truly metadata-only (page_size unchanged), safe to do.
     std::optional<ttnn::Tensor> x_3d_i;
     ttnn::Tensor x_3d_r;
-    if (src_page_tp > kRebankThresholdBytes) {
-        // rebank_rm produces (B*N1, N2); view as (B, N1, N2) is free.
-        x_3d_r = ttnn::reshape(reshape_or_rebank(src_real, B * N1, N2),
+    // reshape_or_rebank produces (B*N1, N2) with correct page_size.
+    x_3d_r = ttnn::reshape(reshape_or_rebank(src_real, B * N1, N2),
+                           make_shape({B, N1, N2}));
+    if (has_imag)
+        x_3d_i = ttnn::reshape(reshape_or_rebank(*src_imag, B * N1, N2),
                                make_shape({B, N1, N2}));
-        if (has_imag)
-            x_3d_i = ttnn::reshape(reshape_or_rebank(*src_imag, B * N1, N2),
-                                   make_shape({B, N1, N2}));
-    } else {
-        x_3d_r = ttnn::reshape(src_real, make_shape({B, N1, N2}));
-        if (has_imag)
-            x_3d_i = ttnn::reshape(*src_imag, make_shape({B, N1, N2}));
-    }
 
     // ── Step 2: initial transpose (B, N1, N2) → (B, N2, N1).
     //   So that Pass-1 (FFT_N1) sees stride-N1 sub-samples as
