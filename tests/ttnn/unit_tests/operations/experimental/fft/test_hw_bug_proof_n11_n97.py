@@ -411,3 +411,217 @@ def test_level0_full_vs_step3(device, N, M):
         print("              → May be JIT cache / seed dependent; retry with cleared cache.")
 
     pytest.xfail(reason=f"bf16 N={N} known hardware anomaly candidate")
+
+
+# ---------------------------------------------------------------------------
+# Helpers for step-by-step tests
+# ---------------------------------------------------------------------------
+
+def _upload(device, t: torch.Tensor):
+    """Upload a bfloat16 torch tensor to the device as a ttnn tensor."""
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16,
+                           layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+
+def _download(tt) -> torch.Tensor:
+    """Download a ttnn tensor back to a float32 torch tensor."""
+    return ttnn.to_torch(tt).to(torch.float32)
+
+
+def _numpy_cmul(ar, ai, br, bi):
+    """Element-wise complex multiply in fp64 (reference)."""
+    return ar * br - ai * bi, ar * bi + ai * br
+
+
+def _numpy_fft(re, im):
+    x = torch.complex(re.float(), im.float())
+    X = torch.fft.fft(x, dim=-1)
+    return X.real, X.imag
+
+
+def _numpy_ifft(re, im):
+    x = torch.complex(re.float(), im.float())
+    y = torch.fft.ifft(x, dim=-1)
+    return y.real, y.imag
+
+
+def _rel_err_tensors(got_r, got_i, ref_r, ref_i) -> float:
+    got = torch.complex(got_r.float(), got_i.float())
+    ref = torch.complex(ref_r.float(), ref_i.float())
+    return float((got - ref).abs().norm() / ref.abs().norm().clamp_min(1e-30))
+
+
+# ---------------------------------------------------------------------------
+# Test: Step-by-step Bluestein chain isolation
+#
+# Runs each of the 7 Bluestein steps individually on device using Python-
+# accessible ttnn ops, comparing each intermediate result against numpy.
+# The FIRST step whose output diverges is the one containing the bug.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("N,M", [(7, 32), (11, 32), (97, 256), (101, 256)])
+def test_stepwise_bluestein_chain(device, N, M):
+    """
+    Manually execute each Bluestein step using ttnn Python ops and compare
+    every intermediate result against the numpy reference.
+
+    Steps:
+      1. a = x * chirp_n           (ttnn.experimental.complex_mul)
+      2. a_pad = pad(a, M)         (torch.nn.functional.pad on CPU → upload)
+      3. A = FFT(a_pad)            (ttnn.experimental.fft)
+      4. C = A * B_fft             (ttnn.experimental.complex_mul)
+      5. c = IFFT(C)               (ttnn.experimental.ifft)
+      6. c_n = c[:N]               (slice on CPU → download)
+      7. X = c_n * chirp_k         (ttnn.experimental.complex_mul)
+
+    A mismatch at step K while step K-1 is correct pins the bug to step K.
+    """
+    print(f"\n{'='*65}")
+    print(f"  Step-by-step Bluestein chain: N={N}  M={M}  dtype=bf16")
+    print(f"{'='*65}")
+
+    # ── Host data ────────────────────────────────────────────────────────
+    torch.manual_seed(N)
+    x_f32  = torch.randn(N, dtype=torch.float32)
+    x_bf16 = x_f32.to(torch.bfloat16)
+
+    chirp_re_list, chirp_im_list = _build_chirp_n_bf16(N, sign=-1)
+    chirp_r = torch.tensor(chirp_re_list, dtype=torch.bfloat16).unsqueeze(0)  # (1, N)
+    chirp_i = torch.tensor(chirp_im_list, dtype=torch.bfloat16).unsqueeze(0)
+
+    b_cyc_r, b_cyc_i = _build_b_cyc_bf16(N, M)  # (1, M) bf16
+
+    # Reference numpy B_fft (host fp64)
+    B_ref_r, B_ref_i = _numpy_fft(b_cyc_r.float(), b_cyc_i.float())
+
+    # ── Step 1: a = x * chirp_n ─────────────────────────────────────────
+    x_r_tt = _upload(device, x_bf16.unsqueeze(0))       # (1, N)
+    x_i_tt = _upload(device, torch.zeros(1, N, dtype=torch.bfloat16))
+    c_r_tt = _upload(device, chirp_r)
+    c_i_tt = _upload(device, chirp_i)
+
+    a_r_tt, a_i_tt = ttnn.experimental.complex_mul(x_r_tt, x_i_tt, c_r_tt, c_i_tt)
+    a_r = _download(a_r_tt).squeeze(0)  # (N,)
+    a_i = _download(a_i_tt).squeeze(0)
+
+    ref_a_r = x_f32 * torch.tensor(chirp_re_list)   # fp32 reference
+    ref_a_i = x_f32 * torch.tensor(chirp_im_list)
+    err1 = _rel_err_tensors(a_r.unsqueeze(0), a_i.unsqueeze(0),
+                            ref_a_r.unsqueeze(0), ref_a_i.unsqueeze(0))
+    print(f"  Step 1 (chirp pre-mul)  rel_err = {err1:.3e}  "
+          f"{'FAIL <<<' if err1 > 0.1 else 'ok'}")
+
+    # ── Step 2: a_pad = zero-pad a to M ─────────────────────────────────
+    # Pad is done on CPU (using the device output as base)
+    a_r_full = torch.zeros(1, M, dtype=torch.float32)
+    a_i_full = torch.zeros(1, M, dtype=torch.float32)
+    a_r_full[0, :N] = a_r
+    a_i_full[0, :N] = a_i
+    a_pad_r = a_r_full.to(torch.bfloat16)
+    a_pad_i = a_i_full.to(torch.bfloat16)
+
+    ref_a_pad_r = torch.zeros(1, M)
+    ref_a_pad_i = torch.zeros(1, M)
+    ref_a_pad_r[0, :N] = ref_a_r
+    ref_a_pad_i[0, :N] = ref_a_i
+    err2 = _rel_err_tensors(a_pad_r, a_pad_i, ref_a_pad_r, ref_a_pad_i)
+    print(f"  Step 2 (zero-pad)       rel_err = {err2:.3e}  "
+          f"{'FAIL <<<' if err2 > 0.1 else 'ok'}")
+
+    # ── Step 3: A = FFT(a_pad) ───────────────────────────────────────────
+    A_r_tt, A_i_tt = _device_fft(device, a_pad_r, a_pad_i)   # (M,) float32
+    ref_A_r, ref_A_i = _numpy_fft(ref_a_pad_r, ref_a_pad_i)
+    A_r_tt_2d = A_r_tt.unsqueeze(0); A_i_tt_2d = A_i_tt.unsqueeze(0)
+    err3 = _rel_err_tensors(A_r_tt_2d, A_i_tt_2d, ref_A_r, ref_A_i)
+    print(f"  Step 3 (FFT a_pad)      rel_err = {err3:.3e}  "
+          f"{'FAIL <<<' if err3 > 0.1 else 'ok'}")
+
+    # ── Step 4: C = A * B_fft ────────────────────────────────────────────
+    # Compute B_fft on device (fresh, not from Bluestein cache)
+    B_r_tt_2d, B_i_tt_2d = _device_fft(device, b_cyc_r, b_cyc_i)   # (M,) float32
+    B_r_tt_2d = B_r_tt_2d.unsqueeze(0); B_i_tt_2d = B_i_tt_2d.unsqueeze(0)
+
+    # Upload A and B to device for complex_mul
+    A_r_dev = _upload(device, A_r_tt_2d.to(torch.bfloat16))
+    A_i_dev = _upload(device, A_i_tt_2d.to(torch.bfloat16))
+    B_r_dev = _upload(device, B_r_tt_2d.to(torch.bfloat16))
+    B_i_dev = _upload(device, B_i_tt_2d.to(torch.bfloat16))
+
+    C_r_tt, C_i_tt = ttnn.experimental.complex_mul(A_r_dev, A_i_dev,
+                                                    B_r_dev, B_i_dev)
+    C_r = _download(C_r_tt)  # (1, M)
+    C_i = _download(C_i_tt)
+
+    ref_C_r, ref_C_i = _numpy_cmul(ref_A_r, ref_A_i, B_ref_r, B_ref_i)
+    err4 = _rel_err_tensors(C_r, C_i, ref_C_r, ref_C_i)
+    print(f"  Step 4 (A * B_fft)      rel_err = {err4:.3e}  "
+          f"{'FAIL <<<' if err4 > 0.1 else 'ok'}")
+
+    # ── Step 5: c = IFFT(C) ──────────────────────────────────────────────
+    C_r_bf16 = C_r.to(torch.bfloat16)
+    C_i_bf16 = C_i.to(torch.bfloat16)
+    C_r_dev = _upload(device, C_r_bf16)
+    C_i_dev = _upload(device, C_i_bf16)
+
+    c_r_tt, c_i_tt = ttnn.experimental.ifft(C_r_dev, C_i_dev)
+    c_r = _download(c_r_tt)  # (1, M)
+    c_i = _download(c_i_tt)
+
+    ref_c_r, ref_c_i = _numpy_ifft(ref_C_r, ref_C_i)
+    err5 = _rel_err_tensors(c_r, c_i, ref_c_r, ref_c_i)
+    print(f"  Step 5 (IFFT)           rel_err = {err5:.3e}  "
+          f"{'FAIL <<<' if err5 > 0.1 else 'ok'}")
+
+    # ── Step 6+7: slice + chirp_k post-mul ──────────────────────────────
+    c_r_n = c_r[0, :N].unsqueeze(0)  # (1, N) - slice on CPU
+    c_i_n = c_i[0, :N].unsqueeze(0)
+    c_r_n_bf16 = c_r_n.to(torch.bfloat16)
+    c_i_n_bf16 = c_i_n.to(torch.bfloat16)
+
+    c_r_dev = _upload(device, c_r_n_bf16)
+    c_i_dev = _upload(device, c_i_n_bf16)
+    ck_r_dev = _upload(device, chirp_r)
+    ck_i_dev = _upload(device, chirp_i)
+
+    X_r_tt, X_i_tt = ttnn.experimental.complex_mul(c_r_dev, c_i_dev,
+                                                    ck_r_dev, ck_i_dev)
+    X_r = _download(X_r_tt)  # (1, N)
+    X_i = _download(X_i_tt)
+
+    ref_full = torch.fft.fft(x_f32.to(torch.complex64))
+    ref_X_r  = ref_full.real.unsqueeze(0)
+    ref_X_i  = ref_full.imag.unsqueeze(0)
+    err67 = _rel_err_tensors(X_r, X_i, ref_X_r, ref_X_i)
+    print(f"  Steps 6+7 (slice+post)  rel_err = {err67:.3e}  "
+          f"{'FAIL <<<' if err67 > 0.15 else 'ok'}")
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    print()
+    first_fail = None
+    for step, err, tol, name in [
+        (1, err1,  0.1,  "chirp pre-mul"),
+        (2, err2,  0.1,  "zero-pad"),
+        (3, err3,  0.1,  "FFT(a_pad)"),
+        (4, err4,  0.1,  "A*B_fft cmul"),
+        (5, err5,  0.1,  "IFFT"),
+        (67, err67, 0.15, "slice+post-mul"),
+    ]:
+        if err > tol and first_fail is None:
+            first_fail = (step, name, err)
+
+    if first_fail:
+        s, nm, e = first_fail
+        print(f"  FIRST FAILURE: Step {s} ({nm})  rel_err={e:.3e}")
+        print(f"  All steps BEFORE step {s} are CORRECT.")
+        print(f"  Bug is in ttnn.experimental.{'ifft' if s==5 else 'complex_mul' if s in (1,4,67) else 'fft/pad'}.")
+    else:
+        print(f"  ALL steps PASS — stepwise chain is correct.")
+        print(f"  The full Bluestein failure must come from TENSOR ALIASING")
+        print(f"  between the CACHED plan->B_re and a freshly allocated tensor.")
+        print(f"  Key evidence: this test uses a FRESH B_fft (not cached).")
+        print(f"  → Try: does replacing plan->B_re with a fresh computation fix it?")
+
+    print()
+    # Don't assert — this is diagnostic only
+    if N in (11, 97):
+        pytest.xfail(reason=f"bf16 N={N} orchestration bug under investigation")
