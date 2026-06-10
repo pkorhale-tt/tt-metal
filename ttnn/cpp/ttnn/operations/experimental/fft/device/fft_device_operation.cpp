@@ -156,11 +156,22 @@ FFTDeviceOperation::tensor_return_value_t FFTDeviceOperation::create_output_tens
 tt::stl::hash::hash_t FFTDeviceOperation::compute_program_hash(
     const operation_attributes_t& attrs, const tensor_args_t& args) {
     const auto& shape = args.input_real.padded_shape();
+    // Include has_value() so that a real-only call (SingleTileStockhamFactory,
+    // index 0) and a complex call (BatchedStockhamFactory, index 1) for the
+    // same shape/dtype never share a cache entry.  Without this bit, a
+    // real-only N=32 bf16 test that runs first caches factory_index=0; the
+    // Bluestein b_cyc FFT (complex, same shape) then gets a cache HIT and
+    // blindly uses SingleTileStockhamFactory::create_descriptor, which
+    // hard-codes zscratch (all-zeros) as the imaginary input regardless of
+    // tensor_args.input_imag — corrupting plan->B_re for every subsequent
+    // Bluestein call.  FftRadixPassDeviceOperation has the same fix; see that
+    // file's comment for the full rationale.
     return tt::tt_metal::operation::hash_operation<FFTDeviceOperation>(
         attrs,
         args.input_real.dtype(),
         args.input_real.memory_config(),
-        shape);
+        shape,
+        args.input_imag.has_value());
 }
 
 }  // namespace ttnn::experimental::prim

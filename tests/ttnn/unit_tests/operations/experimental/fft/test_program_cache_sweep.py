@@ -222,6 +222,52 @@ def test_cache_fft_single_tile(device, N, dtype):
     _assert_cache_hit(device, f"fft-N{N}-{dtype}", fn)
 
 
+# ─── 6b. fft — real-only vs complex MUST produce DISTINCT cache entries ──
+# Root-cause of the bf16 Bluestein N=11/N=97 failures:
+#   real-only (1,32) bf16  → SingleTileStockhamFactory  (factory_index=0)
+#   complex   (1,32) bf16  → BatchedStockhamFactory     (factory_index=1)
+#
+# Without `input_imag.has_value()` in compute_program_hash both calls share
+# the same hash.  The complex call gets a cache HIT, blindly reuses factory
+# index 0, and SingleTileStockhamFactory::create_descriptor hard-codes
+# zscratch (zeros) as the imaginary input — silently computing
+# FFT(b_cyc_re + i·0) instead of FFT(b_cyc_re + i·b_cyc_im).
+# plan->B_re / B_im are then wrong for every Bluestein call at that N.
+@pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
+                         ids=["fp32", "bf16"])
+def test_cache_fft_real_vs_complex_distinct(device, dtype):
+    """Real-only and complex FFT of the same shape must not share a cache entry.
+
+    The test calls real-only first (warms up SingleTileStockhamFactory),
+    then calls complex and asserts the entry count increases by ≥1 — i.e.
+    the complex call is a cache MISS, not a collision HIT on the real entry.
+    """
+    torch.manual_seed(42)
+    N = 32
+    xr = torch.randn(1, N, dtype=torch.float32)
+    xi = torch.randn(1, N, dtype=torch.float32)
+
+    # Warm up real-only entry.
+    ttnn.experimental.fft(_rm(xr, device, dtype))
+    n_after_real = device.num_program_cache_entries()
+
+    # Complex call must be a MISS (new entry) — not a collision HIT.
+    ttnn.experimental.fft(_rm(xr, device, dtype), _rm(xi, device, dtype))
+    n_after_complex = device.num_program_cache_entries()
+
+    assert n_after_complex > n_after_real, (
+        f"[fft-real-vs-complex-{dtype}] real-only and complex (1,{N}) "
+        f"{dtype} FFT share a program cache entry — compute_program_hash "
+        "is missing input_imag.has_value(). "
+        f"Cache entries before complex call: {n_after_real}, after: {n_after_complex}."
+    )
+
+    # Now repeat the complex call — must HIT its own entry.
+    _assert_cache_hit(device, f"fft-complex-N{N}-{dtype}",
+                      lambda: ttnn.experimental.fft(
+                          _rm(xr, device, dtype), _rm(xi, device, dtype)))
+
+
 # ─── 7. fft_two_pass (N > 1024) ─────────────────────────────────────────
 @pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16],
                          ids=["fp32", "bf16"])

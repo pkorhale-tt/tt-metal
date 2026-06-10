@@ -268,6 +268,23 @@ void handle_mesh_adapter_cache_hit(
 
     auto& cached_program_factory = program_cache.get(program_hash);
     auto program_factory_index = cached_program_factory.program_factory_index;
+
+    // Debug-mode safety check: verify the cache entry was built by the same
+    // factory variant the current call would select.  A mismatch means two
+    // semantically-different programs share a hash — i.e. compute_program_hash
+    // is missing a discriminating parameter.  Classic symptom: a real-only FFT
+    // caches factory_index=0 (SingleTile); a complex FFT with the same shape
+    // then gets a cache HIT and silently uses the wrong factory.
+    TT_ASSERT(
+        program_factory_index ==
+            mesh_device_operation_t::select_program_factory(operation_attributes, tensor_args).index(),
+        "Program cache factory-index mismatch for op '{}': cached index {} != "
+        "current call would select {}. Add the discriminating field to "
+        "compute_program_hash().",
+        detail::get_operation_name<mesh_device_operation_t>(operation_attributes),
+        program_factory_index,
+        mesh_device_operation_t::select_program_factory(operation_attributes, tensor_args).index());
+
     auto program_factory = map_index_to_variant(
         program_factory_index, mesh_device_operation_t::select_program_factory(operation_attributes, tensor_args));
 

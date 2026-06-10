@@ -266,32 +266,11 @@ _BLUESTEIN_SMALL = [
     33, 63, 65, 128, 129, 255,
 ]
 
-# Bluestein accuracy limitations (bf16 only)
-# ─────────────────────────────────────────────
-# For certain small-N primes in bf16, correlated rounding errors between the
-# on-device bf16 FFTs of b_cyc (plan step) and a_pad / c (per-call steps)
-# accumulate to produce catastrophically wrong output.  These are N-specific,
-# not simply M-size dependent: N=13 (same M=32) and N=31 (same M=64) pass.
-#
-#   N=11 → M=32:  rel_err ≈ 2.5  (bf16 chirp accumulation)
-#   N=97 → M=256: rel_err ≈ 3.77e+07 (phase k²π/97 overflows bf16 precision)
-#
-# fp32 N=509 is FIXED: bluestein_M now guarantees ≥8 zero-pad elements,
-# forcing N=509 to use M=2048 (fft_two_pass) instead of M=1024 (Stockham).
-_BF16_BLUESTEIN_CHIRP_UNSTABLE = frozenset({11, 97})
-_FP32_BLUESTEIN_UNSTABLE       = frozenset()
-
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES_BLUESTEIN,
                          ids=[d[2] for d in _DTYPES_BLUESTEIN])
 @pytest.mark.parametrize("N", _BLUESTEIN_SMALL)
 def test_bluestein_fft_small(device, N, tt_dtype, torch_dtype, label, tol):
     """Bluestein non-pow-2 N with M ≤ 2^20 via ttnn.experimental.fft."""
-    if tt_dtype == ttnn.bfloat16 and N in _BF16_BLUESTEIN_CHIRP_UNSTABLE:
-        pytest.xfail(
-            f"bf16 Bluestein N={N}: device bf16 FFT in steps 3/5 accumulates "
-            "too much error for small M; B_fft is now accurate (host DFT) but "
-            "per-call Stockham FFT still limits accuracy."
-        )
     torch.manual_seed(N)
     x = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
     ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
@@ -305,11 +284,6 @@ def test_bluestein_fft_small(device, N, tt_dtype, torch_dtype, label, tol):
 @pytest.mark.parametrize("N", [7, 97, 383, 997])
 def test_bluestein_ifft_roundtrip(device, N, tt_dtype, torch_dtype, label, tol):
     """Bluestein forward → inverse roundtrip via unified API."""
-    if tt_dtype == ttnn.bfloat16 and N in _BF16_BLUESTEIN_CHIRP_UNSTABLE:
-        pytest.xfail(
-            f"bf16 Bluestein N={N}: device bf16 FFT accumulates too much "
-            "error for small M; roundtrip also affected."
-        )
     torch.manual_seed(N)
     x = torch.randn(1, N, dtype=torch.float32).to(torch_dtype)
     ref = x.to(torch.float32)
@@ -686,9 +660,10 @@ def test_metal_trace(device, N):
 #   TT_FFT_PRIME_SWEEP=1 pytest test_fft_all_n.py \
 #       -k test_bluestein_bf16_prime_sweep -v --tb=no -q
 #
-# Primes that FAIL will show up as FAILED (not xfailed) unless they are
-# already in _BF16_BLUESTEIN_CHIRP_UNSTABLE.  Add any newly found primes
-# to that frozenset.
+# All N values now pass: the root cause (program-cache collision between
+# real-only SingleTileStockhamFactory and complex BatchedStockhamFactory for
+# the same shape) is fixed by including input_imag.has_value() in
+# FFTDeviceOperation::compute_program_hash.
 # ════════════════════════════════════════════════════════════════════════════
 
 _PRIME_SWEEP_ENABLED = os.environ.get("TT_FFT_PRIME_SWEEP", "0") == "1"
@@ -714,8 +689,6 @@ _PRIMES_BF16_SWEEP = [p for p in _sieve(503) if p >= 3]
 @pytest.mark.parametrize("N", _PRIMES_BF16_SWEEP)
 def test_bluestein_bf16_prime_sweep(device, N):
     """bf16 Bluestein accuracy for every prime 3 ≤ N ≤ 503 (M ≤ 1024)."""
-    if N in _BF16_BLUESTEIN_CHIRP_UNSTABLE:
-        pytest.xfail(f"bf16 Bluestein N={N}: known chirp-phase bf16 instability.")
     torch.manual_seed(N)
     x = torch.randn(1, N, dtype=torch.float32).to(torch.bfloat16)
     ref = torch.fft.fft(x.to(torch.float32).to(torch.complex64), dim=-1)
