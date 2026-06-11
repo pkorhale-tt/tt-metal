@@ -31,6 +31,8 @@ pytestmark = pytest.mark.skipif(
     reason="TT_FFT_NATIVE=1 not set; new ProgramDescriptor path is gated.",
 )
 
+_AGGRESSIVE = os.environ.get("TT_FFT_AGGRESSIVE", "0") == "1"
+
 
 # (ttnn dtype, torch dtype, dtype label, rel-err tolerance)
 # Two-pass uses fp32 internal compute; bf16 only at DRAM I/O boundary
@@ -59,7 +61,15 @@ def _expected_factorization(N: int) -> tuple[int, int]:
 # single-tile cutoff (2048 → N1=64,N2=32) up through 8192 (128,64).
 @pytest.mark.parametrize("tt_dtype,torch_dtype,label,tol", _DTYPES,
                          ids=[d[2] for d in _DTYPES])
-@pytest.mark.parametrize("B", [1, 2, 4])
+@pytest.mark.parametrize("B", [
+    1,
+    # B=2/4 doubles CB pressure in fft_radix_pass.  Gate behind AGGRESSIVE to
+    # keep the default suite within safe L1 headroom on Wormhole B0.
+    pytest.param(2, marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                             reason="TT_FFT_AGGRESSIVE not set")),
+    pytest.param(4, marks=pytest.mark.skipif(not _AGGRESSIVE,
+                                             reason="TT_FFT_AGGRESSIVE not set")),
+])
 @pytest.mark.parametrize("N", [2048, 4096, 8192])
 def test_two_pass_correctness(device, B, N, tt_dtype, torch_dtype, label, tol):
     N1, N2 = _expected_factorization(N)

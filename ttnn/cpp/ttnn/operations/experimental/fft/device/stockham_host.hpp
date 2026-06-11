@@ -115,6 +115,10 @@ struct BatchFFTPlan {
     std::vector<float> out_r_host, out_i_host;
 
     bool initialized = false;
+
+    // Per-instance fingerprint: address of the heap-allocated MeshCommandQueue.
+    // Detects MeshDevice pointer reuse across pytest function-scoped fixtures.
+    uint64_t cq_fingerprint = 0u;
 };
 
 inline std::pair<uint32_t, uint32_t> pick_batch_grid(uint32_t num_cores, uint32_t grid_x) {
@@ -331,10 +335,16 @@ inline std::shared_ptr<BatchFFTPlan> get_cached_batch_plan(
     std::shared_ptr<MeshDevice> md, uint32_t sub_N, uint32_t batch)
 {
     const uint64_t key = detail::batch_plan_key(md.get(), sub_N, batch);
+    // Per-instance fingerprint detects device-pointer reuse across test fixtures.
+    const uint64_t fp  = reinterpret_cast<uint64_t>(&(md->mesh_command_queue()));
     auto& cache = detail::batch_plan_cache();
     auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) {
+        if (it->second->cq_fingerprint == fp) return it->second;
+        cache.erase(it);   // stale entry: same ptr, different device instance
+    }
     auto bp = make_batch_plan(md, sub_N, batch);
+    bp->cq_fingerprint = fp;
     cache.emplace(key, bp);
     return bp;
 }

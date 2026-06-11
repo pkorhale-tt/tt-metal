@@ -63,6 +63,9 @@ using MeshBufferPtr_rp = std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>;
 struct ZeroScratch_rp {
     MeshBufferPtr_rp buf;
     uint32_t B = 0;
+    // Per-instance fingerprint: address of the heap-allocated MeshCommandQueue.
+    // Detects MeshDevice pointer reuse across pytest function-scoped fixtures.
+    uint64_t cq_fingerprint = 0u;
 };
 
 inline std::unordered_map<uint64_t, std::shared_ptr<ZeroScratch_rp>>&
@@ -88,12 +91,17 @@ std::shared_ptr<ZeroScratch_rp> get_or_create_zero_scratch_rp(
 {
     using namespace tt::tt_metal::distributed;
     const uint64_t key = zero_key_rp(md.get(), dtype, B);
+    const uint64_t fp  = reinterpret_cast<uint64_t>(&(md->mesh_command_queue()));
     auto& cache = zero_scratch_cache_rp();
     auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) {
+        if (it->second->cq_fingerprint == fp) return it->second;
+        cache.erase(it);   // stale entry: same ptr, different device instance
+    }
 
     auto z = std::make_shared<ZeroScratch_rp>();
     z->B = B;
+    z->cq_fingerprint = fp;
     MeshCommandQueue& cq = md->mesh_command_queue();
 
     if (dtype == tt::tt_metal::DataType::BFLOAT16) {

@@ -66,9 +66,16 @@ using MeshBufferPtr = std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>;
 
 struct ZeroScratch {
     MeshBufferPtr buf;
+    // Per-instance fingerprint: address of the heap-allocated MeshCommandQueue
+    // object inside this device.  Two MeshDevice instances at the same heap
+    // address will always have different MeshCommandQueue addresses because the
+    // command queue is itself heap-allocated (unique_ptr member of MeshDeviceImpl).
+    // This lets us detect address reuse across pytest function-scoped fixtures
+    // without modifying the TT-Metal framework.
+    uint64_t cq_fingerprint = 0u;
 };
 
-// Keyed by (device, dtype) — fp32 and bf16 zero tiles differ in size.
+// Keyed by (device ptr, dtype) — fp32 and bf16 zero tiles differ in size.
 inline std::unordered_map<uint64_t, std::shared_ptr<ZeroScratch>>&
 zero_scratch_cache() {
     static std::unordered_map<uint64_t, std::shared_ptr<ZeroScratch>> c;
@@ -89,11 +96,17 @@ std::shared_ptr<ZeroScratch> get_or_create_zero_scratch(
 {
     using namespace tt::tt_metal::distributed;
     const uint64_t key = zero_scratch_key(md.get(), dtype);
+    // Per-instance fingerprint detects device-pointer reuse across test fixtures.
+    const uint64_t fp  = reinterpret_cast<uint64_t>(&(md->mesh_command_queue()));
     auto& cache = zero_scratch_cache();
     auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) {
+        if (it->second->cq_fingerprint == fp) return it->second;
+        cache.erase(it);   // stale entry: same ptr, different device instance
+    }
 
     auto z = std::make_shared<ZeroScratch>();
+    z->cq_fingerprint = fp;
     MeshCommandQueue& cq = md->mesh_command_queue();
 
     if (dtype == tt::tt_metal::DataType::BFLOAT16) {

@@ -42,6 +42,9 @@ struct TwiddlePlan {
     uint32_t N2 = 0;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> tw_r_buf;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> tw_i_buf;
+    // Per-instance fingerprint: address of the heap-allocated MeshCommandQueue.
+    // Detects MeshDevice pointer reuse across pytest function-scoped fixtures.
+    uint64_t cq_fingerprint = 0u;
 };
 
 // Build T[n2, k1] = (cos, sin) for n2 ∈ [0, N2), k1 ∈ [0, N1).
@@ -90,13 +93,19 @@ inline std::shared_ptr<TwiddlePlan> get_or_create(
     using namespace tt::tt_metal::distributed;
 
     const uint64_t key = make_key(md.get(), N1, N2);
+    // Per-instance fingerprint detects device-pointer reuse across test fixtures.
+    const uint64_t fp  = reinterpret_cast<uint64_t>(&(md->mesh_command_queue()));
     auto& c = cache();
     auto it = c.find(key);
-    if (it != c.end()) return it->second;
+    if (it != c.end()) {
+        if (it->second->cq_fingerprint == fp) return it->second;
+        c.erase(it);   // stale entry: same ptr, different device instance
+    }
 
     auto plan = std::make_shared<TwiddlePlan>();
     plan->N1 = N1;
     plan->N2 = N2;
+    plan->cq_fingerprint = fp;
 
     const uint32_t bytes = N2 * kTileBytesFp32_at;
     plan->tw_r_buf = fft_example::make_mesh_buf(md, bytes, kTileBytesFp32_at);
