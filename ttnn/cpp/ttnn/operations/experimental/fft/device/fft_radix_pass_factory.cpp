@@ -63,9 +63,10 @@ using MeshBufferPtr_rp = std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>;
 struct ZeroScratch_rp {
     MeshBufferPtr_rp buf;
     uint32_t B = 0;
-    // Per-instance fingerprint: address of the heap-allocated MeshCommandQueue.
-    // Detects MeshDevice pointer reuse across pytest function-scoped fixtures.
-    uint64_t cq_fingerprint = 0u;
+    // Weak reference to the owning device.  lock() returns nullptr once the
+    // device is fully destroyed, correctly detecting stale entries even when
+    // the heap allocator reuses the same raw MeshDevice* address.
+    std::weak_ptr<tt::tt_metal::distributed::MeshDevice> device_weak;
 };
 
 inline std::unordered_map<uint64_t, std::shared_ptr<ZeroScratch_rp>>&
@@ -91,17 +92,16 @@ std::shared_ptr<ZeroScratch_rp> get_or_create_zero_scratch_rp(
 {
     using namespace tt::tt_metal::distributed;
     const uint64_t key = zero_key_rp(md.get(), dtype, B);
-    const uint64_t fp  = reinterpret_cast<uint64_t>(&(md->mesh_command_queue()));
     auto& cache = zero_scratch_cache_rp();
     auto it = cache.find(key);
     if (it != cache.end()) {
-        if (it->second->cq_fingerprint == fp) return it->second;
-        cache.erase(it);   // stale entry: same ptr, different device instance
+        if (it->second->device_weak.lock()) return it->second;
+        cache.erase(it);   // stale: device was destroyed (and ptr may be reused)
     }
 
     auto z = std::make_shared<ZeroScratch_rp>();
     z->B = B;
-    z->cq_fingerprint = fp;
+    z->device_weak = md;
     MeshCommandQueue& cq = md->mesh_command_queue();
 
     if (dtype == tt::tt_metal::DataType::BFLOAT16) {

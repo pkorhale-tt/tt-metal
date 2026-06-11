@@ -105,7 +105,10 @@ struct BatchFFTPlan {
     uint32_t grid_cols      = 0;
     uint32_t grid_rows      = 0;
 
-    std::shared_ptr<MeshDevice> md;
+    // Weak reference: avoids keeping a closed/destroyed device alive in the
+    // static cache. lock() returns nullptr once all shared_ptr copies to the
+    // MeshDevice are released, which is the correct staleness signal.
+    std::weak_ptr<MeshDevice> device_weak;
     std::shared_ptr<MeshBuffer> in_r_buf,  in_i_buf;
     std::shared_ptr<MeshBuffer> out_r_buf, out_i_buf;
     std::shared_ptr<MeshBuffer> tw_r_buf,  tw_i_buf;
@@ -115,10 +118,6 @@ struct BatchFFTPlan {
     std::vector<float> out_r_host, out_i_host;
 
     bool initialized = false;
-
-    // Per-instance fingerprint: address of the heap-allocated MeshCommandQueue.
-    // Detects MeshDevice pointer reuse across pytest function-scoped fixtures.
-    uint64_t cq_fingerprint = 0u;
 };
 
 inline std::pair<uint32_t, uint32_t> pick_batch_grid(uint32_t num_cores, uint32_t grid_x) {
@@ -182,7 +181,7 @@ inline std::shared_ptr<BatchFFTPlan> make_batch_plan(
     using namespace tt::tt_metal::distributed;
 
     auto bp = std::make_shared<BatchFFTPlan>();
-    bp->md          = md;
+    bp->device_weak = md;   // weak_ptr — set by caller; also set after make_batch_plan returns
     bp->sub_N       = sub_N;
     bp->log2_sub_N  = log2u(sub_N);
     bp->batch       = batch;
@@ -335,16 +334,14 @@ inline std::shared_ptr<BatchFFTPlan> get_cached_batch_plan(
     std::shared_ptr<MeshDevice> md, uint32_t sub_N, uint32_t batch)
 {
     const uint64_t key = detail::batch_plan_key(md.get(), sub_N, batch);
-    // Per-instance fingerprint detects device-pointer reuse across test fixtures.
-    const uint64_t fp  = reinterpret_cast<uint64_t>(&(md->mesh_command_queue()));
     auto& cache = detail::batch_plan_cache();
     auto it = cache.find(key);
     if (it != cache.end()) {
-        if (it->second->cq_fingerprint == fp) return it->second;
-        cache.erase(it);   // stale entry: same ptr, different device instance
+        if (it->second->device_weak.lock()) return it->second;
+        cache.erase(it);   // stale: device was destroyed (and ptr may be reused)
     }
     auto bp = make_batch_plan(md, sub_N, batch);
-    bp->cq_fingerprint = fp;
+    bp->device_weak = md;
     cache.emplace(key, bp);
     return bp;
 }
@@ -361,7 +358,9 @@ inline void execute_batch(
     assert(in_r.size() == static_cast<size_t>(plan.batch) * kTileElems);
     assert(in_i.size() == in_r.size());
 
-    MeshCommandQueue& cq = plan.md->mesh_command_queue();
+    auto dev = plan.device_weak.lock();
+    TT_FATAL(dev, "execute_batch: BatchFFTPlan's device has been destroyed");
+    MeshCommandQueue& cq = dev->mesh_command_queue();
 
     WriteShard(cq, plan.in_r_buf, in_r, MeshCoordinate(0, 0), false);
     WriteShard(cq, plan.in_i_buf, in_i, MeshCoordinate(0, 0), false);
