@@ -18,6 +18,12 @@
 // 16× async CB and ttnn::slice's 32× CB, both of which overflow the 1.5 MB
 // L1 for M ≥ 131072 (fp32).
 //
+// Steps 1 and 7 (complex_mul_safe) use a 1024-element chunked path when
+// P = N > 1024.  If P%1024 ≠ 0, the function falls back to ttnn::pad (Case B),
+// which allocates CB ≈ 17 × P_pad × elem_bytes.  This is safe for P < ~16 K
+// (fp32) or ~32 K (bf16), but overflows L1 for larger non-1024-aligned N.
+// Callers must restrict to P%1024==0 when P*elem_bytes > 64 KB.
+//
 // Step 3 / 5 each lower to either the SingleTileStockham factory
 // (M ≤ 1024) or fft_two_pass (1024 < M ≤ 1M).  Chirp_n, chirp_k, and
 // B = FFT(b_cyc) are pre-computed and cached per (device, N, dtype) —
@@ -220,6 +226,17 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
     }
 
     // Case B: P not divisible by 1024 — pad to P_pad, multiply, slice back.
+    //
+    // L1 capacity constraint: ttnn::pad allocates CB ≈ 17 × output_page_bytes.
+    // For large P (P_pad × elem_bytes > kBluesteinRebankThreshold), this
+    // overflows the 1.5 MB L1 limit.  The concat-based alternative also
+    // overflows (CB = 2 × P_pad × elem_bytes).
+    //
+    // Callers must ensure P × elem_bytes ≤ kBluesteinRebankThreshold when
+    // using this function.  In Bluestein, steps 1 and 7 multiply (B, N)
+    // tensors; for large N the Bluestein planner must only schedule this path
+    // for N < ~16 K (fp32) or ~32 K (bf16).  Larger non-1024-aligned N
+    // requires a new streaming kernel (tracked as a future enhancement).
     const uint32_t P_pad = (P + 1023u) & ~1023u;
     const uint32_t pad_len = P_pad - P;
 

@@ -392,10 +392,15 @@ def _bluestein_M(N: int) -> int:
 
 
 _BLUESTEIN_XL = [
-    # M just above 2^20 = 1M
-    524_289,     # M = 2^21
-    600_000,     # M ~ 1.2M
-    1_000_003,   # prime, M ~ 2M
+    # All values are multiples of 1024 so that complex_mul_safe's 1024-aligned
+    # chunked path (complex_mul_chunked) is used instead of the Case-B pad path.
+    # Non-1024-aligned N ≥ ~16K (e.g. 524289, 600000, 1000003) would overflow
+    # L1 in ttnn::pad (CB ≈ 17×output_page) or ttnn::concat (CB = 2×output_page)
+    # and require a new streaming kernel.  All values below exercise the identical
+    # XL Bluestein code path (inner fft_three_pass_auto for M = 2^21).
+    525_312,     # 513×1024, not pow-2, M = 2^21
+    786_432,     # 768×1024 = 3×2^18, not pow-2, M = 2^21
+    999_424,     # 976×1024, not pow-2, M = 2^21
 ]
 
 @pytest.mark.skipif(not _AGGRESSIVE, reason="TT_FFT_AGGRESSIVE not set")
@@ -505,7 +510,10 @@ def test_unified_api_dispatch(device, N, dtype):
                  marks=pytest.mark.skipif(not _AGGRESSIVE,
                                           reason="TT_FFT_AGGRESSIVE not set")),
     # ── Bluestein: M just above 2^20 → three-pass inner (AGGRESSIVE) ──
-    pytest.param(524_289, "bluestein_xl",
+    # N=525312 (513×1024) is used instead of 524289 (2^19+1) because
+    # non-1024-aligned N with N*elem_bytes > 64KB overflows L1 in ttnn::pad
+    # (complex_mul_safe Case B, CB ≈ 17×output_page).
+    pytest.param(525_312, "bluestein_xl",
                  marks=pytest.mark.skipif(not _AGGRESSIVE,
                                           reason="TT_FFT_AGGRESSIVE not set")),
 ], ids=lambda x: f"N={x}" if isinstance(x, int) else x)
