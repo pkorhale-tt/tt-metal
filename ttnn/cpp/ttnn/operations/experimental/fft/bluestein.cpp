@@ -203,7 +203,14 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_chunked(
     auto cr_f = ttnn::concat(cr_vec, /*dim=*/0);
     auto ci_f = ttnn::concat(ci_vec, /*dim=*/0);
 
-    // Reshape back (page-growing, CB ≤ 1 MB).
+    // Reassemble (total_rows, 1024) → (B, P_col).
+    // For large P_col (output page > 64 KB), ttnn::reshape allocates
+    // CB = 2 × P_col × elem_bytes which can overflow L1.  Use
+    // rebank_rm_merge instead (CB = 2 × 1024 × elem_bytes = 8 KB).
+    if ((uint64_t)P_col * elem_bytes > kBluesteinRebankThreshold) {
+        return {ttnn::prim::rebank_rm_merge(cr_f, nchunks),
+                ttnn::prim::rebank_rm_merge(ci_f, nchunks)};
+    }
     const auto orig = ttnn::Shape{ttnn::SmallVector<uint32_t>{B, P_col}};
     return {ttnn::reshape(cr_f, orig), ttnn::reshape(ci_f, orig)};
 }
