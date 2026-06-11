@@ -86,17 +86,26 @@ static ttnn::Tensor shrink_reshape(
             ttnn::Shape{ttnn::SmallVector<uint32_t>{new_rows, new_cols}});
     }
 
-    // Large source page: use rebank_rm (DRAM-to-DRAM, CB = 8 KB).
-    // rebank_rm now accepts any N divisible by chunk (pow-2 no longer required).
-    if (src_cols % new_cols == 0u) {
+    // Large source page: prefer rebank_rm (DRAM-to-DRAM, CB = 8 KB).
+    // Compute next pow-2 ≥ src_cols (needed for the pow-2 check and the concat fallback).
+    uint32_t src_pow2 = 1u;
+    while (src_pow2 < src_cols) src_pow2 <<= 1u;
+
+    if (src_pow2 == src_cols) {
+        // src_cols is exactly a power of 2: rebank directly.
+        return ttnn::prim::rebank_rm(t, new_cols);
+    }
+    // Non-pow-2: use rebank_rm directly only when the concat-to-pow2 fallback would
+    // overflow L1 (concat CB = 2 * src_pow2 * elem > ~1 MB).
+    // For small non-pow2 N (e.g. 64512 → src_pow2=65536 → CB=512KB) the concat path
+    // is safe and avoids dispatch-core-placement issues that arise when the rebank_rm
+    // work-unit count (B × N/1024) cannot be tiled into the device's physical grid.
+    if (src_cols % new_cols == 0u && (uint64_t)src_pow2 * elem_bytes > (1u << 19u)) {
         return ttnn::prim::rebank_rm(t, new_cols);
     }
 
-    // src_cols is not divisible by new_cols.  Zero-pad to the next multiple of
-    // new_cols so that rebank_rm can be used.  If new_cols is a power of 2 we
-    // pad to the next power of 2 (which is also a multiple of new_cols).
-    uint32_t src_pow2 = 1u;
-    while (src_pow2 < src_cols) src_pow2 <<= 1u;
+    // src_cols is not divisible by new_cols OR the concat path is safe.
+    // Zero-pad to the next pow-2 (which is a multiple of new_cols).
 
     // Compute B (product of all leading dims).
     uint32_t B_total = 1u;

@@ -90,6 +90,20 @@ tt::tt_metal::ProgramDescriptor RebankRmFactory::create_descriptor(
     TT_FATAL(num_cores >= 1u && (num_units % num_cores) == 0u,
         "rebank_rm: failed to pick num_cores for num_units={}.", num_units);
 
+    // Validate that pick_batch_grid(num_cores) stays within the physical grid.
+    // When num_cores is non-pow2 (e.g. 63 units → pick_batch_grid returns {7,9}
+    // which exceeds dev_grid.y=8), the CoreRange would include dispatch cores and
+    // the kernel placement fails.  Decrement num_cores until the grid fits.
+    {
+        auto [gc, gr] = fft_stockham::pick_batch_grid(num_cores, dev_grid.x);
+        while (num_cores > 1u && gr > dev_grid.y) {
+            --num_cores;
+            while (num_cores > 1u && (num_units % num_cores) != 0u)
+                --num_cores;
+            std::tie(gc, gr) = fft_stockham::pick_batch_grid(num_cores, dev_grid.x);
+        }
+    }
+
     const uint32_t units_per_core = num_units / num_cores;
     auto [grid_cols, grid_rows] = fft_stockham::pick_batch_grid(num_cores, dev_grid.x);
 

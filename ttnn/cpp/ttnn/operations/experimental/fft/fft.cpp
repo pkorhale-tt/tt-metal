@@ -759,16 +759,34 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
             "fft_three_pass: input_imag shape must match input_real shape.");
     }
 
+    // ── Dtype helpers (used for large-N path selection below).
+    const uint32_t elem_bytes_3p =
+        (src_real.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    // L1 safe limit: reshape CB = 2 × page; overflow when page > 750 KB.
+    constexpr uint64_t kPageOverflowBytes = 750u * 1024u;
+
     // ── Initial rearrangement (input n1 OUTER → n1 to LAST axis).
     //   Input (B·N1·N2, N3) is row-major with n = n1·N2·N3 + n2·N3 + n3.
-    //   View as (B, N1, N2·N3) [merges (N2, N3) → page = N2·N3·elem,
-    //   page-changing reshape], then transpose_rm → (B, N2·N3, N1).
-    auto x_3d_r = ttnn::reshape(src_real, make_shape({B, N1, N2 * N3}));
+    //   Normal path: view as (B, N1, N2·N3) [page = N2·N3·elem], then
+    //     transpose_rm → (B, N2·N3, N1).
+    //   Large-N path (N ≥ 2^26, page = N2·N3·elem > 750 KB → CB > 1.5 MB):
+    //     Use rebank_rm_merge(src, N2) to merge N2 rows at CB = 2·N3·elem (tiny),
+    //     producing (B·N1, N2·N3).  A metadata-only 3-D view gives (B, N1, N2·N3).
+    //     The subsequent transpose_rm and flatten are unchanged.
+    const bool large_page_in = ((uint64_t)N2 * N3 * elem_bytes_3p > kPageOverflowBytes);
+    auto rearrange_3d = [&](const ttnn::Tensor& src) -> ttnn::Tensor {
+        if (large_page_in) {
+            auto merged = ttnn::prim::rebank_rm_merge(src, N2);         // (B·N1, N2·N3)
+            return ttnn::reshape(merged, make_shape({B, N1, N2 * N3})); // metadata-only
+        }
+        return ttnn::reshape(src, make_shape({B, N1, N2 * N3}));
+    };
+    auto x_3d_r = rearrange_3d(src_real);
     auto x_t_r  = ttnn::prim::transpose_rm(x_3d_r);                   // (B, N2·N3, N1)
     auto x_p1_r = ttnn::reshape(x_t_r, make_shape({B * N2 * N3, N1}));
     std::optional<ttnn::Tensor> x_p1_i;
     if (has_imag) {
-        auto x_3d_i = ttnn::reshape(*src_imag, make_shape({B, N1, N2 * N3}));
+        auto x_3d_i = rearrange_3d(*src_imag);
         auto x_t_i  = ttnn::prim::transpose_rm(x_3d_i);               // (B, N2·N3, N1)
         x_p1_i = ttnn::reshape(x_t_i, make_shape({B * N2 * N3, N1}));
     }
@@ -788,14 +806,35 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
 
     // ── Bring n2 to inner for Stage 2.
     //   Logical (B, N2, N3, k1) → (B, N3, k1, N2).
-    //   View as (B, N2, N3·N1) [merge last two — page change], then
-    //   transpose_rm → (B, N3·N1, N2).
-    auto r2_3d = ttnn::reshape(r1t, make_shape({B, N2, N3 * N1}));
-    auto i2_3d = ttnn::reshape(i1t, make_shape({B, N2, N3 * N1}));
-    auto r2t   = ttnn::prim::transpose_rm(r2_3d);                     // (B, N3·N1, N2)
-    auto i2t   = ttnn::prim::transpose_rm(i2_3d);
-    auto r2p   = ttnn::reshape(r2t, make_shape({B * N3 * N1, N2}));
-    auto i2p   = ttnn::reshape(i2t, make_shape({B * N3 * N1, N2}));
+    //   Normal path (N < 2^25): view as (B, N2, N3·N1) [page = N3·N1·elem],
+    //     then transpose_rm → (B, N3·N1, N2).
+    //   Large-N path (N ≥ 2^25, N3·N1·elem > 750 KB → old CB > 1.5 MB):
+    //     Decompose into two small-page 3-D transposes, each safe for L1.
+    //     (1) reshape (B·N2·N3, N1) → (B·N2, N3, N1)   [metadata, page=N1·e]
+    //     (2) transpose_rm → (B·N2, N1, N3)             [page=N3·e ≤ 4 KB]
+    //     (3) reshape → (B, N2·N1, N3)                  [metadata, page=N3·e]
+    //     (4) transpose_rm → (B, N3, N2·N1)             [page=N2·N1·e ≤ 512KB]
+    //     (5) reshape → (B·N3, N1, N2)                  [page shrinks → N2·e]
+    //     (6) reshape → (B·N3·N1, N2)                   [metadata]
+    //   Correctness: the 6-step sequence implements the same cyclic permutation
+    //     [N2, N3, k1] → [N3, k1, N2] that the normal path does, using only
+    //     3-D transposes with page sizes N3·e and N2·N1·e (both < 1 MB for N≤2^27).
+    const bool large_intermed = ((uint64_t)N3 * N1 * elem_bytes_3p > kPageOverflowBytes);
+    auto bring_n2_inner = [&](const ttnn::Tensor& t) -> ttnn::Tensor {
+        if (large_intermed) {
+            auto s1 = ttnn::reshape(t, make_shape({B * N2, N3, N1}));   // metadata
+            auto s2 = ttnn::prim::transpose_rm(s1);                      // (B·N2, N1, N3)
+            auto s3 = ttnn::reshape(s2, make_shape({B, N2 * N1, N3}));  // metadata
+            auto s4 = ttnn::prim::transpose_rm(s3);                      // (B, N3, N2·N1)
+            auto s5 = ttnn::reshape(s4, make_shape({B * N3, N1, N2}));  // page shrinks
+            return ttnn::reshape(s5, make_shape({B * N3 * N1, N2}));    // metadata
+        }
+        auto t3d = ttnn::reshape(t, make_shape({B, N2, N3 * N1}));
+        auto tt  = ttnn::prim::transpose_rm(t3d);                        // (B, N3·N1, N2)
+        return ttnn::reshape(tt, make_shape({B * N3 * N1, N2}));
+    };
+    auto r2p = bring_n2_inner(r1t);
+    auto i2p = bring_n2_inner(i1t);
 
     // ── Stage 2 + Twiddle-2 fused: FFT_N2 + post-twiddle
     //       exp(-2πi · n3 · k2 / (N2·N3)).

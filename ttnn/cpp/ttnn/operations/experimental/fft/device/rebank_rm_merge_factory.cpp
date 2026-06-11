@@ -88,6 +88,17 @@ tt::tt_metal::ProgramDescriptor RebankRmMergeFactory::create_descriptor(
     TT_FATAL(num_cores >= 1u && (num_units % num_cores) == 0u,
         "rebank_rm_merge: failed to pick num_cores for num_units={}.", num_units);
 
+    // Validate that the resulting core grid fits within the physical device.
+    {
+        auto [gc, gr] = fft_stockham::pick_batch_grid(num_cores, dev_grid.x);
+        while (num_cores > 1u && gr > dev_grid.y) {
+            --num_cores;
+            while (num_cores > 1u && (num_units % num_cores) != 0u)
+                --num_cores;
+            std::tie(gc, gr) = fft_stockham::pick_batch_grid(num_cores, dev_grid.x);
+        }
+    }
+
     const uint32_t units_per_core = num_units / num_cores;
     auto [grid_cols, grid_rows] = fft_stockham::pick_batch_grid(num_cores, dev_grid.x);
 
