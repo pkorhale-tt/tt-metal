@@ -14,6 +14,7 @@
 #include "device/apply_twiddles_xl_device_operation.hpp"
 #include "device/transpose_rm_device_operation.hpp"
 #include "device/rebank_rm_device_operation.hpp"
+#include "device/rebank_rm_merge_device_operation.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/types.hpp"  // ttnn::Shape, ttnn::SmallVector
 
@@ -302,8 +303,22 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_two_pass(
     auto r4t = ttnn::prim::transpose_rm(r3_3d);
     auto i4t = ttnn::prim::transpose_rm(i3_3d);
 
-    auto out_r = ttnn::reshape(r4t, in_shape);
-    auto out_i = ttnn::reshape(i4t, in_shape);
+    // Final reshape (B, N2, N1) → (B, N).  For large N the destination
+    // page = N*elem_bytes can exceed L1 and crash reshape_rm.  Use
+    // rebank_rm_merge (CB = 2*N1*elem_bytes, tiny) in that case.
+    const uint32_t elem_bytes_fp =
+        (input_real.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    const bool need_merge = ((uint64_t)N * elem_bytes_fp > kRebankThresholdBytes);
+
+    auto merge_or_reshape = [&](const ttnn::Tensor& t3d) -> ttnn::Tensor {
+        if (need_merge) {
+            auto t2d = ttnn::reshape(t3d, make_shape({B * N2, N1}));
+            return ttnn::prim::rebank_rm_merge(t2d, N2);
+        }
+        return ttnn::reshape(t3d, in_shape);
+    };
+    auto out_r = merge_or_reshape(r4t);
+    auto out_i = merge_or_reshape(i4t);
 
     // ── OUTPUT swap (free) — completes the swap-trick.  After the
     //   forward FFT chain with scale=1/N we have (W_re/N, W_im/N);
@@ -616,10 +631,24 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass_auto(
 
     auto [out_re, out_im] = fft_three_pass(re_pre, im_pre, N, precision, inverse);
 
-    // fft_three_pass output is (B·N3, N2, N1) — flatten to (B, N)
-    auto out_re_flat = ttnn::reshape(out_re, make_shape({B, N}));
-    auto out_im_flat = ttnn::reshape(out_im, make_shape({B, N}));
-    return {std::move(out_re_flat), std::move(out_im_flat)};
+    // fft_three_pass output is (B·N3, N2, N1) — flatten to (B, N).
+    // For large N the destination page = N*elem_bytes overflows L1; use
+    // rebank_rm_merge (CB = 2*N1*elem_bytes, tiny) in that case.
+    const uint32_t elem_bytes_tp =
+        (input_real.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
+    const bool need_merge_3p = ((uint64_t)N * elem_bytes_tp > kRebankThresholdBytes);
+
+    if (need_merge_3p) {
+        // CPM = N2 * N3 (both pow-2 → product is pow-2).
+        // 3D→2D metadata flatten (page = N1*elem unchanged) then merge-rebank.
+        const uint32_t cpm = N2 * N3;
+        auto out_re_2d = ttnn::reshape(out_re, make_shape({B * N3 * N2, N1}));
+        auto out_im_2d = ttnn::reshape(out_im, make_shape({B * N3 * N2, N1}));
+        return {ttnn::prim::rebank_rm_merge(out_re_2d, cpm),
+                ttnn::prim::rebank_rm_merge(out_im_2d, cpm)};
+    }
+    return {ttnn::reshape(out_re, make_shape({B, N})),
+            ttnn::reshape(out_im, make_shape({B, N}))};
 }
 
 // ── Bluestein batch-dim flatten helper ───────────────────────────────────
