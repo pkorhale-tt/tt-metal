@@ -292,7 +292,6 @@ static ttnn::Tensor zero_pad_to_m(
     // Fast path for large M and 1024-aligned N (avoids large-CB concat).
     if ((uint64_t)M * elem_bytes > kBluesteinRebankThreshold &&
         N % 1024u == 0u && (M - N) % 1024u == 0u) {
-        const uint32_t n_chunks   = B * N / 1024u;
         const uint32_t pad_chunks = B * (M - N) / 1024u;
 
         auto rebankd = ttnn::prim::rebank_rm(t, 1024u);
