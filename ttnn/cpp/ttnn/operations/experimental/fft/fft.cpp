@@ -806,31 +806,36 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
 
     // ── Bring n2 to inner for Stage 2.
     //   Logical (B, N2, N3, k1) → (B, N3, k1, N2).
-    //   Normal path (N < 2^25): view as (B, N2, N3·N1) [page = N3·N1·elem],
-    //     then transpose_rm → (B, N3·N1, N2).
-    //   Large-N path (N ≥ 2^25, N3·N1·elem > 750 KB → old CB > 1.5 MB):
-    //     Decompose into two small-page 3-D transposes, each safe for L1.
-    //     (1) reshape (B·N2·N3, N1) → (B·N2, N3, N1)   [metadata, page=N1·e]
-    //     (2) transpose_rm → (B·N2, N1, N3)             [page=N3·e ≤ 4 KB]
-    //     (3) reshape → (B, N2·N1, N3)                  [metadata, page=N3·e]
-    //     (4) transpose_rm → (B, N3, N2·N1)             [page=N2·N1·e ≤ 512KB]
-    //     (5) reshape → (B·N3, N1, N2)                  [page shrinks → N2·e]
-    //     (6) reshape → (B·N3·N1, N2)                   [metadata]
-    //   Correctness: the 6-step sequence implements the same cyclic permutation
-    //     [N2, N3, k1] → [N3, k1, N2] that the normal path does, using only
-    //     3-D transposes with page sizes N3·e and N2·N1·e (both < 1 MB for N≤2^27).
+    //   Input  (B·N2·N3, N1).  Output (B·N3·N1, N2).
+    //
+    //   Normal path (N3·N1·elem ≤ 750 KB):
+    //     reshape (B·N2·N3, N1) → (B, N2, N3·N1)  [dest page = N3·N1·e, small]
+    //     transpose_rm → (B, N3·N1, N2)             [page = N2·e, tiny]
+    //     reshape → (B·N3·N1, N2)                   [metadata]
+    //
+    //   Large-N path (N3·N1·elem > 750 KB → page-growing reshape CB > 1.5 MB):
+    //     Use rebank_rm_merge to merge N3 consecutive rows (CB = 2·N1·e = 8 KB),
+    //     avoiding any large-page reshape:
+    //       (1) rebank_rm_merge(t, N3) → (B·N2, N3·N1)   [CB = 8 KB]
+    //       (2) reshape → (B, N2, N3·N1)                  [metadata]
+    //       (3) transpose_rm → (B, N3·N1, N2)             [CB = 8 KB, page=N2·e]
+    //       (4) reshape → (B·N3·N1, N2)                   [metadata]
+    //     Step (1) is correct because input rows are ordered n2-major, n3-minor:
+    //     N3 consecutive rows [b·N2·N3+n2·N3, …, b·N2·N3+n2·N3+N3-1] all share
+    //     the same (b, n2) and together form the (n3=0..N3-1) slice, which is
+    //     exactly what rebank_rm_merge concatenates into one output row. ✓
     const bool large_intermed = ((uint64_t)N3 * N1 * elem_bytes_3p > kPageOverflowBytes);
     auto bring_n2_inner = [&](const ttnn::Tensor& t) -> ttnn::Tensor {
         if (large_intermed) {
-            auto s1 = ttnn::reshape(t, make_shape({B * N2, N3, N1}));   // metadata
-            auto s2 = ttnn::prim::transpose_rm(s1);                      // (B·N2, N1, N3)
-            auto s3 = ttnn::reshape(s2, make_shape({B, N2 * N1, N3}));  // metadata
-            auto s4 = ttnn::prim::transpose_rm(s3);                      // (B, N3, N2·N1)
-            auto s5 = ttnn::reshape(s4, make_shape({B * N3, N1, N2}));  // page shrinks
-            return ttnn::reshape(s5, make_shape({B * N3 * N1, N2}));    // metadata
+            // Step (1): merge N3 consecutive rows.  Input (B·N2·N3, N1).
+            // CB = 2·N1·elem = 8 KB.  N3 is always pow-2 (=1024).
+            auto merged = ttnn::prim::rebank_rm_merge(t, N3);           // (B·N2, N3·N1)
+            auto t3d    = ttnn::reshape(merged, make_shape({B, N2, N3 * N1}));  // metadata
+            auto tt     = ttnn::prim::transpose_rm(t3d);                // (B, N3·N1, N2)
+            return ttnn::reshape(tt, make_shape({B * N3 * N1, N2}));   // metadata
         }
         auto t3d = ttnn::reshape(t, make_shape({B, N2, N3 * N1}));
-        auto tt  = ttnn::prim::transpose_rm(t3d);                        // (B, N3·N1, N2)
+        auto tt  = ttnn::prim::transpose_rm(t3d);                       // (B, N3·N1, N2)
         return ttnn::reshape(tt, make_shape({B * N3 * N1, N2}));
     };
     auto r2p = bring_n2_inner(r1t);
