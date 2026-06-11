@@ -79,7 +79,7 @@ tt::tt_metal::ProgramDescriptor RebankRmFactory::create_descriptor(
         "rebank_rm: input/output tensors must be on device.");
 
     auto* device_raw = x.device();
-    auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
+    auto md = device_raw->get_mesh_device();
 
     // ── Core grid ─────────────────────────────────────────────────────
     const auto dev_grid   = md->compute_with_storage_grid_size();

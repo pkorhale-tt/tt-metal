@@ -95,7 +95,7 @@ tt::tt_metal::ProgramDescriptor ApplyTwiddlesFactory::create_descriptor(
 
     // ── MeshDevice (no-op deleter — tensor owns lifetime) ──────────────
     auto* device_raw = in_r_tensor.device();
-    auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
+    auto md = device_raw->get_mesh_device();
 
     // ── Cached fp32 twiddle table for (N1, N2) ─────────────────────────
     auto tw_plan = apply_twiddles_host::get_or_create(md, N1, N2);

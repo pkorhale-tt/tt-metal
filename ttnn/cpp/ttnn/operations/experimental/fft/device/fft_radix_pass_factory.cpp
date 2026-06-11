@@ -180,7 +180,7 @@ tt::tt_metal::ProgramDescriptor FftRadixPassFactory::create_descriptor(
         "FftRadixPassFactory: input/output tensors must be on device.");
 
     auto* device_raw = in_real.device();
-    auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
+    auto md = device_raw->get_mesh_device();
 
     // FFT internal twiddles — cached (device, N).
     auto plan = fft_stockham::get_cached_batch_plan(md, /*sub_N=*/N, /*batch=*/1u);

@@ -159,7 +159,7 @@ tt::tt_metal::ProgramDescriptor SingleTileStockhamFactory::create_descriptor(
 
     // ── Resolve MeshDevice (mirror fft_program_factory.cpp pattern) ────
     auto* device_raw = in_real.device();
-    auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
+    auto md = device_raw->get_mesh_device();
 
     // ── Reuse legacy plan's twiddle MeshBuffers (Category B, cached) ──
     // Twiddles are always fp32 — internal compute happens in fp32 even on

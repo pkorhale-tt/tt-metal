@@ -100,7 +100,7 @@ tt::tt_metal::ProgramDescriptor ApplyTwiddlesXlFactory::create_descriptor(
         "ApplyTwiddlesXlFactory: all input/output tensors must be on device.");
 
     auto* device_raw = in_r_tensor.device();
-    auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
+    auto md = device_raw->get_mesh_device();
 
     auto delta_plan = apply_twiddles_xl_host::get_or_create(md, big_modulus, full_N);
 

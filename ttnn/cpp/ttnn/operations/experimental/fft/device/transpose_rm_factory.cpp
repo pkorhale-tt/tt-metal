@@ -69,7 +69,7 @@ tt::tt_metal::ProgramDescriptor TransposeRmFactory::create_descriptor(
         "transpose_rm: input/output tensors must be on device.");
 
     auto* device_raw = x.device();
-    auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
+    auto md = device_raw->get_mesh_device();
 
     // ── Pick a pow-2 core count that divides num_units cleanly ─────────
     const auto dev_grid = md->compute_with_storage_grid_size();

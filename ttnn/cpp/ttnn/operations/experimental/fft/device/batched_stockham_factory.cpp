@@ -154,7 +154,7 @@ tt::tt_metal::ProgramDescriptor BatchedStockhamFactory::create_descriptor(
     //    we use ITS buffer; otherwise we fall back to the cached B-tile
     //    zero scratch (real-only forward FFT, original commit-3a path).
     auto* device_raw = in_real.device();
-    auto md = std::shared_ptr<MeshDevice>(device_raw, [](MeshDevice*){});
+    auto md = device_raw->get_mesh_device();
 
     // ── Cached fp32 twiddles (same per-N twiddle table, reused) ────────
     auto plan = fft_stockham::get_cached_batch_plan(md, /*sub_N=*/N, /*batch=*/1u);
