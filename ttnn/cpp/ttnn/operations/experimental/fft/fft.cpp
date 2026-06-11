@@ -842,15 +842,29 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     //   1024 < N ≤ 2^20, pow-2     → fft_two_pass   (3 transposes + 2 passes)
     //   2^20 < N ≤ 2^30, pow-2     → fft_three_pass_auto (auto-reshape)
     //   non-pow-2, M ≤ 2^30        → bluestein_dispatch (7-op device chain)
-    if (two_pass_eligible(input_real))
-        return fft_two_pass(input_real, /*input_imag=*/std::nullopt, precision, false);
-    if (three_pass_eligible(input_real))
-        return fft_three_pass_auto(input_real, /*input_imag=*/std::nullopt, precision, false);
-    if (bluestein_eligible(input_real))
-        return bluestein_dispatch(input_real, /*input_imag=*/std::nullopt, precision, false);
-    // N ≤ 1024 pow-2 (or unsupported N > 2^30): delegate to prim::fft.
-    return ttnn::prim::fft(input_real, /*inverse=*/false,
-                           /*input_imag=*/std::nullopt, precision);
+
+    // Accept 1D (N,) inputs by promoting to (1, N) so all downstream ops
+    // (rebank_rm, transpose_rm, …) see rank ≥ 2.  Squeeze back on return.
+    const bool was_1d = (input_real.padded_shape().size() == 1u);
+    const uint32_t N_last = static_cast<uint32_t>(input_real.padded_shape()[-1]);
+    std::optional<ttnn::Tensor> real_2d_buf;
+    if (was_1d) real_2d_buf = ttnn::reshape(input_real, make_shape({1u, N_last}));
+    const ttnn::Tensor& real_in = was_1d ? *real_2d_buf : input_real;
+
+    auto squeeze = [&](std::tuple<ttnn::Tensor, ttnn::Tensor> out)
+        -> std::tuple<ttnn::Tensor, ttnn::Tensor> {
+        if (!was_1d) return out;
+        auto& [r, i] = out;
+        return {ttnn::reshape(r, make_shape({N_last})),
+                ttnn::reshape(i, make_shape({N_last}))};
+    };
+    if (two_pass_eligible(real_in))
+        return squeeze(fft_two_pass(real_in, /*input_imag=*/std::nullopt, precision, false));
+    if (three_pass_eligible(real_in))
+        return squeeze(fft_three_pass_auto(real_in, /*input_imag=*/std::nullopt, precision, false));
+    if (bluestein_eligible(real_in))
+        return squeeze(bluestein_dispatch(real_in, /*input_imag=*/std::nullopt, precision, false));
+    return squeeze(ttnn::prim::fft(real_in, /*inverse=*/false, /*input_imag=*/std::nullopt, precision));
 }
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
@@ -858,13 +872,30 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft(
     const ttnn::Tensor& input_imag,
     FFTPrecision precision) {
     // Complex-input variant — same routing table as the real-input overload.
-    if (two_pass_eligible(input_real))
-        return fft_two_pass(input_real, input_imag, precision, false);
-    if (three_pass_eligible(input_real))
-        return fft_three_pass_auto(input_real, input_imag, precision, false);
-    if (bluestein_eligible(input_real))
-        return bluestein_dispatch(input_real, input_imag, precision, false);
-    return ttnn::prim::fft(input_real, /*inverse=*/false, input_imag, precision);
+    const bool was_1d = (input_real.padded_shape().size() == 1u);
+    const uint32_t N_last = static_cast<uint32_t>(input_real.padded_shape()[-1]);
+    std::optional<ttnn::Tensor> real_2d_buf, imag_2d_buf;
+    if (was_1d) {
+        real_2d_buf = ttnn::reshape(input_real, make_shape({1u, N_last}));
+        imag_2d_buf = ttnn::reshape(input_imag, make_shape({1u, N_last}));
+    }
+    const ttnn::Tensor& real_in = was_1d ? *real_2d_buf : input_real;
+    const ttnn::Tensor& imag_in = was_1d ? *imag_2d_buf : input_imag;
+
+    auto squeeze = [&](std::tuple<ttnn::Tensor, ttnn::Tensor> out)
+        -> std::tuple<ttnn::Tensor, ttnn::Tensor> {
+        if (!was_1d) return out;
+        auto& [r, i] = out;
+        return {ttnn::reshape(r, make_shape({N_last})),
+                ttnn::reshape(i, make_shape({N_last}))};
+    };
+    if (two_pass_eligible(real_in))
+        return squeeze(fft_two_pass(real_in, imag_in, precision, false));
+    if (three_pass_eligible(real_in))
+        return squeeze(fft_three_pass_auto(real_in, imag_in, precision, false));
+    if (bluestein_eligible(real_in))
+        return squeeze(bluestein_dispatch(real_in, imag_in, precision, false));
+    return squeeze(ttnn::prim::fft(real_in, /*inverse=*/false, imag_in, precision));
 }
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> ifft(
@@ -879,25 +910,44 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> ifft(
     //
     // Bluestein IFFT: sign-flipped chirps + 1/N folded into chirp_k;
     //   see bluestein_host.hpp get_or_create(inverse=true).
-    if (two_pass_eligible(spectrum_real))
-        return fft_two_pass(spectrum_real, spectrum_imag, precision, true);
-    if (three_pass_eligible(spectrum_real))
-        return fft_three_pass_auto(spectrum_real, spectrum_imag, precision, true);
-    if (bluestein_eligible(spectrum_real))
-        return bluestein_dispatch(spectrum_real, spectrum_imag, precision, true);
+
+    // Promote 1D (N,) inputs to (1, N) — same contract as fft().
+    const bool was_1d = (spectrum_real.padded_shape().size() == 1u);
+    const uint32_t N_last = static_cast<uint32_t>(spectrum_real.padded_shape()[-1]);
+    std::optional<ttnn::Tensor> real_2d_buf, imag_2d_buf;
+    if (was_1d) {
+        real_2d_buf = ttnn::reshape(spectrum_real, make_shape({1u, N_last}));
+        imag_2d_buf = ttnn::reshape(spectrum_imag, make_shape({1u, N_last}));
+    }
+    const ttnn::Tensor& real_in = was_1d ? *real_2d_buf : spectrum_real;
+    const ttnn::Tensor& imag_in = was_1d ? *imag_2d_buf : spectrum_imag;
+
+    auto squeeze = [&](std::tuple<ttnn::Tensor, ttnn::Tensor> out)
+        -> std::tuple<ttnn::Tensor, ttnn::Tensor> {
+        if (!was_1d) return out;
+        auto& [r, i] = out;
+        return {ttnn::reshape(r, make_shape({N_last})),
+                ttnn::reshape(i, make_shape({N_last}))};
+    };
+    if (two_pass_eligible(real_in))
+        return squeeze(fft_two_pass(real_in, imag_in, precision, true));
+    if (three_pass_eligible(real_in))
+        return squeeze(fft_three_pass_auto(real_in, imag_in, precision, true));
+    if (bluestein_eligible(real_in))
+        return squeeze(bluestein_dispatch(real_in, imag_in, precision, true));
     // Small pow-2 N ≤ 1024: SingleTile/BatchedStockhamFactory only implement
     // the forward DFT, so prim::fft(inverse=true) would fall through to the
     // legacy FFTProgramFactory → TT_THROW.  Use the same swap trick as the
     // two-pass IFFT but via fft_radix_pass (which has output_scale for 1/N).
     {
-        const uint32_t N = static_cast<uint32_t>(spectrum_real.padded_shape()[-1]);
+        const uint32_t N = static_cast<uint32_t>(real_in.padded_shape()[-1]);
         if (native_path_enabled() && is_pow2(N) && N >= 2u && N <= 1024u)
-            return small_pow2_ifft(spectrum_real, spectrum_imag, N, precision);
+            return squeeze(small_pow2_ifft(real_in, imag_in, N, precision));
     }
     // Unreachable with TT_FFT_NATIVE ON for any supported N.  Kept as a
     // safety valve for the TT_FFT_NATIVE=0 debug mode.
-    return ttnn::prim::fft(spectrum_real, /*inverse=*/true,
-                           std::make_optional(spectrum_imag), precision);
+    return squeeze(ttnn::prim::fft(real_in, /*inverse=*/true,
+                                   std::make_optional(imag_in), precision));
 }
 
 }  // namespace ttnn::operations::experimental
