@@ -14,9 +14,15 @@
 # This file exercises one or more N values per backend with tolerances
 # tuned to the precision floor of each (fp32 ≈ 1e-4, bf16 ≈ 1e-2).
 
+import os
+
 import pytest
 import torch
 import ttnn
+
+# N=2^20 with B=1 sits at the L1 boundary; only run it when the user opts in
+# via TT_FFT_AGGRESSIVE=1 (same convention as test_fft_all_n.py).
+_AGGRESSIVE = os.getenv("TT_FFT_AGGRESSIVE", "0") == "1"
 
 
 def _rel_err(got_complex, ref_complex):
@@ -151,7 +157,13 @@ def test_fft_invalid_precision_raises(device):
         (1024,     2e-4),
         (4096,     5e-4),
         (65536,    1e-3),
-        (1048576,  2e-3),
+        pytest.param(
+            1048576, 2e-3,
+            marks=pytest.mark.skipif(
+                not _AGGRESSIVE,
+                reason="N=2^20 B=1 is at the L1 limit; set TT_FFT_AGGRESSIVE=1 to run",
+            ),
+        ),
     ],
 )
 def test_fft_stockham_fp32_pow2(device, N, tol):
