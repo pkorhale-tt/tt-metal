@@ -10,8 +10,8 @@
 //   dst_page   = (base_unit + u) / CHUNKS_PER_MERGE
 //   col_offset = ((base_unit + u) % CHUNKS_PER_MERGE) * CHUNK * elem_bytes
 //
-// CHUNKS_PER_MERGE is a power-of-2 compile-time constant, so division and
-// modulo are implemented as shifts / masks by the compiler.
+// CHUNKS_PER_MERGE is a compile-time constant; the compiler optimises division
+// and modulo (e.g. via reciprocal multiplication) for any integer value.
 //
 // Runtime args:
 //   0: dst_addr              (DRAM buffer base address)
@@ -21,7 +21,7 @@
 //
 // Compile-time args:
 //   0: CHUNK             (elements per source row = write granularity)
-//   1: CHUNKS_PER_MERGE  (source rows merged into one output row; must be pow-2)
+//   1: CHUNKS_PER_MERGE  (source rows merged into one output row; any integer ≥ 1)
 //   2: IS_BF16           (0 = fp32, 1 = bf16)
 
 #include <cstdint>
@@ -42,19 +42,12 @@ void kernel_main() {
     constexpr uint32_t elem_bytes  = IS_BF16 ? 2u : 4u;
     constexpr uint32_t chunk_bytes = CHUNK * elem_bytes;
 
-    // CHUNKS_PER_MERGE is a pow-2 compile-time constant.
-    constexpr uint32_t LOG2_CPM = [] {
-        uint32_t v = CHUNKS_PER_MERGE, r = 0u;
-        while (v > 1u) { v >>= 1; ++r; }
-        return r;
-    }();
-
     const InterleavedAddrGen<true> dst_gen = {
         .bank_base_address = dst_addr, .page_size = dst_page_size_bytes};
 
     // Starting page and chunk-within-page for base_unit.
-    uint32_t dst_page      = base_unit >> LOG2_CPM;
-    uint32_t chunk_in_page = base_unit & (CHUNKS_PER_MERGE - 1u);
+    uint32_t dst_page      = base_unit / CHUNKS_PER_MERGE;
+    uint32_t chunk_in_page = base_unit % CHUNKS_PER_MERGE;
 
     for (uint32_t u = 0u; u < num_units; ++u) {
         const uint32_t col_offset = chunk_in_page * chunk_bytes;

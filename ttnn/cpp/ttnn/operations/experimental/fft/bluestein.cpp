@@ -35,6 +35,7 @@
 #include "ttnn/operations/experimental/fft/fft.hpp"
 #include "ttnn/operations/experimental/fft/device/bluestein_host.hpp"
 #include "ttnn/operations/experimental/fft/device/rebank_rm_device_operation.hpp"
+#include "ttnn/operations/experimental/fft/device/rebank_rm_merge_device_operation.hpp"
 
 #include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/pad/pad.hpp"
@@ -86,13 +87,14 @@ static ttnn::Tensor shrink_reshape(
     }
 
     // Large source page: use rebank_rm (DRAM-to-DRAM, CB = 8 KB).
-    if (ttnn::experimental::prim::rebank_is_pow2(src_cols)) {
-        // Already pow-2: direct rebank.
+    // rebank_rm now accepts any N divisible by chunk (pow-2 no longer required).
+    if (src_cols % new_cols == 0u) {
         return ttnn::prim::rebank_rm(t, new_cols);
     }
 
-    // src_cols is NOT a power of 2.  Zero-pad the last dim to the next pow-2
-    // so that rebank_rm's pow-2 constraint is satisfied.
+    // src_cols is not divisible by new_cols.  Zero-pad to the next multiple of
+    // new_cols so that rebank_rm can be used.  If new_cols is a power of 2 we
+    // pad to the next power of 2 (which is also a multiple of new_cols).
     uint32_t src_pow2 = 1u;
     while (src_pow2 < src_cols) src_pow2 <<= 1u;
 
@@ -262,15 +264,17 @@ static std::tuple<ttnn::Tensor, ttnn::Tensor> complex_mul_safe(
 
 // zero_pad_to_m: zero-pad (B, N) → (B, M) without using ttnn::pad.
 //
-// ttnn::pad allocates CB = 16 × output_stick_size (+ 1 staging), giving
-// CB ≈ 17 × M × elem_bytes, which overflows 1.5 MB L1 for M ≥ 131072 (fp32).
+// For small output (M × elem_bytes ≤ kBluesteinRebankThreshold):
+//   Creates (B, M-N) zeros and column-concatenates.  CB = 2 × M × elem_bytes.
 //
-// This helper instead creates a (B, M-N) zeros tensor and column-concatenates.
-// concat_program_factory uses CB = 2 × single_page_size, where
-//   single_page_size = align(M × elem_bytes, 32),
-// so CB ≤ 2 × 524,288 = 1 MB for M ≤ 131,072 (fp32) or M ≤ 262,144 (bf16).
-//
-// NOTE: N does NOT need to be a power of 2 (unlike rebank_rm).
+// For large output (M × elem_bytes > kBluesteinRebankThreshold) and N%1024==0:
+//   Uses a streaming rebank+merge approach (all steps CB ≤ 8 KB):
+//     1. rebank_rm(t, 1024)         → (B*N/1024, 1024)
+//     2. zeros(B*(M-N)/1024, 1024)  → tiny pages
+//     3. concat dim=0               → (B*M/1024, 1024),  CB = 2×4 KB = 8 KB
+//     4. rebank_rm_merge(., M/1024) → (B, M),            CB = 2×4 KB = 8 KB
+//   This avoids creating any tensor with a page > 4 KB in L1.
+//   Requires N%1024==0 and (M-N)%1024==0 (guaranteed when M is pow-2 and N%1024==0).
 static ttnn::Tensor zero_pad_to_m(
     const ttnn::Tensor& t, uint32_t M)
 {
@@ -282,9 +286,25 @@ static ttnn::Tensor zero_pad_to_m(
     auto* dev = t.device();
     TT_FATAL(dev != nullptr, "zero_pad_to_m: tensor has no device.");
     const auto mc = t.memory_config();
+    const uint32_t elem_bytes =
+        (t.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
 
-    // (B, M-N) zeros, column-concatenated to reach (B, M).
-    // CB = 2 × M × elem_bytes.
+    // Fast path for large M and 1024-aligned N (avoids large-CB concat).
+    if ((uint64_t)M * elem_bytes > kBluesteinRebankThreshold &&
+        N % 1024u == 0u && (M - N) % 1024u == 0u) {
+        const uint32_t n_chunks   = B * N / 1024u;
+        const uint32_t pad_chunks = B * (M - N) / 1024u;
+
+        auto rebankd = ttnn::prim::rebank_rm(t, 1024u);
+        auto zeros_r = ttnn::zeros(
+            ttnn::Shape{ttnn::SmallVector<uint32_t>{pad_chunks, 1024u}},
+            t.dtype(), t.layout(), std::ref(*dev), mc);
+        auto stacked = ttnn::concat({rebankd, zeros_r}, /*dim=*/0);
+        return ttnn::prim::rebank_rm_merge(stacked, M / 1024u);
+    }
+
+    // Fallback: (B, M-N) zeros, column-concatenated.  CB = 2 × M × elem_bytes.
+    // Safe for M × elem_bytes ≤ ~750 KB (fp32 M ≤ 131072 / bf16 M ≤ 262144).
     auto zeros_tail = ttnn::zeros(
         ttnn::Shape{ttnn::SmallVector<uint32_t>{B, M - N}},
         t.dtype(), t.layout(), std::ref(*dev), mc);
@@ -296,7 +316,10 @@ static ttnn::Tensor zero_pad_to_m(
 // ttnn::slice on a 2-D RM tensor allocates CB = 32 × 2 × output_row_bytes,
 // which overflows L1 for N > ~22 K elements (fp32).  This helper rebands to
 // (B·M/1024, 1024), takes the first B·N/1024 rows via a row-slice (page =
-// 4 KB), and reshapes back — the maximum CB per step is ~1 MB.
+// 4 KB), then reassembles to (B, N):
+//   - small N (N × elem ≤ 64 KB): ttnn::reshape — CB = 2 × N × elem ≤ 1 MB.
+//   - large N (N × elem >  64 KB): rebank_rm_merge — CB = 2 × 1024 × elem = 8 KB.
+//     n_chunks = N/1024 need not be a power of 2.
 //
 // PRECONDITION: N % 1024 == 0, M must be a power of 2 (Bluestein always
 // satisfies this: M = next_pow2(2N-1) ≥ 2048), M >= N.
@@ -310,6 +333,8 @@ static ttnn::Tensor trim_to_n(
 
     const uint32_t n_chunks = N / 1024u;
     const auto mc = t.memory_config();
+    const uint32_t elem_bytes =
+        (t.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
 
     // (B, M) → (B·m_chunks, 1024).  CB = 8 KB via rebank_rm.
     auto flat_m = ttnn::prim::rebank_rm(t, 1024u);
@@ -321,8 +346,12 @@ static ttnn::Tensor trim_to_n(
     const ttnn::SmallVector<uint32_t> stp = {1u, 1u};
     auto flat_n = ttnn::slice(flat_m, beg, end, stp, mc);
 
-    // Reshape (B·n_chunks, 1024) → (B, N).
-    // Page grows to N × elem_bytes; CB = 2 × N × elem_bytes ≤ ~1 MB.
+    // Reassemble (B·n_chunks, 1024) → (B, N).
+    if ((uint64_t)N * elem_bytes > kBluesteinRebankThreshold) {
+        // Large N: CB = 2 × 1024 × elem_bytes = 8 KB (n_chunks need not be pow-2).
+        return ttnn::prim::rebank_rm_merge(flat_n, n_chunks);
+    }
+    // Small N: page-growing reshape, CB = 2 × N × elem_bytes ≤ 1 MB.
     return ttnn::reshape(
         flat_n,
         ttnn::Shape{ttnn::SmallVector<uint32_t>{B, N}});

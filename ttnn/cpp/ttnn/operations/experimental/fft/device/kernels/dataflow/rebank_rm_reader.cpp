@@ -15,8 +15,9 @@
 //   src_page   = u / CHUNKS_PER_ROW    (which source batch row)
 //   col_offset = (u % CHUNKS_PER_ROW) * CHUNK * elem_bytes
 //
-// Because CHUNK divides N exactly (both are powers of 2 and CHUNK ≤ N),
+// Because CHUNK divides N exactly (CHUNK ≤ N and N % CHUNK == 0),
 // the read never crosses a source page boundary.  One NoC read per unit.
+// N need not be a power of 2; CHUNKS_PER_ROW (= N/CHUNK) may be any integer.
 //
 // Runtime args:
 //   0: src_addr              (DRAM buffer base address)
@@ -47,20 +48,15 @@ void kernel_main() {
     constexpr uint32_t elem_bytes  = IS_BF16 ? 2u : 4u;
     constexpr uint32_t chunk_bytes = CHUNK * elem_bytes;
 
-    // CHUNKS_PER_ROW is a pow-2 compile-time constant; the compiler
-    // replaces the division and modulo with shifts / masks automatically.
-    constexpr uint32_t LOG2_CPR = [] {
-        uint32_t v = CHUNKS_PER_ROW, r = 0u;
-        while (v > 1u) { v >>= 1; ++r; }
-        return r;
-    }();
-
+    // CHUNKS_PER_ROW is a compile-time constant; the compiler can optimise
+    // division and modulo (e.g. via reciprocal multiplication) whether or not
+    // CHUNKS_PER_ROW is a power of 2.
     const InterleavedAddrGen<true> src_gen = {
         .bank_base_address = src_addr, .page_size = src_page_size_bytes};
 
     // Starting page and chunk-within-page for base_unit.
-    uint32_t src_page      = base_unit >> LOG2_CPR;     // base_unit / CHUNKS_PER_ROW
-    uint32_t chunk_in_page = base_unit & (CHUNKS_PER_ROW - 1u); // base_unit % CHUNKS_PER_ROW
+    uint32_t src_page      = base_unit / CHUNKS_PER_ROW;
+    uint32_t chunk_in_page = base_unit % CHUNKS_PER_ROW;
 
     for (uint32_t u = 0u; u < num_units; ++u) {
         const uint32_t col_offset = chunk_in_page * chunk_bytes;

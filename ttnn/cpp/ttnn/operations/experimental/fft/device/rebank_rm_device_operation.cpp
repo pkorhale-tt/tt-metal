@@ -38,8 +38,7 @@ void RebankRmDeviceOperation::validate_on_program_cache_miss(
         "rebank_rm: chunk_size must be pow-2 in [1, N={}] (got {}).", N, chunk);
     TT_FATAL(N % chunk == 0u,
         "rebank_rm: N={} must be divisible by chunk_size={}.", N, chunk);
-    TT_FATAL(rebank_is_pow2(N),
-        "rebank_rm: N must be a power of 2 (got {}).", N);
+    // N need not be a power of 2; only chunk must be pow-2 (for output-page alignment).
 }
 
 RebankRmDeviceOperation::spec_return_value_t

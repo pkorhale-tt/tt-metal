@@ -35,8 +35,10 @@ void RebankRmMergeDeviceOperation::validate_on_program_cache_miss(
         "rebank_rm_merge: input must be 2D (got {}D).", shape.size());
 
     const uint32_t rows = static_cast<uint32_t>(shape[0]);
-    TT_FATAL(rebank_is_pow2(cpm) && cpm >= 1u,
-        "rebank_rm_merge: chunks_per_merge must be a power-of-2 ≥ 1 (got {}).", cpm);
+    TT_FATAL(cpm >= 1u,
+        "rebank_rm_merge: chunks_per_merge must be ≥ 1 (got {}).", cpm);
+    // chunks_per_merge need not be a power of 2; the kernel uses compile-time
+    // constant division which the compiler optimises via reciprocal multiplication.
     TT_FATAL(rows % cpm == 0u,
         "rebank_rm_merge: input rows {} not divisible by chunks_per_merge {}.", rows, cpm);
 }
