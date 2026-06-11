@@ -875,18 +875,41 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> fft_three_pass(
     //   After Stage 3 we have (B·N1·N2, N3) ≡ (B, k1, k2, k3).
     //   Target: (B, N3, N2, N1) ≡ (B, k3, k2, k1).
     //
-    //   (a) view → (B, N1·N2, N3)         [free, last dim unchanged]
-    //   (b) transpose_rm → (B, N3, N1·N2) [page_out = N1·N2·elem]
-    //   (c) view → (B, N3, N1, N2)        [page change: N1·N2 → N2]
-    //   (d) transpose_rm → (B, N3, N2, N1)[page_out = N1·elem, tiny]
-    auto r4_3d = ttnn::reshape(r3, make_shape({B, N1 * N2, N3}));
-    auto i4_3d = ttnn::reshape(i3, make_shape({B, N1 * N2, N3}));
-    auto r4t1  = ttnn::prim::transpose_rm(r4_3d);                     // (B, N3, N1·N2)
-    auto i4t1  = ttnn::prim::transpose_rm(i4_3d);
-    auto r4s   = ttnn::reshape(r4t1, make_shape({B, N3, N1, N2}));
-    auto i4s   = ttnn::reshape(i4t1, make_shape({B, N3, N1, N2}));
-    auto r_out = ttnn::prim::transpose_rm(r4s);                       // (B, N3, N2, N1)
-    auto i_out = ttnn::prim::transpose_rm(i4s);
+    //   Normal path (N1·N2·elem ≤ 375 KB):
+    //     (a) view → (B, N1·N2, N3)         [page=N3·e, tiny]
+    //     (b) transpose_rm → (B, N3, N1·N2) [CB=8 KB; page_out=N1·N2·e]
+    //     (c) view → (B, N3, N1, N2)        [page-shrink CB=4×N1·N2·e ≤ 1 MB]
+    //     (d) transpose_rm → (B, N3, N2, N1)[CB=8 KB]
+    //
+    //   Large-N path (N1·N2·elem > 375 KB, e.g. N=2^27 → 512 KB → CB≈2 MB):
+    //     The page-shrink reshape in step (c) would overflow L1.
+    //     Use rebank_rm to split (B·N3, N1·N2) into (B·N3·N1, N2) first:
+    //       (a) view → (B, N1·N2, N3)         [tiny]
+    //       (b) transpose_rm → (B, N3, N1·N2) [CB=8 KB]
+    //       (c) view → (B·N3, N1·N2)          [metadata, same large page]
+    //       (d) rebank_rm(., N2) → (B·N3·N1, N2)  [CB=2·N2·e ≤ 2 KB]
+    //       (e) view → (B·N3, N1, N2)             [metadata]
+    //       (f) transpose_rm → (B·N3, N2, N1)     [CB=8 KB]
+    //       (g) view → (B, N3, N2, N1)            [metadata]
+    //     N2 is always pow-2 (from pick_three_factorization).  ✓
+    constexpr uint64_t kSrcPageOverflowBytes = 375u * 1024u;
+    const bool large_n1n2 = ((uint64_t)N1 * N2 * elem_bytes_3p > kSrcPageOverflowBytes);
+    auto final_rearrange = [&](const ttnn::Tensor& src) -> ttnn::Tensor {
+        auto t3d = ttnn::reshape(src, make_shape({B, N1 * N2, N3}));   // (B, N1·N2, N3) tiny page
+        auto tt1  = ttnn::prim::transpose_rm(t3d);                      // (B, N3, N1·N2)
+        if (large_n1n2) {
+            auto tt1_2d = ttnn::reshape(tt1, make_shape({B * N3, N1 * N2}));  // metadata
+            auto rb     = ttnn::prim::rebank_rm(tt1_2d, N2);                  // (B·N3·N1, N2)
+            auto t4d    = ttnn::reshape(rb, make_shape({B * N3, N1, N2}));    // metadata
+            auto tt2    = ttnn::prim::transpose_rm(t4d);                       // (B·N3, N2, N1)
+            return ttnn::reshape(tt2, make_shape({B, N3, N2, N1}));           // metadata
+        }
+        auto t4d  = ttnn::reshape(tt1, make_shape({B, N3, N1, N2}));   // page-shrink CB≤1 MB
+        auto tout = ttnn::prim::transpose_rm(t4d);                      // (B, N3, N2, N1)
+        return tout;
+    };
+    auto r_out = final_rearrange(r3);
+    auto i_out = final_rearrange(i3);
 
     // ── OUTPUT swap (free) — completes the swap-trick for IFFT.
     if (inverse) {
