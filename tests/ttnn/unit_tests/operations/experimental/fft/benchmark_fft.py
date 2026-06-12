@@ -9,17 +9,21 @@ Usage:
     python benchmark_fft.py --dtype fp32       # fp32 only
     python benchmark_fft.py --warmup 5 --runs 50
     python benchmark_fft.py --csv results.csv  # save CSV for plotting
+    python benchmark_fft.py --wh-power 42 --cpu-power 353  # paper-accurate energy
 
 Metrics reported per (N, dtype, algorithm):
-  - Wormhole device time  (ms)   — median of timed runs
-  - CPU time              (ms)   — NumPy on host (single-threaded)
-  - GFLOPs/s (device)            — 5 N log2(N) / time_s
-  - Speedup vs CPU               — cpu_time / device_time  (<1 = WH faster)
-  - Estimated energy ratio       — (cpu_time × cpu_TDP) / (wh_time × wh_TDP)
-                                    default: cpu_TDP=240W, wh_TDP=75W (n300 PCIe)
+  - Wormhole device time (ms) — median of timed runs, kernel execution only
+    (excludes host-device transfer, matching Brown et al. ISC 2025 methodology)
+  - CPU time (ms) — NumPy on host (all available cores)
+  - GFLOPs/s (device) — 5 N log2(N) / time_s  (complex FFT convention)
+  - Speedup vs CPU — cpu_time / device_time (>1 = WH faster)
+  - Energy ratio — (cpu_time × cpu_power) / (wh_time × wh_power)
+    Pass --wh-power and --cpu-power for paper-accurate measured values.
+    Falls back to TDP estimates: cpu_TDP=240W, wh_TDP=75W (conservative).
+    Formula: Brown et al. ISC 2025, Table 3 — E = P × t, ratio = E_cpu / E_wh
 
 FFT FLOP count convention (matches cuFFT docs):
-  real FFT of length N:  5 N log2(N)  FLOPs
+  complex FFT of length N:  5 N log2(N)  FLOPs
 """
 
 import argparse
@@ -28,7 +32,7 @@ import math
 import os
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import List, Optional
 
 import numpy as np
@@ -37,9 +41,12 @@ import ttnn
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-# Wormhole n300 PCIe TDP in watts (measured ~75 W under load)
-WH_TDP_W = 75.0
-# Xeon Platinum 8260 (24-core) TDP in watts — matches Brown et al. ISC 2025
+# TDP fallback values (used if --wh-power / --cpu-power not supplied).
+# For paper-accurate results, measure with:
+#   WH  power: tt_power_sidecar.py --backend sysfs → avg_power_W
+#   CPU power: RAPL via /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj
+# Paper (Brown et al. ISC 2025) measured: CPU=353W, WH=42W for 2D FFT 1024×1024
+WH_TDP_W  = 75.0
 CPU_TDP_W = 240.0
 
 
@@ -87,7 +94,11 @@ def _algorithm_label(N: int) -> str:
 
 
 def _fft_flops(N: int) -> float:
-    """5 N log2(N) — standard complex FFT FLOP count."""
+    """5 N log2(N) — standard complex FFT FLOP count convention (matches cuFFT docs).
+    Input to the benchmark is real-valued, but we use the complex convention
+    (5 N log2 N rather than 2.5 N log2 N) for comparability with FFT literature.
+    This is consistent regardless of whether the WH kernel internally exploits
+    real-input symmetry."""
     return 5.0 * N * math.log2(max(N, 2))
 
 
@@ -117,21 +128,23 @@ def _download(re: ttnn.Tensor, im: ttnn.Tensor, N: int) -> np.ndarray:
     return r + 1j * i
 
 
-def _wh_fft_timed(tt_in: ttnn.Tensor, N: int, n_runs: int) -> List[float]:
-    """Return list of per-run wall-clock times in ms (device synced)."""
+def _wh_fft_timed(tt_in: ttnn.Tensor, N: int, n_runs: int, device) -> List[float]:
+    """Return list of per-run wall-clock times in ms.
+    Times kernel execution only — excludes D2H download, matching
+    Brown et al. ISC 2025: 'performance numbers for WH are execution time only.'
+    """
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
         re, im = _run_wh_fft(tt_in)
-        # Force completion — to_torch blocks until kernel finishes
-        ttnn.to_torch(re)
-        ttnn.to_torch(im)
+        ttnn.synchronize_device(device)  # sync without downloading
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1e3)
     return times
 
 
 def _cpu_fft_timed(x_np: np.ndarray, n_runs: int) -> List[float]:
+    """Return list of per-run wall-clock times in ms (all available CPU cores)."""
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
@@ -149,6 +162,8 @@ def benchmark_one(
     device,
     warmup: int,
     runs: int,
+    wh_power_w: float,
+    cpu_power_w: float,
 ) -> Optional[BenchResult]:
     tt_dtype = ttnn.float32 if dtype_str == "fp32" else ttnn.bfloat16
 
@@ -167,7 +182,8 @@ def benchmark_one(
     np.random.seed(N % (1 << 20))
     x_np = np.random.randn(N).astype(np.float32)
     if dtype_str == "bf16":
-        x_np = x_np.astype(np.float16).astype(np.float32)  # quantise to bf16 range
+        # Correct bf16 quantisation via PyTorch (np.float16 is fp16, not bf16)
+        x_np = torch.tensor(x_np).to(torch.bfloat16).float().numpy()
 
     print(f"  bench N={N:>10,}  dtype={dtype_str}  algo={algo:<12}", end="", flush=True)
 
@@ -187,20 +203,20 @@ def benchmark_one(
         print(f"  → SKIP (warmup failed: {e})")
         return None
 
-    # Accuracy check
+    # Accuracy check (after warmup, so program is cached)
     ref = np.fft.fft(x_np)
     re, im = _run_wh_fft(tt_in)
     got = _download(re, im, N)
     rel_err = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
 
-    # Timed runs — device
-    wh_times = _wh_fft_timed(tt_in, N, runs)
+    # Timed runs — device (kernel only, no D2H)
+    wh_times = _wh_fft_timed(tt_in, N, runs, device)
     wh_times.sort()
     wh_med = float(np.median(wh_times))
-    wh_p25 = wh_times[runs // 4]
-    wh_p75 = wh_times[3 * runs // 4]
+    wh_p25 = float(np.percentile(wh_times, 25))
+    wh_p75 = float(np.percentile(wh_times, 75))
 
-    # CPU baseline (NumPy single-thread)
+    # CPU baseline (NumPy, all available cores)
     cpu_times = _cpu_fft_timed(x_np, max(runs, 10))
     cpu_times.sort()
     cpu_med = float(np.median(cpu_times))
@@ -208,7 +224,7 @@ def benchmark_one(
     flops = _fft_flops(N)
     gflops_s = flops / (wh_med * 1e-3) / 1e9
     speedup = cpu_med / wh_med
-    energy_ratio = speedup * (CPU_TDP_W / WH_TDP_W)  # > 1 = WH more energy efficient
+    energy_ratio = speedup * (cpu_power_w / wh_power_w)
 
     print(f"  WH={wh_med:7.2f}ms  CPU={cpu_med:7.2f}ms  "
           f"{gflops_s:6.2f}GFlops/s  "
@@ -237,11 +253,20 @@ def main():
                         help="timed iterations per (N, dtype)")
     parser.add_argument("--csv", default="fft_benchmark.csv",
                         help="output CSV path")
-    parser.add_argument("--stockham",    action="store_true", help="only Stockham N")
-    parser.add_argument("--two-pass",    action="store_true", help="only two-pass N")
-    parser.add_argument("--three-pass",  action="store_true", help="only three-pass N")
-    parser.add_argument("--bluestein",   action="store_true", help="only Bluestein N")
+    parser.add_argument("--stockham",   action="store_true", help="only Stockham N")
+    parser.add_argument("--two-pass",   action="store_true", help="only two-pass N")
+    parser.add_argument("--three-pass", action="store_true", help="only three-pass N")
+    parser.add_argument("--bluestein",  action="store_true", help="only Bluestein N")
+    parser.add_argument("--wh-power",  type=float, default=None,
+                        help="Measured WH avg power in watts (from TT-SMI). "
+                             "Overrides WH_TDP_W for energy calculation.")
+    parser.add_argument("--cpu-power", type=float, default=None,
+                        help="Measured CPU avg power in watts (from RAPL). "
+                             "Overrides CPU_TDP_W for energy calculation.")
     args = parser.parse_args()
+
+    wh_power_w  = args.wh_power  if args.wh_power  is not None else WH_TDP_W
+    cpu_power_w = args.cpu_power if args.cpu_power is not None else CPU_TDP_W
 
     dtypes = (["fp32", "bf16"] if args.dtype == "both"
               else [args.dtype])
@@ -261,10 +286,10 @@ def main():
 
     print("=" * 80)
     print("FFT Benchmark — Tenstorrent Wormhole B0  (HPEC 2026)")
-    print(f"  dtypes  : {dtypes}")
-    print(f"  warmup  : {args.warmup}   runs: {args.runs}")
-    print(f"  WH TDP  : {WH_TDP_W} W   CPU TDP: {CPU_TDP_W} W (Xeon Platinum)")
-    print(f"  N count : {len(n_list)} sizes × {len(dtypes)} dtypes = "
+    print(f"  dtypes   : {dtypes}")
+    print(f"  warmup   : {args.warmup}   runs: {args.runs}")
+    print(f"  WH power : {wh_power_w} W   CPU power: {cpu_power_w} W")
+    print(f"  N count  : {len(n_list)} sizes × {len(dtypes)} dtypes = "
           f"{len(n_list)*len(dtypes)} benchmarks")
     print("=" * 80)
 
@@ -276,7 +301,8 @@ def main():
             print(f"\n── dtype = {dtype_str} ──")
             for N in n_list:
                 r = benchmark_one(N, dtype_str, device,
-                                  warmup=args.warmup, runs=args.runs)
+                                  warmup=args.warmup, runs=args.runs,
+                                  wh_power_w=wh_power_w, cpu_power_w=cpu_power_w)
                 if r is not None:
                     results.append(r)
     finally:
@@ -305,17 +331,17 @@ def main():
 
     # ── Paper-ready summary ────────────────────────────────────────────────────
     if results:
-        print("\n── Paper highlights (median across N per algorithm tier) ──")
+        print("\n── Paper highlights (median across N per algorithm tier, fp32) ──")
         from collections import defaultdict
         by_algo = defaultdict(list)
         for r in results:
             if r.dtype == "fp32":
                 by_algo[r.algorithm].append(r)
         for algo, rs in sorted(by_algo.items()):
-            med_energy = sorted([r.energy_ratio for r in rs])[len(rs)//2]
-            med_gflops = sorted([r.gflops_s for r in rs])[len(rs)//2]
+            med_energy = sorted([r.energy_ratio for r in rs])[len(rs) // 2]
+            med_gflops = sorted([r.gflops_s for r in rs])[len(rs) // 2]
             print(f"  {algo:<12}:  {med_gflops:5.2f} GFlops/s  "
-                  f"energy efficiency {med_energy:.1f}× vs Xeon Platinum")
+                  f"energy efficiency {med_energy:.1f}× vs CPU")
 
 
 if __name__ == "__main__":
