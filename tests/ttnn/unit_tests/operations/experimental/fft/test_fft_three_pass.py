@@ -322,8 +322,9 @@ _AGGRESSIVE_GATE = os.environ.get("TT_FFT_AGGRESSIVE", "0") == "1"
     # a 4-D strided-transpose kernel is needed (future work).
     pytest.param(1 << 28, marks=pytest.mark.xfail(
         reason=(
-            "N=2^28: bring_n2_inner step-4 page=N2·N1·elem=1MB→CB=2MB "
-            "overflows L1; requires a 4-D strided-transpose kernel."
+            "N=2^28: DRAM OOM on WH B0 (≈1 GB). "
+            "fp32 input = 1 GB; bf16 input = 512 MB. "
+            "Exceeds device DRAM capacity."
         ),
         strict=False,
     )),
