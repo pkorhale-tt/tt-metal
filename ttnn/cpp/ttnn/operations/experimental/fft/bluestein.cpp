@@ -59,16 +59,6 @@ namespace {
 // Matches kRebankThresholdBytes in fft.cpp (kept separate to avoid Unity collision).
 constexpr uint32_t kBluesteinRebankThreshold = 64u * 1024u;
 
-// Returns true iff n is a power of two (n > 0).
-// Used to guard rebank_rm / rebank_rm_merge calls: when the work-unit count
-// (N/chunk or B×N/chunk) is NOT a power of 2, the current factories may fail
-// to find a valid rectangular core grid and can inadvertently target dispatch
-// cores on harvested WH B0 machines.  Falling back to ttnn::reshape or concat
-// is safe for the sizes that arise in Bluestein (pages ≤ 1 MB < 1.5 MB L1).
-static inline bool is_pow2_chunks(uint32_t n) {
-    return n > 0u && (n & (n - 1u)) == 0u;
-}
-
 // Page-shrinking reshape: (B, src_cols) → (B × src_cols/new_cols, new_cols).
 //
 // For large source pages (> 64 KB), ttnn::reshape overflows L1, so we use
@@ -316,13 +306,13 @@ static ttnn::Tensor zero_pad_to_m(
         (t.dtype() == tt::tt_metal::DataType::BFLOAT16) ? 2u : 4u;
 
     // Fast path for large M and 1024-aligned N (avoids large-CB concat).
-    // Guard: B*N/1024 must be a power of 2 so that rebank_rm can form a valid
-    // rectangular CoreRange without landing on dispatch cores.  For non-pow-2
-    // counts (e.g. N=64512 → 63 work units) the concat fallback below is safe
-    // because CB = 2 × M × elem_bytes = 2×131072×4 = 1 MB < 1.5 MB L1 limit.
+    // Uses a streaming rebank+zeros-concat+merge chain; all steps have tiny
+    // (8 KB) CBs regardless of M or N.  The rebank_rm factory's grid-
+    // validation loop correctly handles non-pow-2 num_units (e.g. N=64512 →
+    // 63 units → 21 cores with grid {7,3}; N=525312 → 513 units → 1 core).
+    // The concat fallback below only handles small M (CB = 2×M×elem ≤ 750 KB).
     if ((uint64_t)M * elem_bytes > kBluesteinRebankThreshold &&
-        N % 1024u == 0u && (M - N) % 1024u == 0u &&
-        is_pow2_chunks(B * N / 1024u)) {
+        N % 1024u == 0u && (M - N) % 1024u == 0u) {
         const uint32_t pad_chunks = B * (M - N) / 1024u;
 
         auto rebankd = ttnn::prim::rebank_rm(t, 1024u);
@@ -334,7 +324,8 @@ static ttnn::Tensor zero_pad_to_m(
     }
 
     // Fallback: (B, M-N) zeros, column-concatenated.  CB = 2 × M × elem_bytes.
-    // Safe for M × elem_bytes ≤ ~750 KB (fp32 M ≤ 131072 / bf16 M ≤ 262144).
+    // Only reached when M × elem_bytes ≤ kBluesteinRebankThreshold (≤ 64 KB),
+    // so CB ≤ 128 KB — well within the 1.5 MB L1 limit.
     auto zeros_tail = ttnn::zeros(
         ttnn::Shape{ttnn::SmallVector<uint32_t>{B, M - N}},
         t.dtype(), t.layout(), std::ref(*dev), mc);
