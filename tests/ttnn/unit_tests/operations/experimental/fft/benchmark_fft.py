@@ -96,7 +96,7 @@ def _fft_flops(N: int) -> float:
 def _open_device():
     """Open the first available Wormhole device."""
     device = ttnn.open_device(device_id=0)
-    ttnn.enable_program_cache(device)
+    device.enable_program_cache()
     return device
 
 
