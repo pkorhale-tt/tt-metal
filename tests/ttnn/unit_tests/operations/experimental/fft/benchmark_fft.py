@@ -62,15 +62,15 @@ class BenchResult:
 
 POW2_STOCKHAM = [32, 64, 128, 256, 512, 1024]
 POW2_TWO_PASS = [2048, 4096, 8192, 65536, 1 << 17, 1 << 20]
-POW2_THREE_PASS = [1 << 21, 1 << 23, 1 << 24, 1 << 26]   # ≤ 2^26 fp32-safe
+POW2_THREE_PASS = [1 << 21, 1 << 23, 1 << 24]  # 2^26 OOMs on 1 GB WH B0
 BLUESTEIN_N = [
     # small primes and composites
     97, 127, 257, 509,
     # medium composites (M = 2-pass)
-    1000, 3000, 9999, 65535,
-    # large 1024-aligned (M = 2-pass inner)
+    1000, 3000, 9999,
+    # large 1024-aligned (M = 2-pass inner, fp32 hw limit: M ≤ 2^17)
     64512,          # 63 × 1024, M = 2^17
-    # XL (M = 3-pass inner)
+    # XL (M = 3-pass inner); non-1024-aligned (65535) is L1-unsafe → excluded
     525312,         # 513 × 1024
     786432,         # 768 × 1024
 ]
