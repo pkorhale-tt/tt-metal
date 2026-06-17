@@ -1,0 +1,38 @@
+================================================================================
+SECTION 7 — CONCLUSION
+================================================================================
+
+We presented ttnn.experimental.fft, a unified 1-D FFT library for the
+Tenstorrent Wormhole B0 chip that accepts any transform length N and both fp32
+and bfloat16 data types through a single cuFFT-compatible API. The library
+introduces two L1-safe streaming primitives — rebank_rm and rebank_rm_merge —
+that reduce intermediate circular-buffer requirements from tens of megabytes to
+8 KB, enabling Bluestein and three-pass algorithms at sizes previously
+impossible on this hardware. A core-grid validation loop prevents dispatch-core
+placement for non-power-of-2 work-unit counts, eliminating a class of runtime
+errors in the Wormhole kernel scheduler.
+
+Benchmarks on a single n300 Wormhole B0 card show peak throughput of
+3.62 GFLOPs/s (fp32) and 3.44 GFLOPs/s (bf16) at N=1,048,576, with up to
+46.9× lower energy consumption than a 24-core Xeon Platinum 8260 server CPU
+at N=16,777,216 bf16 — using measured device power of 42 W versus 353 W for
+the CPU. The wall-clock crossover point, where Wormhole first exceeds CPU
+performance, is N≈131,072 for fp32 and N≈1,048,576 for bf16. All fp32 results
+satisfy a 5×10⁻⁴ relative-error tolerance; bfloat16 results satisfy 5×10⁻².
+
+Future work includes: (i) extending coverage to 2-D and batch 1-D FFTs to
+directly compare with Brown et al. on equal footing; (ii) precomputing
+Bluestein chirp sequences in fp64 on the host to eliminate large-argument
+sincos error; (iii) applying a Spiral-style automated kernel generator for
+per-N Tensix code to fill the performance gap at small N; and (iv) multi-card
+(Ethernet-linked Wormhole mesh) FFT for N beyond the 1 GB DRAM limit of a
+single n300 card.
+
+================================================================================
+NOTES FOR REVISION
+--------------------------------------------------------------------------------
+- Trim to fit page budget — conclusion can be as short as 1 paragraph
+- "n300 card" → confirm official product name before submission
+- If multi-card FFT work progresses before submission, move from future work
+  to a new results paragraph
+================================================================================

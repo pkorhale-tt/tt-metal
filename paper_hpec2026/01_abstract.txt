@@ -1,0 +1,28 @@
+================================================================================
+SECTION 1 — ABSTRACT
+================================================================================
+
+We present ttnn.experimental.fft, a unified 1-D Fast Fourier Transform library
+for the Tenstorrent Wormhole B0 neural-processor chip. Unlike prior
+Tenstorrent FFT work that targets fixed, power-of-two sizes in 2-D, our
+implementation exposes a single API call — identical in form to NVIDIA cuFFT —
+that accepts any transform length N and both fp32 and bfloat16 data types.
+Internally, a compile-time router selects among four algorithm tiers:
+single-tile Stockham (N ≤ 1,024), two-pass radix (N ≤ 1,048,576), three-pass
+radix (N ≤ 16,777,216), and Bluestein chirp-Z (arbitrary N). Two new L1-safe
+streaming primitives — rebank_rm and rebank_rm_merge — enable intermediate
+tensor reshapes that previously overflowed the 1.5 MB Wormhole L1 cache, and
+a core-grid validation loop prevents kernel placement on reserved dispatch
+cores for non-power-of-2 work-unit counts. On a single Wormhole n300 card,
+our implementation reaches 3.62 GFLOPs/s (fp32) and achieves up to 46.9×
+lower energy consumption than a 24-core Intel Xeon Platinum 8260 server CPU,
+at N=16,777,216 bfloat16 using measured device power (Wormhole: 42 W,
+CPU: 353 W). All fp32 results meet a 5×10⁻⁴ relative-error tolerance.
+
+================================================================================
+NOTES FOR REVISION
+--------------------------------------------------------------------------------
+- Word count target: 150 words (currently ~180 — trim before submission)
+- Add DOI / arXiv link of Brown et al. after it is published
+- Replace "n300 card" with specific part number if reviewers require it
+================================================================================

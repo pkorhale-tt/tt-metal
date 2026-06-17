@@ -1,0 +1,54 @@
+================================================================================
+REFERENCES (IEEE format — fill DOIs before submission)
+================================================================================
+
+[Bluestein70]
+  L. I. Bluestein, "A linear filtering approach to the computation of discrete
+  Fourier transform," IEEE Trans. Audio Electroacoust., vol. 18, no. 4,
+  pp. 451–455, Dec. 1970.
+
+[Brown25]
+  M. Brown et al., "High-Performance FFT on Tenstorrent Wormhole," in Proc.
+  IEEE/ACM Int. Symp. High Performance Computing (ISC), Hamburg, Germany, 2025.
+  [FILL: pages, DOI once published]
+
+[Cooley65]
+  J. W. Cooley and J. W. Tukey, "An algorithm for the machine calculation of
+  complex Fourier series," Math. Comput., vol. 19, no. 90, pp. 297–301, 1965.
+
+[cuFFT]
+  NVIDIA Corporation, "cuFFT Library User Guide," DU-06707-001_v12.0, 2023.
+  [Online]. Available: https://docs.nvidia.com/cuda/cufft/
+
+[FFTW]
+  M. Frigo and S. G. Johnson, "The Design and Implementation of FFTW3," Proc.
+  IEEE, vol. 93, no. 2, pp. 216–231, Feb. 2005, doi: 10.1109/JPROC.2004.840301.
+
+[Rabiner75]
+  L. R. Rabiner, R. W. Schafer, and C. M. Rader, "The chirp z-transform
+  algorithm and its application," Bell Syst. Tech. J., vol. 48, no. 5,
+  pp. 1249–1292, 1975. [CONFIRM: check exact year/volume]
+
+[Spiral]
+  M. Püschel et al., "SPIRAL: Code Generation for DSP Transforms," Proc. IEEE,
+  vol. 93, no. 2, pp. 232–275, Feb. 2005, doi: 10.1109/JPROC.2004.840306.
+
+[ttnn]
+  Tenstorrent Inc., "tt-metal: Open Source AI Accelerator Framework," GitHub,
+  2024. [Online]. Available: https://github.com/tenstorrent/tt-metal
+
+================================================================================
+OPTIONAL — ADD THESE IF REFERENCED IN TEXT
+================================================================================
+
+[FNet]
+  J. Lee-Thorp et al., "FNet: Mixing Tokens with Fourier Transforms," in Proc.
+  NAACL, 2022, doi: 10.18653/v1/2022.naacl-main.319.
+
+[Intel MKL FFT]
+  Intel Corporation, "Intel oneAPI Math Kernel Library Developer Reference:
+  Fourier Transform Functions," 2023.
+  [Online]. Available: https://www.intel.com/content/www/us/en/developer/
+  tools/oneapi/onemkl.html
+
+================================================================================

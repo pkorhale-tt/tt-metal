@@ -1,0 +1,73 @@
+================================================================================
+SECTION 3 — BACKGROUND
+================================================================================
+
+A. Tenstorrent Wormhole B0 Architecture
+----------------------------------------
+
+The Wormhole B0 (WH B0) chip contains a 10×12 grid of Tensix cores connected
+by a 2-D mesh Network-on-Chip (NoC). Each Tensix core consists of five RISC-V
+processors (one dataflow controller and four SIMD units), 1,499,136 bytes
+(≈1.5 MB) of L1 SRAM, and a hardware Circular Buffer (CB) controller. Compute
+kernels communicate exclusively through L1-resident circular buffers: a data
+movement RISC-V core fills buffers from DRAM or from a neighbouring core via
+the NoC, a compute RISC-V core drains and refills them, and a second data
+movement RISC-V core writes results out. All CB allocations are static and must
+be declared at compile time; the firmware validates that the total L1 footprint
+across all CBs on a core does not exceed 1,499,136 bytes before launching the
+program. This hard constraint is central to the challenges addressed in this work.
+
+Two cores per row are reserved as "dispatch cores" used by the firmware for
+command routing; user-defined kernels may not be placed on these cores. Any
+CoreRange that accidentally includes a dispatch core causes a fatal "Illegal
+kernel placement" error at program launch.
+
+The device is connected to the host via PCIe Gen4 x16, providing approximately
+32 GB/s bidirectional bandwidth. The n300 configuration uses a single WH B0
+die with 1 GB of LPDDR5 DRAM organised across 12 banks.
+
+B. The ttnn Framework
+----------------------
+
+TT-NN (tt-metal neural-network framework) provides a PyTorch-like tensor API
+for Tenstorrent hardware. Operations are expressed as DeviceOperation subclasses
+with three components: (i) an attribute struct holding hyperparameters, (ii) a
+tensor_args struct holding input/output tensor references, and (iii) a factory
+class that generates the low-level Metal program (kernel source, CB sizes, core
+grids). The framework caches compiled programs keyed by a hash of the operation
+attributes and tensor shapes, so repeated calls with the same configuration
+incur no recompilation overhead.
+
+Composite operations (such as FFT) are implemented as host-side C++ functions
+that chain primitive operations (pad, concat, reshape, transpose, matrix
+multiply) and custom device operations. The intermediate tensors are allocated
+from a per-operation output pool and freed when no longer referenced.
+
+C. The FFT Algorithm Zoo
+-------------------------
+
+All practical FFT implementations derive from the Cooley-Tukey radix-2 algorithm
+[Cooley65], which recursively factors a DFT of length N = N₁ × N₂ into N₁
+DFTs of length N₂ followed by N₂ DFTs of length N₁ connected by twiddle-factor
+multiplications. For non-power-of-2 N, the standard approach is Bluestein's
+chirp-Z transform [Bluestein70]: it rewrites the DFT as a linear convolution,
+then evaluates that convolution via a power-of-2 FFT of length M ≥ 2N−1. The
+inner FFT can itself be any implementation, including a multi-pass one.
+
+For hardware with limited per-core memory, a key challenge is performing the
+inter-pass transpositions required by multi-pass Cooley-Tukey without
+materialising full N×1 intermediate tensors in L1. Prior GPU FFT libraries
+(cuFFT, rocFFT) handle this through warp-shuffle or shared-memory swaps within
+a single GPU kernel. On Wormhole, where each core has only 1.5 MB of L1 and
+kernels cannot communicate through shared memory (only through NoC-connected
+CBs), equivalent operations must be decomposed into streaming passes — the
+design challenge addressed by our rebank_rm primitives.
+
+================================================================================
+NOTES FOR REVISION
+--------------------------------------------------------------------------------
+- Confirm exact WH B0 L1 size (currently 1,499,136 bytes = 1.5 MB - 768 B)
+- Add die photo / block diagram figure if space allows (Figure 1)
+- "10×12 grid" — confirm exact Tensix count with hardware datasheet
+- PCIe bandwidth: confirm Gen4 x16 vs x8 for n300 SKU
+================================================================================

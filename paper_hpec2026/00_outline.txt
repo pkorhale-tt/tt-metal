@@ -1,0 +1,68 @@
+================================================================================
+HPEC 2026 — PAPER OUTLINE
+Title: ttnn.experimental.fft: A Unified, Arbitrary-Length 1-D FFT Library
+       for Tenstorrent Wormhole B0
+================================================================================
+
+Target: IEEE HPEC 2026 (6–8 pages, double-column IEEE format)
+
+--------------------------------------------------------------------------------
+SECTIONS
+--------------------------------------------------------------------------------
+
+01_abstract.txt         ~150 words
+02_introduction.txt     ~0.6 pages  (motivation, contributions)
+03_background.txt       ~0.6 pages  (WH B0 architecture, ttnn, prior work gap)
+04_design.txt           ~1.8 pages  (routing, L1 safety, Bluestein, three-pass)
+05_evaluation.txt       ~1.5 pages  (throughput, energy, accuracy tables)
+06_related_work.txt     ~0.5 pages  (Brown ISC25, cuFFT, FFTW, Spiral)
+07_conclusion.txt       ~0.25 pages
+
+--------------------------------------------------------------------------------
+KEY CLAIMS (one sentence each — must be supported by data)
+--------------------------------------------------------------------------------
+
+C1. First unified 1-D FFT covering ALL N on Tenstorrent hardware,
+    exposing the same API surface as cuFFT (single call, any dtype).
+
+C2. L1-safe kernel composition via rebank_rm / rebank_rm_merge eliminates
+    static circular-buffer overflows that blocked prior Bluestein and
+    three-pass implementations for large N (>1 M).
+
+C3. Peak throughput: 3.62 GFLOPs/s fp32, 3.44 GFLOPs/s bf16 at N=1,048,576.
+
+C4. Energy efficiency: up to 46.9× lower energy than 24-core Xeon Platinum
+    (N=16 M, bf16) using measured power (WH: 42 W, CPU: 353 W).
+
+C5. Wall-clock crossover at N≈131 K (fp32) and N≈1 M (bf16): WH is faster
+    than a 24-core server CPU at these sizes.
+
+--------------------------------------------------------------------------------
+BENCHMARK DATA SUMMARY (from benchmark_fft.py, WH=42W CPU=353W)
+--------------------------------------------------------------------------------
+
+N           dtype   algo        WH(ms)   CPU(ms)  GFlops/s  speedup  energy×
+32          fp32    stockham     0.10      0.00      0.01     0.02×     0.3×
+1,024       fp32    stockham     0.47      0.01      0.11     0.02×     0.3×
+65,536      fp32    two_pass     2.37      0.80      2.21     0.34×     4.6×
+131,072     fp32    two_pass     4.27      4.76      2.61     1.11×    15.2×   ← crossover
+1,048,576   fp32    two_pass    29.00     46.12      3.62     1.59×    21.7×   ← peak
+16,777,216  fp32    three_pass 1008.92  1040.39      2.00     1.03×    14.1×
+64,512      fp32    bluestein   11.52      0.81      0.45     0.07×     1.0×
+9,999       fp32    bluestein    4.72      0.31      0.14     0.07×     0.9×   err=4.2e-4
+1,048,576   bf16    two_pass    30.50     46.62      3.44     1.53×    20.8×
+8,388,608   bf16    three_pass 577.74    932.42      1.67     1.61×    22.0×
+16,777,216  bf16    three_pass 1062.26  3655.99      1.90     3.44×    46.9×  ← best
+
+--------------------------------------------------------------------------------
+FILES TO CITE
+--------------------------------------------------------------------------------
+
+[Brown25]  Brown et al., "FFT on Tenstorrent Wormhole," ISC 2025
+[cuFFT]    NVIDIA cuFFT Library User Guide
+[FFTW]    Frigo & Johnson, "The Design and Implementation of FFTW3," 2005
+[Bluestein] Bluestein, "A linear filtering approach to the computation of
+            discrete Fourier transform," 1970
+[Cooley]   Cooley & Tukey, "An algorithm for the machine calculation of
+           complex Fourier series," 1965
+================================================================================

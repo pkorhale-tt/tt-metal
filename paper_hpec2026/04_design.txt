@@ -1,0 +1,361 @@
+================================================================================
+SECTION 4 — DESIGN
+================================================================================
+
+A. Unified API
+---------------
+
+The public interface is a single Python function:
+
+    re, im = ttnn.experimental.fft(tensor)
+    re, im = ttnn.experimental.ifft(re, im)
+
+The input tensor has shape (B, N) in row-major layout, where B is the batch
+dimension and N is the transform length. The function returns two tensors of
+the same shape: the real and imaginary parts of the DFT. This mirrors the
+cuFFT C2C (complex-to-complex) calling convention adapted for real inputs,
+and requires no user knowledge of which algorithm is used internally.
+
+The inverse transform ttnn.experimental.ifft accepts (re, im) and returns
+a single real-valued tensor of shape (B, N), applying the 1/N normalisation
+conventionally.
+
+B. Algorithm Routing
+---------------------
+
+At host call time, a C++ router in fft.cpp selects one of four algorithm tiers
+based solely on N and the active dtype. The routing conditions are:
+
+  Stockham (single-tile):
+    N is a power of 2 AND N ≤ 1,024.
+    The entire transform fits in a single Tensix tile (1024 elements).
+    A Stockham butterfly FFT is computed directly in L1 with no DRAM traffic.
+
+  Two-pass (Cooley-Tukey, 2 stages):
+    N is a power of 2 AND 1,024 < N ≤ 1,048,576.
+    N is factored as N = N₁ × N₂ with N₁ = N₂ = √N (or nearest split).
+    Step 1: N₁ column-FFTs of length N₂.
+    Step 2: Apply N₁ × N₂ twiddle factors.
+    Step 3: N₂ row-FFTs of length N₁.
+    A row-major transpose between steps 2 and 3 re-orders the data.
+
+  Three-pass (Cooley-Tukey, 3 stages):
+    N is a power of 2 AND 1,048,576 < N ≤ 16,777,216.
+    N is factored as N = N₁ × N₂ × N₃ where each factor ≤ 1,024.
+    The three-pass structure avoids single large twiddle matrices by nesting
+    two-pass transforms as inner stages.
+
+  Bluestein (chirp-Z):
+    N is not a power of 2, any N.
+    Selects M = smallest power of 2 ≥ 2N (with a minimum zero-pad of 8
+    elements to guarantee the chirp convolution is not aliased).
+    The inner FFT uses the two-pass or three-pass tier depending on M.
+
+Hardware memory limits for fp32 on the 1 GB Wormhole B0:
+  - Supported three-pass: N ≤ 16,777,216 (2^24)
+  - Supported Bluestein power-of-2-aligned: N ≤ 64,512 (fp32), 130,048 (bf16)
+  - Bluestein XL (1024-aligned only): N ≤ ~786,432
+
+C. L1-Safe Tensor Streaming: rebank_rm and rebank_rm_merge
+-----------------------------------------------------------
+
+The central engineering challenge in multi-pass FFT on WH B0 is performing
+inter-pass data rearrangements (transposes, reshapes, zero-padding) without
+creating circular buffers that exceed the 1.5 MB L1 limit.
+
+The standard ttnn.concat and ttnn.reshape operations allocate a circular buffer
+proportional to the page size of the output tensor. For an N-element row, this
+CB is N × bytes_per_element. At N = 131,072 (fp32), the CB is 512 KB — below
+the limit. But at N = 2,097,152, the required CB is 8 MB — 5× the L1 limit —
+causing a hard failure at program compile time.
+
+We introduce two new streaming primitives to solve this:
+
+  rebank_rm(tensor, chunk_size):
+    Reads the input tensor row by row and writes it out in chunks of
+    chunk_size elements. The circular buffer is only chunk_size × bytes_per_element
+    (e.g., 1,024 × 4 = 4 KB for fp32), regardless of N. This allows large
+    tensors to be "rebanked" (split into smaller logical rows) without any L1
+    pressure. The output shape is (num_chunks, chunk_size) where
+    num_chunks = total_elements / chunk_size.
+
+  rebank_rm_merge(tensor, rows_per_group):
+    The inverse of rebank_rm. Merges rows_per_group consecutive rows into a
+    single logical row, again using a small CB (rows_per_group × chunk_size
+    × bytes_per_element). This reconstructs the full-N row after inter-stage
+    transpositions.
+
+Together, these two operations replace all large-page tensor manipulations in
+the two-pass and three-pass pipelines. Table I shows the CB reduction achieved:
+
+  TABLE I — Circular buffer size before and after streaming primitives
+
+  Operation              | N example    | Old CB size | New CB size | Result
+  ---------------------- | ------------ | ----------- | ----------- | ------
+  zero_pad_to_m (concat) | N=64,512     | 1.00 MB     | 8 KB        | Fixed
+  bring_n2_inner reshape | N=2,097,152  | 8.00 MB     | 8 KB        | Fixed
+  final_rearrange reshape| N=16,777,216 | 32.00 MB    | 8 KB        | Fixed
+  L1 limit (WH B0)       | —            | —           | 1.5 MB      | —
+
+D. Core-Grid Validation for Non-Power-of-2 Work Units
+------------------------------------------------------
+
+The pick_batch_grid() function selects a CoreRange from the available Tensix
+cores such that num_cores evenly divides num_units (the number of independent
+work items). For power-of-2 num_units this is straightforward. For non-power-
+of-2 values (e.g., the 63 chunks produced by rebank_rm for N=64,512 with
+chunk_size=1,024), the naive selection may include reserved dispatch cores or
+yield a CoreRange whose area does not divide num_units, causing "Illegal kernel
+placement" at program launch.
+
+We add a grid validation loop inside both rebank_rm_factory.cpp and
+rebank_rm_merge_factory.cpp:
+
+    num_cores = max_cores_for_grid(device)
+    while num_cores > 1:
+        grid = pick_batch_grid(device, num_cores)
+        if grid.fits_in_device(device) and num_units % grid.area() == 0:
+            break
+        num_cores -= 1
+
+This loop iteratively reduces num_cores until a valid grid is found. For
+N=64,512 (63 units), it selects a {7,3}=21-core grid (63/21=3 units per core).
+For N=525,312 (513 units), it falls back to a single core (513/513=1 unit per core).
+The worst-case overhead of the loop is O(log(num_cores)) iterations, executed once
+at operation compile time and cached by the ttnn program cache.
+
+E. Bluestein Zero-Padding Path
+--------------------------------
+
+Bluestein's chirp-Z requires padding the input from length N to length M:
+
+    zero_pad_to_m(t, N, M, device):
+
+For small M (M × bytes_per_element ≤ 64 KB, the kBluesteinRebankThreshold),
+a standard concat with a zeros tensor is used: the CB is 2×M×elem_bytes ≤
+128 KB, well within the L1 limit.
+
+For large M (above the threshold) AND M divisible by 1,024, the function uses
+the streaming path:
+    1. rebank_rm(t, 1,024)          — split input into 1,024-element chunks
+    2. zeros(pad_chunks, 1,024)     — allocate zero-padding as matching chunks
+    3. concat(rebankd, zeros, dim=0) — concatenate along the chunk axis
+    4. rebank_rm_merge(stacked, M/1,024) — reassemble into rows of length M
+
+The CB across all four steps is bounded by 8 KB (the chunk CB), achieving a
+1024× reduction from the naive 8 MB CB that the direct concat would require.
+
+F. Three-Pass Implementation Details
+--------------------------------------
+
+For N = N₁ × N₂ × N₃ (all factors ≤ 1,024), the three-pass FFT proceeds as:
+
+  Pass 1: Treat input as (N₁·N₂, N₃) — compute N₁·N₂ FFTs of length N₃.
+  Twiddle 1: Apply (N₁·N₂ × N₃) twiddle factors.
+  Pass 2 (bring_n2_inner): Rearrange to expose N₂ inner slices.
+           Uses rebank_rm_merge to avoid large-page reshape (see Table I).
+  Twiddle 2: Apply N₁·N₂ twiddle factors.
+  Pass 3: Compute N₁·N₂ FFTs of length N₁.
+  final_rearrange: Transpose to (B, N) output order.
+           Uses rebank_rm for large N to avoid the N₁×N₂ reshape overflow.
+
+The factor assignment N₁, N₂, N₃ is chosen to minimise the largest intermediate
+tensor dimension, subject to each factor being ≤ 1,024. For example:
+  N = 2,097,152 = 2^21 → N₁=256, N₂=64, N₃=128  (all ≤ 1,024)
+  N = 16,777,216 = 2^24 → N₁=256, N₂=256, N₃=256 (balanced)
+
+G. Kernel Architecture — How Each Operation Maps to Tensix
+-----------------------------------------------------------
+
+Every device operation in our FFT library compiles to a ProgramDescriptor
+containing up to three RISC-V binaries placed on each compute core:
+
+  BRISC0 (reader):  reads tiles from DRAM into L1 circular buffers via NoC.
+  TRISC  (compute): drains input CBs, executes the arithmetic, fills output CBs.
+  BRISC1 (writer):  drains output CBs and writes results back to DRAM via NoC.
+
+Reader and writer run concurrently with the compute core; the CB controller
+enforces producer–consumer flow control with no explicit synchronisation
+instructions. This three-way pipeline is the fundamental execution model for
+all kernels in our library.
+
+Below we describe each distinct kernel class, its CB layout, and its grid
+mapping.
+
+─────────────────────────────────────────────────────────────────────
+KERNEL 1: Stockham Butterfly (single-tile and batched)
+─────────────────────────────────────────────────────────────────────
+Files: batch_fft_reader.cpp, fft_compute.cpp, batch_fft_writer.cpp
+
+This kernel computes a complete radix-2 Stockham FFT of length N ≤ 1,024
+in a single Tensix core pass. The compute kernel uses 14 named CBs:
+
+  CB index  Name        Role
+  ─────────────────────────────────────────────────────────────────
+  c_0       EVEN_R      even-indexed butterfly inputs, real
+  c_1       EVEN_I      even-indexed butterfly inputs, imag
+  c_2       ODD_R       odd-indexed butterfly inputs, real
+  c_3       ODD_I       odd-indexed butterfly inputs, imag
+  c_4       TW_R        twiddle factors (cos), one 1024-element tile
+  c_5       TW_I        twiddle factors (sin), one 1024-element tile
+  c_6       OUT0_R      butterfly output slot 0, real
+  c_7       OUT0_I      butterfly output slot 0, imag
+  c_8       OUT1_R      butterfly output slot 1, real
+  c_9       OUT1_I      butterfly output slot 1, imag
+  c_10      TMP_R       temporary accumulator, real
+  c_11      TMP_I       temporary accumulator, imag
+  c_12      TW_ODD_R    odd-stage twiddle, real (for radix-4 fast path)
+  c_13      TW_ODD_I    odd-stage twiddle, imag
+  ─────────────────────────────────────────────────────────────────
+  Total CB footprint: 14 tiles × 4 KB (fp32) = 56 KB per core.
+  Well within the 1.5 MB L1 limit.
+
+The compute kernel implements a two-operand SFPU butterfly:
+  (EVEN ± TW × ODD) in four real multiplies and two real adds,
+using the Tensix tile_regs_acquire / pack_tile pipeline:
+
+    sfpu_binop_push<MUL>(TW_R, ODD_R, TMP_R)   // tw_r * odd_r
+    sfpu_binop_push<MUL>(TW_I, ODD_I, TMP_I)   // tw_i * odd_i
+    sfpu_binop_push<SUB>(TMP_R, TMP_I, OUT0_R) // real = tw_r*odd_r - tw_i*odd_i
+    ... (symmetric for imag)
+
+Each butterfly stage processes one tile (1,024 elements) per CB push/pop cycle.
+LOG2N stages are unrolled at compile time (LOG2N is a compile-time arg).
+
+Grid: one core per batch row (B rows → B cores, capped at device max).
+Twiddle tables (sin/cos for each stage) are precomputed on the host at first
+call and stored in a static MeshBuffer cache, keyed by (device, N, dtype).
+On subsequent calls the factory does a cache lookup only — no recomputation.
+
+─────────────────────────────────────────────────────────────────────
+KERNEL 2: Radix Pass (fused FFT + optional post-twiddle)
+─────────────────────────────────────────────────────────────────────
+Files: radix_pass_reader.cpp, batch_fft_compute.cpp, batch_fft_writer.cpp
+
+This kernel extends the Stockham butterfly with an optional post-twiddle
+phase that multiplies each output tile by a pre-loaded twiddle factor table.
+It is the core building block of the two-pass and three-pass FFT stages.
+
+Additional CBs beyond the 14 Stockham CBs:
+  c_21  PT_R   post-twiddle tile, real  (only when APPLY_POST_TWIDDLE=1)
+  c_22  PT_I   post-twiddle tile, imag
+
+For bf16 I/O, four additional staging CBs (c_17..c_20) buffer the
+bf16→fp32 and fp32→bf16 conversions at the DRAM boundary, keeping the
+compute path fully fp32.
+
+The post-twiddle multiply is performed by BRISC1 (writer), not by the
+compute core, to avoid a cross-BRISC L1 visibility hazard that was
+observed to corrupt STATE_R/I tiles for specific (row, core) combinations
+in early implementations. This architectural decision is documented
+explicitly in radix_pass_reader.cpp:
+  "Letting BRISC1 read, modify, and write STATE within a single thread
+  closes that gap entirely."
+
+Grid: same multi-core assignment as Stockham (batch rows distributed across
+up to max_cores_for_grid(device) cores, with each core handling
+ceil(total_rows / num_cores) rows).
+
+─────────────────────────────────────────────────────────────────────
+KERNEL 3: Apply Twiddles
+─────────────────────────────────────────────────────────────────────
+Files: apply_twiddles_reader.cpp, apply_twiddles_compute.cpp,
+       apply_twiddles_writer.cpp
+
+Applies inter-pass twiddle factors W[k₁, k₂] = exp(-2πi k₁k₂/N) to the
+intermediate tensor between FFT passes. The input is a (M_rows, N1)-shaped
+tensor; each row r is multiplied element-wise by twiddle row (r mod N2).
+
+CBs (fp32 path):
+  c_0  IN_R   input tile, real
+  c_1  IN_I   input tile, imag
+  c_2  TW_R   twiddle tile for current row, real
+  c_3  TW_I   twiddle tile for current row, imag
+  c_4  OUT_R  output tile, real
+  c_5  OUT_I  output tile, imag
+  ─────────────────────────────────────────────────────────────────
+  Total: 6 tiles × 4 KB = 24 KB per core.
+
+The reader broadcasts the correct twiddle row using:
+  tw_row = row % N2
+which requires only an integer modulo and a DRAM page address lookup —
+no additional memory copies. The twiddle table is a (N2, N1)-shaped
+MeshBuffer precomputed once per (device, N1, N2, dtype).
+
+For the XL variant (apply_twiddles_xl), the twiddle table is too large
+for a single tile; it is streamed in N1-element chunks, still within
+the 24 KB CB budget regardless of N.
+
+─────────────────────────────────────────────────────────────────────
+KERNEL 4: rebank_rm (streaming page-size converter)
+─────────────────────────────────────────────────────────────────────
+Files: rebank_rm_reader.cpp, rebank_rm_writer.cpp  (NO compute kernel)
+
+This is a pure data-movement kernel with no compute TRISC. It uses a
+single double-buffered CB:
+
+  c_0  REBANK  double-buffered, 2 × chunk × elem_bytes
+               = 2 × 1,024 × 4 B = 8 KB for fp32 (chunk = 1,024)
+
+The reader issues noc_async_read_tile calls for each input chunk; the
+writer issues noc_async_write_tile for the corresponding output chunk.
+Because reader and writer operate on the same CB with opposite sides
+of the double-buffer, they pipeline automatically with zero stalls when
+DRAM bandwidth is the bottleneck.
+
+Work distribution: num_units = B_total × (N / chunk) chunks.
+The grid validation loop (Section IV.D) ensures num_units % grid.area() == 0
+before the program is compiled, so each core receives an integer number
+of chunks.
+
+CB footprint: 8 KB — independent of N and B_total.
+This is the key property that makes rebank_rm L1-safe for any N.
+
+─────────────────────────────────────────────────────────────────────
+KERNEL 5: Transpose Row-Major (transpose_rm)
+─────────────────────────────────────────────────────────────────────
+Files: transpose_rm_reader.cpp, transpose_rm_writer.cpp (NO compute)
+
+Transposes a (R, C) row-major tensor to (C, R) using a double-buffered
+CB of size 2 × C × elem_bytes. Used between FFT passes to re-order
+the data for the next radix stage. For small C (≤ 64 KB), this fits
+in L1. For large C, rebank_rm is used instead (see Section IV.C).
+
+─────────────────────────────────────────────────────────────────────
+KERNEL 6: Complex Multiply (complex_mul)
+─────────────────────────────────────────────────────────────────────
+Files: complex_mul_reader.cpp, (batch_fft_compute.cpp shared), batch_fft_writer.cpp
+
+Used in Bluestein to compute a × b and a × conj(b) in the frequency
+domain. Implements the same SFPU butterfly pipeline as Kernel 1 but
+without the inter-stage bit-reversal: straight element-wise complex
+multiply with four real SFPU operations per output element.
+
+─────────────────────────────────────────────────────────────────────
+Summary: CB footprint across all kernels (fp32, chunk=1024)
+─────────────────────────────────────────────────────────────────────
+
+  Kernel              Active CBs  Peak L1 per core  L1 limit
+  ──────────────────────────────────────────────────────────
+  Stockham butterfly  14 tiles    56 KB             1,499 KB
+  Radix pass + PT     16 tiles    64 KB             1,499 KB
+  Apply twiddles      6 tiles     24 KB             1,499 KB
+  rebank_rm           1 (×2 buf)   8 KB             1,499 KB
+  rebank_rm_merge     1 (×2 buf)   8 KB             1,499 KB
+  transpose_rm        1 (×2 buf)  variable          1,499 KB
+  ──────────────────────────────────────────────────────────
+  All kernels remain far below the 1.5 MB L1 limit with our design.
+  The old (pre-rebank_rm) Bluestein path allocated 2×M×elem_bytes
+  for the zero-pad concat CB — up to 4.56 MB at M=2^17 fp32 —
+  exceeding the limit by 3×.
+
+================================================================================
+NOTES FOR REVISION
+--------------------------------------------------------------------------------
+- Add Figure 2: routing decision tree (flowchart of fft.cpp router)
+- Add Figure 3: rebank_rm streaming diagram (before/after with CB sizes)
+- Table I sizes: confirm old CB sizes from TT_THROW error messages in testing
+  (see prior conversation: 4,560,192 B for N=64512 fp32 old path)
+- Section D: cite the firmware documentation for dispatch core layout
+- Section F: confirm N1/N2/N3 assignment for N=2^24 from fft.cpp source
+================================================================================

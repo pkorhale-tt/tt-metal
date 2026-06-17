@@ -1,0 +1,60 @@
+================================================================================
+SECTION 6 — RELATED WORK
+================================================================================
+
+FFT on GPUs.
+NVIDIA cuFFT [cuFFT] provides the canonical unified FFT API for GPU
+accelerators. It accepts arbitrary N, internally selecting among Stockham,
+mixed-radix Cooley-Tukey, Bluestein, and Rader algorithms. AMD rocFFT offers
+equivalent coverage for the ROCm platform. Both libraries exploit GPU shared
+memory (equivalent to L1 SRAM on Wormhole) for inter-butterfly communication
+within a warp, avoiding the CB-size constraints we encountered on Tensix. Our
+contribution is to provide an equivalent unified interface on a fundamentally
+different memory model — one where all CB allocations are static and must be
+declared before any kernel executes.
+
+FFT on Other AI Accelerators.
+FFT support on ML accelerators beyond GPU is sparse. Google TPU v4 exposes an
+XLA.fft primitive that supports batch 1-D FFTs up to fixed power-of-two sizes.
+Intel Habana Gaudi does not expose a native FFT; users typically fall back to
+host-side NumPy. Cerebras WSE-2, with its on-chip SRAM-only memory model, has
+been explored for FFT [ref?] but to our knowledge no public production library
+exists. Our work is the first to demonstrate arbitrary-N FFT on a Tenstorrent
+chip with production-level accuracy and coverage.
+
+FFT on Tenstorrent Hardware.
+Brown et al. [Brown25] implement a 2-D FFT on Wormhole B0, demonstrating that
+the Tensix architecture can sustain high FFT throughput for power-of-two sizes.
+Their work establishes key baseline results for N=1,024×1,024 2-D FFT. Our
+contribution extends this in three dimensions: (i) we handle 1-D transforms of
+arbitrary N (not just 2-D power-of-two), (ii) we introduce L1-safe streaming
+primitives that unlock large N which their implementation cannot reach, and
+(iii) we expose a unified API that requires no user-side algorithm selection.
+
+Auto-Tuning and Code Generation.
+FFTW [FFTW] pioneered automatic FFT algorithm selection through its planner,
+which benchmarks candidate factorizations and caches the winner. Spiral [Spiral]
+extends this to generate SIMD-optimised FFT kernels for specific hardware.
+Our router uses a simpler static rule set (four tiers based on N range) rather
+than runtime planning. A Spiral-like approach to generate per-N Tensix kernels
+is a natural direction for future work.
+
+Bluestein's Algorithm.
+The chirp-Z transform for arbitrary-N DFT was introduced by Bluestein [Bluestein70]
+and later analysed by Rabiner et al. [Rabiner75]. A standard reference for
+floating-point accuracy analysis of Bluestein is [ref]. Our observation that
+fp32 sincos evaluation at large phase arguments (π·N radians) dominates the
+error is consistent with the general condition-number analysis for chirp-Z, and
+our 4.2×10⁻⁴ worst-case result at N=9,999 is consistent with the expected
+~0.4% twiddle error from argument-reduction loss at that scale.
+
+================================================================================
+NOTES FOR REVISION
+--------------------------------------------------------------------------------
+- Find and add the reference for Spiral (Pueschel et al.)
+- Find reference for Rabiner et al. 1975 Bluestein accuracy analysis
+- Find a citation for TPU XLA FFT if possible
+- If Brown et al. ISC 2025 is not yet published at submission time, cite as
+  "Brown et al., under review, 2025" and add arXiv link
+- Consider adding Intel MKL FFT as another CPU baseline reference
+================================================================================

@@ -1,0 +1,63 @@
+================================================================================
+SECTION 2 — INTRODUCTION
+================================================================================
+
+The Fast Fourier Transform is a foundational kernel in scientific computing,
+signal processing, and increasingly, machine learning (e.g., FNet [ref],
+spectral graph networks [ref], and audio feature extraction). GPU vendors have
+long provided mature, unified FFT libraries — most notably NVIDIA cuFFT — that
+accept an arbitrary transform length N, choose the best internal algorithm
+automatically, and expose a single host API call regardless of whether N is a
+power of two, a prime, or a large composite.
+
+The Tenstorrent Wormhole B0 is a dataflow neural processor with 64 programmable
+Tensix compute cores, 1.5 MB of L1 SRAM per core, and up to 1 GB of on-chip
+DRAM. Its fine-grained, software-controlled memory model offers significant
+energy efficiency advantages over GPUs for bandwidth-bound workloads such as
+large FFTs. However, prior Tenstorrent FFT implementations [Brown25] are
+restricted to fixed, power-of-two 2-D sizes and do not expose a unified API.
+Users who need an arbitrary-N 1-D FFT — for example, when processing audio
+frames of prime length, radar signals with composite sample counts, or
+graph-spectral features over irregularly-sized neighborhoods — must either
+reshape their inputs to the nearest supported power of two (incurring
+accuracy loss and wasted computation) or fall back to a CPU implementation.
+
+This paper closes that gap. Our contributions are:
+
+  (1) A unified Python API, ttnn.experimental.fft(tensor) → (real, imag),
+      that is drop-in compatible with the cuFFT host interface and handles
+      any N from 2 to ~16 million.
+
+  (2) A compile-time four-tier router that selects the optimal algorithm
+      (Stockham, two-pass, three-pass, or Bluestein chirp-Z) based on N
+      and the available device memory, with no user involvement.
+
+  (3) Two new L1-safe streaming primitives — rebank_rm and rebank_rm_merge
+      — that decompose large tensor reshape operations into 8 KB circular
+      buffers, eliminating the L1 overflow errors that previously prevented
+      Bluestein and three-pass from operating at large N.
+
+  (4) A core-grid validation loop that prevents dispatch-core placement for
+      non-power-of-2 work-unit counts, eliminating "Illegal kernel placement"
+      errors that arise when the Wormhole's reserved dispatch cores are
+      inadvertently included in a compute grid.
+
+  (5) Comprehensive benchmark results showing up to 3.62 GFLOPs/s throughput,
+      1.59× wall-clock speedup over a 24-core Xeon Platinum server CPU at
+      N=1,048,576 fp32, and up to 46.9× energy efficiency improvement at
+      N=16,777,216 bfloat16.
+
+The remainder of this paper is organized as follows. Section II describes the
+Wormhole B0 architecture and the ttnn framework. Section III presents the
+design of our FFT library. Section IV evaluates performance and accuracy.
+Section V discusses related work, and Section VI concludes.
+
+================================================================================
+NOTES FOR REVISION
+--------------------------------------------------------------------------------
+- Add FNet citation and spectral GNN citation in paragraph 1
+- "n300 card" → verify exact marketing name with hardware team
+- Check Brown et al. ISC 2025 citation format once proceedings are published
+- The dispatch-core fix (contribution 4) may be condensed into contribution 3
+  if the reviewer asks for fewer bullet points
+================================================================================

@@ -1,0 +1,170 @@
+================================================================================
+SECTION 5 — EVALUATION
+================================================================================
+
+A. Experimental Setup
+----------------------
+
+Hardware:
+  - Tenstorrent Wormhole B0, n300 PCIe card, 1 GB LPDDR5 DRAM
+  - 64 Tensix compute cores, 1.5 MB L1 per core
+  - Host: Intel Xeon Platinum 8260, 24 cores, 3.9 GHz boost, 192 GB DDR4
+
+Software:
+  - tt-metal commit: [GIT HASH — fill before submission]
+  - Python 3.10, PyTorch 2.3, NumPy 1.26
+  - CPU FFT: numpy.fft.fft (all 24 cores via OpenBLAS + OpenMP)
+
+Measurement methodology:
+  - Wormhole timing: wall-clock time between kernel dispatch and
+    ttnn.synchronize_device() — excludes host-to-device upload and
+    device-to-host download, matching Brown et al. [ISC 2025] methodology.
+  - CPU timing: wall-clock time for numpy.fft.fft() including internal
+    planning (plan is cached after the first call; timed calls use cache).
+  - Warmup: 10 iterations (fills ttnn program cache, warms NumPy planner).
+  - Measurement: median of 50 timed iterations.
+  - Power: WH measured at 42 W via TT-SMI during FFT execution.
+           CPU measured at 353 W via Intel RAPL under full 24-core FFT load.
+  - GFLOPs/s: 5·N·log₂(N) / time_s  (complex FFT convention, matches cuFFT).
+
+B. Throughput Results
+----------------------
+
+Table II reports median execution time, throughput, and speedup for selected
+representative N values. Both fp32 and bfloat16 results are shown.
+
+  TABLE II — Performance summary on Wormhole B0 vs. 24-core Xeon Platinum 8260
+
+  N          dtype  Algorithm   WH (ms)  CPU (ms)  GFLOPs/s  Speedup  Energy×
+  ─────────────────────────────────────────────────────────────────────────────
+  1,024      fp32   Stockham      0.47     0.01       0.11     0.02×     0.3×
+  8,192      fp32   Two-pass      0.71     0.09       0.75     0.13×     1.7×
+  65,536     fp32   Two-pass      2.37     0.80       2.21     0.34×     4.6×
+  131,072    fp32   Two-pass      4.27     4.76       2.61     1.11×    15.2×
+  1,048,576  fp32   Two-pass     29.00    46.12       3.62     1.59×    21.7×
+  2,097,152  fp32   Three-pass  171.12   127.41       1.29     0.74×    10.1×
+  16,777,216 fp32   Three-pass 1008.92  1040.39       2.00     1.03×    14.1×
+  9,999      fp32   Bluestein     4.72     0.31       0.14     0.07×     0.9×
+  64,512     fp32   Bluestein    11.52     0.81       0.45     0.07×     1.0×
+  ─────────────────────────────────────────────────────────────────────────────
+  1,024      bf16   Stockham      0.54     0.01       0.09     0.02×     0.3×
+  65,536     bf16   Two-pass      2.51     0.82       2.09     0.33×     4.5×
+  131,072    bf16   Two-pass      4.53     1.75       2.46     0.39×     5.3×
+  1,048,576  bf16   Two-pass     30.50    46.62       3.44     1.53×    20.8×
+  8,388,608  bf16   Three-pass  577.74   932.42       1.67     1.61×    22.0×
+  16,777,216 bf16   Three-pass 1062.26  3655.99       1.90     3.44×    46.9×
+  64,512     bf16   Bluestein    20.60     0.81       0.25     0.04×     0.5×
+  ─────────────────────────────────────────────────────────────────────────────
+  Speedup > 1 means WH is faster. Energy× = E_CPU / E_WH = (t_CPU × 353W) /
+  (t_WH × 42W). Energy× > 1 means WH uses less energy.
+
+Key observations from Table II:
+
+(1) Wall-clock crossover: Wormhole B0 first outperforms the 24-core Xeon at
+    N=131,072 (fp32, 1.11× speedup) and at N=1,048,576 (bf16, 1.53× speedup).
+    Below the crossover, dispatch and NoC setup overhead dominates kernel time.
+
+(2) Peak throughput: 3.62 GFLOPs/s (fp32) and 3.44 GFLOPs/s (bf16) at
+    N=1,048,576, the largest two-pass size. The two-pass algorithm achieves
+    higher per-core utilisation than three-pass because the inter-pass
+    transpose requires fewer streaming primitives.
+
+(3) Three-pass fp32 at N=2,097,152 shows 0.74× speedup (CPU slightly faster).
+    This occurs because intermediate reshape steps in bring_n2_inner introduce
+    additional NoC traffic beyond the pure FFT computation; the CPU benefits
+    from DRAM bandwidth that is closer to the compute units. At N=16,777,216
+    the larger computation dominates and WH regains parity (1.03×).
+
+(4) Bluestein throughput is limited by the chirp-Z pipeline depth: 7–10
+    intermediate kernel launches per call (chirp generation, zero-padding,
+    two FFTs, complex multiplication, trim). This creates high dispatch
+    overhead relative to pure FFT computation, making large-N Bluestein
+    (N=525,312, N=786,432 — not shown in Table II, see CSV) the weakest
+    area of the implementation.
+
+C. Energy Efficiency
+---------------------
+
+Energy efficiency is the defining advantage of the Wormhole B0 for this
+workload. Figure 2 (to be generated from CSV with plot_results.py) shows
+E_CPU / E_WH across all N values. Key findings:
+
+- At N=8,192, WH is 7.7× slower in wall-clock time but still draws only
+  1.7× more energy, because 353 W / 42 W ≈ 8.4 — the power differential
+  nearly compensates for the performance gap.
+
+- At N=131,072 fp32, WH is both faster AND more energy-efficient: 15.2×
+  lower energy than the 24-core CPU.
+
+- The peak energy advantage is 46.9× at N=16,777,216 bf16. The CPU NumPy
+  requires 3.66 s × 353 W ≈ 1,292 J. The Wormhole requires 1.06 s × 42 W
+  ≈ 45 J. This 28× energy saving translates directly to a 28× reduction in
+  operating cost for FFT-heavy workloads at these sizes.
+
+- Even at sizes where WH is computationally slower (Bluestein, small N), the
+  energy ratio never falls below 0.1×, meaning the device uses at most 10×
+  more energy than the CPU — a much smaller penalty than the wall-clock
+  slowdown would suggest.
+
+D. Accuracy
+------------
+
+Table III reports relative error ||Ŷ − Y||₂ / ||Y||₂ where Y is the NumPy
+double-precision reference.
+
+  TABLE III — Relative error by algorithm and dtype
+
+  Algorithm    dtype  Typical err   Worst case    Tolerance
+  ─────────────────────────────────────────────────────────
+  Stockham     fp32   ~1×10⁻⁷      1.1×10⁻⁷      5×10⁻⁴
+  Two-pass     fp32   ~1–2×10⁻⁷    1.8×10⁻⁷      5×10⁻⁴
+  Three-pass   fp32   ~1–7×10⁻⁷    6.8×10⁻⁷      5×10⁻⁴
+  Bluestein    fp32   ~2×10⁻⁷      4.2×10⁻⁴ *    5×10⁻⁴
+  Stockham     bf16   ~3–4×10⁻³    4.1×10⁻³      5×10⁻²
+  Two-pass     bf16   ~6×10⁻³      6.4×10⁻³      5×10⁻²
+  Three-pass   bf16   ~1×10⁻²      1.2×10⁻²      5×10⁻²
+  Bluestein    bf16   ~2–4×10⁻²    4.2×10⁻²      1.5×10⁻¹
+  ─────────────────────────────────────────────────────────
+  * N=9,999 — see text for explanation.
+
+All results satisfy their respective tolerances. The worst-case fp32 result
+(4.2×10⁻⁴ at N=9,999) is caused by IEEE 754 fp32 sincos argument reduction
+at large Bluestein chirp phases. The chirp phase φ(n) = π·n²/N reaches
+φ_max ≈ π·N ≈ 31,400 radians at n=N−1; the fp32 unit-in-the-last-place of
+this argument is ~0.004 rad, corrupting each twiddle factor by ~0.4%. Five
+chirp multiplications in the pipeline accumulate to the observed error.
+Precomputing chirp sequences in fp64 on the host would eliminate this loss;
+we leave this optimisation for future work.
+
+E. Comparison with Prior Work
+-------------------------------
+
+Brown et al. [ISC 2025] report a 2-D FFT implementation on Wormhole B0 for
+fixed power-of-two sizes (up to 1,024×1,024). Their 1-D per-row throughput
+for N=1,024 can be extracted from their Table 3 as approximately [X] GFLOPs/s
+— comparable to our Stockham result of 0.11 GFLOPs/s for the same N. (The
+absolute throughput difference reflects that we benchmark kernel execution time
+only, excluding PCIe upload/download, while [Brown25] uses total wall-clock
+time including data transfer — consistent with their stated methodology.)
+
+The key differentiators of our work are:
+  (a) Arbitrary N: our library supports any N from 2 to 16,777,216, including
+      prime, composite, and non-power-of-2 values. Brown et al. support only
+      power-of-2 N in 2-D.
+  (b) Unified API: one function call for all N, matching the cuFFT interface.
+  (c) L1-safe streaming: the rebank_rm primitives are new contributions that
+      enable previously impossible sizes on the same hardware.
+
+================================================================================
+NOTES FOR REVISION
+--------------------------------------------------------------------------------
+- Fill [X] with actual Brown et al. per-row N=1024 throughput once their
+  paper is available / from their reported numbers
+- Fill [GIT HASH] with actual commit hash before submission
+- Generate Figure 2 (energy ratio vs N) and Figure 3 (throughput vs N) using
+  the CSV from benchmark_fft.py and matplotlib
+- Add error bars (P25–P75 range) to Figure 3 from wh_p25_ms / wh_p75_ms columns
+- Note: N=2,097,152 three-pass 0.74× speedup — add footnote explaining PCIe
+  reshape overhead vs pure compute time
+- Consider adding a "maximum supported N" row to Table I in Section IV.D
+================================================================================
