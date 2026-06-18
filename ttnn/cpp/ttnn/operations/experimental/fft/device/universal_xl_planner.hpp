@@ -66,19 +66,15 @@ inline XLPlan plan(uint32_t N) {
     p.factors.push_back(1u << remaining_log2);
 
     // Sanity: factor product == N and each factor <= cap.
-    // Guarded by #ifndef NDEBUG so the variable disappears entirely in
-    // Release builds, avoiding -Wunused-but-set-variable.
-#ifndef NDEBUG
-    {
-        uint64_t prod = 1ull;
-        for (uint32_t f : p.factors) {
-            assert(f <= kFactorCap && "factor exceeds tile cap");
-            assert(is_pow2(f)      && "factor must be pow2");
-            prod *= f;
-        }
-        assert(prod == static_cast<uint64_t>(N));
+    // [[maybe_unused]] because asserts are stripped in Release (-DNDEBUG)
+    // and the variable is only consumed by them.
+    [[maybe_unused]] uint64_t prod = 1ull;
+    for (uint32_t f : p.factors) {
+        assert(f <= kFactorCap && "factor exceeds tile cap");
+        assert(is_pow2(f)      && "factor must be pow2");
+        prod *= f;
     }
-#endif
+    assert(prod == static_cast<uint64_t>(N));
 
     return p;
 }
