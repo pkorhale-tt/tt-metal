@@ -117,7 +117,8 @@ def _open_device():
 
 
 def _upload(x_np: np.ndarray, device, tt_dtype, B: int = 1) -> ttnn.Tensor:
-    t = torch.from_numpy(x_np).reshape(B, -1)
+    # x_np is 1-D shape (N,); tile to (B, N) so each row is an independent FFT.
+    t = torch.from_numpy(np.tile(x_np.reshape(1, -1), (B, 1)))
     return ttnn.from_torch(t, dtype=tt_dtype,
                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
 
