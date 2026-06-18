@@ -93,13 +93,18 @@ def _algorithm_label(N: int) -> str:
     return "bluestein"
 
 
-def _fft_flops(N: int) -> float:
-    """5 N log2(N) — standard complex FFT FLOP count convention (matches cuFFT docs).
+def _fft_flops(N: int, B: int = 1) -> float:
+    """5 B N log2(N) — standard complex FFT FLOP count convention (matches cuFFT docs).
     Input to the benchmark is real-valued, but we use the complex convention
     (5 N log2 N rather than 2.5 N log2 N) for comparability with FFT literature.
-    This is consistent regardless of whether the WH kernel internally exploits
-    real-input symmetry."""
-    return 5.0 * N * math.log2(max(N, 2))
+    Multiplied by B (batch size) to reflect total device work per call."""
+    return 5.0 * B * N * math.log2(max(N, 2))
+
+
+# Stockham batch size — uses B=64 so all 64 Tensix cores are active.
+# Two-pass / three-pass / Bluestein distribute work across cores internally
+# regardless of batch size, so they use B=1.
+STOCKHAM_BATCH = 64
 
 
 # ── Device helpers ────────────────────────────────────────────────────────────
@@ -111,8 +116,8 @@ def _open_device():
     return device
 
 
-def _upload(x_np: np.ndarray, device, tt_dtype) -> ttnn.Tensor:
-    t = torch.from_numpy(x_np).reshape(1, -1)
+def _upload(x_np: np.ndarray, device, tt_dtype, B: int = 1) -> ttnn.Tensor:
+    t = torch.from_numpy(x_np).reshape(B, -1)
     return ttnn.from_torch(t, dtype=tt_dtype,
                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
 
@@ -122,9 +127,10 @@ def _run_wh_fft(tt_in: ttnn.Tensor):
     return re, im
 
 
-def _download(re: ttnn.Tensor, im: ttnn.Tensor, N: int) -> np.ndarray:
-    r = ttnn.to_torch(re).reshape(N).to(torch.float32).numpy()
-    i = ttnn.to_torch(im).reshape(N).to(torch.float32).numpy()
+def _download(re: ttnn.Tensor, im: ttnn.Tensor, N: int, B: int = 1) -> np.ndarray:
+    """Download first row only for accuracy check."""
+    r = ttnn.to_torch(re).reshape(B, N)[0].to(torch.float32).numpy()
+    i = ttnn.to_torch(im).reshape(B, N)[0].to(torch.float32).numpy()
     return r + 1j * i
 
 
@@ -144,11 +150,12 @@ def _wh_fft_timed(tt_in: ttnn.Tensor, N: int, n_runs: int, device) -> List[float
 
 
 def _cpu_fft_timed(x_np: np.ndarray, n_runs: int) -> List[float]:
-    """Return list of per-run wall-clock times in ms (all available CPU cores)."""
+    """Return list of per-run wall-clock times in ms (all available CPU cores).
+    x_np may be 1-D (B=1) or 2-D (B>1); np.fft.fft operates on last axis."""
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
-        _ = np.fft.fft(x_np)
+        _ = np.fft.fft(x_np, axis=-1)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1e3)
     return times
@@ -179,17 +186,22 @@ def benchmark_one(
         return None
 
     algo = _algorithm_label(N)
+    # Stockham (N≤1024) runs one transform per core → use B=STOCKHAM_BATCH
+    # to fill all 64 cores and measure peak device throughput fairly.
+    # All other algorithms distribute work across cores internally (B=1).
+    B = STOCKHAM_BATCH if algo == "stockham" else 1
+
     np.random.seed(N % (1 << 20))
     x_np = np.random.randn(N).astype(np.float32)
     if dtype_str == "bf16":
         # Correct bf16 quantisation via PyTorch (np.float16 is fp16, not bf16)
         x_np = torch.tensor(x_np).to(torch.bfloat16).float().numpy()
 
-    print(f"  bench N={N:>10,}  dtype={dtype_str}  algo={algo:<12}", end="", flush=True)
+    print(f"  bench N={N:>10,}  B={B:<2}  dtype={dtype_str}  algo={algo:<12}", end="", flush=True)
 
-    # Upload to device
+    # Upload to device — shape (B, N)
     try:
-        tt_in = _upload(x_np, device, tt_dtype)
+        tt_in = _upload(x_np, device, tt_dtype, B=B)
     except RuntimeError as e:
         print(f"  → SKIP (device alloc failed: {e})")
         return None
@@ -203,10 +215,10 @@ def benchmark_one(
         print(f"  → SKIP (warmup failed: {e})")
         return None
 
-    # Accuracy check (after warmup, so program is cached)
+    # Accuracy check — compare first row against NumPy reference
     ref = np.fft.fft(x_np)
     re, im = _run_wh_fft(tt_in)
-    got = _download(re, im, N)
+    got = _download(re, im, N, B=B)
     rel_err = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
 
     # Timed runs — device (kernel only, no D2H)
@@ -216,12 +228,13 @@ def benchmark_one(
     wh_p25 = float(np.percentile(wh_times, 25))
     wh_p75 = float(np.percentile(wh_times, 75))
 
-    # CPU baseline (NumPy, all available cores)
-    cpu_times = _cpu_fft_timed(x_np, max(runs, 10))
+    # CPU baseline: B independent FFTs of length N (matches WH total work)
+    x_batch_np = np.tile(x_np, (B, 1))   # shape (B, N)
+    cpu_times = _cpu_fft_timed(x_batch_np, max(runs, 10))
     cpu_times.sort()
     cpu_med = float(np.median(cpu_times))
 
-    flops = _fft_flops(N)
+    flops = _fft_flops(N, B=B)           # 5 * B * N * log2(N)
     gflops_s = flops / (wh_med * 1e-3) / 1e9
     speedup = cpu_med / wh_med
     energy_ratio = speedup * (cpu_power_w / wh_power_w)
