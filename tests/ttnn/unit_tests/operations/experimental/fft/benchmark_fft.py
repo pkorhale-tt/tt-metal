@@ -30,7 +30,6 @@ import argparse
 import csv
 import math
 import os
-import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import List, Optional
@@ -53,6 +52,7 @@ CPU_TDP_W = 240.0
 @dataclass
 class BenchResult:
     N: int
+    batch: int          # B=64 for Stockham (all cores), B=1 for others
     dtype: str          # "fp32" or "bf16"
     algorithm: str      # "stockham" | "two_pass" | "three_pass" | "bluestein"
     wh_median_ms: float
@@ -135,7 +135,7 @@ def _download(re: ttnn.Tensor, im: ttnn.Tensor, N: int, B: int = 1) -> np.ndarra
     return r + 1j * i
 
 
-def _wh_fft_timed(tt_in: ttnn.Tensor, N: int, n_runs: int, device) -> List[float]:
+def _wh_fft_timed(tt_in: ttnn.Tensor, n_runs: int, device) -> List[float]:
     """Return list of per-run wall-clock times in ms.
     Times kernel execution only — excludes D2H download, matching
     Brown et al. ISC 2025: 'performance numbers for WH are execution time only.'
@@ -223,7 +223,7 @@ def benchmark_one(
     rel_err = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
 
     # Timed runs — device (kernel only, no D2H)
-    wh_times = _wh_fft_timed(tt_in, N, runs, device)
+    wh_times = _wh_fft_timed(tt_in, runs, device)
     wh_times.sort()
     wh_med = float(np.median(wh_times))
     wh_p25 = float(np.percentile(wh_times, 25))
@@ -246,7 +246,7 @@ def benchmark_one(
           f"err={rel_err:.1e}")
 
     return BenchResult(
-        N=N, dtype=dtype_str, algorithm=algo,
+        N=N, batch=B, dtype=dtype_str, algorithm=algo,
         wh_median_ms=wh_med, wh_p25_ms=wh_p25, wh_p75_ms=wh_p75,
         cpu_median_ms=cpu_med,
         gflops_s=gflops_s,
