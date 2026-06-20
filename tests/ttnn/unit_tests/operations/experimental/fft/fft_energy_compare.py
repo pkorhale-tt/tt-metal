@@ -18,13 +18,23 @@ CPU timing — wall-clock time for the entire FFT call (plan is cached after
   warmup).  numpy uses pocketfft (multi-core); torch uses its own FFT backend.
 
 Energy     — E = avg_power_W × median_time_s  (same formula as Brown et al.)
-  ⚠ avg_power_W MUST come from actual measurement for your run:
+  Both --wh-power and --cpu-power default to None (not set).
+  • WH energy is reported only when --wh-power is explicitly supplied.
+  • CPU energy and the CPU-over-WH energy ratio are reported only when
+    --cpu-power is also explicitly supplied.
+  • If either is absent the corresponding column prints "N/A".
+  Obtain power values from actual measurement before publishing:
       WH  → TT-SMI:  tt-smi -s --json | jq '.boards[0].telemetry.input_current'
              or tt_power_sidecar.py --backend sysfs
       CPU → RAPL:    /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj
-  The defaults (--wh-power 42, --cpu-power 353) are from Brown et al.
-  measurement on WH n300 + Xeon Platinum Cascade Lake — they may not apply
-  to your setup.  Always pass measured values for publishable results.
+
+CPU baseline note:
+  The prior FFT paper (Brown et al. ISC 2025) used a native OpenMP C++
+  FFT on Xeon Platinum 8260 (24 cores, 353 W measured).  This script uses
+  torch.fft.fft (PyTorch CPU backend) by default, which is NOT the same
+  baseline.  Speedup and energy numbers from this script are therefore NOT
+  directly comparable to those in Brown et al.  Label your baseline clearly
+  in any paper or report.
 
 bfloat16 note:
   WH B0 executes bf16 natively (no upcast).
@@ -51,8 +61,8 @@ CLI quick reference:
   --batch    batch size (rows)
   --warmup   warmup iterations (default 10)
   --iters    timed iterations  (default 20)
-  --wh-power   measured WH avg power in W  (default 42 — from Brown et al.)
-  --cpu-power  measured CPU avg power in W (default 353 — from Brown et al.)
+  --wh-power   measured WH avg power in W  (no default — must be supplied for energy)
+  --cpu-power  measured CPU avg power in W (no default — energy ratio skipped if absent)
   --json-out   path to write JSON result
 """
 
@@ -417,10 +427,18 @@ def check_accuracy(x_np: np.ndarray, dtype: str, mode: str,
 
 def compare_perf(x_np: np.ndarray, warmup: int, iters: int,
                  dtype: str, mode: str, device_id: int,
-                 wh_power_w: float, cpu_power_w: float,
+                 wh_power_w: Optional[float], cpu_power_w: Optional[float],
                  cpu_backend: str) -> dict:
-    """Run both CPU and WH backends; compute speedup and energy ratio."""
+    """Run both CPU (torch) and WH backends; compute speedup and optional energy ratio.
 
+    Energy ratio is only computed when both wh_power_w and cpu_power_w are
+    explicitly supplied.  If either is None the corresponding energy fields
+    are omitted and the ratio is reported as 'N/A'.
+
+    NOTE: the CPU baseline here is torch.fft.fft, NOT the native OpenMP C++
+    baseline used in Brown et al. ISC 2025.  Results are not directly
+    comparable to that paper.
+    """
     if cpu_backend == "numpy":
         cpu_result = benchmark_numpy(x_np, warmup, iters, dtype, mode)
     else:
@@ -432,27 +450,44 @@ def compare_perf(x_np: np.ndarray, warmup: int, iters: int,
     wh_med  = wh_result.median_ms
     speedup = cpu_med / wh_med
 
-    # Energy = avg_power × time.  Ratio > 1 → WH uses less energy.
-    cpu_energy_j = cpu_result.energy_j(cpu_power_w)
-    wh_energy_j  = wh_result.energy_j(wh_power_w)
-    energy_ratio  = cpu_energy_j / wh_energy_j if wh_energy_j > 0 else float("inf")
+    # Energy and ratio are optional — only when both power values are provided.
+    energy_ratio: Optional[float] = None
+    if wh_power_w is not None and cpu_power_w is not None:
+        cpu_energy_j = cpu_result.energy_j(cpu_power_w)
+        wh_energy_j  = wh_result.energy_j(wh_power_w)
+        energy_ratio = cpu_energy_j / wh_energy_j if wh_energy_j > 0 else float("inf")
+
+    summary: dict = {
+        "n": x_np.shape[1],
+        "batch": x_np.shape[0],
+        "dtype": dtype,
+        "mode": mode,
+        "cpu_baseline": cpu_result.backend,
+        "wh_faster_than_cpu": bool(speedup > 1.0),
+        "speedup_cpu_over_wh": round(speedup, 4),
+        "baseline_note": (
+            "CPU baseline is torch.fft.fft — NOT the native OpenMP C++ baseline "
+            "used in Brown et al. ISC 2025.  Do not compare these numbers directly "
+            "to that paper without noting the difference."
+        ),
+    }
+    if energy_ratio is not None:
+        summary["wh_more_energy_efficient"] = bool(energy_ratio > 1.0)
+        summary["energy_ratio_cpu_over_wh"] = round(energy_ratio, 4)
+        summary["power_note"] = (
+            f"WH power: {wh_power_w} W, CPU power: {cpu_power_w} W  "
+            "(supply --wh-power and --cpu-power from TT-SMI / RAPL measurement)"
+        )
+    else:
+        summary["wh_more_energy_efficient"] = "N/A (--cpu-power not provided)"
+        summary["energy_ratio_cpu_over_wh"] = "N/A"
+        summary["power_note"] = (
+            "Energy ratio not computed — provide --wh-power and --cpu-power "
+            "from actual measurement (TT-SMI for WH, RAPL for CPU)."
+        )
 
     return {
-        "summary": {
-            "n": x_np.shape[1],
-            "batch": x_np.shape[0],
-            "dtype": dtype,
-            "mode": mode,
-            "wh_faster_than_cpu": bool(speedup > 1.0),
-            "wh_more_energy_efficient": bool(energy_ratio > 1.0),
-            "speedup_cpu_over_wh": round(speedup, 4),
-            "energy_ratio_cpu_over_wh": round(energy_ratio, 4),
-            "power_note": (
-                "avg_power values must come from actual measurement "
-                "(TT-SMI for WH, RAPL for CPU). "
-                f"Using: WH={wh_power_w}W, CPU={cpu_power_w}W."
-            ),
-        },
+        "summary": summary,
         "cpu": cpu_result.to_dict(avg_power_w=cpu_power_w),
         "wh":  wh_result.to_dict(avg_power_w=wh_power_w),
     }
@@ -462,7 +497,10 @@ def compare_perf(x_np: np.ndarray, warmup: int, iters: int,
 # Pretty printer
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _print_timing(r: TimingResult, power_w: Optional[float]) -> None:
+def _print_timing(r: TimingResult, avg_power_w: Optional[float] = None,
+                  power_w: Optional[float] = None) -> None:
+    # accept both keyword spellings for backwards compatibility
+    power_w = avg_power_w if avg_power_w is not None else power_w
     print(f"  backend          : {r.backend}")
     print(f"  N                : {r.n:,}  batch={r.batch}  mode={r.mode}")
     print(f"  dtype requested  : {r.dtype}")
@@ -479,31 +517,52 @@ def _print_timing(r: TimingResult, power_w: Optional[float]) -> None:
         print(f"  ffts/joule       : {r.ffts_per_joule(power_w):.2f}")
 
 
+def _fmt(val, fmt=".3f") -> str:
+    """Format a value, printing 'N/A' if it is None or a string sentinel."""
+    if val is None or isinstance(val, str):
+        return "N/A"
+    return format(val, fmt)
+
+
 def _print_compare(result: dict) -> None:
-    s = result["summary"]
+    s   = result["summary"]
     cpu = result["cpu"]
     wh  = result["wh"]
-    print(f"\n{'═'*60}")
+
+    cpu_energy_mj = f"{cpu['energy_j']*1000:.3f}" if "energy_j" in cpu else "N/A"
+    wh_energy_mj  = f"{wh['energy_j']*1000:.3f}"  if "energy_j" in wh  else "N/A"
+    cpu_jpf = f"{cpu['joules_per_fft']:.6f}" if "joules_per_fft" in cpu else "N/A"
+    wh_jpf  = f"{wh['joules_per_fft']:.6f}"  if "joules_per_fft" in wh  else "N/A"
+    cpu_fpj = f"{cpu['ffts_per_joule']:.2f}" if "ffts_per_joule" in cpu else "N/A"
+    wh_fpj  = f"{wh['ffts_per_joule']:.2f}"  if "ffts_per_joule" in wh  else "N/A"
+
+    print(f"\n{'═'*66}")
     print(f"  N={s['n']:,}  batch={s['batch']}  dtype={s['dtype']}  mode={s['mode']}")
-    print(f"{'─'*60}")
-    print(f"  {'':20s}  {'CPU':>12}  {'WH B0':>12}")
-    print(f"  {'backend':20s}  {cpu['backend']:>12}  {wh['backend']:>12}")
-    print(f"  {'eff. compute':20s}  {cpu['effective_compute_dtype']:>12}  {wh['effective_compute_dtype']:>12}")
-    print(f"  {'median (ms)':20s}  {cpu['median_ms']:>12.3f}  {wh['median_ms']:>12.3f}")
-    print(f"  {'min (ms)':20s}  {cpu['min_ms']:>12.3f}  {wh['min_ms']:>12.3f}")
-    print(f"  {'max (ms)':20s}  {cpu['max_ms']:>12.3f}  {wh['max_ms']:>12.3f}")
-    print(f"  {'GFLOPs/s':20s}  {cpu['gflops_s']:>12.3f}  {wh['gflops_s']:>12.3f}")
-    if "energy_j" in cpu:
-        print(f"  {'energy (mJ)':20s}  {cpu['energy_j']*1000:>12.3f}  {wh['energy_j']*1000:>12.3f}")
-        print(f"  {'joules/fft':20s}  {cpu['joules_per_fft']:>12.6f}  {wh['joules_per_fft']:>12.6f}")
-        print(f"  {'ffts/joule':20s}  {cpu['ffts_per_joule']:>12.2f}  {wh['ffts_per_joule']:>12.2f}")
-    print(f"{'─'*60}")
-    faster = "YES" if s["wh_faster_than_cpu"] else "NO"
-    greener = "YES" if s["wh_more_energy_efficient"] else "NO"
-    print(f"  WH faster?       {faster:>5}   (speedup {s['speedup_cpu_over_wh']:.3f}×)")
-    print(f"  WH more efficient? {greener:>3}   (energy ratio {s['energy_ratio_cpu_over_wh']:.3f}×)")
-    print(f"  ⚠ {s['power_note']}")
-    print(f"{'═'*60}")
+    print(f"{'─'*66}")
+    print(f"  {'':24s}  {'CPU (torch)':>14}  {'WH B0 (ttnn)':>14}")
+    print(f"  {'backend':24s}  {cpu['backend']:>14}  {wh['backend']:>14}")
+    print(f"  {'eff. compute':24s}  {cpu['effective_compute_dtype']!s:>14}  {wh['effective_compute_dtype']!s:>14}")
+    print(f"  {'median (ms)':24s}  {cpu['median_ms']:>14.3f}  {wh['median_ms']:>14.3f}")
+    print(f"  {'min / max (ms)':24s}  {cpu['min_ms']:.2f}/{cpu['max_ms']:.2f}  {wh['min_ms']:.2f}/{wh['max_ms']:.2f}")
+    print(f"  {'GFLOPs/s':24s}  {cpu['gflops_s']:>14.3f}  {wh['gflops_s']:>14.3f}")
+    print(f"  {'energy (mJ)':24s}  {cpu_energy_mj:>14}  {wh_energy_mj:>14}")
+    print(f"  {'joules/fft':24s}  {cpu_jpf:>14}  {wh_jpf:>14}")
+    print(f"  {'ffts/joule':24s}  {cpu_fpj:>14}  {wh_fpj:>14}")
+    print(f"{'─'*66}")
+
+    faster  = "YES" if s["wh_faster_than_cpu"] else "NO"
+    greener = s["wh_more_energy_efficient"]
+    greener_str = "YES" if greener is True else ("NO" if greener is False else str(greener))
+    energy_ratio_str = _fmt(s["energy_ratio_cpu_over_wh"])
+
+    print(f"  WH faster than CPU?        {faster}   (speedup {s['speedup_cpu_over_wh']:.3f}×)")
+    print(f"  WH more energy efficient?  {greener_str}")
+    if energy_ratio_str != "N/A":
+        print(f"  energy ratio (CPU/WH):     {energy_ratio_str}×")
+    print(f"{'─'*66}")
+    print(f"  ⚠ BASELINE NOTE: {s['baseline_note']}")
+    print(f"  ⚠ POWER  NOTE:   {s['power_note']}")
+    print(f"{'═'*66}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -547,19 +606,19 @@ def main() -> None:
                    choices=["float32", "bfloat16"],
                    help="float32 or bfloat16  (float64 not supported on WH B0)")
     p.add_argument("--device-id",  type=int,   default=0)
-    p.add_argument("--cpu-backend", default="numpy", choices=["numpy", "torch"],
-                   help="which CPU library to use in 'compare' mode (default: numpy)")
-    p.add_argument("--wh-power",  type=float, default=42.0,
+    p.add_argument("--cpu-backend", default="torch", choices=["numpy", "torch"],
+                   help="which CPU library to use in 'compare' mode (default: torch)")
+    p.add_argument("--wh-power",  type=float, default=None,
                    help=(
-                       "MEASURED WH avg power in W (from TT-SMI). "
-                       "Default 42 W is from Brown et al. on n300 — "
-                       "measure for your card before publishing."
+                       "MEASURED WH avg power in W (from TT-SMI / tt_power_sidecar.py). "
+                       "No default — WH energy is reported as N/A if not supplied. "
+                       "Brown et al. measured 42 W on n300; your value may differ."
                    ))
-    p.add_argument("--cpu-power", type=float, default=353.0,
+    p.add_argument("--cpu-power", type=float, default=None,
                    help=(
                        "MEASURED CPU avg power in W (from RAPL). "
-                       "Default 353 W is from Brown et al. on Xeon Platinum — "
-                       "measure for your CPU before publishing."
+                       "No default — CPU energy and energy ratio are N/A if not supplied. "
+                       "Brown et al. measured 353 W on Xeon Platinum; your value may differ."
                    ))
     p.add_argument("--json-out", default=None,
                    help="Write full result dict to this JSON file")
@@ -572,12 +631,14 @@ def main() -> None:
     if args.backend == "numpy":
         result = benchmark_numpy(x_np, args.warmup, args.iters, args.dtype, args.mode)
         print(f"\n── numpy CPU benchmark ──")
+        print(f"  ⚠ NOTE: numpy is not the same baseline as Brown et al. OpenMP C++ FFT.")
         _print_timing(result, avg_power_w=args.cpu_power)
         result = result.to_dict(avg_power_w=args.cpu_power)
 
     elif args.backend == "torch":
         result = benchmark_torch_cpu(x_np, args.warmup, args.iters, args.dtype, args.mode)
-        print(f"\n── torch CPU benchmark ──")
+        print(f"\n── torch CPU benchmark (default comparison baseline) ──")
+        print(f"  ⚠ NOTE: torch.fft.fft is not the same baseline as Brown et al. OpenMP C++ FFT.")
         _print_timing(result, avg_power_w=args.cpu_power)
         result = result.to_dict(avg_power_w=args.cpu_power)
 
@@ -585,6 +646,8 @@ def main() -> None:
         result = benchmark_ttnn(x_np, args.warmup, args.iters,
                                 args.dtype, args.mode, args.device_id)
         print(f"\n── ttnn WH B0 benchmark (kernel-only timing) ──")
+        if args.wh_power is None:
+            print(f"  ⚠ --wh-power not supplied: energy will be reported as N/A.")
         _print_timing(result, avg_power_w=args.wh_power)
         result = result.to_dict(avg_power_w=args.wh_power)
 
