@@ -624,7 +624,7 @@ def main() -> None:
                    help="Write full result dict to this JSON file")
     args = p.parse_args()
 
-    x_np = _make_real_input_np(args.n, args.batch, args.seed, args.dtype)
+    x_np = _make_real_np(args.n, args.batch, args.seed, args.dtype)
 
     result: dict | TimingResult
 
