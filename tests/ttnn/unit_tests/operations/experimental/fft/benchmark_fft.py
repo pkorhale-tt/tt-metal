@@ -23,35 +23,22 @@ CPU timing — wall-clock for the full numpy.fft.fft() call (plan cached after
 ENERGY METHODOLOGY
 ════════════════════════════════════════════════════════════════════════════════
 Energy is NEVER computed from borrowed constants or TDP estimates.
-Four levels of energy reporting:
+Two modes:
 
-  Level 0 — no power or energy provided (default):
+  Mode 0 — no sidecar dirs supplied (default):
     All energy fields = N/A.  energy_ratio_valid = False.
+    Use this for timing-only runs.
 
-  Level 1 — global --wh-power supplied:
-    wh_energy_j       = wh_power_w × median_time_s     (publishable)
-    wh_joules_per_fft = wh_energy_j / batch            (publishable)
-    wh_ffts_per_joule = batch / wh_energy_j            (publishable)
-    wh_energy_source  = "power_x_time"
-    CPU energy / ratio = N/A.  energy_ratio_valid = False.
-
-  Level 2 — per-run --wh-energy-dir sidecar with energy_J key:
-    wh_energy_j       = energy_J from sidecar file     (most accurate)
-    avg_power_W from sidecar stored as wh_power_w (informational only).
-    wh_energy_source  = "sidecar_energy_J"
-    CPU side follows same logic.  energy_ratio_valid = True if both present.
-
-  Level 3 — both WH and CPU energy known (either source):
-    energy_ratio      = cpu_energy_j / wh_energy_j     (publishable)
-    energy_ratio_valid = True.
-
-Sidecar JSON naming convention (--wh-energy-dir / --cpu-energy-dir):
-  Files must be named  N{N}_{dtype}.json  inside the directory.
-  Example: wh_energy/N1048576_fp32.json
-  Accepted schemas:
-    {"energy_J": 1.220}                       ← preferred (direct measurement)
-    {"energy_J": 1.220, "avg_power_W": 42.1}  ← energy_J used, power informational
-    {"avg_power_W": 42.1, "duration_s": 0.029}← fallback: power × duration
+  Mode 1 — --wh-energy-dir and/or --cpu-energy-dir supplied:
+    Per-run sidecar JSON is loaded for each (N, dtype) point.
+    File naming: N{N}_{dtype}.json inside the directory.
+    Example:  wh_energy/N1048576_fp32.json
+    Accepted schemas:
+      {"energy_J": 1.220}                        ← preferred (direct measurement)
+      {"energy_J": 1.220, "avg_power_W": 42.1}   ← energy_J used, power informational
+      {"avg_power_W": 42.1, "duration_s": 0.029} ← fallback: power × duration
+    If no file exists for a given (N, dtype), that point's energy = N/A.
+    energy_ratio_valid = True only when both WH and CPU energy are present.
 
 bfloat16 note:
   WH B0 executes bf16 natively — no upcast.
@@ -59,7 +46,7 @@ bfloat16 note:
   internally.  bf16 CPU timings therefore reflect float64 compute, not bf16.
   Do not interpret CPU bf16 numbers as a precision-matched native bf16 baseline.
 
-To measure energy:
+To measure energy per run:
   WH  → tt_power_sidecar.py --backend sysfs --out wh_energy/N{N}_{dtype}.json
          or integrate TT-SMI power over the benchmark window.
   CPU → RAPL: read energy_uj before/after run → compute energy_J directly.
@@ -67,21 +54,15 @@ To measure energy:
 ════════════════════════════════════════════════════════════════════════════════
 USAGE
 ════════════════════════════════════════════════════════════════════════════════
-  # Runtime only (no energy)
+  # Runtime only (no energy) — default mode
   python benchmark_fft.py --dtype fp32 --warmup 10 --runs 50 --csv out.csv
 
-  # Global WH power (energy = power × time, same for all N)
-  python benchmark_fft.py --wh-power 42 --csv out.csv
+  # Single N
+  python benchmark_fft.py --n 1048576 --dtype fp32 --csv out.csv
 
-  # Per-run sidecar energy files (most accurate — energy_J used directly)
+  # Per-run sidecar energy (energy_J used directly when available)
   python benchmark_fft.py --wh-energy-dir wh_energy/ \\
                            --cpu-energy-dir cpu_energy/ --csv out.csv
-
-  # Mix: sidecar for WH, global scalar for CPU
-  python benchmark_fft.py --wh-energy-dir wh_energy/ --cpu-power 353 --csv out.csv
-
-  # Full energy ratio from global scalars
-  python benchmark_fft.py --wh-power 42 --cpu-power 353 --csv out.csv
 
   # Single tier
   python benchmark_fft.py --two-pass --dtype fp32 --csv out.csv
@@ -96,7 +77,7 @@ import json
 import math
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -194,23 +175,6 @@ def _fft_flops(N: int, B: int) -> float:
     return 5.0 * B * N * math.log2(max(N, 2))
 
 
-def _load_power_json(path: str) -> Optional[float]:
-    """Read avg_power_W from a TT-SMI or tt_power_sidecar JSON file (global).
-
-    Supported schemas:
-      {"avg_power_W": 42.1}
-      {"devices": {"0": {"avg_power_W": 42.1}}}
-    """
-    with open(path) as f:
-        data = json.load(f)
-    if "avg_power_W" in data:
-        return float(data["avg_power_W"])
-    if "devices" in data:
-        for dev in data["devices"].values():
-            if "avg_power_W" in dev:
-                return float(dev["avg_power_W"])
-    raise ValueError(f"Cannot find avg_power_W in {path}. Keys: {list(data.keys())}")
-
 
 def _load_sidecar_energy(energy_dir: Optional[str],
                          N: int,
@@ -260,27 +224,21 @@ def _load_sidecar_energy(energy_dir: Optional[str],
 
 
 def _resolve_energy(energy_dir: Optional[str],
-                    global_power_w: Optional[float],
                     N: int,
                     dtype_str: str,
                     median_ms: float,
                     batch: int) -> tuple:
-    """Resolve energy for one benchmark point from sidecar or global power.
+    """Resolve energy for one benchmark point from per-run sidecar JSON only.
 
-    Priority: sidecar energy_J > sidecar power×duration > global power×time.
+    No fallback to global power scalars — if no matching sidecar file exists
+    for this (N, dtype), all energy fields are None (reported as N/A).
 
     Returns: (energy_j, power_w_info, duration_s, joules_per_fft,
               ffts_per_joule, source)
     """
-    # Try per-run sidecar first
+    # Per-run sidecar only — no fallback to global power scalar.
+    # If no matching sidecar file exists, energy is N/A for this point.
     e, pw_info, duration_s, source = _load_sidecar_energy(energy_dir, N, dtype_str)
-
-    # Fall back to global power × median time
-    if e is None and global_power_w is not None:
-        e         = global_power_w * median_ms * 1e-3
-        pw_info   = global_power_w
-        duration_s = median_ms * 1e-3
-        source    = "power_x_time"
 
     if e is None:
         return None, None, None, None, None, None
@@ -360,8 +318,6 @@ def benchmark_one(
     device,
     warmup: int,
     runs: int,
-    wh_power_w: Optional[float],       # global WH power scalar (fallback)
-    cpu_power_w: Optional[float],      # global CPU power scalar (fallback)
     wh_energy_dir: Optional[str],      # dir with per-run WH sidecar JSONs
     cpu_energy_dir: Optional[str],     # dir with per-run CPU sidecar JSONs
 ) -> Optional[BenchResult]:
@@ -426,16 +382,15 @@ def benchmark_one(
     gflops_s = flops / (wh_med * 1e-3) / 1e9
     speedup  = cpu_med / wh_med
 
-    # WH energy — sidecar takes priority over global power
+    # WH energy — per-run sidecar only; N/A if no matching file.
     wh_e, wh_pw_info, wh_dur_s, wh_jpf, wh_fpj, wh_src = _resolve_energy(
-        wh_energy_dir, wh_power_w, N, dtype_str, wh_med, B)
+        wh_energy_dir, N, dtype_str, wh_med, B)
 
-    # CPU energy — sidecar takes priority over global power.
-    # Use B (not 1) because the CPU baseline runs B FFTs via np.tile(x_np, (B, 1)).
-    # For Stockham B=64; for all other tiers B=1. Using B ensures
-    # cpu_joules_per_fft and cpu_ffts_per_joule match the WH accounting.
+    # CPU energy — per-run sidecar only; N/A if no matching file.
+    # Use B (not 1): CPU baseline runs B FFTs via np.tile(x_np, (B, 1)).
+    # For Stockham B=64; for all other tiers B=1.
     cpu_e, cpu_pw_info, cpu_dur_s, cpu_jpf, cpu_fpj, cpu_src = _resolve_energy(
-        cpu_energy_dir, cpu_power_w, N, dtype_str, cpu_med, B)
+        cpu_energy_dir, N, dtype_str, cpu_med, B)
 
     ratio, ratio_valid = _compute_energy_ratio(wh_e, cpu_e)
 
@@ -514,9 +469,9 @@ def _print_summary_table(results: List[BenchResult]) -> None:
     print("=" * width)
 
     if not has_wh_e:
-        print("  ⚠ Energy not reported — supply --wh-power or --wh-energy-dir to enable.")
+        print("  ⚠ Energy not reported — supply --wh-energy-dir to enable.")
     elif not has_energy:
-        print("  ⚠ Energy ratio not reported — supply --cpu-power or --cpu-energy-dir too.")
+        print("  ⚠ Energy ratio not reported — supply --cpu-energy-dir too.")
     print(f"  ⚠ CPU baseline = numpy_cpu (pocketfft). NOT Brown et al. native OpenMP C++ FFT.")
     print(f"  ⚠ bf16 CPU numbers reflect float64 compute (numpy internal upcast) — "
           f"not a precision-matched bf16 baseline.")
@@ -564,53 +519,36 @@ def main():
     parser.add_argument("--csv",    default="fft_benchmark.csv",
                         help="output CSV path")
 
-    # Tier selection
+    parser.add_argument("--n", type=int, default=None,
+                        help="Run only a single FFT size N (overrides tier flags). "
+                             "Useful for generating one sidecar JSON per N: "
+                             "python benchmark_fft.py --n 1048576 --dtype fp32")
+
+    # Tier selection (ignored when --n is set)
     parser.add_argument("--stockham",    action="store_true")
     parser.add_argument("--two-pass",    action="store_true")
     parser.add_argument("--three-pass",  action="store_true")
     parser.add_argument("--bluestein",   action="store_true")
 
-    # Power inputs — all optional, no fallback TDP
+    # Energy inputs — per-run sidecar only, no global power scalars
     pwr = parser.add_argument_group(
-        "power (all optional — energy is N/A if not supplied)")
-    pwr.add_argument("--wh-power",      type=float, default=None,
-                     help="Measured WH avg power in W (TT-SMI). "
-                          "If not supplied, WH energy = N/A.")
-    pwr.add_argument("--cpu-power",     type=float, default=None,
-                     help="Measured CPU avg power in W (RAPL). "
-                          "If not supplied, energy ratio = N/A.")
-    pwr.add_argument("--wh-power-json",  default=None,
-                     help="Global JSON file with avg_power_W for WH. "
-                          "Overrides --wh-power if both given.")
-    pwr.add_argument("--cpu-power-json", default=None,
-                     help="Global JSON file with avg_power_W for CPU. "
-                          "Overrides --cpu-power if both given.")
+        "energy (sidecar JSONs only — no global power fallback)")
     pwr.add_argument("--wh-energy-dir",  default=None,
                      help="Directory of per-run WH sidecar JSONs. "
                           "Files named N{N}_{dtype}.json (e.g. N1048576_fp32.json). "
                           "energy_J key used directly if present; "
-                          "falls back to avg_power_W × duration_s. "
-                          "Takes priority over --wh-power for matched N/dtype.")
+                          "falls back to avg_power_W × duration_s if not.")
     pwr.add_argument("--cpu-energy-dir", default=None,
-                     help="Directory of per-run CPU sidecar JSONs (same naming). "
-                          "Takes priority over --cpu-power for matched N/dtype.")
+                     help="Directory of per-run CPU sidecar JSONs (same naming convention).")
     args = parser.parse_args()
 
-    # Resolve global power scalars (used as fallback when no sidecar exists)
-    wh_power_w: Optional[float] = args.wh_power
-    if args.wh_power_json:
-        wh_power_w = _load_power_json(args.wh_power_json)
-        print(f"  WH global power loaded from {args.wh_power_json}: {wh_power_w:.2f} W")
-
-    cpu_power_w: Optional[float] = args.cpu_power
-    if args.cpu_power_json:
-        cpu_power_w = _load_power_json(args.cpu_power_json)
-        print(f"  CPU global power loaded from {args.cpu_power_json}: {cpu_power_w:.2f} W")
-
     if args.wh_energy_dir:
-        print(f"  WH per-run sidecar dir : {args.wh_energy_dir}/N{{N}}_{{dtype}}.json")
+        print(f"  WH energy sidecar dir : {args.wh_energy_dir}/N{{N}}_{{dtype}}.json")
     if args.cpu_energy_dir:
-        print(f"  CPU per-run sidecar dir: {args.cpu_energy_dir}/N{{N}}_{{dtype}}.json")
+        print(f"  CPU energy sidecar dir: {args.cpu_energy_dir}/N{{N}}_{{dtype}}.json")
+    if not args.wh_energy_dir and not args.cpu_energy_dir:
+        print("  Energy: not measured (no --wh-energy-dir / --cpu-energy-dir supplied)."
+              " All energy columns will be N/A.")
 
     dtypes = ["fp32", "bf16"] if args.dtype == "both" else [args.dtype]
 
@@ -623,15 +561,17 @@ def main():
     if not any_sel or args.bluestein:  n_list += BLUESTEIN_N
     n_list = sorted(set(n_list))
 
+    # Single-N override — useful for generating one sidecar JSON per point
+    if args.n is not None:
+        n_list = [args.n]
+
     # Header
     print("=" * 80)
     print("FFT Benchmark — Tenstorrent Wormhole B0  (HPEC 2026)")
     print(f"  dtypes      : {dtypes}")
     print(f"  warmup/runs : {args.warmup} / {args.runs}")
-    print(f"  WH power    : {wh_power_w} W (global fallback; None = N/A if no sidecar)")
-    print(f"  CPU power   : {cpu_power_w} W (global fallback; None = ratio N/A if no sidecar)")
-    print(f"  WH sidecar  : {args.wh_energy_dir or 'not set'}")
-    print(f"  CPU sidecar : {args.cpu_energy_dir or 'not set'}")
+    print(f"  WH sidecar  : {args.wh_energy_dir or 'not set (energy = N/A)'}")
+    print(f"  CPU sidecar : {args.cpu_energy_dir or 'not set (energy = N/A)'}")
     print(f"  N sizes     : {len(n_list)} × {len(dtypes)} dtypes = "
           f"{len(n_list)*len(dtypes)} benchmarks")
     print(f"  CPU baseline: numpy_cpu (pocketfft, all cores)")
@@ -647,8 +587,6 @@ def main():
             for N in n_list:
                 r = benchmark_one(N, dtype_str, device,
                                   warmup=args.warmup, runs=args.runs,
-                                  wh_power_w=wh_power_w,
-                                  cpu_power_w=cpu_power_w,
                                   wh_energy_dir=args.wh_energy_dir,
                                   cpu_energy_dir=args.cpu_energy_dir)
                 if r is not None:
