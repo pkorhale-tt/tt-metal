@@ -2,157 +2,345 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent Inc.
 # SPDX-License-Identifier: Apache-2.0
 """
-FFT benchmark for HPEC 2026 paper evaluation.
+FFT benchmark for HPEC 2026 — paper-safe results only.
 
-Usage:
-    python benchmark_fft.py                    # all N, fp32+bf16, 10 warm + 20 timed
-    python benchmark_fft.py --dtype fp32       # fp32 only
-    python benchmark_fft.py --warmup 5 --runs 50
-    python benchmark_fft.py --csv results.csv  # save CSV for plotting
-    python benchmark_fft.py --wh-power 42 --cpu-power 353  # paper-accurate energy
+════════════════════════════════════════════════════════════════════════════════
+TIMING METHODOLOGY
+════════════════════════════════════════════════════════════════════════════════
+WH timing  — kernel-only execution time.
+  Window:  right before ttnn.experimental.fft(...)
+         → ttnn.synchronize_device(device)
+  Excludes: host→device upload, device→host download, Python overhead.
+  Rationale: matches Brown et al. ISC 2025 ("performance numbers for WH are
+             execution time only").
 
-Metrics reported per (N, dtype, algorithm):
-  - Wormhole device time (ms) — median of timed runs, kernel execution only
-    (excludes host-device transfer, matching Brown et al. ISC 2025 methodology)
-  - CPU time (ms) — NumPy on host (all available cores)
-  - GFLOPs/s (device) — 5 N log2(N) / time_s  (complex FFT convention)
-  - Speedup vs CPU — cpu_time / device_time (>1 = WH faster)
-  - Energy ratio — (cpu_time × cpu_power) / (wh_time × wh_power)
-    Pass --wh-power and --cpu-power for paper-accurate measured values.
-    Falls back to TDP estimates: cpu_TDP=240W, wh_TDP=75W (conservative).
-    Formula: Brown et al. ISC 2025, Table 3 — E = P × t, ratio = E_cpu / E_wh
+CPU timing — wall-clock for the full numpy.fft.fft() call (plan cached after
+  warmup). Labelled "numpy_cpu" in all output. This is a practical Python
+  software baseline, NOT the native OpenMP C++ baseline used by Brown et al.
+  Do not compare CPU speedup numbers directly to that paper.
 
-FFT FLOP count convention (matches cuFFT docs):
-  complex FFT of length N:  5 N log2(N)  FLOPs
+════════════════════════════════════════════════════════════════════════════════
+ENERGY METHODOLOGY
+════════════════════════════════════════════════════════════════════════════════
+Energy is NEVER computed from borrowed constants or TDP estimates.
+Four levels of energy reporting:
+
+  Level 0 — no power or energy provided (default):
+    All energy fields = N/A.  energy_ratio_valid = False.
+
+  Level 1 — global --wh-power supplied:
+    wh_energy_j       = wh_power_w × median_time_s     (publishable)
+    wh_joules_per_fft = wh_energy_j / batch            (publishable)
+    wh_ffts_per_joule = batch / wh_energy_j            (publishable)
+    wh_energy_source  = "power_x_time"
+    CPU energy / ratio = N/A.  energy_ratio_valid = False.
+
+  Level 2 — per-run --wh-energy-dir sidecar with energy_J key:
+    wh_energy_j       = energy_J from sidecar file     (most accurate)
+    avg_power_W from sidecar stored as wh_power_w (informational only).
+    wh_energy_source  = "sidecar_energy_J"
+    CPU side follows same logic.  energy_ratio_valid = True if both present.
+
+  Level 3 — both WH and CPU energy known (either source):
+    energy_ratio      = cpu_energy_j / wh_energy_j     (publishable)
+    energy_ratio_valid = True.
+
+Sidecar JSON naming convention (--wh-energy-dir / --cpu-energy-dir):
+  Files must be named  N{N}_{dtype}.json  inside the directory.
+  Example: wh_energy/N1048576_fp32.json
+  Accepted schemas:
+    {"energy_J": 1.220}                       ← preferred (direct measurement)
+    {"energy_J": 1.220, "avg_power_W": 42.1}  ← energy_J used, power informational
+    {"avg_power_W": 42.1, "duration_s": 0.029}← fallback: power × duration
+
+bfloat16 note:
+  WH B0 executes bf16 natively — no upcast.
+  NumPy pocketfft has no native bf16 path; it upcasts input to float64
+  internally.  bf16 CPU timings therefore reflect float64 compute, not bf16.
+  Do not interpret CPU bf16 numbers as a precision-matched native bf16 baseline.
+
+To measure energy:
+  WH  → tt_power_sidecar.py --backend sysfs --out wh_energy/N{N}_{dtype}.json
+         or integrate TT-SMI power over the benchmark window.
+  CPU → RAPL: read energy_uj before/after run → compute energy_J directly.
+
+════════════════════════════════════════════════════════════════════════════════
+USAGE
+════════════════════════════════════════════════════════════════════════════════
+  # Runtime only (no energy)
+  python benchmark_fft.py --dtype fp32 --warmup 10 --runs 50 --csv out.csv
+
+  # Global WH power (energy = power × time, same for all N)
+  python benchmark_fft.py --wh-power 42 --csv out.csv
+
+  # Per-run sidecar energy files (most accurate — energy_J used directly)
+  python benchmark_fft.py --wh-energy-dir wh_energy/ \\
+                           --cpu-energy-dir cpu_energy/ --csv out.csv
+
+  # Mix: sidecar for WH, global scalar for CPU
+  python benchmark_fft.py --wh-energy-dir wh_energy/ --cpu-power 353 --csv out.csv
+
+  # Full energy ratio from global scalars
+  python benchmark_fft.py --wh-power 42 --cpu-power 353 --csv out.csv
+
+  # Single tier
+  python benchmark_fft.py --two-pass --dtype fp32 --csv out.csv
+
+GFLOPs/s convention (matches cuFFT docs):
+  complex FFT of length N:  5 × B × N × log2(N)  FLOPs
 """
 
 import argparse
 import csv
+import json
 import math
-import os
 import time
-from dataclasses import dataclass, asdict
-from typing import List, Optional
+from collections import defaultdict
+from dataclasses import dataclass, field, fields
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 import ttnn
 
-# ── Configuration ─────────────────────────────────────────────────────────────
 
-# TDP fallback values (used if --wh-power / --cpu-power not supplied).
-# For paper-accurate results, measure with:
-#   WH  power: tt_power_sidecar.py --backend sysfs → avg_power_W
-#   CPU power: RAPL via /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj
-# Paper (Brown et al. ISC 2025) measured: CPU=353W, WH=42W for 2D FFT 1024×1024
-WH_TDP_W  = 75.0
-CPU_TDP_W = 240.0
+# ─────────────────────────────────────────────────────────────────────────────
+# N lists per algorithm tier
+# ─────────────────────────────────────────────────────────────────────────────
+
+POW2_STOCKHAM  = [32, 64, 128, 256, 512, 1024]
+POW2_TWO_PASS  = [2048, 4096, 8192, 65536, 1 << 17, 1 << 20]
+POW2_THREE_PASS = [1 << 21, 1 << 23, 1 << 24]   # 2^26 OOMs on 1 GB WH B0
+BLUESTEIN_N = [
+    97, 127, 257, 509,
+    1000, 3000, 9999,
+    64512,           # 63 × 1024, M = 2^17
+    525312,          # 513 × 1024  (XL, M = 3-pass inner)
+    786432,          # 768 × 1024  (XL)
+]
+
+# Stockham: one transform per core → fill all 64 cores with B=64.
+# All other tiers distribute work across cores internally → B=1.
+STOCKHAM_BATCH = 64
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result dataclass
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NA = "N/A"   # sentinel for unmeasured energy fields in CSV
 
 
 @dataclass
 class BenchResult:
+    # ── identity ──────────────────────────────────────────────────────────────
     N: int
-    batch: int          # B=64 for Stockham (all cores), B=1 for others
-    dtype: str          # "fp32" or "bf16"
-    algorithm: str      # "stockham" | "two_pass" | "three_pass" | "bluestein"
+    batch: int                  # B=64 for Stockham, B=1 for all others
+    dtype: str                  # "fp32" | "bf16"
+    algorithm: str              # "stockham" | "two_pass" | "three_pass" | "bluestein"
+    cpu_baseline: str           # always "numpy_cpu"
+
+    # ── timing ────────────────────────────────────────────────────────────────
     wh_median_ms: float
     wh_p25_ms: float
     wh_p75_ms: float
-    cpu_median_ms: float
-    gflops_s: float
-    speedup_vs_cpu: float   # > 1 means WH is faster
-    energy_ratio: float     # > 1 means WH uses less energy
-    rel_err: float
+    cpu_median_ms: float        # numpy wall-clock
+    gflops_s: float             # WH device GFLOPs/s
+    speedup_vs_cpu: float       # cpu_median / wh_median  (>1 = WH faster)
+
+    # ── accuracy ──────────────────────────────────────────────────────────────
+    rel_err: float              # ||y_wh - y_ref||_2 / ||y_ref||_2
+
+    # ── energy — None when not measured ───────────────────────────────────────
+    wh_power_w: Optional[float]         # informational; None if not available
+    wh_energy_j: Optional[float]        # from sidecar energy_J or power×time
+    wh_joules_per_fft: Optional[float]  # wh_energy_j / batch
+    wh_ffts_per_joule: Optional[float]  # batch / wh_energy_j
+    wh_energy_source: Optional[str]     # "sidecar_energy_J" | "power_x_time" | None
+
+    cpu_power_w: Optional[float]           # informational; None if not available
+    cpu_energy_j: Optional[float]         # from sidecar energy_J or power×time
+    cpu_joules_per_fft: Optional[float]   # cpu_energy_j / batch
+    cpu_ffts_per_joule: Optional[float]   # batch / cpu_energy_j
+    cpu_energy_source: Optional[str]      # "sidecar_energy_J" | "power_x_time" | None
+    cpu_duration_s: Optional[float]       # duration_s from sidecar if present
+    wh_duration_s: Optional[float]        # duration_s from sidecar if present
+    energy_ratio: Optional[float]         # cpu_energy_j / wh_energy_j  (>1 = WH greener)
+    energy_ratio_valid: bool              # True only when both energy values are real measurements
+
+    def csv_row(self) -> Dict:
+        """Flat dict for CSV — replaces None with 'N/A'."""
+        d = {}
+        for f in fields(self):
+            v = getattr(self, f.name)
+            d[f.name] = _NA if v is None else v
+        return d
 
 
-# ── N list per algorithm tier ─────────────────────────────────────────────────
-
-POW2_STOCKHAM = [32, 64, 128, 256, 512, 1024]
-POW2_TWO_PASS = [2048, 4096, 8192, 65536, 1 << 17, 1 << 20]
-POW2_THREE_PASS = [1 << 21, 1 << 23, 1 << 24]  # 2^26 OOMs on 1 GB WH B0
-BLUESTEIN_N = [
-    # small primes and composites
-    97, 127, 257, 509,
-    # medium composites (M = 2-pass)
-    1000, 3000, 9999,
-    # large 1024-aligned (M = 2-pass inner, fp32 hw limit: M ≤ 2^17)
-    64512,          # 63 × 1024, M = 2^17
-    # XL (M = 3-pass inner); non-1024-aligned (65535) is L1-unsafe → excluded
-    525312,         # 513 × 1024
-    786432,         # 768 × 1024
-]
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _algorithm_label(N: int) -> str:
-    if N & (N - 1) == 0:          # power of 2
-        if N <= 1024:
-            return "stockham"
-        if N <= (1 << 20):
-            return "two_pass"
+    if N & (N - 1) == 0:
+        if N <= 1024:      return "stockham"
+        if N <= (1 << 20): return "two_pass"
         return "three_pass"
     return "bluestein"
 
 
-def _fft_flops(N: int, B: int = 1) -> float:
-    """5 B N log2(N) — standard complex FFT FLOP count convention (matches cuFFT docs).
-    Input to the benchmark is real-valued, but we use the complex convention
-    (5 N log2 N rather than 2.5 N log2 N) for comparability with FFT literature.
-    Multiplied by B (batch size) to reflect total device work per call."""
+def _fft_flops(N: int, B: int) -> float:
+    """5 × B × N × log2(N) — standard complex FFT FLOP count (cuFFT docs)."""
     return 5.0 * B * N * math.log2(max(N, 2))
 
 
-# Stockham batch size — uses B=64 so all 64 Tensix cores are active.
-# Two-pass / three-pass / Bluestein distribute work across cores internally
-# regardless of batch size, so they use B=1.
-STOCKHAM_BATCH = 64
+def _load_power_json(path: str) -> Optional[float]:
+    """Read avg_power_W from a TT-SMI or tt_power_sidecar JSON file (global).
+
+    Supported schemas:
+      {"avg_power_W": 42.1}
+      {"devices": {"0": {"avg_power_W": 42.1}}}
+    """
+    with open(path) as f:
+        data = json.load(f)
+    if "avg_power_W" in data:
+        return float(data["avg_power_W"])
+    if "devices" in data:
+        for dev in data["devices"].values():
+            if "avg_power_W" in dev:
+                return float(dev["avg_power_W"])
+    raise ValueError(f"Cannot find avg_power_W in {path}. Keys: {list(data.keys())}")
 
 
-# ── Device helpers ────────────────────────────────────────────────────────────
+def _load_sidecar_energy(energy_dir: Optional[str],
+                         N: int,
+                         dtype_str: str) -> tuple:
+    """Look up per-run sidecar JSON for this (N, dtype) point.
+
+    File name convention: {energy_dir}/N{N}_{dtype}.json
+    e.g.  wh_energy/N1048576_fp32.json
+
+    Returns: (energy_j, power_w_info, duration_s, source_label)
+      energy_j      — direct energy in Joules if sidecar has energy_J,
+                      else power × duration if both present, else None.
+      power_w_info  — avg_power_W from sidecar (informational), or None.
+      duration_s    — duration_s field from sidecar if present, else None.
+      source_label  — "sidecar_energy_J" | "sidecar_power_x_duration" | None
+    """
+    if energy_dir is None:
+        return None, None, None, None
+
+    import os
+    path = os.path.join(energy_dir, f"N{N}_{dtype_str}.json")
+    if not os.path.exists(path):
+        return None, None, None, None
+
+    with open(path) as f:
+        data = json.load(f)
+
+    power_w  = data.get("avg_power_W") or data.get("avg_power_w")
+    if power_w is not None:
+        power_w = float(power_w)
+
+    duration = data.get("duration_s") or data.get("duration")
+    if duration is not None:
+        duration = float(duration)
+
+    # Prefer direct energy_J measurement
+    if "energy_J" in data or "energy_j" in data:
+        e = float(data.get("energy_J") or data.get("energy_j"))
+        return e, power_w, duration, "sidecar_energy_J"
+
+    # Fallback: avg_power_W × duration_s
+    if power_w is not None and duration is not None:
+        e = power_w * duration
+        return e, power_w, duration, "sidecar_power_x_duration"
+
+    return None, power_w, duration, None
+
+
+def _resolve_energy(energy_dir: Optional[str],
+                    global_power_w: Optional[float],
+                    N: int,
+                    dtype_str: str,
+                    median_ms: float,
+                    batch: int) -> tuple:
+    """Resolve energy for one benchmark point from sidecar or global power.
+
+    Priority: sidecar energy_J > sidecar power×duration > global power×time.
+
+    Returns: (energy_j, power_w_info, duration_s, joules_per_fft,
+              ffts_per_joule, source)
+    """
+    # Try per-run sidecar first
+    e, pw_info, duration_s, source = _load_sidecar_energy(energy_dir, N, dtype_str)
+
+    # Fall back to global power × median time
+    if e is None and global_power_w is not None:
+        e         = global_power_w * median_ms * 1e-3
+        pw_info   = global_power_w
+        duration_s = median_ms * 1e-3
+        source    = "power_x_time"
+
+    if e is None:
+        return None, None, None, None, None, None
+
+    jpf = e / batch if batch > 0 else None
+    fpj = batch / e if e > 0 else None
+    return e, pw_info, duration_s, jpf, fpj, source
+
+
+def _compute_energy_ratio(wh_energy_j: Optional[float],
+                          cpu_energy_j: Optional[float]) -> tuple:
+    """Return (ratio, valid).  valid=True only when both energies are real."""
+    if wh_energy_j is None or cpu_energy_j is None:
+        return None, False
+    ratio = cpu_energy_j / wh_energy_j if wh_energy_j > 0 else None
+    return ratio, True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Device helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _open_device():
-    """Open the first available Wormhole device."""
     device = ttnn.open_device(device_id=0)
     device.enable_program_cache()
     return device
 
 
-def _upload(x_np: np.ndarray, device, tt_dtype, B: int = 1) -> ttnn.Tensor:
-    # x_np is 1-D shape (N,); tile to (B, N) so each row is an independent FFT.
+def _upload(x_np: np.ndarray, device, tt_dtype, B: int) -> ttnn.Tensor:
+    """Tile 1-D x_np → (B, N) and upload to device."""
     t = torch.from_numpy(np.tile(x_np.reshape(1, -1), (B, 1)))
     return ttnn.from_torch(t, dtype=tt_dtype,
                            layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
 
 
 def _run_wh_fft(tt_in: ttnn.Tensor):
-    re, im = ttnn.experimental.fft(tt_in)
-    return re, im
+    return ttnn.experimental.fft(tt_in)   # returns (re, im)
 
 
-def _download(re: ttnn.Tensor, im: ttnn.Tensor, N: int, B: int = 1) -> np.ndarray:
-    """Download first row only for accuracy check."""
+def _download_first_row(re: ttnn.Tensor, im: ttnn.Tensor,
+                        N: int, B: int) -> np.ndarray:
     r = ttnn.to_torch(re).reshape(B, N)[0].to(torch.float32).numpy()
     i = ttnn.to_torch(im).reshape(B, N)[0].to(torch.float32).numpy()
     return r + 1j * i
 
 
 def _wh_fft_timed(tt_in: ttnn.Tensor, n_runs: int, device) -> List[float]:
-    """Return list of per-run wall-clock times in ms.
-    Times kernel execution only — excludes D2H download, matching
-    Brown et al. ISC 2025: 'performance numbers for WH are execution time only.'
-    """
+    """Kernel-only timing: dispatch → synchronize_device (no D2H)."""
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
         re, im = _run_wh_fft(tt_in)
-        ttnn.synchronize_device(device)  # sync without downloading
+        ttnn.synchronize_device(device)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1e3)
     return times
 
 
 def _cpu_fft_timed(x_np: np.ndarray, n_runs: int) -> List[float]:
-    """Return list of per-run wall-clock times in ms (all available CPU cores).
-    x_np may be 1-D (B=1) or 2-D (B>1); np.fft.fft operates on last axis."""
+    """Wall-clock for numpy.fft.fft (all available cores, plan cached)."""
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
@@ -162,7 +350,9 @@ def _cpu_fft_timed(x_np: np.ndarray, n_runs: int) -> List[float]:
     return times
 
 
-# ── Benchmark one (N, dtype) point ───────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Core benchmark function
+# ─────────────────────────────────────────────────────────────────────────────
 
 def benchmark_one(
     N: int,
@@ -170,141 +360,282 @@ def benchmark_one(
     device,
     warmup: int,
     runs: int,
-    wh_power_w: float,
-    cpu_power_w: float,
+    wh_power_w: Optional[float],       # global WH power scalar (fallback)
+    cpu_power_w: Optional[float],      # global CPU power scalar (fallback)
+    wh_energy_dir: Optional[str],      # dir with per-run WH sidecar JSONs
+    cpu_energy_dir: Optional[str],     # dir with per-run CPU sidecar JSONs
 ) -> Optional[BenchResult]:
+
+    # DRAM safety guard (fp32/bf16 N=2^27 = 512 MB input → OOM on 1 GB WH B0)
+    if N > (1 << 26):
+        print(f"  SKIP N={N:>10,} {dtype_str} (DRAM OOM on WH B0)")
+        return None
+
     tt_dtype = ttnn.float32 if dtype_str == "fp32" else ttnn.bfloat16
-
-    # Skip N values that require more DRAM than safe for this dtype
-    # (fp32 N=2^27 input alone = 512 MB → OOM on 1 GB WH B0)
-    max_fp32_n = 1 << 26
-    max_bf16_n = 1 << 26   # conservative; 2^27 bf16 intermediates also OOM
-    if dtype_str == "fp32" and N > max_fp32_n:
-        print(f"  SKIP N={N:>10,} fp32 (DRAM OOM on WH B0)")
-        return None
-    if dtype_str == "bf16" and N > max_bf16_n:
-        print(f"  SKIP N={N:>10,} bf16 (DRAM OOM on WH B0)")
-        return None
-
     algo = _algorithm_label(N)
-    # Stockham (N≤1024) runs one transform per core → use B=STOCKHAM_BATCH
-    # to fill all 64 cores and measure peak device throughput fairly.
-    # All other algorithms distribute work across cores internally (B=1).
-    B = STOCKHAM_BATCH if algo == "stockham" else 1
+    B    = STOCKHAM_BATCH if algo == "stockham" else 1
 
     np.random.seed(N % (1 << 20))
     x_np = np.random.randn(N).astype(np.float32)
     if dtype_str == "bf16":
-        # Correct bf16 quantisation via PyTorch (np.float16 is fp16, not bf16)
         x_np = torch.tensor(x_np).to(torch.bfloat16).float().numpy()
 
-    print(f"  bench N={N:>10,}  B={B:<2}  dtype={dtype_str}  algo={algo:<12}", end="", flush=True)
+    print(f"  bench N={N:>10,}  B={B:<2}  {dtype_str}  {algo:<12}", end="", flush=True)
 
-    # Upload to device — shape (B, N)
+    # ── upload ────────────────────────────────────────────────────────────────
     try:
         tt_in = _upload(x_np, device, tt_dtype, B=B)
     except RuntimeError as e:
-        print(f"  → SKIP (device alloc failed: {e})")
+        print(f"  → SKIP (alloc failed: {e})")
         return None
 
-    # Warmup — fills program cache
+    # ── warmup (fills program cache) ──────────────────────────────────────────
     try:
         for _ in range(warmup):
             re, im = _run_wh_fft(tt_in)
-            ttnn.to_torch(re); ttnn.to_torch(im)
+            ttnn.to_torch(re)
+            ttnn.to_torch(im)
     except RuntimeError as e:
         print(f"  → SKIP (warmup failed: {e})")
         return None
 
-    # Accuracy check — compare first row against NumPy reference
-    ref = np.fft.fft(x_np)
+    # ── accuracy (first row vs numpy float64 reference) ───────────────────────
+    ref = np.fft.fft(x_np.astype(np.float64))
     re, im = _run_wh_fft(tt_in)
-    got = _download(re, im, N, B=B)
+    got = _download_first_row(re, im, N, B)
     rel_err = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
 
-    # Timed runs — device (kernel only, no D2H)
-    wh_times = _wh_fft_timed(tt_in, runs, device)
-    wh_times.sort()
+    # ── WH timed runs (kernel only, no D2H) ───────────────────────────────────
+    wh_times = sorted(_wh_fft_timed(tt_in, runs, device))
     wh_med = float(np.median(wh_times))
     wh_p25 = float(np.percentile(wh_times, 25))
     wh_p75 = float(np.percentile(wh_times, 75))
 
-    # CPU baseline: B independent FFTs of length N (matches WH total work)
-    x_batch_np = np.tile(x_np, (B, 1))   # shape (B, N)
-    cpu_times = _cpu_fft_timed(x_batch_np, max(runs, 10))
-    cpu_times.sort()
+    # ── CPU baseline (numpy, all cores) ───────────────────────────────────────
+    x_batch = np.tile(x_np, (B, 1))   # shape (B, N) — same total work as WH
+    cpu_times = sorted(_cpu_fft_timed(x_batch, max(runs, 10)))
     cpu_med = float(np.median(cpu_times))
 
-    flops = _fft_flops(N, B=B)           # 5 * B * N * log2(N)
-    gflops_s = flops / (wh_med * 1e-3) / 1e9
-    speedup = cpu_med / wh_med
-    energy_ratio = speedup * (cpu_power_w / wh_power_w)
+    # ── bf16 note ─────────────────────────────────────────────────────────────
+    if dtype_str == "bf16":
+        print(f"\n  ⚠ bf16 note: CPU numpy baseline upcasts bf16→float64 internally. "
+              f"CPU bf16 time is NOT a precision-matched native bf16 baseline.")
 
-    print(f"  WH={wh_med:7.2f}ms  CPU={cpu_med:7.2f}ms  "
-          f"{gflops_s:6.2f}GFlops/s  "
-          f"speedup={speedup:.2f}×  energy={energy_ratio:.1f}×  "
-          f"err={rel_err:.1e}")
+    # ── derived metrics ───────────────────────────────────────────────────────
+    flops    = _fft_flops(N, B)
+    gflops_s = flops / (wh_med * 1e-3) / 1e9
+    speedup  = cpu_med / wh_med
+
+    # WH energy — sidecar takes priority over global power
+    wh_e, wh_pw_info, wh_dur_s, wh_jpf, wh_fpj, wh_src = _resolve_energy(
+        wh_energy_dir, wh_power_w, N, dtype_str, wh_med, B)
+
+    # CPU energy — sidecar takes priority over global power.
+    # Use B (not 1) because the CPU baseline runs B FFTs via np.tile(x_np, (B, 1)).
+    # For Stockham B=64; for all other tiers B=1. Using B ensures
+    # cpu_joules_per_fft and cpu_ffts_per_joule match the WH accounting.
+    cpu_e, cpu_pw_info, cpu_dur_s, cpu_jpf, cpu_fpj, cpu_src = _resolve_energy(
+        cpu_energy_dir, cpu_power_w, N, dtype_str, cpu_med, B)
+
+    ratio, ratio_valid = _compute_energy_ratio(wh_e, cpu_e)
+
+    # ── progress line ─────────────────────────────────────────────────────────
+    if ratio_valid and ratio is not None:
+        energy_str = f"energy={ratio:.1f}× (wh:{wh_src}, cpu:{cpu_src})"
+    else:
+        energy_str = "energy=N/A"
+    print(f"  WH={wh_med:7.2f}ms  CPU(numpy)={cpu_med:7.2f}ms  "
+          f"{gflops_s:5.2f}GFlops/s  speedup={speedup:.2f}×  "
+          f"{energy_str}  err={rel_err:.1e}")
 
     return BenchResult(
         N=N, batch=B, dtype=dtype_str, algorithm=algo,
+        cpu_baseline="numpy_cpu",
         wh_median_ms=wh_med, wh_p25_ms=wh_p25, wh_p75_ms=wh_p75,
         cpu_median_ms=cpu_med,
         gflops_s=gflops_s,
         speedup_vs_cpu=speedup,
-        energy_ratio=energy_ratio,
         rel_err=rel_err,
+        wh_power_w=wh_pw_info,
+        wh_energy_j=wh_e,
+        wh_joules_per_fft=wh_jpf,
+        wh_ffts_per_joule=wh_fpj,
+        wh_energy_source=wh_src,
+        wh_duration_s=wh_dur_s,
+        cpu_power_w=cpu_pw_info,
+        cpu_energy_j=cpu_e,
+        cpu_joules_per_fft=cpu_jpf,
+        cpu_ffts_per_joule=cpu_fpj,
+        cpu_energy_source=cpu_src,
+        cpu_duration_s=cpu_dur_s,
+        energy_ratio=ratio,
+        energy_ratio_valid=ratio_valid,
     )
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary printers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt(v: Optional[float], fmt: str = ".2f", suffix: str = "") -> str:
+    return _NA if v is None else f"{v:{fmt}}{suffix}"
+
+
+def _print_summary_table(results: List[BenchResult]) -> None:
+    has_energy = any(r.energy_ratio_valid for r in results)
+    has_wh_e   = any(r.wh_energy_j is not None for r in results)
+
+    hdr = (f"{'N':>10}  {'B':>2}  {'dtype':<5}  {'algo':<12}  "
+           f"{'WH(ms)':>8}  {'CPU(ms)':>8}  {'GFlops/s':>9}  {'Speedup':>8}  "
+           f"{'RelErr':>8}")
+    if has_wh_e:
+        hdr += f"  {'WH_mJ':>8}  {'J/FFT':>10}"
+    if has_energy:
+        hdr += f"  {'Energy×':>8}"
+
+    width = len(hdr)
+    print("\n" + "=" * width)
+    print(hdr)
+    print("-" * width)
+
+    for r in results:
+        line = (f"{r.N:>10,}  {r.batch:>2}  {r.dtype:<5}  {r.algorithm:<12}  "
+                f"{r.wh_median_ms:>8.2f}  {r.cpu_median_ms:>8.2f}  "
+                f"{r.gflops_s:>9.2f}  {r.speedup_vs_cpu:>8.2f}×  "
+                f"{r.rel_err:>8.1e}")
+        if has_wh_e:
+            wh_mj  = _fmt(r.wh_energy_j,       ".1f") if r.wh_energy_j is None else f"{r.wh_energy_j*1000:>8.1f}"
+            j_per_f = _fmt(r.wh_joules_per_fft, ".6f")
+            line += f"  {wh_mj:>8}  {j_per_f:>10}"
+        if has_energy:
+            line += f"  {_fmt(r.energy_ratio, '.2f', '×'):>8}"
+        print(line)
+
+    print("=" * width)
+
+    if not has_wh_e:
+        print("  ⚠ Energy not reported — supply --wh-power or --wh-energy-dir to enable.")
+    elif not has_energy:
+        print("  ⚠ Energy ratio not reported — supply --cpu-power or --cpu-energy-dir too.")
+    print(f"  ⚠ CPU baseline = numpy_cpu (pocketfft). NOT Brown et al. native OpenMP C++ FFT.")
+    print(f"  ⚠ bf16 CPU numbers reflect float64 compute (numpy internal upcast) — "
+          f"not a precision-matched bf16 baseline.")
+
+
+def _print_per_algo_summary(results: List[BenchResult]) -> None:
+    """Print median GFLOPs/s per algorithm tier (fp32 only)."""
+    by_algo: Dict[str, List[BenchResult]] = defaultdict(list)
+    for r in results:
+        if r.dtype == "fp32":
+            by_algo[r.algorithm].append(r)
+
+    if not by_algo:
+        return
+
+    print("\n── Per-algorithm summary (fp32, median GFLOPs/s) ──")
+    for algo in ["stockham", "two_pass", "three_pass", "bluestein"]:
+        rs = by_algo.get(algo)
+        if not rs:
+            continue
+        med_gf = sorted(r.gflops_s for r in rs)[len(rs) // 2]
+        med_sp = sorted(r.speedup_vs_cpu for r in rs)[len(rs) // 2]
+        ratio_str = ""
+        valid_ratios = [r.energy_ratio for r in rs if r.energy_ratio_valid and r.energy_ratio is not None]
+        if valid_ratios:
+            med_er = sorted(valid_ratios)[len(valid_ratios) // 2]
+            ratio_str = f"  energy_ratio={med_er:.1f}× (measured)"
+        print(f"  {algo:<12}: {med_gf:5.2f} GFLOPs/s  speedup={med_sp:.2f}×{ratio_str}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="FFT benchmark for HPEC 2026")
+    parser = argparse.ArgumentParser(
+        description="FFT benchmark for HPEC 2026 — paper-safe results only",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--dtype", choices=["fp32", "bf16", "both"], default="both")
     parser.add_argument("--warmup", type=int, default=10,
                         help="warmup iterations per (N, dtype)")
-    parser.add_argument("--runs", type=int, default=20,
+    parser.add_argument("--runs",   type=int, default=20,
                         help="timed iterations per (N, dtype)")
-    parser.add_argument("--csv", default="fft_benchmark.csv",
+    parser.add_argument("--csv",    default="fft_benchmark.csv",
                         help="output CSV path")
-    parser.add_argument("--stockham",   action="store_true", help="only Stockham N")
-    parser.add_argument("--two-pass",   action="store_true", help="only two-pass N")
-    parser.add_argument("--three-pass", action="store_true", help="only three-pass N")
-    parser.add_argument("--bluestein",  action="store_true", help="only Bluestein N")
-    parser.add_argument("--wh-power",  type=float, default=None,
-                        help="Measured WH avg power in watts (from TT-SMI). "
-                             "Overrides WH_TDP_W for energy calculation.")
-    parser.add_argument("--cpu-power", type=float, default=None,
-                        help="Measured CPU avg power in watts (from RAPL). "
-                             "Overrides CPU_TDP_W for energy calculation.")
+
+    # Tier selection
+    parser.add_argument("--stockham",    action="store_true")
+    parser.add_argument("--two-pass",    action="store_true")
+    parser.add_argument("--three-pass",  action="store_true")
+    parser.add_argument("--bluestein",   action="store_true")
+
+    # Power inputs — all optional, no fallback TDP
+    pwr = parser.add_argument_group(
+        "power (all optional — energy is N/A if not supplied)")
+    pwr.add_argument("--wh-power",      type=float, default=None,
+                     help="Measured WH avg power in W (TT-SMI). "
+                          "If not supplied, WH energy = N/A.")
+    pwr.add_argument("--cpu-power",     type=float, default=None,
+                     help="Measured CPU avg power in W (RAPL). "
+                          "If not supplied, energy ratio = N/A.")
+    pwr.add_argument("--wh-power-json",  default=None,
+                     help="Global JSON file with avg_power_W for WH. "
+                          "Overrides --wh-power if both given.")
+    pwr.add_argument("--cpu-power-json", default=None,
+                     help="Global JSON file with avg_power_W for CPU. "
+                          "Overrides --cpu-power if both given.")
+    pwr.add_argument("--wh-energy-dir",  default=None,
+                     help="Directory of per-run WH sidecar JSONs. "
+                          "Files named N{N}_{dtype}.json (e.g. N1048576_fp32.json). "
+                          "energy_J key used directly if present; "
+                          "falls back to avg_power_W × duration_s. "
+                          "Takes priority over --wh-power for matched N/dtype.")
+    pwr.add_argument("--cpu-energy-dir", default=None,
+                     help="Directory of per-run CPU sidecar JSONs (same naming). "
+                          "Takes priority over --cpu-power for matched N/dtype.")
     args = parser.parse_args()
 
-    wh_power_w  = args.wh_power  if args.wh_power  is not None else WH_TDP_W
-    cpu_power_w = args.cpu_power if args.cpu_power is not None else CPU_TDP_W
+    # Resolve global power scalars (used as fallback when no sidecar exists)
+    wh_power_w: Optional[float] = args.wh_power
+    if args.wh_power_json:
+        wh_power_w = _load_power_json(args.wh_power_json)
+        print(f"  WH global power loaded from {args.wh_power_json}: {wh_power_w:.2f} W")
 
-    dtypes = (["fp32", "bf16"] if args.dtype == "both"
-              else [args.dtype])
+    cpu_power_w: Optional[float] = args.cpu_power
+    if args.cpu_power_json:
+        cpu_power_w = _load_power_json(args.cpu_power_json)
+        print(f"  CPU global power loaded from {args.cpu_power_json}: {cpu_power_w:.2f} W")
+
+    if args.wh_energy_dir:
+        print(f"  WH per-run sidecar dir : {args.wh_energy_dir}/N{{N}}_{{dtype}}.json")
+    if args.cpu_energy_dir:
+        print(f"  CPU per-run sidecar dir: {args.cpu_energy_dir}/N{{N}}_{{dtype}}.json")
+
+    dtypes = ["fp32", "bf16"] if args.dtype == "both" else [args.dtype]
 
     # Build N list
-    any_selected = args.stockham or args.two_pass or args.three_pass or args.bluestein
-    n_list = []
-    if not any_selected or args.stockham:
-        n_list += POW2_STOCKHAM
-    if not any_selected or args.two_pass:
-        n_list += POW2_TWO_PASS
-    if not any_selected or args.three_pass:
-        n_list += POW2_THREE_PASS
-    if not any_selected or args.bluestein:
-        n_list += BLUESTEIN_N
+    any_sel = args.stockham or args.two_pass or args.three_pass or args.bluestein
+    n_list: List[int] = []
+    if not any_sel or args.stockham:   n_list += POW2_STOCKHAM
+    if not any_sel or args.two_pass:   n_list += POW2_TWO_PASS
+    if not any_sel or args.three_pass: n_list += POW2_THREE_PASS
+    if not any_sel or args.bluestein:  n_list += BLUESTEIN_N
     n_list = sorted(set(n_list))
 
+    # Header
     print("=" * 80)
     print("FFT Benchmark — Tenstorrent Wormhole B0  (HPEC 2026)")
-    print(f"  dtypes   : {dtypes}")
-    print(f"  warmup   : {args.warmup}   runs: {args.runs}")
-    print(f"  WH power : {wh_power_w} W   CPU power: {cpu_power_w} W")
-    print(f"  N count  : {len(n_list)} sizes × {len(dtypes)} dtypes = "
+    print(f"  dtypes      : {dtypes}")
+    print(f"  warmup/runs : {args.warmup} / {args.runs}")
+    print(f"  WH power    : {wh_power_w} W (global fallback; None = N/A if no sidecar)")
+    print(f"  CPU power   : {cpu_power_w} W (global fallback; None = ratio N/A if no sidecar)")
+    print(f"  WH sidecar  : {args.wh_energy_dir or 'not set'}")
+    print(f"  CPU sidecar : {args.cpu_energy_dir or 'not set'}")
+    print(f"  N sizes     : {len(n_list)} × {len(dtypes)} dtypes = "
           f"{len(n_list)*len(dtypes)} benchmarks")
+    print(f"  CPU baseline: numpy_cpu (pocketfft, all cores)")
+    print(f"  ⚠ CPU baseline ≠ Brown et al. native OpenMP C++ FFT")
     print("=" * 80)
 
     device = _open_device()
@@ -316,46 +647,33 @@ def main():
             for N in n_list:
                 r = benchmark_one(N, dtype_str, device,
                                   warmup=args.warmup, runs=args.runs,
-                                  wh_power_w=wh_power_w, cpu_power_w=cpu_power_w)
+                                  wh_power_w=wh_power_w,
+                                  cpu_power_w=cpu_power_w,
+                                  wh_energy_dir=args.wh_energy_dir,
+                                  cpu_energy_dir=args.cpu_energy_dir)
                 if r is not None:
                     results.append(r)
     finally:
         ttnn.close_device(device)
 
-    # ── Print summary table ────────────────────────────────────────────────────
-    print("\n" + "=" * 100)
-    print(f"{'N':>10}  {'dtype':<5}  {'algo':<12}  "
-          f"{'WH(ms)':>8}  {'CPU(ms)':>8}  "
-          f"{'GFlops/s':>9}  {'Speedup':>8}  {'Energy×':>8}  {'RelErr':>8}")
-    print("-" * 100)
-    for r in results:
-        print(f"{r.N:>10,}  {r.dtype:<5}  {r.algorithm:<12}  "
-              f"{r.wh_median_ms:>8.2f}  {r.cpu_median_ms:>8.2f}  "
-              f"{r.gflops_s:>9.2f}  {r.speedup_vs_cpu:>8.2f}×  "
-              f"{r.energy_ratio:>8.1f}×  {r.rel_err:>8.1e}")
+    if not results:
+        print("No results collected.")
+        return
 
-    # ── CSV output ─────────────────────────────────────────────────────────────
-    if results and args.csv:
-        with open(args.csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(asdict(results[0]).keys()))
+    # ── Summary table ─────────────────────────────────────────────────────────
+    _print_summary_table(results)
+    _print_per_algo_summary(results)
+
+    # ── CSV ───────────────────────────────────────────────────────────────────
+    if args.csv:
+        fieldnames = [f.name for f in fields(BenchResult)]
+        with open(args.csv, "w", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
             writer.writeheader()
             for r in results:
-                writer.writerow(asdict(r))
+                writer.writerow(r.csv_row())
         print(f"\nCSV saved to: {args.csv}")
-
-    # ── Paper-ready summary ────────────────────────────────────────────────────
-    if results:
-        print("\n── Paper highlights (median across N per algorithm tier, fp32) ──")
-        from collections import defaultdict
-        by_algo = defaultdict(list)
-        for r in results:
-            if r.dtype == "fp32":
-                by_algo[r.algorithm].append(r)
-        for algo, rs in sorted(by_algo.items()):
-            med_energy = sorted([r.energy_ratio for r in rs])[len(rs) // 2]
-            med_gflops = sorted([r.gflops_s for r in rs])[len(rs) // 2]
-            print(f"  {algo:<12}:  {med_gflops:5.2f} GFlops/s  "
-                  f"energy efficiency {med_energy:.1f}× vs CPU")
+        print("  Columns with N/A = energy not measured for this run.")
 
 
 if __name__ == "__main__":
