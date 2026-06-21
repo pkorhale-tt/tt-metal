@@ -109,7 +109,8 @@ STOCKHAM_BATCH = 64
 # Result dataclass
 # ─────────────────────────────────────────────────────────────────────────────
 
-_NA = "N/A"   # sentinel for unmeasured energy fields in CSV
+_NA = "N/A"                 # sentinel for unmeasured energy fields in CSV
+_BF16_NOTE_PRINTED = False  # print bf16 upcast warning only once per run
 
 
 @dataclass
@@ -226,7 +227,6 @@ def _load_sidecar_energy(energy_dir: Optional[str],
 def _resolve_energy(energy_dir: Optional[str],
                     N: int,
                     dtype_str: str,
-                    median_ms: float,
                     batch: int) -> tuple:
     """Resolve energy for one benchmark point from per-run sidecar JSON only.
 
@@ -294,11 +294,13 @@ def _wh_fft_timed(tt_in: ttnn.Tensor, n_runs: int, device) -> List[float]:
         ttnn.synchronize_device(device)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1e3)
+        re.deallocate()
+        im.deallocate()
     return times
 
 
 def _cpu_fft_timed(x_np: np.ndarray, n_runs: int) -> List[float]:
-    """Wall-clock for numpy.fft.fft (all available cores, plan cached)."""
+    """Wall-clock for numpy.fft.fft (single-threaded pocketfft, plan cached)."""
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
@@ -331,8 +333,8 @@ def benchmark_one(
     algo = _algorithm_label(N)
     B    = STOCKHAM_BATCH if algo == "stockham" else 1
 
-    np.random.seed(N % (1 << 20))
-    x_np = np.random.randn(N).astype(np.float32)
+    rng = np.random.default_rng(N)
+    x_np = rng.standard_normal(N).astype(np.float32)
     if dtype_str == "bf16":
         x_np = torch.tensor(x_np).to(torch.bfloat16).float().numpy()
 
@@ -351,6 +353,8 @@ def benchmark_one(
             re, im = _run_wh_fft(tt_in)
             ttnn.to_torch(re)
             ttnn.to_torch(im)
+            re.deallocate()
+            im.deallocate()
     except RuntimeError as e:
         print(f"  → SKIP (warmup failed: {e})")
         return None
@@ -360,6 +364,8 @@ def benchmark_one(
     re, im = _run_wh_fft(tt_in)
     got = _download_first_row(re, im, N, B)
     rel_err = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-30))
+    re.deallocate()
+    im.deallocate()
 
     # ── WH timed runs (kernel only, no D2H) ───────────────────────────────────
     wh_times = sorted(_wh_fft_timed(tt_in, runs, device))
@@ -367,15 +373,17 @@ def benchmark_one(
     wh_p25 = float(np.percentile(wh_times, 25))
     wh_p75 = float(np.percentile(wh_times, 75))
 
-    # ── CPU baseline (numpy, all cores) ───────────────────────────────────────
+    # ── CPU baseline (numpy pocketfft, single-threaded) ───────────────────────
     x_batch = np.tile(x_np, (B, 1))   # shape (B, N) — same total work as WH
     cpu_times = sorted(_cpu_fft_timed(x_batch, max(runs, 10)))
     cpu_med = float(np.median(cpu_times))
 
-    # ── bf16 note ─────────────────────────────────────────────────────────────
-    if dtype_str == "bf16":
+    # ── bf16 note — printed once per process, not once per N ──────────────────
+    global _BF16_NOTE_PRINTED
+    if dtype_str == "bf16" and not _BF16_NOTE_PRINTED:
         print(f"\n  ⚠ bf16 note: CPU numpy baseline upcasts bf16→float64 internally. "
               f"CPU bf16 time is NOT a precision-matched native bf16 baseline.")
+        _BF16_NOTE_PRINTED = True
 
     # ── derived metrics ───────────────────────────────────────────────────────
     flops    = _fft_flops(N, B)
@@ -384,13 +392,13 @@ def benchmark_one(
 
     # WH energy — per-run sidecar only; N/A if no matching file.
     wh_e, wh_pw_info, wh_dur_s, wh_jpf, wh_fpj, wh_src = _resolve_energy(
-        wh_energy_dir, N, dtype_str, wh_med, B)
+        wh_energy_dir, N, dtype_str, B)
 
     # CPU energy — per-run sidecar only; N/A if no matching file.
     # Use B (not 1): CPU baseline runs B FFTs via np.tile(x_np, (B, 1)).
     # For Stockham B=64; for all other tiers B=1.
     cpu_e, cpu_pw_info, cpu_dur_s, cpu_jpf, cpu_fpj, cpu_src = _resolve_energy(
-        cpu_energy_dir, N, dtype_str, cpu_med, B)
+        cpu_energy_dir, N, dtype_str, B)
 
     ratio, ratio_valid = _compute_energy_ratio(wh_e, cpu_e)
 
@@ -514,7 +522,7 @@ def main():
     parser.add_argument("--dtype", choices=["fp32", "bf16", "both"], default="both")
     parser.add_argument("--warmup", type=int, default=10,
                         help="warmup iterations per (N, dtype)")
-    parser.add_argument("--runs",   type=int, default=20,
+    parser.add_argument("--runs",   type=int, default=50,
                         help="timed iterations per (N, dtype)")
     parser.add_argument("--csv",    default="fft_benchmark.csv",
                         help="output CSV path")
@@ -574,7 +582,7 @@ def main():
     print(f"  CPU sidecar : {args.cpu_energy_dir or 'not set (energy = N/A)'}")
     print(f"  N sizes     : {len(n_list)} × {len(dtypes)} dtypes = "
           f"{len(n_list)*len(dtypes)} benchmarks")
-    print(f"  CPU baseline: numpy_cpu (pocketfft, all cores)")
+    print(f"  CPU baseline: numpy_cpu (pocketfft, single-threaded)")
     print(f"  ⚠ CPU baseline ≠ Brown et al. native OpenMP C++ FFT")
     print("=" * 80)
 
