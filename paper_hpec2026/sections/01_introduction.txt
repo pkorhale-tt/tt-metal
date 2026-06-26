@@ -1,0 +1,81 @@
+I. INTRODUCTION
+================================================================================
+
+The Fast Fourier Transform (FFT) is among the most widely used kernels in
+high-performance computing. Applications in radar signal processing, wireless
+channel estimation, spectral solvers for partial differential equations, audio
+analysis, and spectral graph neural networks all depend on efficient FFT
+execution. Critically, these applications require transforms of diverse sizes:
+N may be a power of two, a prime, a large composite, or a size dictated by
+physical constraints such as the number of range bins in a radar pulse or the
+number of subcarriers in an OFDM frame. A production FFT library must handle
+all of these transparently.
+
+GPU vendors address this requirement through unified FFT libraries. NVIDIA
+cuFFT [1] accepts any N, selects the optimal algorithm internally — Cooley-Tukey
+for power-of-two, mixed-radix for composite, Bluestein chirp-Z for arbitrary N
+— and exposes a single host API regardless of transform size. Application code
+never changes when N changes. This "unified API" design has become the baseline
+expectation for hardware FFT support.
+
+The Tenstorrent Wormhole B0 (WH B0) is a dataflow neural processor built on 64
+programmable Tensix cores, each with 1.5 MB of L1 SRAM. Unlike GPU
+architectures, WH B0 requires all inter-kernel data buffers to be declared
+statically before execution: the firmware validates that total circular buffer
+(CB) allocations per core do not exceed 1,499,136 bytes and aborts with a fatal
+error if they do. This hardware constraint has a direct consequence for FFT: the
+inter-pass transpositions and zero-padding steps required by multi-pass and
+Bluestein algorithms produce CB allocation demands proportional to N. For large
+N, these exceed the 1.5 MB L1 limit by an order of magnitude, making large-N
+FFT physically impossible with standard ttnn primitives.
+
+The most directly related prior work, Brown et al. [2], demonstrates 2-D FFT on
+WH B0 for power-of-two sizes (1024 × 1024) and reports 3.6× energy efficiency
+over a 24-core Intel Xeon Platinum. That work uses the high-level ttnn transpose
+primitive and explicitly identifies data reordering as the primary unsolved
+performance bottleneck. It does not provide a unified API, does not support
+non-power-of-2 N, and does not address the CB overflow problem that prevents
+large-N operation.
+
+This paper closes all three gaps. We make the following contributions:
+
+  (1) ttnn.experimental.fft — a unified 1-D FFT API for WH B0 that accepts any
+      transform length N from 2 to 16,777,216 in both fp32 and bfloat16 with a
+      single function call: re, im = ttnn.experimental.fft(tensor). No user
+      knowledge of the internal algorithm is required.
+
+  (2) rebank_rm and rebank_rm_merge — two new streaming primitives that reduce
+      intermediate circular buffer requirements from O(N) bytes to a constant
+      8 KB, independent of transform size. This is the key enabling innovation:
+      without rebank_rm, Bluestein and three-pass FFT trigger CB overflow for
+      N > 65,536 on WH B0 and cannot execute at all.
+
+  (3) A compile-time four-tier algorithm router — Stockham (N ≤ 1,024),
+      two-pass radix-2 (N ≤ 1,048,576), three-pass radix-2 (N ≤ 16,777,216),
+      and Bluestein chirp-Z (arbitrary non-power-of-2 N) — with automatic
+      selection based on N and dtype. This constitutes the first Bluestein
+      implementation on WH B0.
+
+  (4) A core-grid validation loop that prevents dispatch-core placement for
+      non-power-of-2 work-unit counts, eliminating "Illegal kernel placement"
+      errors that previously blocked Bluestein operation for 1024-aligned N.
+
+  (5) Comprehensive evaluation on WH B0 hardware, covering all four algorithm
+      tiers across fp32 and bf16, with measured power (23.4 W avg, 29 W peak)
+      from the tt-power-sidecar sysfs backend. Peak throughput reaches 3.67
+      GFLOPs/s (Stockham fp32, B=64). All fp32 results satisfy a 5×10⁻⁴
+      relative error tolerance; bf16 satisfies 5×10⁻².
+
+The rest of this paper is structured as follows. Section II describes the WH B0
+architecture and the ttnn programming model, focusing on the CB constraint that
+motivates our design. Section III presents the library design, with particular
+attention to rebank_rm and the routing logic. Section IV evaluates performance
+and accuracy. Section V discusses related work, and Section VI concludes.
+
+================================================================================
+NOTES FOR REVISION BEFORE SUBMISSION:
+  - [2] Brown et al.: confirm final DOI from ISC 2025 proceedings (Springer)
+  - Power numbers: 23.4 W avg is your measured value on wh-lb-43; note this
+    differs from the 42 W in Brown et al. which used a different board/slot.
+  - If you run on the wh-03 machine and get different numbers, update Section IV.
+================================================================================

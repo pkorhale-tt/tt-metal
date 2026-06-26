@@ -1,0 +1,38 @@
+ABSTRACT
+================================================================================
+
+We present ttnn.experimental.fft, the first unified 1-D Fast Fourier Transform
+library for the Tenstorrent Wormhole B0 (WH B0) neural processor that supports
+arbitrary transform lengths N and both fp32 and bfloat16 (bf16) data types
+through a single cuFFT-compatible API call. The central engineering challenge on
+WH B0 is a hard hardware constraint: all circular buffer (CB) allocations must
+be declared statically before kernel execution, and the per-core L1 SRAM limit
+of 1,499,136 bytes is exceeded by O(N) intermediate buffers in standard
+multi-pass and Bluestein FFT pipelines, making large-N FFT physically impossible
+with existing primitives.
+
+We introduce two streaming primitives — rebank_rm and rebank_rm_merge — that
+reduce intermediate CB requirements from O(N) to a constant 8 KB, independent
+of transform length. This enables, for the first time on WH B0, Bluestein
+chirp-Z transforms for arbitrary non-power-of-2 N and three-pass radix-2 FFT
+for N up to 16,777,216. A compile-time router selects among four algorithm tiers
+— single-tile Stockham (N ≤ 1,024), two-pass radix-2 (N ≤ 1,048,576),
+three-pass radix-2 (N ≤ 16,777,216), and Bluestein chirp-Z (any
+non-power-of-2 N) — with no user involvement.
+
+Evaluation on a WH B0 n300 card (23.4 W average measured power) achieves peak
+throughput of 3.67 GFLOPs/s for batched Stockham (N=1,024, B=64, all 64
+cores active) and 1.84 GFLOPs/s for two-pass (N=1,048,576, fp32). All fp32
+results satisfy a 5×10⁻⁴ relative-error tolerance against double-precision
+reference; bf16 results satisfy 5×10⁻². To our knowledge, this is the first
+implementation of arbitrary-N 1-D FFT on any dataflow AI accelerator.
+
+================================================================================
+NOTES:
+  - Word count: ~240 words (HPEC limit is typically 250 — fits)
+  - "first implementation of arbitrary-N 1-D FFT on any dataflow AI accelerator"
+    is a strong claim — only make it if you are confident no other paper exists.
+    Based on our literature search this is accurate as of June 2026.
+  - Update GFLOPs/s numbers if you re-run on a faster machine (wh-03 gave
+    higher numbers than wh-lb-43).
+================================================================================

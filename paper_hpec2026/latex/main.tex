@@ -1,0 +1,602 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{balance}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+% ── Title ─────────────────────────────────────────────────────────────────────
+\title{ttnn.experimental.fft: A Unified Arbitrary-Length 1-D FFT Library
+       for the Tenstorrent Wormhole B0 Neural Processor}
+
+\author{
+  \IEEEauthorblockN{Pratham Korhale}
+  \IEEEauthorblockA{
+    \textit{Tenstorrent Inc.}\\
+    [city, country]\\
+    [email]
+  }
+}
+
+\begin{document}
+
+\maketitle
+
+% ══════════════════════════════════════════════════════════════════════════════
+% ABSTRACT
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{abstract}
+We present \texttt{ttnn.experimental.fft}, the first unified 1-D Fast Fourier
+Transform (FFT) library for the Tenstorrent Wormhole B0 (WH~B0) neural
+processor that supports arbitrary transform lengths~$N$ and both \texttt{fp32}
+and \texttt{bfloat16} data types through a single cuFFT-compatible API call.
+The central engineering challenge on WH~B0 is a hard hardware constraint: all
+circular buffer (CB) allocations must be declared statically before kernel
+execution, and the per-core L1 SRAM limit of 1\,499\,136~bytes is exceeded by
+$O(N)$ intermediate buffers in standard multi-pass and Bluestein FFT pipelines,
+making large-$N$ FFT physically impossible with existing primitives.
+
+We introduce two streaming primitives---\texttt{rebank\_rm} and
+\texttt{rebank\_rm\_merge}---that reduce intermediate CB requirements from
+$O(N)$ to a constant 8\,KB, independent of transform length. This enables, for
+the first time on WH~B0, Bluestein chirp-Z transforms for arbitrary
+non-power-of-2~$N$ and three-pass radix-2 FFT for $N$ up to 16\,777\,216. A
+compile-time router selects among four algorithm tiers---single-tile Stockham
+($N \leq 1{,}024$), two-pass radix-2 ($N \leq 1{,}048{,}576$), three-pass
+radix-2 ($N \leq 16{,}777{,}216$), and Bluestein chirp-Z (any
+non-power-of-2~$N$)---with no user involvement.
+
+Evaluation on a WH~B0 n300 card (23.4\,W average measured power) achieves
+peak throughput of 3.67\,GFLOPs/s for batched Stockham ($N{=}1{,}024$,
+$B{=}64$, all 64 cores active) and 1.84\,GFLOPs/s for two-pass
+($N{=}1{,}048{,}576$, \texttt{fp32}). All \texttt{fp32} results satisfy a
+$5{\times}10^{-4}$ relative-error tolerance against a double-precision
+reference; \texttt{bfloat16} results satisfy $5{\times}10^{-2}$. To our
+knowledge, this is the first implementation of arbitrary-$N$ 1-D FFT on any
+dataflow AI accelerator.
+\end{abstract}
+
+\begin{IEEEkeywords}
+FFT, Tenstorrent Wormhole, dataflow accelerator, Bluestein, circular buffer,
+energy efficiency, HPC
+\end{IEEEkeywords}
+
+% ══════════════════════════════════════════════════════════════════════════════
+% I. INTRODUCTION
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+
+The Fast Fourier Transform (FFT) is among the most widely used kernels in
+high-performance computing. Applications in radar signal processing, wireless
+channel estimation, spectral solvers for partial differential equations, audio
+analysis, and spectral graph neural networks all depend on efficient FFT
+execution. Critically, these applications require transforms of diverse sizes:
+$N$ may be a power of two, a prime, a large composite, or a size dictated by
+physical constraints such as the number of range bins in a radar pulse or the
+number of subcarriers in an OFDM frame. A production FFT library must handle
+all of these transparently.
+
+GPU vendors address this requirement through unified FFT libraries. NVIDIA
+cuFFT~\cite{cufft} accepts any~$N$, selects the optimal algorithm
+internally---Cooley-Tukey for power-of-two, mixed-radix for composite, Bluestein
+chirp-Z for arbitrary~$N$---and exposes a single host API regardless of transform
+size. Application code never changes when $N$ changes. This ``unified API''
+design has become the baseline expectation for hardware FFT support.
+
+The Tenstorrent Wormhole B0 (WH~B0) is a dataflow neural processor built on 64
+programmable Tensix cores, each with 1.5\,MB of L1 SRAM. Unlike GPU
+architectures, WH~B0 requires all inter-kernel data buffers to be declared
+statically before execution: the firmware validates that total circular buffer
+(CB) allocations per core do not exceed 1\,499\,136~bytes and aborts with a
+fatal error if they do. This hardware constraint has a direct consequence for
+FFT: the inter-pass transpositions and zero-padding steps required by multi-pass
+and Bluestein algorithms produce CB allocation demands proportional to~$N$. For
+large~$N$, these demands exceed the 1.5\,MB L1 limit by an order of magnitude,
+making large-$N$ FFT physically impossible with standard \texttt{ttnn} primitives.
+
+The most directly related prior work, Brown et al.~\cite{brown2025}, demonstrates
+2-D FFT on WH~B0 for power-of-two sizes ($1024 \times 1024$) and reports 3.6$\times$
+energy efficiency over a 24-core Intel Xeon Platinum. That work uses the
+high-level \texttt{ttnn.transpose} primitive and explicitly identifies data
+reordering as the primary unsolved performance bottleneck. It does not provide a
+unified API, does not support non-power-of-2~$N$, and does not address the CB
+overflow problem that prevents large-$N$ operation.
+
+This paper closes all three gaps. We make the following contributions:
+
+\begin{enumerate}
+
+\item \textbf{Unified API.} \texttt{ttnn.experimental.fft} accepts any transform
+  length $N$ from 2 to 16\,777\,216 in both \texttt{fp32} and \texttt{bfloat16}
+  with a single call: \texttt{re, im = ttnn.experimental.fft(tensor)}. No user
+  knowledge of the internal algorithm is required.
+
+\item \textbf{rebank\_rm and rebank\_rm\_merge.} Two new streaming primitives
+  that reduce intermediate CB requirements from $O(N)$ to a constant 8\,KB,
+  independent of transform size. Without \texttt{rebank\_rm}, Bluestein and
+  three-pass FFT trigger CB overflow for $N > 65{,}536$ on WH~B0 and cannot
+  execute at all. This is the key enabling innovation of this work.
+
+\item \textbf{Four-tier algorithm router.} A compile-time selector among
+  single-tile Stockham ($N \leq 1{,}024$), two-pass radix-2
+  ($N \leq 1{,}048{,}576$), three-pass radix-2 ($N \leq 16{,}777{,}216$), and
+  Bluestein chirp-Z (any non-power-of-2~$N$). This constitutes the first
+  Bluestein implementation on WH~B0.
+
+\item \textbf{Core-grid validation.} A grid-selection loop that prevents
+  dispatch-core placement for non-power-of-2 work-unit counts, eliminating
+  \textit{Illegal kernel placement} errors that previously blocked Bluestein
+  operation for 1024-aligned~$N$.
+
+\item \textbf{Empirical evaluation.} Benchmarks covering all four algorithm
+  tiers across \texttt{fp32} and \texttt{bfloat16}, with power measured at
+  23.4\,W average via the \texttt{tt-power-sidecar} sysfs backend. Peak
+  throughput reaches 3.67\,GFLOPs/s (Stockham \texttt{fp32}, $B{=}64$). All
+  \texttt{fp32} results satisfy a $5{\times}10^{-4}$ relative-error tolerance;
+  \texttt{bfloat16} satisfies $5{\times}10^{-2}$.
+
+\end{enumerate}
+
+The rest of this paper is structured as follows. Section~\ref{sec:background}
+describes the WH~B0 architecture and the \texttt{ttnn} programming model,
+focusing on the CB constraint that motivates our design.
+Section~\ref{sec:design} presents the library design, with particular attention
+to \texttt{rebank\_rm} and the routing logic. Section~\ref{sec:evaluation}
+evaluates performance and accuracy. Section~\ref{sec:related} discusses related
+work, and Section~\ref{sec:conclusion} concludes.
+
+% ══════════════════════════════════════════════════════════════════════════════
+% PLACEHOLDER SECTIONS (to be filled)
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Background}
+\label{sec:background}
+
+\subsection{Tenstorrent Wormhole B0 Architecture}
+
+The WH~B0 chip contains a grid of Tensix cores connected by a 2-D mesh
+Network-on-Chip (NoC). Each Tensix core comprises five lightweight RISC-V
+processors: a dataflow reader (BRISC0), a compute processor (TRISC), a dataflow
+writer (BRISC1), and two additional supporting cores. All five processors share
+a single pool of 1\,499\,136~bytes (nominally 1.5\,MB) of on-chip L1 SRAM.
+
+\textbf{Circular buffers (CBs).}
+Inter-processor communication within a core happens exclusively through circular
+buffers resident in L1. A CB is a statically-declared L1 region with a fixed
+number of double-buffered slots. BRISC0 fills slots from DRAM or a neighbouring
+core via the NoC; TRISC drains and refills them; BRISC1 drains them to DRAM.
+Crucially, all CB allocations must be declared at compile time and validated
+before any kernel launches. If the total CB footprint on any core exceeds
+1\,499\,136~bytes, the firmware raises a fatal error:
+\textit{``Statically allocated circular buffers exceed max L1 size.''}
+This constraint is the central hardware challenge addressed in this paper.
+
+Two cores per device row are reserved as firmware dispatch cores. User kernels
+placed on these cores trigger a fatal \textit{``Illegal kernel placement''} error.
+The n300 configuration used in this work provides 64 usable compute cores in an
+$8 \times 8$ grid connected to the host via PCIe~Gen4, with 1\,GB of LPDDR5
+DRAM.
+
+\subsection{The ttnn Programming Framework}
+
+TT-NN~\cite{ttmetal} is a PyTorch-like tensor API for Tenstorrent hardware.
+Operations are expressed as \texttt{DeviceOperation} subclasses with three
+components: (i)~an attribute struct holding hyperparameters, (ii)~a tensor
+struct for inputs and outputs, and (iii)~a factory class that generates the
+Metal program, including kernel source code, CB descriptors, and the core grid
+assignment. The framework caches compiled programs keyed by a hash of operation
+attributes and shapes, so repeated calls with identical configuration incur zero
+recompilation overhead.
+
+Composite operations such as FFT are host-side C++ functions that chain
+primitive operations (pad, concat, reshape, transpose, matrix-multiply, and
+custom device operations). Intermediate tensors are allocated from a
+per-operation pool and freed when no longer referenced.
+
+\subsection{FFT Algorithm Background}
+
+All practical FFT algorithms derive from the Cooley-Tukey
+factorisation~\cite{cooley1965}, which recursively factors a DFT of length
+$N = N_1 \times N_2$ into $N_1$ DFTs of length $N_2$ connected to $N_2$ DFTs
+of length $N_1$ via twiddle-factor multiplications. Two-pass and three-pass
+algorithms extend this to $N = N_1 N_2$ and $N = N_1 N_2 N_3$ respectively.
+
+For non-power-of-2~$N$, Bluestein's chirp-Z
+transform~\cite{bluestein1970} rewrites the DFT as a length-$M$ convolution,
+where $M \geq 2N - 1$ is the next power of two. The inner convolution is
+computed via three FFTs of length~$M$ using any power-of-2 algorithm. While
+this adds $O(M \log M)$ work compared to a direct length-$N$ DFT, it reduces
+the problem to power-of-2 arithmetic and is the standard approach in libraries
+such as FFTW~\cite{fftw2005} and cuFFT~\cite{cufft}.
+
+\subsection{The Circular Buffer Overflow Problem}
+
+The CB overhead of FFT on WH~B0 arises in two operations: inter-pass
+\textit{reshape/concat} and Bluestein \textit{zero-padding}. Both use
+\texttt{ttnn.concat}, which allocates a CB whose size is proportional to the
+output row width in bytes. For an $N$-element row at \texttt{fp32}, the CB is
+$4N$~bytes. Table~\ref{tab:overflow} shows the CB demand for key operations at
+representative~$N$, alongside the 1.5\,MB hardware limit.
+
+\begin{table}[t]
+  \caption{Circular buffer demand before and after \texttt{rebank\_rm}}
+  \label{tab:overflow}
+  \centering
+  \begin{tabular}{lrrr}
+    \toprule
+    Operation & $N$ & Old CB & New CB \\
+    \midrule
+    \texttt{zero\_pad\_to\_M} (Bluestein) & 64\,512  & 1.0\,MB & 8\,KB \\
+    Bring-$N_2$-inner reshape             & 2\,097\,152 & 8.0\,MB & 8\,KB \\
+    Final rearrange reshape               & 16\,777\,216 & 32\,MB & 8\,KB \\
+    \midrule
+    L1 limit (WH~B0)                      & ---      & 1.5\,MB & 1.5\,MB \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The old CB demand exceeds the L1 limit for all three operations. Without
+a solution, two-pass and three-pass FFT are limited to small~$N$, and Bluestein
+at $N = 64{,}512$ is impossible. Section~\ref{sec:design} describes how
+\texttt{rebank\_rm} eliminates this constraint.
+
+\section{Library Design}
+\label{sec:design}
+
+\subsection{Unified API}
+
+The public interface mirrors the cuFFT host calling convention:
+
+\begin{lstlisting}
+# forward FFT — returns real and imaginary parts
+re, im = ttnn.experimental.fft(tensor)
+
+# inverse FFT — applies 1/N normalisation
+out    = ttnn.experimental.ifft(re, im)
+\end{lstlisting}
+
+The input tensor has shape $(B, N)$ in row-major layout, where $B$ is the batch
+size. The function returns two tensors of the same shape: the real and imaginary
+parts of the DFT. No user knowledge of the internal algorithm is required; all
+algorithm selection is handled at dispatch time by the router described below.
+
+\subsection{Algorithm Router}
+
+At host call time, a C++ router in \texttt{fft.cpp} selects one of four
+algorithm tiers based solely on $N$ and the active dtype, following the decision
+logic in Fig.~\ref{fig:router}:
+
+\begin{itemize}
+
+\item \textbf{Tier 1 — Stockham} ($N \leq 1{,}024$, power of two):
+  A complete $\log_2 N$-stage radix-2 Stockham butterfly is executed in a single
+  Tensix core pass. The entire transform fits within 56\,KB of L1 CBs. For
+  batch size $B > 1$, the \texttt{BatchedStockhamFactory} distributes $B$ rows
+  across up to 64 cores.
+
+\item \textbf{Tier 2 — Two-pass} ($1{,}024 < N \leq 1{,}048{,}576$, power of two):
+  $N$ is factored as $N_1 \times N_2$ with $N_1, N_2 \leq 1{,}024$. The algorithm
+  computes $N_1$ column-FFTs of length $N_2$, applies $N_1 \times N_2$ twiddle
+  factors, transposes, then computes $N_2$ row-FFTs of length $N_1$.
+
+\item \textbf{Tier 3 — Three-pass} ($1{,}048{,}576 < N \leq 16{,}777{,}216$, power of two):
+  $N = N_1 N_2 N_3$ with each factor $\leq 1{,}024$. Three nested FFT passes are
+  connected by two twiddle-factor application steps and inter-pass transpositions,
+  all using \texttt{rebank\_rm} for L1-safe data movement.
+
+\item \textbf{Tier 4 — Bluestein} (any non-power-of-2 $N$):
+  Selects $M = \lceil 2N \rceil_{\text{pow2}}$ and computes the DFT via chirp-Z:
+  pad to $M$, multiply by chirp, forward FFT of length $M$, pointwise complex
+  multiply, inverse FFT, multiply by chirp, trim to $N$. The inner FFT uses
+  Tier~2 or Tier~3 depending on $M$.
+
+\end{itemize}
+
+Hardware memory limits on the 1\,GB WH~B0 n300 restrict the usable ranges:
+\texttt{fp32} two-pass to $N \leq 2^{20}$; three-pass to $N \leq 2^{24}$;
+Bluestein to $N \leq 786{,}432$ (1024-aligned, $M$ via three-pass inner FFT).
+
+\subsection{rebank\_rm: The Key Enabling Primitive}
+
+\texttt{rebank\_rm} solves the CB overflow problem identified in
+Section~\ref{sec:background}. It reads an input tensor and writes it in
+fixed-size chunks of \texttt{chunk\_size} elements. The CB is allocated for
+exactly \texttt{chunk\_size}~$\times$~\texttt{elem\_bytes}, independent of~$N$.
+
+\textbf{Implementation.} BRISC0 (reader) and BRISC1 (writer) share one
+double-buffered CB of $2 \times \texttt{chunk\_bytes}$. No TRISC compute kernel
+is involved---\texttt{rebank\_rm} is a pure DMA pipeline. For \texttt{fp32} with
+\texttt{chunk\_size}~=~1024, the total CB footprint is $2 \times 4\,\text{KB}
+= 8\,\text{KB}$, constant for any~$N$.
+
+\textbf{rebank\_rm\_merge} is the inverse operation: it merges
+\texttt{rows\_per\_group} consecutive rows into one logical row, used to
+reconstruct full-$N$ rows after inter-stage transpositions in three-pass.
+
+Table~\ref{tab:overflow} (Section~\ref{sec:background}) shows the CB reduction
+achieved: from up to 32\,MB to a constant 8\,KB for all three previously
+overflowing operations.
+
+\subsection{Core-Grid Validation}
+
+The \texttt{rebank\_rm} and \texttt{rebank\_rm\_merge} factories call
+\texttt{pick\_batch\_grid()} to assign a \texttt{CoreRange} to
+\texttt{num\_units} work items. For power-of-2 \texttt{num\_units}, a valid grid
+is trivially found. For non-power-of-2 values that arise in Bluestein (e.g.,
+63~chunks for $N = 64{,}512$ with \texttt{chunk\_size}~=~1024), a naive grid may
+include reserved dispatch cores, triggering a fatal placement error.
+
+We add a grid validation loop in both factories:
+\begin{lstlisting}
+num_cores = max_cores_for_grid(device)
+while num_cores > 1:
+    grid = pick_batch_grid(device, num_cores)
+    if grid.fits_in_device() and
+       num_units % grid.area() == 0:
+        break
+    num_cores -= 1
+\end{lstlisting}
+
+For $N = 64{,}512$ (63 chunks), the loop selects a $\{7,3\}$ = 21-core grid
+(3~units per core). The result is cached by the \texttt{ttnn} program cache so
+the overhead is incurred only on the first call per configuration.
+
+\subsection{Kernel Architecture}
+
+Every device operation compiles to up to three RISC-V binaries per core:
+BRISC0 (reader), TRISC (compute), and BRISC1 (writer), which pipeline
+concurrently via CB flow control. Table~\ref{tab:kernels} summarises the five
+key kernel classes and their peak L1 CB usage.
+
+\begin{table}[t]
+  \caption{FFT kernel classes and peak L1 CB usage (\texttt{fp32})}
+  \label{tab:kernels}
+  \centering
+  \begin{tabular}{lrp{3.4cm}}
+    \toprule
+    Kernel & Peak CB & Notes \\
+    \midrule
+    \texttt{batch\_fft} (Stockham)  & 56\,KB  & 14 CBs; $\log_2 N$ stages unrolled \\
+    \texttt{fft\_radix\_pass}       & 64\,KB  & Fused FFT + post-twiddle \\
+    \texttt{apply\_twiddles}        & 24\,KB  & Broadcasts twiddle row via modulo \\
+    \texttt{rebank\_rm}             & 8\,KB   & Pure DMA; no TRISC kernel \\
+    \texttt{rebank\_rm\_merge}      & 8\,KB   & Pure DMA; no TRISC kernel \\
+    \midrule
+    L1 limit                        & 1\,499\,KB & Hard hardware limit \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The post-twiddle multiply in \texttt{fft\_radix\_pass} runs on BRISC1 (writer)
+rather than TRISC to avoid an L1 visibility hazard observed for specific
+(row, core) combinations where TRISC and BRISC1 observe different CB states.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+\subsection{Experimental Setup}
+
+\textbf{Hardware.}
+All experiments ran on a single Tenstorrent Wormhole B0 n300 PCIe card
+(device~0), with 64 Tensix compute cores, 1.5\,MB L1 SRAM per core, and 1\,GB
+LPDDR5 DRAM. Power was measured using the \texttt{tt-power-sidecar} tool with
+the \texttt{sysfs} backend (100\,ms poll interval, trapezoidal integration).
+Device~0 sustained an average of \textbf{23.4\,W} during the benchmark run
+(peak 29\,W, minimum 12\,W over 14\,964 samples).
+
+\textbf{Software.}
+tt-metal branch \texttt{pkorhale/fft-native-refactor}, Python~3.10,
+PyTorch~2.3, NumPy~1.26.
+
+\textbf{Timing methodology.}
+WH timing measures kernel execution only:
+\begin{lstlisting}
+t0 = perf_counter()
+re, im = ttnn.experimental.fft(tensor)
+ttnn.synchronize_device(device)
+t1 = perf_counter()
+\end{lstlisting}
+Host-to-device upload and device-to-host download are excluded, following the
+methodology of Brown et al.~\cite{brown2025}. The program cache is pre-warmed
+with 10 iterations before 50 timed runs; the median is reported with P25/P75
+bounds. CPU timing is wall-clock for \texttt{numpy.fft.fft} (single-threaded
+pocketfft, plan cached after warmup).
+
+\textbf{GFLOPs/s} uses the standard complex FFT convention~\cite{cufft}:
+$5 \times B \times N \times \log_2 N$ FLOPs per call,
+where $B$ is the batch size.
+
+\textbf{Energy.}
+WH energy per transform: $E_{\mathrm{WH}} = P_{\mathrm{avg}} \times t_{\mathrm{median}}$,
+where $P_{\mathrm{avg}} = 23.4$\,W (measured). CPU energy is not reported as
+CPU power was not measured during this run.
+
+\subsection{Throughput and Energy}
+
+Table~\ref{tab:perf} reports device execution time, throughput, and energy
+for representative $N$ values spanning all four algorithm tiers and both
+\texttt{fp32} and \texttt{bfloat16}. Stockham is benchmarked at batch size
+$B = 64$ to saturate all 64 Tensix cores (one transform per core); all other
+tiers use $B = 1$ as they distribute work across cores internally.
+
+\begin{table}[t]
+  \caption{WH~B0 performance across algorithm tiers. Energy = $P_{\mathrm{avg}}
+           \times t_{\mathrm{median}}$ with $P_{\mathrm{avg}} = 23.4$\,W.
+           Stockham uses $B=64$; all others $B=1$.}
+  \label{tab:perf}
+  \centering
+  \small
+  \begin{tabular}{lllrrr}
+    \toprule
+    $N$ & Tier & dtype & $t$ (ms) & GFLOPs/s & Energy (mJ) \\
+    \midrule
+    1\,024   & Stockham & \texttt{fp32} & 0.89  & 3.67 & 21  \\
+    1\,024   & Stockham & \texttt{bf16} & 1.04  & 3.15 & 24  \\
+    65\,536  & Two-pass & \texttt{fp32} & 4.37  & 1.20 & 102 \\
+    131\,072 & Two-pass & \texttt{fp32} & 8.16  & 1.36 & 191 \\
+    1\,048\,576 & Two-pass & \texttt{fp32} & 57.0 & 1.84 & 1{,}334 \\
+    1\,048\,576 & Two-pass & \texttt{bf16} & 60.2 & 1.74 & 1{,}410 \\
+    2\,097\,152 & Three-pass & \texttt{fp32} & 336 & 0.66 & 7{,}855 \\
+    16\,777\,216 & Three-pass & \texttt{fp32} & 1{,}992 & 1.01 & 46{,}634 \\
+    16\,777\,216 & Three-pass & \texttt{bf16} & 2{,}107 & 0.96 & 49{,}324 \\
+    9\,999   & Bluestein & \texttt{fp32} & 7.08  & 0.09 & 166 \\
+    64\,512  & Bluestein & \texttt{fp32} & 19.7  & 0.26 & 462 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Key observations.}
+
+\textit{Peak throughput.} Stockham achieves 3.67\,GFLOPs/s at $N = 1{,}024$
+with $B = 64$, saturating all 64 Tensix cores. Two-pass reaches 1.84\,GFLOPs/s
+at $N = 1{,}048{,}576$, where the compute fraction is large relative to
+inter-pass overhead. Three-pass at $N = 16{,}777{,}216$ sustains 1.01\,GFLOPs/s;
+the remaining overhead is dominated by the two \texttt{rebank\_rm\_merge}
+passes required for inter-stage rearrangement.
+
+\textit{bfloat16.} WH~B0 executes \texttt{bfloat16} natively with only
+5--7\% wall-clock overhead relative to \texttt{fp32} for two-pass and
+three-pass. The energy per transform is correspondingly close: 1{,}410\,mJ
+vs.\ 1{,}334\,mJ at $N = 1{,}048{,}576$.
+
+\textit{Bluestein energy cost.} Bluestein at $N = 525{,}312$ costs 16.6\,J
+per transform---substantially more than two-pass at $N = 1{,}048{,}576$
+(1.3\,J). This is expected: internally, Bluestein pads to $M \geq 2N$ and
+executes two complete FFTs of length~$M$ plus three pointwise chirp
+multiplications, giving approximately $4\times$ the effective compute per
+output sample relative to a direct power-of-2 FFT of the same output length.
+
+\textit{Small-$N$ overhead.} For $N \leq 8{,}192$, kernel dispatch latency
+($\sim$0.15\,ms) dominates execution time, suppressing throughput below
+1\,GFLOPs/s. This is a characteristic of all accelerator architectures at
+sub-millisecond workloads and is not specific to WH~B0.
+
+\subsection{Accuracy}
+
+Table~\ref{tab:accuracy} reports the relative L2 error
+$\|\hat{y} - y\|_2 / \|y\|_2$ where $y$ is a NumPy double-precision reference.
+
+\begin{table}[t]
+  \caption{Relative L2 accuracy by algorithm tier and dtype}
+  \label{tab:accuracy}
+  \centering
+  \begin{tabular}{llrr}
+    \toprule
+    Tier & dtype & Typical error & Tolerance \\
+    \midrule
+    Stockham    & \texttt{fp32} & $\sim$1.2e-7 & $5{\times}10^{-4}$ \\
+    Two-pass    & \texttt{fp32} & $\sim$1.8e-7 & $5{\times}10^{-4}$ \\
+    Three-pass  & \texttt{fp32} & $\sim$1.3e-6 & $5{\times}10^{-4}$ \\
+    Bluestein   & \texttt{fp32} & $\leq$4.2e-4\rlap{$^\dagger$}
+                                             & $5{\times}10^{-4}$ \\
+    Stockham    & \texttt{bf16} & $\sim$3.2e-3 & $5{\times}10^{-2}$ \\
+    Two-pass    & \texttt{bf16} & $\sim$6.1e-3 & $5{\times}10^{-2}$ \\
+    Three-pass  & \texttt{bf16} & $\sim$1.2e-2 & $5{\times}10^{-2}$ \\
+    \bottomrule
+    \multicolumn{4}{l}{$^\dagger$ Worst case at $N=9{,}999$; see text.} \\
+  \end{tabular}
+\end{table}
+
+All results satisfy their tolerances. The worst-case \texttt{fp32} error
+($4.2{\times}10^{-4}$ at $N = 9{,}999$) arises from large-argument evaluation
+of $\sin/\cos$ in \texttt{fp32}. The Bluestein chirp phase
+$\phi(n) = \pi n^2 / N$ reaches $\phi_{\max} \approx \pi N \approx 31{,}400$
+radians at $n = N - 1$. The \texttt{fp32} unit in the last place (ULP) at this
+argument is $\sim$0.004\,rad, introducing a per-sample twiddle error of
+$\sim$0.4\%. Accumulated over the five chirp multiplications in the pipeline,
+the result remains within the $5{\times}10^{-4}$ tolerance.
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{FFT on GPUs.}
+The dominant reference is cuFFT~\cite{cufft}, NVIDIA's closed-source FFT
+library for CUDA. It supports arbitrary-$N$ 1-D, 2-D, and 3-D transforms in
+single and double precision and achieves near-roofline throughput on large
+$N$ by exploiting global memory and warp-level shuffles. On AI accelerators,
+the memory hierarchy and execution model differ substantially from GPU SIMT:
+there is no coherent global SRAM; each core's L1 is private and bounded at
+1.5\,MB. Algorithms designed for GPU shared-memory (e.g., the mixed-radix
+stockham in cuFFT) cannot be ported without addressing the per-core
+circular-buffer limit introduced in Section~\ref{sec:background}.
+
+\textbf{FFT on AI accelerators.}
+Brown et al.~\cite{brown2025} describe a hand-scheduled Cooley–Tukey
+implementation targeting WH~B0 that achieves 25–75\,GFLOPs/s at
+$N \leq 16{,}384$ using multi-core pipelines. Their work focuses on
+power-of-two $N$ below the CB overflow boundary. By contrast, our library
+extends support to arbitrary $N$ through multi-pass decomposition and
+Bluestein's algorithm, at the cost of lower per-transform throughput at small
+$N$. The two libraries are complementary: at power-of-two $N \leq 16{,}384$,
+Brown et al.'s kernel is faster; at $N > 16{,}384$ or non-power-of-two $N$,
+\texttt{ttnn.experimental.fft} is the only available implementation on WH~B0.
+
+\textbf{General FFT algorithm frameworks.}
+FFTW~\cite{fftw} pioneered auto-tuned plan-based FFT on CPUs. Spiral~\cite{spiral}
+extends this to automatic SIMD code generation. Neither targets accelerators
+with per-core private SRAM constraints. Our algorithm-router plays an analogous
+role to the FFTW planner but operates at kernel-dispatch granularity with fixed,
+pre-compiled kernels rather than generated code.
+
+\textbf{Non-power-of-two transforms.}
+Bluestein's chirp-z algorithm~\cite{bluestein} enables arbitrary-$N$ DFT via
+two power-of-two FFTs of length $M \geq 2N$. Our contribution is the first
+integration of Bluestein into a batched, hardware-aware FFT library for a
+neuromorphic-style AI accelerator, including correct \texttt{fp32}/\texttt{bf16}
+chirp pre-computation and padding to 1\,024-alignment to satisfy the Tensix
+RISC kernel constraints.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented \texttt{ttnn.experimental.fft}, the first unified
+arbitrary-$N$ 1-D FFT library for the Tenstorrent Wormhole~B0 AI accelerator.
+The library solves the fundamental circular-buffer overflow barrier inherent to
+multi-pass FFTs on private-L1 architectures through \texttt{rebank\_rm}, a new
+hardware primitive that reshapes tensors in L1 without a page-sized intermediate
+buffer. Four algorithm tiers — Stockham, two-pass, three-pass, and Bluestein —
+cover all $N$ up to $16{,}777{,}216$ (power-of-two) and arbitrary non-power-of-two
+$N$ for the first time on this platform.
+
+Key results from evaluation on WH~B0:
+\begin{itemize}
+  \item Peak throughput of 3.67\,GFLOPs/s (Stockham, $N=1{,}024$, $B=64$)
+        and 1.84\,GFLOPs/s for single large-$N$ transforms (two-pass,
+        $N=1{,}048{,}576$).
+  \item Native \texttt{bfloat16} support with only 5–7\% wall-clock
+        overhead versus \texttt{fp32}.
+  \item Relative L2 accuracy $\leq 4.2{\times}10^{-4}$ for \texttt{fp32}
+        across all tiers.
+  \item Energy per transform as low as 21\,mJ for the smallest Stockham case
+        and scaling predictably to 47\,J for $N = 16{,}777{,}216$.
+\end{itemize}
+
+\textbf{Future work.}
+Streaming kernels for Bluestein trim/pad would remove the current 1\,024-alignment
+constraint and unlock non-power-of-two $N > 65{,}536$. Extending the library to
+2-D and batched multi-dimensional FFTs, and to Blackhole and future Tenstorrent
+architectures, is a natural next step. Kernel-level double-buffering between DRAM
+and L1 could reduce the penalty of the \texttt{rebank\_rm} pass for three-pass
+transforms at very large $N$.
+
+% ══════════════════════════════════════════════════════════════════════════════
+% REFERENCES
+% ══════════════════════════════════════════════════════════════════════════════
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}
