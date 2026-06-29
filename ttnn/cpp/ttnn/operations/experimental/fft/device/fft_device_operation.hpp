@@ -13,6 +13,8 @@
 
 #include "fft_device_operation_types.hpp"
 #include "fft_program_factory.hpp"
+#include "single_tile_stockham_factory.hpp"
+#include "batched_stockham_factory.hpp"
 
 namespace ttnn::experimental::prim {
 
@@ -25,8 +27,17 @@ struct FFTDeviceOperation {
     using spec_return_value_t   = std::tuple<TensorSpec, TensorSpec>;
     using tensor_return_value_t = std::tuple<Tensor, Tensor>;
 
-    using program_factory_t = std::variant<FFTProgramFactory>;
+    // Variant of program factories. Order matters only for default-constructed
+    // variants; select_program_factory() chooses at dispatch time.
+    //   - SingleTileStockhamFactory : ProgramDescriptor path, shape (N,)    , N<=1024
+    //   - BatchedStockhamFactory    : ProgramDescriptor path, shape (B, N)  , N<=1024, B>1
+    //   - FFTProgramFactory         : legacy CachedProgram path (everything else)
+    using program_factory_t = std::variant<
+        SingleTileStockhamFactory,
+        BatchedStockhamFactory,
+        FFTProgramFactory>;
 
+    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
     static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
     static tensor_return_value_t create_output_tensors(

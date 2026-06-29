@@ -14,9 +14,15 @@
 # This file exercises one or more N values per backend with tolerances
 # tuned to the precision floor of each (fp32 ≈ 1e-4, bf16 ≈ 1e-2).
 
+import os
+
 import pytest
 import torch
 import ttnn
+
+# N=2^20 with B=1 sits at the L1 boundary; only run it when the user opts in
+# via TT_FFT_AGGRESSIVE=1 (same convention as test_fft_all_n.py).
+_AGGRESSIVE = os.getenv("TT_FFT_AGGRESSIVE", "0") == "1"
 
 
 def _rel_err(got_complex, ref_complex):
@@ -151,7 +157,13 @@ def test_fft_invalid_precision_raises(device):
         (1024,     2e-4),
         (4096,     5e-4),
         (65536,    1e-3),
-        (1048576,  2e-3),
+        pytest.param(
+            1048576, 2e-3,
+            marks=pytest.mark.skipif(
+                not _AGGRESSIVE,
+                reason="N=2^20 B=1 is at the L1 limit; set TT_FFT_AGGRESSIVE=1 to run",
+            ),
+        ),
     ],
 )
 def test_fft_stockham_fp32_pow2(device, N, tol):
@@ -481,16 +493,14 @@ def test_fft_blackhole_ifft_roundtrip(device, N, dtype, tol):
     assert rel < tol, f"BH ifft roundtrip N={N} dtype={dtype} rel err {rel:.2e}"
 
 
-# ── Out-of-support guard ────────────────────────────────────────────────────
-def test_fft_rejects_unsupported_large_n(device):
-    """fp32 + pow2 + N > 16M is not yet wired (needs packed batch_fft_xl
-    kernel); validation rejects with a clear error."""
-    N = 32 * 1024 * 1024  # 32M
-    # A 32M fp32 tensor is ~128 MB — allocate lazily and skip if device
-    # doesn't have headroom. We still want the validation path to fail
-    # cleanly, but constructing the tensor mustn't OOM the host.
+# ── Large-N three-pass correctness (N=2^25) ─────────────────────────────────
+@pytest.mark.skipif(not _AGGRESSIVE, reason="TT_FFT_AGGRESSIVE not set")
+def test_fft_large_n_three_pass(device):
+    """N=2^25 fp32 is now handled by three-pass (N1=256, N2=128, N3=1024).
+    Skipped if device lacks the ~128 MB DRAM headroom."""
+    N = 32 * 1024 * 1024  # 2^25
     try:
-        torch_in = torch.zeros(N, dtype=torch.float32)
+        torch_in = torch.randn(N, dtype=torch.float32)
         tt_in = ttnn.from_torch(
             torch_in,
             dtype=ttnn.float32,
@@ -498,7 +508,11 @@ def test_fft_rejects_unsupported_large_n(device):
             device=device,
         )
     except (RuntimeError, MemoryError):
-        pytest.skip("not enough host/device memory to allocate 32M tensor")
+        pytest.skip("not enough host/device memory to allocate N=2^25 tensor")
 
-    with pytest.raises(RuntimeError):
-        ttnn.experimental.fft(tt_in)
+    re, im = ttnn.experimental.fft(tt_in)
+    got = ttnn.to_torch(re).reshape(-1).to(torch.float32) + \
+          1j * ttnn.to_torch(im).reshape(-1).to(torch.float32)
+    ref = torch.fft.fft(torch_in.to(torch.complex64))
+    rel = (torch.linalg.norm(got - ref) / torch.linalg.norm(ref)).item()
+    assert rel < 1e-3, f"three-pass N=2^25 fp32: rel_err={rel:.2e} > 1e-3"

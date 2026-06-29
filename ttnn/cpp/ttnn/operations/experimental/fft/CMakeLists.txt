@@ -42,7 +42,29 @@ target_sources(
     PRIVATE
         device/fft_device_operation.cpp
         device/fft_program_factory.cpp
+        device/single_tile_stockham_factory.cpp
+        device/batched_stockham_factory.cpp
+        device/apply_twiddles_device_operation.cpp
+        device/apply_twiddles_factory.cpp
+        device/apply_twiddles_xl_device_operation.cpp
+        device/apply_twiddles_xl_factory.cpp
+        device/transpose_rm_device_operation.cpp
+        device/transpose_rm_factory.cpp
+        device/rebank_rm_device_operation.cpp
+        device/rebank_rm_factory.cpp
+        device/rebank_rm_merge_device_operation.cpp
+        device/rebank_rm_merge_factory.cpp
+        device/fft_radix_pass_device_operation.cpp
+        device/fft_radix_pass_factory.cpp
+        device/complex_mul_device_operation.cpp
+        device/complex_mul_factory.cpp
         fft.cpp
+        apply_twiddles.cpp
+        apply_twiddles_xl.cpp
+        transpose_rm.cpp
+        fft_radix_pass.cpp
+        complex_mul.cpp
+        bluestein.cpp
 )
 
 target_include_directories(ttnn_op_experimental_fft PRIVATE ${FixmeOpIncDirs})
